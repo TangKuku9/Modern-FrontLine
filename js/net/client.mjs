@@ -26,7 +26,7 @@ export class NetClient {
     this.pending = [];                                // 攒一渲染帧一起发的输入包
     this.localTick = 0;
     this.history = [];                                // {tick, inp}
-    this.snaps = 0; this.lastSnapAt = 0; this.rtt = 0; this.serverTick = 0;
+    this.snaps = 0; this.snapGap = 0; this.rtt = 0; this.serverTick = 0;
     this.events = [];                                 // 交给上层做 HUD/音效
     this.type = 'online'; this.ffa = false;
     this.scores = { A: 0, B: 0 };
@@ -40,32 +40,86 @@ export class NetClient {
     return new Promise((res, rej) => {
       const ws = this.ws = new WebSocket(this.url);
       ws.binaryType = 'arraybuffer';
-      const timer = setTimeout(() => rej(new Error('连接超时 ' + this.url)), 8000);
-      ws.onopen = () => ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout }));
+      // res/rej/timer 挂在实例上而不是只留在闭包里：进场失败有四个来源，其中"服务端拒绝"
+      // 发生在 onControl 里 —— 那是个类方法，看不见 Promise 执行函数的作用域。曾经直接在
+      // 里面写 rej()，于是服务端每拒一次进场就抛一次 ReferenceError，而它本该报出的原因
+      // （房间满了、正在维护）正好就是主菜单要显示的那句话。
+      // 拨号超时给 15 秒，进场应答超时给 8 秒，而且后者从 onopen 起算：实测后台标签页里
+      // 光 WebSocket 握手就能吃掉 3 秒多，两个都从 new 起算会把"房间已满"盖成"连接超时"。
+      this._join = { res, rej, timer: setTimeout(() => this.settleJoin(new Error('连不上对局服务 ' + this.url)), 15000) };
+      ws.onopen = () => {
+        this._opened = true;
+        const j = this._join;
+        if (j) { clearTimeout(j.timer); j.timer = setTimeout(() => this.settleJoin(new Error('连接超时：8 秒没等到进场应答')), 8000); }
+        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout }));
+      };
       ws.onmessage = (m) => {
-        if (typeof m.data === 'string') {
-          const j = JSON.parse(m.data);
-          if (j.t === 'welcome') {
-            this.cid = j.cid; this.serverTick = j.tick; this.mapId = j.map;
-            this.welcome = j;
-            // 名字不在二进制快照里（变长字段会毁掉定长包），靠 welcome + join 事件带
-            for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team });
-            clearTimeout(timer); res(j);
-          } else if (j.t === 'ev') {
-            this.onEvents(j);
-          } else if (j.t === 'err') {
-            clearTimeout(timer); rej(new Error('服务端：' + j.msg));
-          } else if (j.t === 'pong') {
-            this.rtt = performance.now() - j.c;
-          }
-          return;
-        }
+        if (typeof m.data === 'string') { this.onControl(JSON.parse(m.data)); return; }
         this.onSnapshot(decodeSnapshot(m.data), performance.now() / 1000);
       };
-      ws.onerror = (e) => { clearTimeout(timer); rej(new Error('WebSocket 错误')); };
-      ws.onclose = () => { this.connected = false; this.events.push({ e: 'disconnected' }); };
+      ws.onerror = (e) => { this.settleJoin(new Error('WebSocket 错误')); };
+      // 断开要能被"看见"。以前只是往 events 里塞一条 disconnected，而没人读 events ——
+      // 症状是"服务器重启后所有人站在一个静止的世界里"，这是上线后第一条客服工单。
+      ws.onclose = (ev) => {
+        this.connected = false;
+        // 把"哪一种关"留在身上：1006 + opened=false 是握手就没完成（地址错、端口没开、
+        // 反代没转发 Upgrade），1006 + opened=true 才是连上之后断的。上线后排障全靠这一句。
+        this.closedInfo = { code: ev && ev.code, reason: (ev && ev.reason) || '', wasClean: !!(ev && ev.wasClean), opened: !!this._opened };
+        if (this._closing) return;      // 我们自己拆的：原因已经在 reject 里说过了，别再报一次"断开"
+        // 握手期就被关掉（来源检查 403、进程已死）：不结算的话 connect() 要空等到超时，
+        // 玩家对着"正在连接"的转圈多等一整轮。welcome 之后这里是正常下场/断线，不该 reject。
+        if (!this.welcome) this.settleJoin(new Error(this._opened ? '连接被服务器关闭' : '没能连上对局服务（握手未完成）'));
+        this.markLost(ev && ev.code === 1001 ? 'lost' : 'closed', (ev && ev.reason) || this.serverNote || '');
+      };
       this.connected = true;
     });
+  }
+
+  // 进场握手的一次性结算：拨号超时 / 应答超时 / WebSocket 错误 / 服务端拒绝 / welcome，
+  // 谁先到算谁，第二次调用是无操作（"还挂着吗"这件事本身就是 onControl 的分支判据）。
+  settleJoin(err, payload) {
+    const j = this._join; if (!j) return;
+    clearTimeout(j.timer); this._join = null;
+    if (!err) return j.res(payload);
+    // 失败就把 socket 拆掉。不拆的话迟到的 welcome 会造出一个僵尸局：主菜单已经退回去了、
+    // 地图从没加载，而 onmessage 还在按拍喂快照 —— 界面上写着"连接失败"，逻辑却在打对局。
+    this._closing = true;
+    try { this.ws.close(1000, 'join failed'); } catch (e) { /* 已经关了 */ }
+    j.rej(err);
+  }
+
+  // 控制帧单独成方法：既让 onmessage 收起来，也让 test/net-drop.mjs 能直接喂一条
+  // 假的服务端消息进来验收 UI（服务器优雅下线在那台机器上测不了，见 README）。
+  onControl(j) {
+    if (j.t === 'welcome') {
+      this.cid = j.cid; this.serverTick = j.tick; this.mapId = j.map;
+      this.welcome = j;
+      // 名字不在二进制快照里（变长字段会毁掉定长包），靠 welcome + join 事件带
+      for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team });
+      this.snapGap = 0;         // 看门狗的基线：从进场这一刻开始数"多久没收到快照"
+      this.settleJoin(null, j);
+    } else if (j.t === 'ev') {
+      this.onEvents(j);
+    } else if (j.t === 'err') {
+      // 进场被拒（房间满、正在维护）只让 connect() 失败，不标 lost：这时玩家还没进过世界，
+      // 该由 startOnline 的 catch 在加载页上说明原因，而不是往对局 HUD 上刷一条横幅。
+      // 已经进场之后收到的 err 只是这一条连接的事，更不该把一局打停。
+      if (!this.welcome) this.settleJoin(new Error('服务端：' + j.msg));
+      else this.events.push({ e: 'serverError', msg: j.msg });
+    } else if (j.t === 'pong') {
+      this.rtt = performance.now() - j.c;
+    } else if (j.t === 'note') {
+      // 服务端优雅下线时给的那句话 —— 比"连接断了"有用得多，玩家知道是维护不是自己网卡
+      this.serverNote = String(j.msg || '');
+      this.events.push({ e: 'note', msg: this.serverNote });
+      this.game.onNetNote && this.game.onNetNote(this.serverNote);
+    }
+  }
+
+  markLost(kind, reason) {
+    if (this.lost) return;
+    this.lost = kind; this.lostReason = reason || ''; this.lostAt = performance.now() / 1000;
+    this.events.push({ e: 'disconnected', kind, reason });
   }
 
   sendPing() { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'ping', c: performance.now() })); }
@@ -100,7 +154,7 @@ export class NetClient {
   }
 
   onSnapshot(snap, now) {
-    this.snaps++; this.lastSnapAt = now; this.serverTick = snap.tick;
+    this.snaps++; this.snapGap = 0; this.serverTick = snap.tick;
     this.lastSnap = snap;                               // 测试与 netdebug 要看原始下行
     this.lastRngState = snap.rngState >>> 0;
     const seen = new Set();
@@ -390,6 +444,17 @@ export class NetClient {
   // 每渲染帧一次：驱动远端实体的插值
   frameUpdate(dt) {
     const now = performance.now() / 1000;
+    // 半开连接：TCP 还在、对端已经不发包了（换网络、进程被 OOM 杀掉、LB 空闲回收）。
+    // 浏览器不会为这种情况触发 onclose，只能自己数"多久没收到快照"：
+    // 正常 20Hz 下行，2.5 秒 = 连丢 50 包，那不是抖，那是没了。
+    // 计时只用"确实在跑帧"的那段时间：整页冻结、切后台、加载地图那种几秒长任务里，帧间隔
+    // 一次就跨过阈值，可那段时间事件循环根本没转 —— 快照没被*处理*不等于服务器没在*发*。
+    // 最早的症状就是基线写死 0：进场本身要 6 秒，于是人人一进对局就报"失联"。
+    const since = now - (this._lastFrameAt || now); this._lastFrameAt = now;
+    if (this.connected && this.welcome && !this.lost) {
+      this.snapGap += since < 0.25 ? since : 0;
+      if (this.snapGap > 2.5) this.markLost('stale', '已经 2.5 秒没收到服务器状态');
+    }
     for (const r of this.remotes.values()) r.update(dt, now);
   }
 

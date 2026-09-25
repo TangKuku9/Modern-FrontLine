@@ -86,6 +86,7 @@ python3 -m http.server 8080
 | 3 / 4 / 5 | 使用连杀奖励 |
 | Tab | 记分板 |
 | Esc | 暂停 |
+| Enter | 联机掉线后重新连接（横幅上会写明原因） |
 
 ## 目录结构
 
@@ -102,6 +103,10 @@ js/world.js / maps.js     关卡构建工具和 5 张地图
 js/textures.js / materials.js  程序化纹理与材质
 js/gunmodel.js / soldier.js    枪械模型与士兵模型
 js/effects.js / combat.js / audio.js / hud.js  特效、弹道判定、合成音效、HUD
+js/net/                 联机客户端：client 连接与对账、predict 回滚重放、remote 远端实体
+js/quant.js             两端共用的量化 —— 预测要和服务端算出同一个数
+server/                 权威对局服务：net-server 传输与静态文件、room 模拟、codec 定长协议、prng
+test/                   验收（rollback 位级一致性、net-play 真浏览器对打、net-drop 掉线可见性）
 ```
 
 ## 实时联机与云端部署
@@ -185,12 +190,13 @@ docker run -d -p 8090:8090 -e ALLOW_ORIGIN=https://your.domain mw-room
 
 ```bash
 npm test          # 不含浏览器：gate + rollback + net-probe + deploy-probe + xenv + fps + viewmodel
-npm run test:all  # 再加两个真浏览器对打（net-play，要下载 playwright 浏览器）
+npm run test:all  # 再加三个真浏览器测试（net-play 对打、net-drop 掉线，要下载 playwright 浏览器）
 ```
 
 - `server/deploy-probe.mjs` 37 项：静态白名单（含 `/server/*.mjs`、`/.git/config` 拿不到，且 dev 模式仍可取，证明拦网会 Discriminate）、ETag/304、gzip 往返一致、路径穿越、来源检查两个方向、超帧被断且**别人那一局不陪葬**、房间配额、自动分配、空房回收、优雅下线。
 - `test/rollback.mjs` 64 项：回滚重放与顺跑逐位相同（12 个 ack 点 × 45 字段）+ 四条反证臂。
 - `test/net-play.mjs`：两个真浏览器对打 —— 移动复制、跨窗口击杀由服务端裁决、重生、武器一致、拍号契约。
+- `test/net-drop.mjs` 24 项：掉线要"看得见"。三种成因分开验收 —— 连接被关（onclose → 'closed'）、半开连接（2.5 秒没快照 → 'stale'，用只掐下行不掐 socket 的方式复现）、进场被拒（welcome 之前的 err → 加载页写明原因，且那句不是我们猜的"连接超时"）。世界会暂停、横幅不自动淡、Enter 重连。（跑测时见过一次"对端先关掉了 socket、err 帧没进来"，两次复跑都没有再出现；`net.closedInfo` 会记下 code/reason/wasClean/opened，下次再撞就是它自己报出来的那种红。）
 
 ### 还没做完的部分（部署前请看一眼）
 

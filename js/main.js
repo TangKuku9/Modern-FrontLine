@@ -292,6 +292,31 @@ class Game {
     else { this.menu.hide(); this.lock(); }
   }
 
+  // 掉线可见性。症状原来是这样的：服务器重启 / 网络断 → 世界静止，但屏幕上没有任何
+  // 解释，玩家以为是自己卡了 —— 上线后这会是第一条工单，而"能重连"这件事必须先让人
+  // 知道发生了什么。刻意不走 pause()：暂停菜单里有"继续"，而断开之后继续没有意义。
+  netLostUi() {
+    const n = this.net;
+    if (!n || !n.lost) return;
+    if (!this._lostUi) {
+      this._lostUi = true;
+      if (this.state === 'play') { this.paused = true; if (document.pointerLockElement) document.exitPointerLock(); }
+      // 只管 lost 的三种成因（closed=对端关了，lost=服务端优雅下线，stale=半开连接）。
+      // "进不去这局"不在这里：那种失败发生在 welcome 之前，startOnline 的 catch 会在加载页
+      // 上说明原因，而此刻还没有对局 HUD 可言。
+      const why = n.lost === 'stale' ? '与服务器失联' : '连接已断开';
+      // hud.announce 走 innerHTML（HUD 别处要放标签），而这里拼进来的是**服务端给的字符串**：
+      // 被攻破的服务器不该能往这台页面上塞脚本。角括号一律先剥掉。
+      const esc = (s) => String(s || '').replace(/[<>]/g, '');
+      const detail = (n.serverNote ? esc(n.serverNote) + ' · ' : '') + esc(n.lostReason) + '（服务器可能在更新）';
+      this.hud.announce(why, detail + ' 按 Enter 重新连接', Infinity);      // Infinity = 不自动消失
+      return;
+    }
+    // 键盘优先：断线时指针已解锁，但游戏里"点一下按钮"这套 UI 我不打算为它新增鼠标依赖
+    const K = this.input && this.input.pressed;
+    if (K && (K.Enter || K.NumpadEnter)) location.reload();
+  }
+
   // 帧输入快照
   snapshotInput() {
     const I = this.input, K = I.keys, P = I.pressed;
@@ -460,6 +485,7 @@ class Game {
       this.grade.uniforms.nvg.value = 0; this.grade.uniforms.hurt.value = 0; this.grade.uniforms.thermal.value = 0; this.grade.uniforms.wp.value = 0;
     }
     if (this.net) { this.net.flush(); this.net.frameUpdate(rdt); }
+    this.netLostUi();
     if (this.netDebug) this.updateNetDebug(raw);
     this.grade.uniforms.time.value = performance.now() * 0.001;
     this.composer.render(rdt);
