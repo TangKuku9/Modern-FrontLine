@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>net trace harness</title>
+<!-- 与 index.html 同一份 import map，所以浏览器端解析到的 three 就是 lib/ 里那份 -->
+<script type="importmap">
+{ "imports": { "three": "./lib/three.module.js", "three/addons/": "./lib/jsm/" } }
+</script>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+  import('./server/sim-twin.mjs').then(async (m) => {
+    try {
+      const t = await m.runTrace({ seed: 2026, ticks: 300, mapId: 'yard' });
+      window.__TRACE = t;
+      document.getElementById('out').textContent =
+        'digest ' + t.digest + '\nmeta ' + JSON.stringify(t.meta) +
+        '\nfirst ' + t.firstSample + '\nlast ' + t.lastSample;
+    } catch (e) {
+      window.__TRACE = { error: String(e && e.stack || e) };
+      document.getElementById('out').textContent = 'ERROR: ' + (e && e.stack || e);
+    }
+  }).catch(e => {
+    window.__TRACE = { error: String(e && e.stack || e) };
+    document.getElementById('out').textContent = 'IMPORT ERROR: ' + (e && e.stack || e);
+  });
+</script>
+</body>
+</html>

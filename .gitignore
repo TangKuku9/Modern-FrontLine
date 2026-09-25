@@ -1,0 +1,8 @@
+node_modules/
+
+# gate.mjs 每次运行重写的比对夹具，不是产物也不是真源
+server/trace-node.json
+server/trace-browser.json
+
+# test/ 下这些是原仓库作者留下的截图/临时输出习惯，一并忽略
+test/*.png
