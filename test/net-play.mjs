@@ -260,7 +260,7 @@ try {
   console.log('\n── 本地预测质量 ──');
   const q = await A.page.evaluate(() => {
     const n = window.game.net;
-    return { reconciles: n.reconciles || 0, replayed: n.replayed || 0, correctedMax: n.correctedMax || 0, steadyMax: n.steadyMax || 0, otherMax: n.otherMax || 0, starved: n.starved || 0, steadyN: n.steadyN || 0, aliveFlips: n.aliveFlips || 0, journalMisses: n.journalMisses || 0, caughtUp: n.caughtUp || 0, repN: n.repN || 0, repMax: n.repMax || 0, repsApplied: n.repsApplied || 0, repSkipped: n.repSkipped || 0, repForgotten: n.repForgotten || 0, qDrops: n.qDrops || 0, dupTicks: n.dupTicks || 0, repSkipWhy: n.repSkipWhy || [], missWhy: n.missWhy || [], snaps: n.snaps, ticks: window.game.tick, pair: n.pairProbe || null, worst: n.steadyWorst || [] };
+    return { reconciles: n.reconciles || 0, replayed: n.replayed || 0, correctedMax: n.correctedMax || 0, steadyMax: n.steadyMax || 0, otherMax: n.otherMax || 0, starved: n.starved || 0, steadyN: n.steadyN || 0, aliveFlips: n.aliveFlips || 0, journalMisses: n.journalMisses || 0, caughtUp: n.caughtUp || 0, repN: n.repN || 0, repMax: n.repMax || 0, repsApplied: n.repsApplied || 0, repSkipped: n.repSkipped || 0, repForgotten: n.repForgotten || 0, qDrops: n.qDrops || 0, dupTicks: n.dupTicks || 0, repSkipWhy: n.repSkipWhy || [], missWhy: n.missWhy || [], snaps: n.snaps, ticks: window.game.tick, pair: n.pairProbe || null, worst: n.steadyWorst || [], flagMismatch: n.flagMismatch || 0, flagMismatchWhy: n.flagMismatchWhy || null };
   });
   ok('每一拍快照都做了回滚重放', q.reconciles > 20, `${q.reconciles} 次 / ${q.snaps} 包快照`);
   // rep 通路的"有牙齿"断言：这一包报了重复拍 ⇔ 服务端比我供得快（饥饿）。
@@ -289,10 +289,21 @@ try {
   ok('稳态样本够多（排除项没把总体吃光）', q.steadyN > 300, `稳态 ${q.steadyN} 包 / 共 ${q.reconciles} 包；饥饿 ${q.starved} · 生死翻转 ${q.aliveFlips}`);
   ok('稳态预测与权威端同刻偏差在厘米级', q.steadyMax < 0.12,
     `稳态最大 ${q.steadyMax.toFixed(4)} m（样本 ${q.steadyN}）· 排除项最大 ${q.otherMax.toFixed(3)} m · 饥饿 ${q.starved} · 生死翻转 ${q.aliveFlips}`);
+  ok('基态旗标与权威端一致（rep=0 的稳态包：同一时刻两端状态同源）', q.flagMismatch === 0,
+    `失步 ${q.flagMismatch} 次 / 稳态 ${q.steadyN} 包${q.flagMismatchWhy ? ` · 首次 ${JSON.stringify(q.flagMismatchWhy)}` : ''}（编码表与取值方式两边已对齐：Crouch 取 crouchT>0.5，不是同名布尔）`);
   if (q.worst.length) {
     const top = [...q.worst].sort((a, b) => b.d - a.d).slice(0, 5);
     console.log(`  >8cm 的稳态校正 ${q.worst.length} 次，最大 5 次现场：`);
     for (const w of top) console.log(`    ${w.d} m · 回演${w.replayed}拍/窗${w.win} · Δtick${w.dTick} Δack${w.dAck} · 报重复${w.rep}拍/实补${w.reps}拍${w.qDrop ? ' · 服务端跳拍' : ''} · 在途${w.inflight}拍 · 速度${w.spd}(vy${w.vy},${w.onG ? '地' : '空'}) · 开火${w.fire ? '是' : '否'}\n      基态差分量 Δpos=${JSON.stringify(w.dp)} Δyaw=${w.dYaw}rad Δhp=${w.dHp} 日记本旗标=${w.jFlags} 权威旗标=${w.eFlags}\n      权威端 ${JSON.stringify(w.auth)} · 本地各拍 ${JSON.stringify(w.traj)} · 基态正前方墙距 ${w.wallAhead} m`);
+  }
+  // 尾部那几个样本要么归因给"服务端在这一包附近对我做了不规则处理"（跳拍、ack 比拍号跑得快），
+  // 要么就是物理真的分叉了 —— 这两件事的修法完全相反，所以先把归因比例打出来再决定动哪里。
+  // 判据线本身不动：排除项必须由独立测到的服务端事件定义，不能为了让它绿而挪阈值。
+  {
+    const big = q.worst.filter(w => w.d > 0.12);
+    const attr = big.filter(w => w.qDrop || w.dAck > w.dTick).length;
+    if (big.length) console.log(`  >0.12 m（判据线）的归因：${attr}/${big.length} 落在服务端不规则事件（跳拍或 Δack>Δtick）上` +
+      ` · 明细 ${JSON.stringify(big.map(w => ({ d: w.d, drop: !!w.qDrop, ahead: w.dAck - w.dTick, inflight: w.inflight, reps: w.reps })))}`);
   }
   if (q.pair && q.pair.n) {
     const p = q.pair, n = p.n;

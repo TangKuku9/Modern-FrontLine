@@ -12,6 +12,8 @@ import { rollback } from './predict.mjs';
 import { clamp } from '../util.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
+// 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
+const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Sprint | FLAG.OnGround | FLAG.Sliding;
 export class NetClient {
   constructor(game, opts = {}) {
     this.game = game;
@@ -334,6 +336,22 @@ export class NetClient {
         // 光有大小不够：0.8 m 的校正到底是"沿地面被推了一下"（dy≈0）、"落地/台阶的高度差"
         // （dz 或 dy 主导）、还是"两边 yaw 已经不同所以走的不是同一条线"，只有分量能分开。
         const jb = win.length ? win[0].j : null;
+        // 旗标两边必须用**同一张编码表**。这条以前是本地自己拼的位序（alive*1、onGround*2、
+        // sliding*4…），而 e.flags 走的是 js/quant.js 的 FLAG —— 第 2 位在表里是 Crouch 不是
+        // OnGround。于是打印出的"日记本 3 / 权威 81"看着像两边状态打架，其实是同一个
+        // "活着、踩在地面上"被两套编码各写了一遍。判据为此红过一整轮才被抓到。
+        // 光有"同一张编码表"还不够，还得是**同一个取值方式**。服务端那一位 Crouch 不是
+        // pl.crouching，而是 pl.crouchT > 0.5（见 server/room.mjs 的打包），Ads 是 ws.adsT > 0.5、
+        // Firing 是 time - lastShot < 0.08。日记本里那几个同名布尔读出来直接对，就会在每一次
+        // 蹲下/起身的过渡里（0 < crouchT ≤ 0.5）稳定报"两边打架"——那是量具在量自己的阈值差，
+        // 不是失步。所以这里镜像服务端的表达式，而不是抄同名字段。
+        const jf = jb ? ((jb.alive ? FLAG.Alive : 0) | (jb.crouchT > 0.5 ? FLAG.Crouch : 0) | (jb.sprinting ? FLAG.Sprint : 0)
+          | (jb.onGround ? FLAG.OnGround : 0) | (jb.sliding ? FLAG.Sliding : 0)) : null;
+        // 只在"基态和快照是同一时刻"（rep=0）时才计数：rep>0 时基态本就早 rep 拍，不等是对的。
+        if (steady && !(e.rep | 0) && hit && jb && jf !== (e.flags & FLAG_BASE_MASK)) {
+          this.flagMismatch = (this.flagMismatch || 0) + 1;
+          if (!this.flagMismatchWhy) this.flagMismatchWhy = { jf, auth: e.flags & FLAG_BASE_MASK, dp: jb.pos && [+e.x.toFixed(2), +e.z.toFixed(2)] };
+        }
         this.steadyWorst = this.steadyWorst || [];
         if (this.steadyWorst.length < 40) this.steadyWorst.push({
           d: +r.corrected.toFixed(4), start, snapTick: this.serverTick, replayed: r.replayed,
@@ -343,8 +361,8 @@ export class NetClient {
           dp: jb ? [+((e.x - jb.pos[0]).toFixed(3)), +(e.y - jb.pos[1]).toFixed(3), +((e.z - jb.pos[2]).toFixed(3))] : null,
           dYaw: jb ? +((e.yaw - jb.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI).toFixed(4) : null,
           dHp: jb ? +(e.hp - jb.hp).toFixed(1) : null,
-          jFlags: jb ? jb.alive * 1 + (jb.onGround ? 2 : 0) + (jb.sliding ? 4 : 0) + (jb.sprinting ? 8 : 0) + (jb.crouching ? 16 : 0) : null,
-          eFlags: e.flags,
+          jFlags: jf,
+          eFlags: e.flags & FLAG_BASE_MASK,
           // 轨迹形状分开两种完全不同的事：
           //  · 逐拍等距爬升  ⇒ 权威端比我多跑了几拍（配对/吞吐）
           //  · 某两拍之间突然断 0.9 m ⇒ 本地自己瞬移了一次（撞墙解算、上一次校正的硬拉）
