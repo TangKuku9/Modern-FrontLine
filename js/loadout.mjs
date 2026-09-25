@@ -58,9 +58,11 @@ export function repairClass(c) {
     lethal: c.lethal, tactical: c.tactical, perks: c.perks || [],
   });
   const out = { ...c, primary: s.primary.id, patt: s.primary.att, pcamo: s.primary.camo,
-    lethal: s.lethal, tactical: s.tactical, perks: s.perks };
-  if (c.secondary) { out.secondary = s.secondary.id; out.satt = s.secondary.att; out.scamo = s.secondary.camo; }
-  else out.secondary = null;
+    lethal: s.lethal, tactical: s.tactical, perks: s.perks,
+    // 修完的卡一定带一把副武器：菜单里五处以上直接读 WEAPONS[k.secondary].name，而配装界面
+    // 本来就没法把副武器去掉 —— 没有副武器的卡只可能来自手改的存档，给它补一把默认手枪，
+    // 比在五个地方各加一次可选链更便宜，也不会漏。
+    secondary: s.secondary.id, satt: s.secondary.att, scamo: s.secondary.camo };
   return out;
 }
 

@@ -24,10 +24,10 @@ async function launch() {
   throw new Error('没有可用浏览器');
 }
 
-const newPage = async (browser, srv, tag, profile) => {
+const newPage = async (browser, srv, tag, profile, query, viewport) => {
   // 用 storageState 播 localStorage：它在任何页面脚本之前落地，比 initScript 少一层时机悬念。
   const ctx = await browser.newContext({
-    viewport: { width: 480, height: 270 },
+    viewport: viewport || { width: 480, height: 270 },
     storageState: {
       cookies: [], origins: [{
         origin: new URL(srv.base).origin,
@@ -54,7 +54,8 @@ const newPage = async (browser, srv, tag, profile) => {
       if (m && window.__marks.length < 400) window.__marks.push([Math.round(performance.now()), t.slice(m.index, m.index + 46)]);
     }).observe(document, { childList: true, subtree: true, characterData: true });
   });
-  await page.goto(`${srv.base}/index.html?online=1&room=${tag}&name=甲&team=A`, { waitUntil: 'domcontentloaded' });
+  // query 可以整段换掉：E 段量的是"从主菜单点进联机"，那第一页就不该带 ?online=1
+  await page.goto(`${srv.base}/index.html${query === undefined ? '?online=1&room=' + tag + '&name=甲&team=A' : query}`, { waitUntil: 'domcontentloaded' });
   return { page, logs, ctx };
 };
 
@@ -75,7 +76,7 @@ async function boot(browser, tag) {
 }
 
 // 只想跑某一段的时候：node test/net-drop.mjs D —— 一次全跑要五分钟，迭代等不起。
-const only = (process.argv[2] || 'ABCD').toUpperCase();
+const only = (process.argv[2] || 'ABCDE').toUpperCase();
 const skip = t => !only.includes(t);
 
 const realErrs = (logs) => logs.filter(l => !/favicon|WebGL|AudioContext|pointer lock|ERR_NETWORK|ERR_INTERNET|Failed to load/i.test(l));
@@ -251,6 +252,51 @@ try {
     // 对象同一，不是深比较：两端共用同一张表之后，"装了自己那份"的实现深比较也照样成立。
     ok('玩家身上那份就是服务端回声的**那个对象**（两套 stats 的口子从这里堵）', st.same === true, JSON.stringify({ same: st.same }));
     ok('页面没有真错误（白屏那起就是 buildGun 读 undefined.model 抛的）', realErrs(logs).length === 0, logs.slice(0, 2).join(' ⏐ '));
+    srv.kill();
+  }
+  if (!skip('E')) {
+    console.log('\n── E：联机入口在菜单里，不用手打网址 ──');
+    // 联机的代码早就在了，但要玩家自己敲 ?online=1&room=… 才算真的有这个模式吗？不算。
+    // 这一段就从主菜单开始用鼠标点：联网对战 → 填呼号 → 选阵营 → 加入对局，看它到不到得了局内。
+    const srv = await withServer();
+    // 视口给成玩家真会用的大小：480×270 是其余几段为了软件渲染快用的，那种尺寸下
+    // 菜单本来就滚不到按钮，拿它来点"加入对局"只会量到视口，量不到入口。
+    const { page, logs } = await newPage(browser, srv, 'menu-e', null, '', { width: 1280, height: 720 });
+    for (let i = 0; i < 200; i++) {
+      const ready = await page.evaluate(() => !!(window.game && window.game.menu && window.game.menu.el && window.game.menu.el.querySelector('[data-a=online]')));
+      if (ready) break;
+      await sleep(250);
+    }
+    const hasEntry = await page.evaluate(() => !!document.querySelector('[data-a=online]'));
+    ok('主菜单上有"联网对战"这一项（不是只能靠 ?online=1 的隐藏入口）', hasEntry);
+    await page.click('[data-a=online]');
+    await sleep(500);
+    const form = await page.evaluate(() => ({
+      name: !!document.querySelector('#onName'), team: document.querySelectorAll('#onTeam div').length,
+      room: !!document.querySelector('#onRoom'), join: !!document.querySelector('[data-a=join]'),
+      screen: (window.game.menu || {}).screen,
+    }));
+    ok('联网大厅给出呼号 / 阵营 / 房间号三项，还有"加入对局"', form.name && form.team === 2 && form.room && form.join && form.screen === 'online', JSON.stringify(form));
+    ok('反证：光是站在大厅里还没连服务器（进了大厅不等于已经进场）',
+      await page.evaluate(() => !window.game.net || !window.game.net.connected), '');
+    await page.fill('#onName', '菜单甲');
+    await page.click('#onTeam div[data-v="B"]');
+    await page.click('[data-a=join]');
+    let landed = null;
+    for (let i = 0; i < 200; i++) {
+      landed = await page.evaluate(() => {
+        const g = window.game, n = g && g.net;
+        return { url: location.search, cid: n && n.cid, team: n && n.team, name: n && n.name, state: g && g.state, snaps: n && n.snaps };
+      });
+      if (landed.cid && landed.snaps > 3) break;
+      await sleep(250);
+    }
+    ok('点"加入对局"之后真的换页进了局内（拿到 cid 且在收快照）',
+      /online=1/.test(landed.url) && !!landed.cid && landed.snaps > 3, JSON.stringify(landed).slice(0, 150));
+    ok('大厅里选的阵营带进了对局（B 队不是写在表单上就完事）', landed.team === 'B', 'team=' + landed.team + ' url=' + landed.url);
+    ok('呼号带进去了（服务端按 24 字截，中文不该被截坏）', landed.name === '菜单甲', JSON.stringify(landed.name));
+    ok('没填房间时不往 URL 里塞 room=（让服务端去做 fill-first 分配）', !/room=/.test(landed.url), landed.url);
+    ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
     srv.kill();
   }
 } catch (e) {

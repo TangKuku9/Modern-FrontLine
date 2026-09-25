@@ -48,7 +48,7 @@ export class Menu {
     this.camTarget = { pos: new THREE.Vector3(-0.3, 1.45, 4.2), look: new THREE.Vector3(0.6, 1.15, 0) };
     this.camLook = this.camTarget.look.clone();
     this.gunRotY = -Math.PI / 2; this.gunRotX = 0; this.gunSpin = true;
-    this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10 };
+    this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, name: '士兵', team: 'A', room: '' };
     this.campDiff = 1;
     this.selClass = game.profile.selClass || 0;
     this.buildScene();
@@ -222,6 +222,7 @@ export class Menu {
         <div class="menu-sub">MODERN FRONTLINE</div>
         <div class="mbtn" data-a="campaign"><div class="ico">◈</div><div><div class="mt">战役</div><div class="md">行动代号：午夜清道夫 ${best ? '· 最佳 ' + fmtTime(best) : ''}</div></div></div>
         <div class="mbtn" data-a="mp"><div class="ico">⚔</div><div><div class="mt">多人对战</div><div class="md">团队死斗 · 占领 · 自由混战（对战AI）</div></div></div>
+        <div class="mbtn" data-a="online"><div class="ico">🌐</div><div><div class="mt">联网对战</div><div class="md">与同一台服务器上的真人对局 · 权威模拟在服务端</div></div></div>
         <div class="mbtn" data-a="loadout"><div class="ico">⚙</div><div><div class="mt">武器装备</div><div class="md">自定义配装 · 枪匠 · 技能 · 连杀奖励</div></div></div>
         <div class="mbtn" data-a="settings"><div class="ico">☰</div><div><div class="mt">设置</div><div class="md">画面 · 操作 · 音频</div></div></div>
       </div>
@@ -235,6 +236,7 @@ export class Menu {
       const a = el.dataset.a;
       if (a === 'campaign') this.showCampaign();
       else if (a === 'mp') this.showLobby();
+      else if (a === 'online') this.showOnlineLobby();
       else if (a === 'loadout') this.showLoadouts('main');
       else if (a === 'settings') this.showSettings('main');
     });
@@ -313,6 +315,54 @@ export class Menu {
       setTimeout(() => this.game.startGame('mp', { mode: L.mode, map: L.map, diff: L.diff, allies: L.mode === 'ffa' ? 0 : L.allies, enemies: L.enemies, scoreLimit, timeLimit: L.time }), 600);
     });
   }
+  // 联网大厅。为什么要有它：联机代码早就在了，但要玩家手打 ?online=1 才能玩，
+  // 那等于没有入口。这里只递三样服务端真用得上的东西（呼号、阵营、房间号）——
+  // 地图与模式由服务器说了算（见 server/net-server.mjs 的 CFG 与 pickRoom），
+  // 大厅里放一个本地选择器去"决定"它们，就是在骗人。
+  showOnlineLobby() {
+    this.setCam('lobby');
+    const L = this.lobby, P = this.game.profile;
+    const cls = P.classes[P.selClass || 0];
+    const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
+    const r = this.render(`
+      <div class="lobby">
+        <div class="hdr">联网对战<small>服务器 ${esc(location.host)} · 权威模拟在服务端，本机只做预测</small></div>
+        <div class="lobby-body">
+          <div class="lobby-col" style="flex:1;max-width:560px">
+            <div class="panel"><div class="opts">
+              <div>呼号</div><input id="onName" maxlength="12" placeholder="士兵" value="${esc(L.name)}" style="${inp}">
+              <div>阵营</div>
+              <div class="seg" id="onTeam"><div data-v="A" class="${L.team === 'B' ? '' : 'sel'}">A 队</div><div data-v="B" class="${L.team === 'B' ? 'sel' : ''}">B 队</div></div>
+              <div>房间号（留空 = 由服务器塞进人最少的一间）</div><input id="onRoom" maxlength="32" placeholder="auto" value="${esc(L.room || '')}" style="${inp}">
+              <div style="font-size:12px;color:#888;line-height:1.7">地图与模式由服务器决定。掉线或服务器更新时屏幕上会写明原因，按 Enter 重连。</div>
+            </div></div>
+            <div class="panel">
+              <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备（服务端会按表重建这一份）</div>
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div><div style="font-size:20px;font-weight:800">${esc(cls.name)}</div><div style="font-size:12px;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name} · ${cls.perks.map(id => this.perk(id).name).join(' / ')}</div></div>
+                <button class="btn small ghost" data-a="loadout">编辑</button>
+              </div>
+            </div>
+            <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button><button class="btn" data-a="join">加入对局</button></div>
+          </div>
+        </div>
+      </div>`, 'solid', 'online');
+    r.querySelectorAll('#onTeam div').forEach(d => d.addEventListener('click', () => {
+      L.team = d.dataset.v; r.querySelectorAll('#onTeam div').forEach(x => x.classList.toggle('sel', x === d));
+    }));
+    this.on(r, '[data-a=back]', () => this.showMain());
+    this.on(r, '[data-a=loadout]', () => this.showLoadouts('online'));
+    this.on(r, '[data-a=join]', () => {
+      const name = String(r.querySelector('#onName').value || '士兵').trim().slice(0, 12) || '士兵';
+      const room = String(r.querySelector('#onRoom').value || '').trim().slice(0, 32);
+      L.name = name; L.room = room;
+      const q = new URLSearchParams({ online: '1', name, team: L.team === 'B' ? 'B' : 'A' });
+      if (room) q.set('room', room);
+      this.showLoadingOverlay('正在进入对局…');
+      location.href = location.pathname + '?' + q.toString();
+    });
+  }
+
   perk(id) { for (const col of PERKS) for (const p of col) if (p.id === id) return p; return { name: id, desc: '', icon: '' }; }
 
   // ---------------- 配装 ----------------
@@ -357,7 +407,7 @@ export class Menu {
     this.on(r, '[data-p=tactical]', () => this.pickSimple(ci, 'tactical'));
     this.on(r, '[data-p=perks]', () => this.pickPerks(ci));
     this.on(r, '[data-p=streaks]', () => this.pickStreaks());
-    this.on(r, '[data-a=back]', () => { if (this.loadoutFrom === 'lobby') this.showLobby(); else if (this.loadoutFrom === 'pause') this.showPause(); else this.showMain(); });
+    this.on(r, '[data-a=back]', () => { if (this.loadoutFrom === 'lobby') this.showLobby(); else if (this.loadoutFrom === 'online') this.showOnlineLobby(); else if (this.loadoutFrom === 'pause') this.showPause(); else this.showMain(); });
   }
   picker(title, sub, inner, onBack) {
     const scr = this.el.firstChild;

@@ -45,6 +45,7 @@ python3 -m http.server 8080
 - **Perk**：3 个栏位共 12 项，包括双倍时间、拾荒者、爆破专家、冷血、强硬路线、火力过载、幽灵、速愈、快手、振奋、静步、高度警觉
 - **连杀奖励**：侦察无人机、集束空袭（手动标记目标）、哨戒机枪、武装直升机、白磷弹；每次从中选 3 项
 - **计分**：有击杀奖章（爆头、远距离、双杀、三杀、首杀）、助攻，以及经验值和等级系统
+- **另一种"多人"**：主菜单里的「联网对战」跑在真对局服务上（见下面《实时联机与云端部署》）。上面这套模式与连杀奖励目前只在打 AI 时完整生效 —— 联网侧只做到"同一间房里的人互相能打死、服务端裁决"，模式规则重做还在下面的清单里。
 
 ### 武器与枪匠
 - **12 把武器**：
@@ -94,7 +95,7 @@ python3 -m http.server 8080
 index.html / style.css    页面与界面样式
 lib/                      Three.js r169（本地文件，不依赖 CDN）
 js/main.js                入口：渲染管线、主循环、输入处理
-js/menu.js                菜单：主菜单、大厅、配装、枪匠、设置
+js/menu.js                菜单：主菜单、大厅（对战 AI / 联网）、配装、枪匠、设置
 js/campaign.js            战役流程
 js/mp.js                  多人模式、连杀奖励（哨戒机枪、直升机等）
 js/player.js / weapons.js 玩家控制器、武器系统、第一人称视图模型
@@ -119,8 +120,11 @@ npm install                 # 只有两个运行时依赖：ws、three
 npm start                   # http://127.0.0.1:8090/  同一个端口发静态资源 + 跑 WebSocket
 ```
 
-浏览器打开 `http://127.0.0.1:8090/index.html?online=1` 就进联机（不带 `?room=` 时由服务端
-把人往人最少的那间塞）。想开两窗对打：再开一个 `?online=1&room=xxx&name=乙&team=B`。
+主菜单 → **联网对战** → 填呼号、选阵营、（可选）房间号 → 加入对局。不带房间号时由服务端
+把人往人最少的那间塞。想开两窗对打：第二窗选别的阵营，或两窗填同一个房间号。
+
+也可以直接给 URL（测试和多开的快捷办法，效果与大厅里点一样）：`http://127.0.0.1:8090/index.html?online=1&room=xxx&name=乙&team=B`。
+地图与模式由服务端的环境变量决定（见下表），大厅不假装能选它。
 
 ### 环境变量
 
@@ -183,8 +187,9 @@ docker build -t mw-room .
 docker run -d -p 8090:8090 -e ALLOW_ORIGIN=https://your.domain mw-room
 ```
 
-- 健康检查：`GET /healthz` → `{ok, rooms, clients, tickHz, uptime, draining}`，Dockerfile 里已挂 HEALTHCHECK。
+- 健康检查：`GET /healthz` → `{ok, rooms, clients, tickHz, uptime, draining, heapMB, per[]}`；`per[]` 逐间报 `hz / stepMs / behindMs / fails`，扩容时看的是"哪一间先吃紧"，`fails` 在"一个客户端的坏数据打死一屋子人"之前就会先动。Dockerfile 里已挂 HEALTHCHECK。
 - 下线：收到 `SIGTERM` 后先置 `draining`（`/healthz` 里能读到，LB 可据此摘实例），给在册连接发一条带原因的 `note` 并以 `1001` 关闭，停掉房间循环，在 `SHUTDOWN_GRACE_MS` 内退净。
+- ⚠ **上面这两条 docker 指令在这台开发机上没有构建验证过**：本机没装 docker。已验的是 `CMD`/`HEALTHCHECK` 依赖的那两条运行时事实（`node server/net-server.mjs` 的启动与 `/healthz` 读数、`SIGTERM` 走的是同一份 `shutdown()`），镜像本身要在有 docker 的机器上 `docker build` 一次才算数。
   ⚠ 这一段在 Windows 上**没被测过**：libuv 的 `child.kill()` 是直接 TerminateProcess，信号送不进子进程。Linux 上由 `server/deploy-probe.mjs` 的三条断言验收。
 
 ### 验收（改这套代码之前先看它绿不绿）
@@ -194,10 +199,10 @@ npm test          # 不含浏览器：gate + rollback + net-probe + deploy-probe
 npm run test:all  # 再加三个真浏览器测试（net-play 对打、net-drop 掉线，要下载 playwright 浏览器）
 ```
 
-- `server/deploy-probe.mjs` 60 项：静态白名单（含 `/server/*.mjs`、`/.git/config` 拿不到，且 dev 模式仍可取，证明拦网会 Discriminate）、ETag/304、gzip 往返一致、路径穿越、来源检查两个方向、超帧被断且**别人那一局不陪葬**、房间配额、自动分配、空房回收、优雅下线；外加进场装备闸门（21 条：五套预设职业原样通过 + 未知枪 id/未知配件/越权副武器/无限手雷数全被筛掉 + 端到端"恶意载荷进来之后这间还在 60Hz、旁观者一秒没停"）、心跳清理的两个方向（不回 pong 的连接 15~26 秒内被拆；刚建立沉默 9 秒的不许被拆）。
+- `server/deploy-probe.mjs` 61 项：静态白名单（含 `/server/*.mjs`、`/.git/config` 拿不到，且 dev 模式仍可取，证明拦网会 Discriminate）、ETag/304、gzip 往返一致、路径穿越、来源检查两个方向、超帧被断且**别人那一局不陪葬**、房间配额、自动分配、空房回收、优雅下线；外加进场装备闸门（21 条：五套预设职业原样通过 + 未知枪 id/未知配件/越权副武器/无限手雷数全被筛掉 + 端到端"恶意载荷进来之后这间还在 60Hz、旁观者一秒没停"）、心跳清理的两个方向（不回 pong 的连接 15~26 秒内被拆；刚建立沉默 9 秒的不许被拆）。
 - `test/rollback.mjs` 64 项：回滚重放与顺跑逐位相同（12 个 ack 点 × 45 字段）+ 四条反证臂。
 - `test/net-play.mjs`：两个真浏览器对打 —— 移动复制、跨窗口击杀由服务端裁决、重生、武器一致、拍号契约。
-- `test/net-drop.mjs` 32 项：掉线要"看得见"。四种情形分开验收 —— 连接被关（onclose → 'closed'）、半开连接（2.5 秒没快照 → 'stale'，用只掐下行不掐 socket 的方式复现）、进场被拒（welcome 之前的 err → 加载页写明原因，且那句不是我们猜的"连接超时"）、存档被手改坏（不存在的枪 id 不许把页面打死，玩家身上那份必须是服务端回声的**那个对象**）。世界会暂停、横幅不自动淡、Enter 重连。
+- `test/net-drop.mjs` 40 项：掉线要"看得见"，外加联机入口真在菜单里。四种情形分开验收 —— 连接被关（onclose → 'closed'）、半开连接（2.5 秒没快照 → 'stale'，用只掐下行不掐 socket 的方式复现）、进场被拒（welcome 之前的 err → 加载页写明原因，且那句不是我们猜的"连接超时"）、存档被手改坏（不存在的枪 id 不许把页面打死，玩家身上那份必须是服务端回声的**那个对象**）。世界会暂停、横幅不自动淡、Enter 重连。E 段从主菜单一路点到局内 —— 走的就是玩家真会走的那条路，视口也给 1280×720（480×270 下菜单滚不到按钮，那种尺寸只会量到视口，量不到入口）。
   - 这一段顺手抓到一次"连接刚建立就被单方面拆掉（1006、wasClean=false）"：判据是 `net.closedInfo`，成因在服务端心跳 —— 老写法按"这轮扫描时标志位"判死，事件循环被建房/GC 拖住几秒就会误杀健康玩家。现在按"上一次收到 pong 的时刻"判，并留了一行 `[hb]` 日志。
 
 ### 还没做完的部分（部署前请看一眼）

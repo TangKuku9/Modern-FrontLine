@@ -229,6 +229,8 @@ try {
     ok('存档里不存在的枪 id 会被放回合法值（菜单不再为手改的存档白屏）',
       repairClass({ name: '坏', primary: 'desert_eagle', patt: {}, secondary: 'nope' }).primary === 'm4', JSON.stringify(repairClass({ name: '坏', primary: 'desert_eagle' })));
     ok('存档形状不对（null）也不抛，回到第一套预设', (() => { try { return repairClass(null).primary === 'm4'; } catch (e) { return '抛了：' + e.message; } })(), '');
+    ok('修完的卡一定带副武器（菜单里五处直接读 WEAPONS[k.secondary].name，去掉它等于把崩溃留下）',
+      repairClass({ name: 'n', primary: 'm4' }).secondary === 'm1911' && repairClass({ name: 'n', primary: 'm4', secondary: null }).secondary === 'm1911', '');
     ok('单人玩法才有的字段（extraLethal）留在职业卡里，但进不了网络形状',
       repairClass({ name: 'n', primary: 'm4', extraLethal: 3 }).extraLethal === 3 && sanitizeLoadout({ primary: { id: 'm4' }, extraLethal: 3 }).extraLethal === undefined, '');
 
