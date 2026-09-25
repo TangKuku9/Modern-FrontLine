@@ -2,6 +2,7 @@
 // 高倍镜要遮罩、拾取要重建。这些正是"把视图模型拆出去"最容易弄断的东西，
 // 而帧率测试（test/fps.mjs）和确定性闸门（server/gate.mjs）都盖不住它们。
 import { chromium } from 'playwright';
+import { withServer } from './with-server.mjs';
 
 const ARGS = ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'];
 async function launch() {
@@ -17,7 +18,8 @@ const errs = [];
 page.on('pageerror', e => errs.push('[pageerror] ' + e.message));
 page.on('console', m => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) errs.push('[console.error] ' + m.text()); });
 await page.addInitScript(() => { HTMLCanvasElement.prototype.requestPointerLock = function () { return Promise.resolve(); }; });
-await page.goto('http://localhost:8080/index.html');
+const srv = await withServer();
+await page.goto(srv.base + '/index.html');
 await page.waitForFunction(() => window.game && window.game.state === 'menu', null, { timeout: 180000 });
 
 const res = await page.evaluate(async () => {
@@ -119,4 +121,4 @@ let green = errs.length === 0;
 for (const [okFlag, label] of res) { green &&= okFlag; console.log(`  ${okFlag ? '✅' : '❌'} ${label}`); }
 if (errs.length) console.log('  页面异常:\n    ' + errs.slice(0, 8).join('\n    '));
 console.log(`\n  结论：${green ? '绿' : '红'}`);
-process.exit(green ? 0 : 1);
+srv.kill(); process.exit(green ? 0 : 1);

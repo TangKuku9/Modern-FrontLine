@@ -70,6 +70,8 @@ async function getRoom(id) {
 function startRoomLoop(room, id) {
   let next = Date.now();
   let since = 0;
+  room.__fails = 0;              // 不显式初始化：首拍就抛时 ++undefined = NaN，
+  // 于是 "×1 || %60" 两个条件都不成立，一个静默死掉的房间正是最难查的那种红。
   const tick = () => {
     // 一个坏 tick 不许静默杀掉整个房间：那症状是"所有人卡住但连接都在"，最难查。
     // 连续失败到阈值就报名字，而不是假装还在跑。
@@ -94,15 +96,22 @@ function startRoomLoop(room, id) {
 }
 
 function broadcast(room) {
-  const { view, byteLength } = encodeSnapshot({ tick: room.tick, seq: (room.seq = (room.seq || 0) + 1), worldFlags: 0, entities: room.snapshotEntities() });
-  // 一份 Buffer 发给所有人：ws.send 不会改写传入的 Buffer，没必要每客户端再拷一次
+  const { view, byteLength } = encodeSnapshot({ ...room.snapshot(), seq: (room.seq = (room.seq || 0) + 1) });
+  // 一份 Buffer 发给这个房间的所有人：ws.send 不会改写传入的 Buffer，没必要每人再拷一次。
+  // 必须按 room.clients 发，不能遍历 wss.clients —— 一台服务上跑多个房间时，
+  // 遍历全部套接字会把别的房间（包括已经空掉的房间，实体表是 0 个）的快照塞给所有人。
+  // 客户端拿到的就是"随机变成没有人的世界 + 陌生 ack"，症状是弹匣数字乱跳、别人凭空消失。
   const buf = Buffer.from(view.buffer, 0, byteLength);
   const ev = room.events.splice(0, room.events.length);
   const evMsg = ev.length ? JSON.stringify({ t: 'ev', tick: room.tick, ev }) : null;
-  for (const ws of wss.clients) {
-    if (ws.readyState !== 1 || ws.__cid == null) continue;
-    ws.send(buf, { binary: true });
+  for (const c of room.clients.values()) {
+    const ws = c.ws;
+    if (!ws || ws.readyState !== 1) continue;
+    // 事件先于快照发：重生事件会让客户端把这次位置跳变当"服务端整体重置"处理。
+    // 反过来的话，那一包快照会先被当成一次普通校正，量出 29 m 的"预测偏差"，
+    // 还会拿死亡前的日记本去回滚 —— 表现就是重生后被拽回死点一下。
     if (evMsg) ws.send(evMsg);
+    ws.send(buf, { binary: true });
   }
 }
 
@@ -127,10 +136,11 @@ wss.on('connection', (ws) => {
         const room = await getRoom(msg.room || 'ffa-1');
         const c = room.addClient({ name: String(msg.name || '士兵').slice(0, 24), team: msg.team === 'B' ? 'B' : 'A', loadout: msg.loadout || null });
         ws.__cid = c.cid; ws.__room = room;      // 存对象本身：rooms 里存的是 promise
+        c.ws = ws;                                // 反向也要有：广播按 room.clients 走
         ws.send(JSON.stringify({
           t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId,
           pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw,
-          others: room.snapshotEntities().filter(e => e.id !== c.cid).map(e => ({ id: e.id, name: [...room.clients.values()].find(x => x.cid === e.id)?.name || '' })),
+          others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team })),
         }));
         console.log(`[join] ${c.name} → cid ${c.cid} @ ${room.id}（在线 ${room.clients.size}）`);
       } else if (msg.t === 'ping') {

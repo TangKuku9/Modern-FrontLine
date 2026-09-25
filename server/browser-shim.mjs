@@ -38,6 +38,11 @@ const shimCtx = {
 
 export function installBrowserShim() {
   const g = globalThis;
+  // 真浏览器里不装。这个垫片补的是"Node 缺的那半套环境"，浏览器本来就有 ——
+  // 而 Window.document 是只读访问器，一句 g.document = doc 直接把模块求值抛掉。
+  // net-trace.html 在浏览器里 import sim-twin.mjs 时正是撞在这上面（xenv 曾因此长红）。
+  // 跳过而不是改写：跨环境一致性这一测要的就是浏览器**原样**跑这份代码。
+  if (typeof g.document !== 'undefined' && typeof g.window !== 'undefined' && g.window === g && g.document.createElement) return null;
   if (g.__browserShimInstalled) return g.__browserShimStats();
   const counts = { createElement: 0, getContext: 0 };
 
@@ -70,6 +75,7 @@ export function installBrowserShim() {
     const store = new Map();
     g.localStorage = { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: k => store.delete(k), clear: () => store.clear() };
   }
+  g.__browserShimInstalled = true;      // 上面那个空判据靠这一行才成立
   g.__browserShimStats = () => counts;
   return counts;
 }

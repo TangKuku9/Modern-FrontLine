@@ -22,11 +22,23 @@ export function mulberry32(seed) {
   };
 }
 
-let gen = mulberry32(1);
+// 玩法流的状态放在模块变量里而不是闭包里，因为联机回滚要把流状态一起存/取：
+// 重放一个 tick 会再抽一次随机，不恢复到服务端那一拍的流位置，客户端和服务端
+// 就会永久错开（快照头里带 rngState 就是这个用途）。序列与 mulberry32(seed) 逐位相同。
+let gstate = 1;
+function gnext() {
+  gstate |= 0; gstate = gstate + 0x6D2B79F5 | 0;
+  let t = Math.imul(gstate ^ gstate >>> 15, 1 | gstate);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+
 export const rng = {
   draws: 0,
-  next() { rng.draws++; return gen(); },
-  seed(s) { gen = mulberry32(s >>> 0); rng.draws = 0; },
+  next() { rng.draws++; return gnext(); },
+  seed(s) { gstate = s >>> 0; rng.draws = 0; },
+  state() { return gstate >>> 0; },
+  setState(s) { gstate = s >>> 0; },
 };
 
 // 画面流：始终用宿主 Math.random，不参与播种，不进快照

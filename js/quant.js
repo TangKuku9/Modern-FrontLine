@@ -34,14 +34,60 @@ export const FLAG = {
 // 上行按键位（与 js/main.js 的 input 字段一一对应）
 export const KEY = {
   Fwd: 1, Back: 2, Left: 4, Right: 8, Sprint: 16, Jump: 32, Crouch: 64,
-  Reload: 128, Interact: 256, NVG: 512, Melee: 1024, Lethal: 2048, Tactical: 4096,
+  Reload: 128, Interact: 256, NVG: 512, Melee: 1024, InteractPressed: 2048,
 };
-export const BTN = { Fire: 1, Ads: 2, FirePressed: 4, AdsPressed: 8, SwapNext: 16, SwapPrev: 32 };
+export const BTN = {
+  Fire: 1, Ads: 2, FirePressed: 4, AdsPressed: 8, SwapNext: 16, SwapPrev: 32,
+  // 投掷物要"按住引信 / 松手投出"两段，所以按下与按住各占一位。
+  // 早先服务端把 lethal 错接成了 buttons&1（= 开火位），按住右键会掏手雷。
+  LethalPressed: 64, LethalHeld: 128, TacticalPressed: 256, TacticalHeld: 512,
+};
 
 // 世界级位标志（快照头里的一个字节）
 export const WORLD = { Night: 1, UAV: 2, WhitePhosphorus: 4, MatchOver: 8 };
+
+// sim 的 input 对象 ⇄ 位包。客户端打包、服务端解包必须用这里的同一对函数：
+// 两边各写一份 switch 的结局是"按键含义悄悄错位"，而这种错位不会报错，只会手感怪。
+const KEYMAP = [
+  ['Fwd', 'fwd'], ['Back', 'back'], ['Left', 'left'], ['Right', 'right'],
+  ['Sprint', 'sprint'], ['Jump', 'jumpPressed'], ['Crouch', 'crouchPressed'],
+  ['Reload', 'reloadPressed'], ['Interact', 'interact'], ['InteractPressed', 'interactPressed'],
+  ['NVG', 'nvgPressed'], ['Melee', 'meleePressed'],
+];
+// 投掷物的"按下/按住"两位都在 buttons 里：keys 只剩 16 位且已排到 1024，
+// 再往里塞会把按住位和按下位重到同一个掩码上（写过一次，症状是手雷自己掏出来）。
+const BTNMAP = [
+  ['Fire', 'fire'], ['Ads', 'ads'], ['FirePressed', 'firePressed'], ['AdsPressed', 'adsPressed'],
+  ['SwapNext', 'swapPressed'],
+  ['LethalPressed', 'lethalPressed'], ['LethalHeld', 'lethal'],
+  ['TacticalPressed', 'tacticalPressed'], ['TacticalHeld', 'tactical'],
+];
+
+export function packInput(inp) {
+  let keys = 0, buttons = 0;
+  for (const [bit, field] of KEYMAP) if (inp[field]) keys |= KEY[bit];
+  for (const [bit, field] of BTNMAP) if (inp[field]) buttons |= BTN[bit];
+  return { keys: keys & 0xffff, buttons: buttons & 0xffff };
+}
+
+export function unpackInput(keys, buttons) {
+  const inp = {
+    fwd: false, back: false, left: false, right: false, sprint: false, jumpPressed: false, crouchPressed: false,
+    fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
+    meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
+    interact: false, interactPressed: false, nvgPressed: false, streak: -1,
+    firePressed: false, adsPressed: false, mdx: 0, mdy: 0,
+  };
+  for (const [bit, field] of KEYMAP) inp[field] = !!(keys & KEY[bit]);
+  for (const [bit, field] of BTNMAP) inp[field] = !!(buttons & BTN[bit]);
+  return inp;
+}
 
 // 武器索引：快照里只发 1 字节，两端用同一张表
 export const WEAPON_IDS = ['m4', 'ak', 'scar', 'mp5', 'vector', 'pkm', 'm870', 'sks', 'l115', 'm1911', 'revolver', 'rpg'];
 export const weaponIndex = (id) => Math.max(0, WEAPON_IDS.indexOf(id));
 export const weaponId = (n) => WEAPON_IDS[n] || 'm4';
+
+export const TEAM_IDS = ['A', 'B', 'P'];
+export const teamIndex = (t) => Math.max(0, TEAM_IDS.indexOf(t));
+export const teamId = (n) => TEAM_IDS[n] || 'A';

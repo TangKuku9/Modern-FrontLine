@@ -4,6 +4,50 @@ import { WeaponSystem } from './weapons.js';
 import { clamp, damp, lerp, raySphere, rayAABB, DEG, rng } from './util.js';
 import { WEAPONS, LETHALS, TACTICALS } from './data.js';
 
+// 回滚重放的状态日记本字段清单。
+// 漏一个字段 = 那一维带着两边不同的初值继续分叉，而且没人会报错，只有手感怪。
+// test/net-journal.mjs 遍历 Player / WeaponState 的 own keys 检查覆盖率，新增字段
+// 要么登记进来，要么进 J_EXCLUDE 并写清理由。
+export const J_PL = ['yaw', 'pitch', 'hp', 'crouchT', 'slideT', 'eyeSmooth', 'dmgT', 'shakeT', 'shakeAmt',
+  'punchV', 'landDip', 'stepDist', 'revealT', 'sprintLock', 'stunT', 'interactHold',
+  'alive', 'crouching', 'sprinting', 'sliding', 'onGround'];
+export const J_WS = ['state', 'stateT', 'stateDur', 'adsT', 'cool', 'cycleT', 'triggerHeld', 'rp', 'lastShot',
+  'shotsInRow', 'bobPhase', 'sprintT', 'equipT', 'cooking', 'cookT', 'reloadStage', 'meleeHit'];
+export const J_EXCLUDE = {
+  // —— Player ——
+  game: '环境引用', ws: '由 J_WS + ammo + cur 覆盖', isPlayer: '常量', name: '常量', team: '常量',
+  maxHp: '常量', perks: '装备时定，对局中不变', stats: '服务端裁决，客户端只显示计数',
+  lastAttacker: '对象引用，只用于 HUD', radius: '常量',
+  lethal: 'count 走 journal（id/max 是装备）', tactical: 'count 走 journal',
+  camPos: 'updateCamera 每拍重算', aimYaw: 'updateCamera 每拍重算', aimPitch: 'updateCamera 每拍重算',
+  eyeH: '常量',
+  // —— WeaponState（game 与 Player 同名条目共用）——
+  owner: '环境引用', cur: 'journal 单独登记（j.cur）',
+  slots: 'journal 单独登记（j.ammo），stats 由 id+att 派生',
+  loadoutVersion: '视图模型的重建计数，不参与裁决', sink: '表现出口',
+  aimAccum: '只喂视图模型摆动', vmKick: '视图模型', vmRot: '视图模型', fx: '视图模型',
+  replay: '每次 update 开头按 opts 重设，不跨拍存活', grenade: 'journal 单独登记（j.grenade）',
+};
+
+// 重放期间挂到 game 上的静音替身：把这一拍会碰的所有外部出口变成空操作。
+// 逐个调用点加 if 是守不住的 —— 以后谁再加一句 game.audio.xxx() 就会漏掉。
+// 计数是为了让"重放没出声"这条断言不空转：test/rollback.mjs 先看 n>0，
+// 确认重放确实撞过这些出口，再断言真出口一次都没被调用。
+function muteSink(counter) {
+  const noop = () => {};
+  return new Proxy({}, {
+    get(t, k) {
+      if (typeof k === 'symbol') return undefined;
+      if (k === 'calls') return counter;
+      counter.n++;
+      return noop;
+    },
+  });
+}
+const _mute = { audio: { n: 0 }, hud: { n: 0 } };
+const _muteProxy = { audio: muteSink(_mute.audio), hud: muteSink(_mute.hud) };
+export const muteCounts = _mute;
+
 export class Player {
   constructor(game, opts) {
     this.game = game;
@@ -86,7 +130,56 @@ export class Player {
   punch(a) { this.punchV += a; }
   cancelSprint() { this.sprinting = false; this.sprintLock = 0.25; }
 
-  update(dt, input) {
+  // —— 回滚重放：把"我自己"完整拨回某一拍 ——
+  // 在 update 之前取，记的就是"这一拍开始时的我"，重放时才和当初逐字段同起点。
+  journal() {
+    const ws = this.ws, j = { time: this.game.time, cur: ws.cur, grenade: ws.grenade ? ws.grenade.type : null };
+    for (const k of J_PL) j[k] = this[k];
+    for (const k of J_WS) j['ws.' + k] = ws[k];
+    j.pos = [this.pos.x, this.pos.y, this.pos.z];
+    j.vel = [this.vel.x, this.vel.y, this.vel.z];
+    j.ammo = ws.slots.map(s => [s.mag, s.reserve]);
+    j.lethal = this.lethal ? this.lethal.count : -1;
+    j.tactical = this.tactical ? this.tactical.count : -1;
+    return j;
+  }
+  applyJournal(j) {
+    const ws = this.ws;
+    this.game.time = j.time;
+    for (const k of J_PL) this[k] = j[k];
+    for (const k of J_WS) ws[k] = j['ws.' + k];
+    this.pos.set(j.pos[0], j.pos[1], j.pos[2]);
+    this.vel.set(j.vel[0], j.vel[1], j.vel[2]);
+    ws.cur = j.cur;
+    for (let i = 0; i < j.ammo.length && i < ws.slots.length; i++) {
+      ws.slots[i].mag = j.ammo[i][0]; ws.slots[i].reserve = j.ammo[i][1];
+    }
+    ws.grenade = j.grenade ? { type: j.grenade } : null;
+    if (this.lethal) this.lethal.count = j.lethal;
+    if (this.tactical) this.tactical.count = j.tactical;
+  }
+
+  update(dt, input, opts = {}) {
+    // replay：把这一拍重新演一遍给"回滚后的我"看。自身状态与随机流照原样推进，
+    // 但所有外部出口（伤害、弹道查询、特效、声音、HUD、抛射物、噪声）关掉 ——
+    // 那些事服务端已经裁过一次，重演第二遍就是双倍伤害 + 双倍音效。
+    const replay = !!opts.replay;
+    if (replay) return this._updateReplay(dt, input);
+    return this._sim(dt, input, false);
+  }
+  _updateReplay(dt, input) {
+    const game = this.game;
+    const a = game.audio, h = game.hud;
+    game.audio = _muteProxy.audio; game.hud = _muteProxy.hud;
+    game.replaying = true;                        // main.js:makeNoise 认这个旗
+    try {
+      this._sim(dt, input, true);
+    } finally {
+      game.audio = a; game.hud = h; game.replaying = false;
+    }
+  }
+  _sim(dt, input, replay) {
+    const opts = { replay };
     const game = this.game, world = game.world;
     if (!this.alive) return;
     // 视角
@@ -187,6 +280,9 @@ export class Player {
     if (this.dmgT > delay && this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + 40 * dt);
     this.revealT -= dt;
     // 武器输入
+    // 武器命令边沿（换弹/切枪/近战/投掷）。回滚重放时**照原样再走一遍**：
+    // journal 已经把这些分支改到的状态全部退回起点，所以重演不会双倍扣弹、
+    // 也不会双倍起状态机。反过来，跳过它们才会错 —— 那之后的时间轴就对不上了。
     if (input.reloadPressed) ws.startReload();
     if (input.swapPressed) ws.switchTo((ws.cur + 1) % ws.slots.length);
     if (input.slot1) ws.switchTo(0);
@@ -195,7 +291,7 @@ export class Player {
     if (input.lethalPressed && this.lethal) ws.beginThrow('lethal', this.lethal.id);
     if (input.tacticalPressed && this.tactical) ws.beginThrow('tactical', this.tactical.id);
     if (ws.state === 'cook' && !input.lethal && !input.tactical) ws.endThrow();
-    ws.update(dt, input);
+    ws.update(dt, input, opts);
     // 相机
     this.updateCamera(dt);
   }

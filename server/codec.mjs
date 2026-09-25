@@ -3,13 +3,20 @@
 // 定死小端 + 定点量化，不用 JSON：联网的第一原则是"包大小可预测"。
 // 量化定义在 js/quant.js，两端 import 同一份 —— 两边各抄一份的症状是"对面的人在抖"，
 // 而不是报错。每个 pack/unpack 的最大误差由本文件的自测实测印出，不写猜的数。
-import { Q, FLAG } from '../js/quant.js';
+import { Q, FLAG, packInput, unpackInput } from '../js/quant.js';
 
 export { Q, FLAG };
 
-// 每个实体固定 21 字节：id2 + xyz6 + yaw2 + pitch2 + hp1 + flags1 + weapon1 + mag1 + phase1 + vel4
-export const ENTITY_SIZE = 21;
-export const HEADER_SIZE = 7;                        // tick4 + seq1 + count1 + worldFlags1
+// 每个实体固定 25 字节：id2 + xyz6 + yaw2 + pitch2 + hp1 + flags1 + weapon1 + mag1
+//                              + phase1 + vel4 + team1 + ack2 + rep1
+// rep = 服务端在 ack 那一拍之后又拿同一份输入折叠了几拍（队列空时的人肉按住）。
+// 少了它，客户端重建的输入序列就比权威端少 rep 拍 —— 见 server/room.mjs:step 的注释。
+export const ENTITY_SIZE = 25;
+// 头部 11 字节：tick4 + seq1 + count1 + worldFlags1 + rngState4
+// rngState 是权威端玩法随机流的当前内部状态：客户端回滚重放必须把流也拨回同一拍，
+// 否则重放多抽的那几次会让两边永久错开（js/rng.js 的 state/setState 就是为它准备的）。
+// ack 是这个玩家最近一份被服务端真正消费的输入序号 —— 客户端拿它才知道"我哪些输入还没被吃"。
+export const HEADER_SIZE = 11;
 
 export function encodeSnapshot(snap, scratch = new DataView(new ArrayBuffer(HEADER_SIZE + 64 * ENTITY_SIZE))) {
   const p = snap.entities.length;
@@ -20,6 +27,7 @@ export function encodeSnapshot(snap, scratch = new DataView(new ArrayBuffer(HEAD
   view.setUint8(o, snap.seq & 0xff, true); o += 1;
   view.setUint8(o, p, true); o += 1;
   view.setUint8(o, snap.worldFlags, true); o += 1;
+  view.setUint32(o, (snap.rngState ?? 0) >>> 0, true); o += 4;
   for (const e of snap.entities) {
     view.setUint16(o, e.id, true); o += 2;
     view.setInt16(o, Q.packPos(e.x), true); o += 2;
@@ -34,6 +42,9 @@ export function encodeSnapshot(snap, scratch = new DataView(new ArrayBuffer(HEAD
     view.setUint8(o, e.phase & 0xff, true); o += 1;
     view.setInt16(o, Q.packVel(e.vx), true); o += 2;
     view.setInt16(o, Q.packVel(e.vz), true); o += 2;
+    view.setUint8(o, e.team ?? 0, true); o += 1;
+    view.setUint16(o, e.ack ?? 0, true); o += 2;
+    view.setUint8(o, e.rep ?? 0, true); o += 1;
   }
   return { view, byteLength: o };
 }
@@ -51,6 +62,7 @@ export function decodeSnapshot(buf) {
   const seq = view.getUint8(o); o += 1;
   const n = view.getUint8(o); o += 1;
   const worldFlags = view.getUint8(o); o += 1;
+  const rngState = view.getUint32(o, true); o += 4;
   const entities = [];
   for (let i = 0; i < n; i++) {
     entities.push({
@@ -67,22 +79,28 @@ export function decodeSnapshot(buf) {
       phase: view.getUint8(o + 16),
       vx: Q.unpackVel(view.getInt16(o + 17, true)),
       vz: Q.unpackVel(view.getInt16(o + 19, true)),
+      team: view.getUint8(o + 21),
+      ack: view.getUint16(o + 22, true),
+      rep: view.getUint8(o + 24),
     });
     o += ENTITY_SIZE;
   }
-  return { tick, seq, worldFlags, entities, byteLength: o };
+  if (o !== HEADER_SIZE + n * ENTITY_SIZE) throw new Error(`读到的长度 ${o} 与 ${HEADER_SIZE}+${n}×${ENTITY_SIZE} 不符`);
+  return { tick, seq, worldFlags, rngState, entities, byteLength: o };
 }
 
-// 上行输入：一个 tick 一份，12 字节定长
-export const INPUT_SIZE = 12;
+// 上行输入：一个 tick 一份，13 字节定长。
+// buttons 从 8 位加宽到 16 位：投掷物要同时表达"按下"和"按住"，8 位装不下
+// （原来把 lethal 的按住位接到开火位上，按住右键就会掏手雷）。
+export const INPUT_SIZE = 13;
 export function encodeInput(inp) {
   const v = new DataView(new ArrayBuffer(INPUT_SIZE));
   v.setUint32(0, inp.tick >>> 0, true);
   v.setInt16(4, Q.packLook(inp.mdx), true);
   v.setInt16(6, Q.packLook(inp.mdy), true);
   v.setUint16(8, inp.keys & 0xffff, true);
-  v.setUint8(10, inp.buttons & 0xff, true);
-  v.setUint8(11, inp.seq & 0xff, true);
+  v.setUint16(10, inp.buttons & 0xffff, true);
+  v.setUint8(12, inp.seq & 0xff, true);
   return v;
 }
 export function decodeInput(buf) {
@@ -92,8 +110,8 @@ export function decodeInput(buf) {
     mdx: Q.unpackLook(v.getInt16(4, true)),
     mdy: Q.unpackLook(v.getInt16(6, true)),
     keys: v.getUint16(8, true),
-    buttons: v.getUint8(10),
-    seq: v.getUint8(11),
+    buttons: v.getUint16(10, true),
+    seq: v.getUint8(12),
   };
 }
 
@@ -107,11 +125,14 @@ if (typeof process !== 'undefined' && __base(process.argv[1] || '') === __base(i
     ents.push({
       id: i + 1, x: -37.4123, y: 1.6184, z: 22.7719, yaw: 2.71828, pitch: -0.6,
       hp: 87, flags: FLAG.Alive | FLAG.OnGround, weapon: 3, mag: 21, phase: 77, vx: 3.2, vz: -1.7,
+      team: i % 2, ack: i === 0 ? 65000 : i, rep: i === 0 ? 200 : i % 4,
     });
   }
-  const { view, byteLength } = encodeSnapshot({ tick: 123456, seq: 9, worldFlags: 1, entities: ents });
+  const { view, byteLength } = encodeSnapshot({ tick: 123456, seq: 9, worldFlags: 1, rngState: 3735928559, entities: ents });
   if (byteLength !== HEADER_SIZE + 16 * ENTITY_SIZE) throw new Error(`包长 ${byteLength} 与 ${HEADER_SIZE}+16×${ENTITY_SIZE} 不符`);
   const back = decodeSnapshot(view);
+  if (back.rngState !== 3735928559) throw new Error(`玩法流状态没原样回来：${back.rngState}`);
+  if (back.entities[0].ack !== 65000 || back.entities[1].ack !== 1) throw new Error(`ack 往返失真：${back.entities[0].ack}/${back.entities[1].ack}`);
   let maxPos = 0, maxYaw = 0, maxPitch = 0, maxVel = 0;
   for (let i = 0; i < ents.length; i++) {
     const a = ents[i], b = back.entities[i];
@@ -119,8 +140,8 @@ if (typeof process !== 'undefined' && __base(process.argv[1] || '') === __base(i
     maxYaw = Math.max(maxYaw, Math.abs(a.yaw - b.yaw));
     maxPitch = Math.max(maxPitch, Math.abs(a.pitch - b.pitch));
     maxVel = Math.max(maxVel, Math.abs(a.vx - b.vx), Math.abs(a.vz - b.vz));
-    if (a.id !== b.id || a.hp !== b.hp || a.flags !== b.flags || a.weapon !== b.weapon || a.mag !== b.mag || a.phase !== b.phase) {
-      throw new Error('整数字段没原样回来');
+    if (a.id !== b.id || a.hp !== b.hp || a.flags !== b.flags || a.weapon !== b.weapon || a.mag !== b.mag || a.phase !== b.phase || a.rep !== b.rep) {
+      throw new Error(`整数字段没原样回来（rep ${a.rep}→${b.rep}）`);
     }
   }
   if (back.tick !== 123456 || back.seq !== 9 || back.worldFlags !== 1) throw new Error('头部失真');
@@ -132,5 +153,26 @@ if (typeof process !== 'undefined' && __base(process.argv[1] || '') === __base(i
   const lossless = ib.tick === inp.tick && ib.keys === inp.keys && ib.buttons === inp.buttons && ib.seq === inp.seq;
   console.log(`  输入包 ${INPUT_SIZE} B：整数字段${lossless ? '原样' : '失真'}，视线位移 ${inp.mdx}→${ib.mdx.toFixed(4)} / ${inp.mdy}→${ib.mdy.toFixed(4)}（步长 0.01）`);
   if (!lossless) process.exit(1);
+
+  // 按键映射往返：sim 的 input 有 21 个布尔字段，打包再解包必须逐个原样回来。
+  // 这条是"按住右键掏手雷"那类错位的唯一防线 —— 位掩码写重了不会报错，只会手感怪。
+  const fields = ['fwd', 'back', 'left', 'right', 'sprint', 'jumpPressed', 'crouchPressed', 'reloadPressed',
+    'interact', 'interactPressed', 'nvgPressed', 'meleePressed', 'fire', 'ads', 'firePressed', 'adsPressed',
+    'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical'];
+  const bad = [];
+  for (const f of fields) {
+    const src = {}; src[f] = true;
+    const { keys, buttons } = packInput(src);
+    const back2 = unpackInput(keys, buttons);
+    const lit = fields.filter(x => back2[x]);
+    if (lit.length !== 1 || lit[0] !== f) bad.push(`${f} → [${lit.join(',')}]  keys=${keys} buttons=${buttons}`);
+  }
+  const all = {}; for (const f of fields) all[f] = true;
+  const ak = packInput(all);
+  const allBack = unpackInput(ak.keys, ak.buttons);
+  const missing = fields.filter(f => !allBack[f]);
+  console.log(`  按键映射往返：单字段${bad.length ? ` ${bad.length} 个错位` : ` ${fields.length} 个全部原样`}；全按下缺 ${missing.length ? missing.join(',') : '无'}（keys ${ak.keys} / buttons ${ak.buttons}）`);
+  for (const b of bad.slice(0, 8)) console.log('    ❌ ' + b);
+  if (bad.length || missing.length) process.exit(1);
   console.log('  ✅ codec 自测通过');
 }

@@ -1,5 +1,8 @@
 node_modules/
 
+# 本地起服务时的日志，不是产物
+server-*.log
+
 # gate.mjs 每次运行重写的比对夹具，不是产物也不是真源
 server/trace-node.json
 server/trace-browser.json

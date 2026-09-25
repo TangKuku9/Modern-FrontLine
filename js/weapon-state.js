@@ -32,6 +32,7 @@ export class WeaponState {
     // 于是 fire() 连事件对象都不构造 —— 既不会攒出一个无限增长的队列，
     // 也不会在服务端为每次开火分配数组。
     this.sink = null;
+    this.replay = false;              // 客户端回滚重放中：见 update() 的注释
     this.aimAccum = new THREE.Vector2();  // 攒给视图模型做摆动用的视线位移
   }
   dispose() { this.sink = null; }
@@ -80,11 +81,19 @@ export class WeaponState {
   }
   fullAmmo() { for (const s of this.slots) { s.mag = s.stats.mag; s.reserve = s.stats.reserve; } }
 
-  update(dt, input) {
+  update(dt, input, opts = {}) {
     const game = this.game, pl = this.owner, w = this.w;
+    // replay：客户端回滚重放。这一拍**所有自身状态与随机数都照原样推进**，
+    // 只有外部出口关掉（见 fire/doMelee/releaseGrenade）。
+    // 为什么不能整段跳过开火（我最初就是这么写的，错得很难看）：
+    // 后坐横向 side 和散布 spreadDir 各抽一次玩法随机流，并写进 pl.yaw / pl.pitch / this.rp。
+    // 跳过 → 重放窗口里那几发的后坐在回滚后凭空消失，每收一份快照就"吃一次枪口"，
+    // 而且两边的随机流消耗次数从此差 N 次，之后每一发弹道都在不同的分支上。
+    const replay = this.replay = !!opts.replay;
     if (!w) return;
     const st = w.stats;
-    this.aimAccum.x += input.mdx; this.aimAccum.y += input.mdy;
+    // 视线位移只喂视图模型，重放时不要再攒第二遍
+    if (!replay) { this.aimAccum.x += input.mdx; this.aimAccum.y += input.mdy; }
     this.stateT += dt;
     this.cool -= dt; this.cycleT -= dt;
     const sprinting = pl.sprinting;
@@ -157,26 +166,31 @@ export class WeaponState {
 
   fire() {
     const game = this.game, pl = this.owner, w = this.w, st = w.stats;
+    const replay = this.replay;
     w.mag--;
     this.cool = 60 / st.rpm;
     if (st.fire === 'bolt' || st.fire === 'pump') { this.cycleT = 60 / st.rpm; }
     this.lastShot = this.game.time;
     this.shotsInRow++;
-    pl.stats.shots++;
+    if (!replay) pl.stats.shots++;
     // 射线来自"这个玩家自己的视点与视线"，不是 game.camera —— 服务端同时跑 N 个
     // 玩家时那块相机不存在，而且它本来就是本机玩家的派生量（player.js:eyePoint）
     const origin = pl.eyePoint(new THREE.Vector3());
     const fwd = pl.aimDir(new THREE.Vector3());
-    const wantFx = !!this.sink;       // 没有视图模型就一个事件都不构造，服务端零分配
+    // 没有视图模型（权威服务端）或正在重放时，一个表现事件都不构造
+    const wantFx = !replay && !!this.sink;
     if (st.projectile === 'rocket') {
-      const p = new Projectile(game, 'rocket', origin.clone().addScaledVector(fwd, 0.8), fwd.clone().multiplyScalar(55), pl, 10);
-      game.projectiles.push(p);
+      // 抛射物的位置由服务端算，客户端自己那份要靠下行事件同步（P2）；
+      // 重放时绝对不能再挤出一枚，那会有两枚同 id 的火箭各炸各的。
+      if (!replay) game.projectiles.push(new Projectile(game, 'rocket', origin.clone().addScaledVector(fwd, 0.8), fwd.clone().multiplyScalar(55), pl, 10));
     } else {
+      // 散布一定要算、随机数一定要抽，哪怕这一发不去打世界
       const spread = this.currentSpread() * DEG * 0.5;
       let anyHit = false, kill = false, head = false;
       const tracers = wantFx ? [] : null;   // 交给视图模型画：命中点是权威结果，线段端点不是
       for (let i = 0; i < st.pellets; i++) {
         const d = spreadDir(fwd, spread, new THREE.Vector3());
+        if (replay) continue;
         const r = fireHitscan(game, pl, origin, d, st, st.name);
         if (r.ent) { anyHit = true; if (r.killed) kill = true; if (r.part === 'head') head = true; }
         if (wantFx && i < 3 && (this.shotsInRow % 2 === 1 || st.pellets > 1 || st.fire !== 'auto')) tracers.push(r.point.clone());
@@ -202,6 +216,7 @@ export class WeaponState {
   }
   doMelee() {
     const game = this.game, pl = this.owner;
+    if (this.replay) return;      // 命中已经在真那一拍裁过了，meleeHit 由 journal 退回
     const fwd = pl.aimDir(new THREE.Vector3());
     const eye = pl.eyePoint(new THREE.Vector3());
     let best = null, bd = 2.3;
@@ -261,7 +276,7 @@ export class WeaponState {
     const fuse = g.type === 'frag' ? Math.max(0.05, fuseBase - this.cookT) : fuseBase;
     const pos = pl.eyePoint(new THREE.Vector3()).addScaledVector(fwd, 0.4).add(new THREE.Vector3(0, -0.1, 0));
     const vel = inHand ? new THREE.Vector3() : fwd.clone().multiplyScalar(17).add(new THREE.Vector3(0, 3.5, 0)).add(pl.vel.clone().multiplyScalar(0.5));
-    game.projectiles.push(new Projectile(game, g.type, pos, vel, pl, fuse));
+    if (!this.replay) game.projectiles.push(new Projectile(game, g.type, pos, vel, pl, fuse));
     if (inHand) { this.state = 'idle'; }
   }
 }

@@ -17,6 +17,8 @@ import { HUD } from './hud.js';
 import { Menu } from './menu.js';
 import { MPMatch } from './mp.js';
 import { Campaign } from './campaign.js';
+import { Player } from './player.js';
+import { NetClient } from './net/client.mjs';
 import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS } from './data.js';
 import { damp } from './util.js';
@@ -68,6 +70,7 @@ class Game {
     this.acc = 0;
     this.frameTicks = 0;
     this.netDebug = /[?&]netdebug=1/.test(location.search);
+    this.online = /[?&]online=1/.test(location.search);
     this.entities = []; this.bots = []; this.projectiles = []; this.pickups = []; this.noises = [];
     this.mat = mat;
     this.input = { keys: {}, pressed: {}, mdx: 0, mdy: 0, buttons: 0, wheel: 0 };
@@ -129,9 +132,59 @@ class Game {
     window.addEventListener('resize', () => this.onResize());
     document.getElementById('loading').style.display = 'none';
     this.state = 'menu';
-    this.menu.showMain();
     this.clock = new THREE.Clock();
     this.renderer.setAnimationLoop(() => this.frame());
+    if (this.online) await this.startOnline();
+    else this.menu.showMain();
+  }
+
+  // ---------- 联机：?online=1 ----------
+  // 本机玩家照常跑完整模拟（预测），远端玩家由 NetClient 喂插值，权威裁决在服务端。
+  async startOnline() {
+    const q = new URLSearchParams(location.search);
+    this.menu.showLoadingOverlay('正在连接对局服务…');
+    // 装备必须在 connect 之前就算好：join 那一句要把 loadout 交给服务端。
+    // 不交的话服务端按默认配置给你发枪 —— 于是"权威那侧的速度/射速/伤害"和你本地
+    // 预测用的根本不是同一把枪，位置每收一份快照被拽一下，弹匣数字也对不上。
+    const loadout = this.buildNetLoadout(this.profile.classes[this.profile.selClass] || DEFAULT_CLASSES[0]);
+    const net = this.net = new NetClient(this, { name: q.get('name') || '士兵', team: q.get('team') || 'A', loadout });
+    net.room = q.get('room') || 'ffa-1';
+    let welcome;
+    try { welcome = await net.connect(); }
+    catch (e) { this.menu.showLoadingOverlay('连接失败：' + e.message); return null; }
+    this.audio.init();
+    this.clearWorld();
+    this.renderPass.scene = this.scene; this.renderPass.camera = this.camera;
+    this.vmPass.enabled = true;
+    this.loadMap(welcome.map || 'yard');
+    this.mode = net;
+    const sp = new THREE.Vector3(welcome.pos[0], welcome.pos[1], welcome.pos[2]);
+    const pl = this.player = new Player(this, { team: net.team, pos: sp, yaw: welcome.yaw, name: net.name, perks: loadout.perks });
+    pl.equip(net.loadout);
+    this.entities = [pl];
+    this.state = 'play'; this.paused = false; this.dead = false; this.ending = false;
+    this.time = 0; this.tick = 0; this.acc = 0; this.frameTicks = 0;
+    this.hud.show(true);
+    this.renderer.compile(this.scene, this.camera);
+    this.menu.hide();
+    document.getElementById('clickToPlay').classList.remove('hidden');
+    this.lock();
+    return welcome;
+  }
+  buildNetLoadout(cls) {
+    return {
+      primary: { id: cls.primary, att: cls.patt || {}, camo: cls.pcamo || 'none' },
+      secondary: cls.secondary ? { id: cls.secondary, att: cls.satt || {}, camo: cls.scamo || 'none' } : null,
+      lethal: cls.lethal, tactical: cls.tactical, perks: cls.perks || [],
+    };
+  }
+  onNetRespawn(ev) {
+    const pl = this.player;
+    if (!pl) return;
+    pl.respawn(new THREE.Vector3(ev.pos[0], ev.pos[1], ev.pos[2]), ev.yaw);
+    this.dead = false;
+    document.getElementById('clickToPlay').classList.remove('hidden');
+    this.lock();
   }
 
   setupComposer() {
@@ -326,6 +379,7 @@ class Game {
     if (this.mode && this.mode.onKill) this.mode.onKill(killer, victim, weapon, head, info || {});
   }
   makeNoise(pos, r, team, footstep = false) {
+    if (this.replaying) return;      // 回滚重放出来的那几拍不该在噪声史上留第二份记录
     this.noises.push({ pos: pos.clone(), r, team, t: this.time, footstep });
   }
   alertGroup(g, pos) { if (this.mode && this.mode.alertGroup) this.mode.alertGroup(g, pos); }
@@ -403,11 +457,15 @@ class Game {
       this.renderPass.scene = this.menu.scene3d; this.renderPass.camera = this.menu.camera3d; this.vmPass.enabled = false;
       this.grade.uniforms.nvg.value = 0; this.grade.uniforms.hurt.value = 0; this.grade.uniforms.thermal.value = 0; this.grade.uniforms.wp.value = 0;
     }
+    if (this.net) { this.net.flush(); this.net.frameUpdate(rdt); }
     if (this.netDebug) this.updateNetDebug(raw);
     this.grade.uniforms.time.value = performance.now() * 0.001;
     this.composer.render(rdt);
   }
   update(dt, inp) {
+    // 联机：每一拍的输入都要连同"这一拍开始前的自身状态"记进日记本，
+    // 服务端回多少 tick 回来，客户端就能退回去重放多少拍。见 net/client.mjs:reconcile
+    if (this.net && this.player) this.net.recordInput(this.tick, inp);
     this.time += dt;
     this.pathBudget = 3;
     if (this.noises.length) this.noises = this.noises.filter(n => this.time - n.t < 0.6);

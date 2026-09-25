@@ -9,6 +9,7 @@
 //   S2 带转向   —— 输入仍按帧到达，量出总线粒度的残余影响，作为 P1 tick 化输入队列的依据
 //   对照组      —— fixedStep=false（改造前）必须漂，否则这把尺子永远绿、白测
 import { chromium } from 'playwright';
+import { withServer } from './with-server.mjs';
 
 const HZ = [15, 30, 60, 100, 144, 240];
 const TICKS = 120;                    // 2 秒模拟量，按 tick 数而不是墙钟
@@ -36,7 +37,8 @@ page.on('pageerror', e => problems.push('[pageerror] ' + e.message));
 page.on('console', m => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) problems.push('[console.error] ' + m.text()); });
 page.on('response', r => { if (r.status() >= 400) httpBad.push(`[HTTP ${r.status()}] ${r.url()}`); });
 await page.addInitScript(() => { HTMLCanvasElement.prototype.requestPointerLock = function () { return Promise.resolve(); }; });
-await page.goto('http://localhost:8080/index.html');
+const srv = await withServer();
+await page.goto(srv.base + '/index.html');
 await page.waitForFunction(() => window.game && window.game.state === 'menu', null, { timeout: 180000 });
 
 const out = await page.evaluate(async ({ HZ, TICKS, seed }) => {
@@ -201,4 +203,4 @@ console.log(`\n  落点偏差：S1 固定 ${H.maxDist} m ／ S1 变步长 ${HV.m
 console.log(`  参照：玩家碰撞半径 0.35 m，门口约 1 m 宽。`);
 console.log(`  结论：${green ? '绿' : '红'}（要求：S1 固定档全等 / 参考行==客户端60Hz / 对照组必须漂 / 暂停不甩视角 / 视图模型每渲染帧一次 / 零控制台错误）`);
 await browser.close();
-process.exit(green ? 0 : 1);
+srv.kill(); process.exit(green ? 0 : 1);
