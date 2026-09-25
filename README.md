@@ -103,3 +103,84 @@ js/textures.js / materials.js  程序化纹理与材质
 js/gunmodel.js / soldier.js    枪械模型与士兵模型
 js/effects.js / combat.js / audio.js / hud.js  特效、弹道判定、合成音效、HUD
 ```
+
+## 实时联机与云端部署
+
+### 本机先跑起来
+
+```bash
+npm install                 # 只有两个运行时依赖：ws、three
+npm start                   # http://127.0.0.1:8090/  同一个端口发静态资源 + 跑 WebSocket
+```
+
+浏览器打开 `http://127.0.0.1:8090/index.html?online=1` 就进联机（不带 `?room=` 时由服务端
+把人往人最少的那间塞）。想开两窗对打：再开一个 `?online=1&room=xxx&name=乙&team=B`。
+
+### 环境变量
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `PORT` | `8090` | 监听端口（也支持 `node server/net-server.mjs 8090`） |
+| `HOST` | `0.0.0.0` | 绑定地址；只走本机反代时可收 `127.0.0.1` |
+| `NODE_ENV` | — | `production` 才启用静态资源白名单（等价开关：`--prod`） |
+| `MAP` / `SEED` | `yard` / `20260925` | 该实例跑的地图与玩法随机流种子 |
+| `MAX_ROOMS` | `32` | 每进程房间数上限（一间 = 一份完整 sim） |
+| `MAX_CLIENTS` | `128` | 每进程真人连接上限 |
+| `MAX_PAYLOAD` | `65536` | 单个入站帧字节上限（正常一帧 ≤ 13×60 = 780 B） |
+| `ALLOW_ORIGIN` | 空=不检查 | 逗号分隔的允许来源，**生产务必设** |
+| `ROOM_IDLE_MS` | `60000` | 空房间多久回收 |
+| `STATIC_MAX_AGE` | `86400` | 非 html 静态资源的 max-age |
+| `SHUTDOWN_GRACE_MS` | `4000` | 收到 SIGTERM 后留给收尾的时间 |
+
+### 带宽与 CPU（实测，不是估算）
+
+- 下行快照定长：头 11 B + 每人 25 B。16 人 @20Hz 时**每个客户端 65.8 kbps**（`node server/codec.mjs` 自己印出来，改字段会变）。
+- 上行输入 13 B/拍/人，攒一渲染帧一个包发。
+- 权威侧一份 yard 对局（9 个实体）实测每拍 0.087~0.10 ms（`node server/xenv.mjs` 的 meta）。照这个数单核约能扛十来个 60Hz 房间 —— **这条是算出来的，没在靶机上压过**。
+
+### 反向代理
+
+TLS 交给 nginx/Caddy，`wss` 需要显式转发 Upgrade 头，否则浏览器握手会直接失败：
+
+```nginx
+location / {
+  proxy_pass http://127.0.0.1:8090;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_set_header Host $host;
+  proxy_read_timeout 120s;          # WS 空闲期，别用默认 60s 把连接掐掉
+}
+```
+
+设了 `ALLOW_ORIGIN=https://your.domain` 之后，别的站点就借不走你的对局服务（WebSocket 不受 CORS 约束，不检查来源等于对所有网站开放）。
+
+### 容器与下线
+
+```bash
+docker build -t mw-room .
+docker run -d -p 8090:8090 -e ALLOW_ORIGIN=https://your.domain mw-room
+```
+
+- 健康检查：`GET /healthz` → `{ok, rooms, clients, tickHz, uptime, draining}`，Dockerfile 里已挂 HEALTHCHECK。
+- 下线：收到 `SIGTERM` 后先置 `draining`（`/healthz` 里能读到，LB 可据此摘实例），给在册连接发一条带原因的 `note` 并以 `1001` 关闭，停掉房间循环，在 `SHUTDOWN_GRACE_MS` 内退净。
+  ⚠ 这一段在 Windows 上**没被测过**：libuv 的 `child.kill()` 是直接 TerminateProcess，信号送不进子进程。Linux 上由 `server/deploy-probe.mjs` 的三条断言验收。
+
+### 验收（改这套代码之前先看它绿不绿）
+
+```bash
+npm test          # 不含浏览器：gate + rollback + net-probe + deploy-probe + xenv + fps + viewmodel
+npm run test:all  # 再加两个真浏览器对打（net-play，要下载 playwright 浏览器）
+```
+
+- `server/deploy-probe.mjs` 37 项：静态白名单（含 `/server/*.mjs`、`/.git/config` 拿不到，且 dev 模式仍可取，证明拦网会 Discriminate）、ETag/304、gzip 往返一致、路径穿越、来源检查两个方向、超帧被断且**别人那一局不陪葬**、房间配额、自动分配、空房回收、优雅下线。
+- `test/rollback.mjs` 64 项：回滚重放与顺跑逐位相同（12 个 ack 点 × 45 字段）+ 四条反证臂。
+- `test/net-play.mjs`：两个真浏览器对打 —— 移动复制、跨窗口击杀由服务端裁决、重生、武器一致、拍号契约。
+
+### 还没做完的部分（部署前请看一眼）
+
+1. **账号与存档**：进度/配装仍写在浏览器 `localStorage`，换台机器就没了，也没有身份 —— 所以现在**没有任何反作弊依据**，服务端只能校验"输入是不是我发的拍号"。
+2. **延迟补偿命中判定**：目前服务端用"当下"的位置裁决 hitTest，高延迟下会出现"我明明打中了"。要做 lag compensation（按快照回溯重放射线）。
+3. **输入总线**（`P1-b`）：客户端供拍子偶尔跟不上服务端消费，快照里的 `rep` 已能补演绝大多数；仍留有 ~1 次/把 的"权威端比本地多走 ~12 拍"事件（实测 0.89~1.27 m，随后被一次硬拉纠正）。net-play 的稳态偏差判据因此是红的，成因已经量化在任务里。
+4. **联机规则**：连杀奖励（白磷弹、UAV）、警觉值、战役检查点这些还带着单机假设（`js/mp.js`、`js/ai.js`）。
+5. **多实例编排**：一间一进程还没做，目前是"一进程 N 间 + 按 map 起多个进程"。要做真正的扩容需要一个外层大厅（分配实例地址），客户端 `?room=` 的语义也要跟着变。

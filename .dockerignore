@@ -1,0 +1,16 @@
+# 镜像里不该有的东西。每一条都对应一次真实的浪费或真实的泄漏：
+#   node_modules —— 用 npm ci 从 lockfile 装，宿主机那份可能带平台相关的二进制
+#   .git         —— 仓库历史整个进镜像 = 把源码历史连同任何提交过的凭据一起发出去
+#   test/ 与 *.png/*.log —— 浏览器实证的产物，运行时用不到（deploy-probe 会证明生产
+#                  模式下这些路径本来也不通过 HTTP 暴露，这里是别把它们打进镜像）
+node_modules
+.git
+.gitignore
+test
+server/trace-node.json
+server/match-node.json
+*.log
+*.png
+Dockerfile
+.dockerignore
+README.md

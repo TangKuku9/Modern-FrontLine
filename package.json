@@ -1,21 +1,28 @@
 {
   "name": "mw",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "现代战线 · 仿 COD 的 three.js 第一人称射击 —— 权威服务端 + 客户端预测回滚的实时联机版",
+  "main": "server/net-server.mjs",
+  "type": "module",
+  "engines": {
+    "node": ">=20.10"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "probe": "node server/probe.mjs"
+    "start": "node server/net-server.mjs",
+    "start:prod": "node server/net-server.mjs --prod",
+    "probe": "node server/probe.mjs",
+    "test": "node server/gate.mjs && node test/rollback.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs",
+    "test:browser": "node test/net-play.mjs",
+    "test:all": "node server/gate.mjs && node test/rollback.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs && node test/net-play.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "three": "^0.169.0",
     "ws": "^8.21.3"
   },
   "devDependencies": {
     "playwright": "^1.63.0"
-  },
-  "type": "module"
+  }
 }

@@ -148,7 +148,9 @@ class Game {
     // 预测用的根本不是同一把枪，位置每收一份快照被拽一下，弹匣数字也对不上。
     const loadout = this.buildNetLoadout(this.profile.classes[this.profile.selClass] || DEFAULT_CLASSES[0]);
     const net = this.net = new NetClient(this, { name: q.get('name') || '士兵', team: q.get('team') || 'A', loadout });
-    net.room = q.get('room') || 'ffa-1';
+    // 不带 ?room= 时交给服务端自动分配（fill-first，见 server/net-server.mjs:pickRoom）。
+    // 默认写死一个房号会让每台新实例都从"互相看不见"开始。
+    net.room = q.get('room') || 'auto';
     let welcome;
     try { welcome = await net.connect(); }
     catch (e) { this.menu.showLoadingOverlay('连接失败：' + e.message); return null; }

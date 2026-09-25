@@ -23,6 +23,9 @@ export async function withServer(env = {}) {
   if (!log.includes('权威对局服务')) { srv.kill(); throw new Error('临时服务没起来：\n' + log); }
   return {
     port: PORT,
+    proc: srv,
+    // 下线测试要等进程真的退了才能断言退出码，所以把"退出"这件事本身交出去
+    exited: new Promise(res => srv.on('exit', (code, signal) => res({ code, signal }))),
     base: `http://127.0.0.1:${PORT}`,
     ws: `ws://127.0.0.1:${PORT}/ws`,
     log: () => log,
