@@ -34,8 +34,10 @@ function inputAt(i) {
 const F = (v, p = 6) => (typeof v === 'number' ? (Number.isFinite(v) ? v.toFixed(p) : 'NaN') : String(v));
 
 export function sampleFields() {
+  // 注意：这里刻意不含 vmKick/vmRot —— 它们从 P0-2 起归 Viewmodel（js/viewmodel.js），
+  // 按渲染帧衰减，不是权威状态的一部分。权威侧的对应量是 rp（写进相机俯仰）。
   return ['pos.x', 'pos.y', 'pos.z', 'vel.x', 'vel.y', 'vel.z', 'yaw', 'pitch', 'crouchT', 'eyeSmooth',
-    'onGround', 'sprinting', 'sliding', 'hp', 'ws.state', 'ws.adsT', 'ws.rp', 'ws.cool', 'ws.vmKick', 'ws.vmRot',
+    'onGround', 'sprinting', 'sliding', 'hp', 'ws.state', 'ws.adsT', 'ws.rp', 'ws.cool',
     'ws.shotsInRow', 'ws.cur', 'mag', 'reserve', 'ws.bobPhase'];
 }
 
@@ -46,7 +48,7 @@ export function sample(pl) {
     F(pl.vel.x), F(pl.vel.y), F(pl.vel.z),
     F(pl.yaw), F(pl.pitch), F(pl.crouchT), F(pl.eyeSmooth),
     pl.onGround ? 1 : 0, pl.sprinting ? 1 : 0, pl.sliding ? 1 : 0, F(pl.hp, 3),
-    ws.state, F(ws.adsT), F(ws.rp), F(ws.cool, 5), F(ws.vmKick), F(ws.vmRot),
+    ws.state, F(ws.adsT), F(ws.rp), F(ws.cool, 5),
     ws.shotsInRow, ws.cur, w ? w.mag : -1, w ? w.reserve : -1, F(ws.bobPhase, 4),
   ].join(',');
 }

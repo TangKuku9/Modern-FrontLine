@@ -393,6 +393,9 @@ class Game {
         this.snapshotInput();
         this.acc = 0;
       }
+      // 视图模型按渲染帧走，与 tick 解耦：144Hz 屏上枪的手感不再被 60Hz 绑住，
+      // 而弹道、后坐、相机仍然只在 tick 上变，服务端能逐位复现
+      if (!this.paused && this.player && this.player.alive && this.player.ws) this.player.ws.updateRender(rdt);
       this.renderPass.scene = this.scene; this.renderPass.camera = this.camera; this.vmPass.enabled = !!(this.player && this.player.alive);
     } else if (this.state === 'menu') {
       this.snapshotInput();

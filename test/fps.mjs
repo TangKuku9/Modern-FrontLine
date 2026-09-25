@@ -139,11 +139,23 @@ const out = await page.evaluate(async ({ HZ, TICKS, seed }) => {
   g.paused = false; g.frame();
   const yawAfter = g.player.yaw;
 
+  // 视图模型必须按渲染帧走，不能退回 60Hz：高刷屏上手持画面才不卡
+  g.settings.fixedStep = true;
+  await boot(240);
+  const vm = g.player.ws.vm;
+  let vmCalls = 0;
+  const origVm = vm.update.bind(vm);
+  vm.update = (dt) => { vmCalls++; origVm(dt); };
+  const tick0 = g.tick;
+  for (let i = 0; i < 12; i++) g.frame();        // 12 帧 @240Hz = 0.05s = 3 个 tick
+  const tickDelta = g.tick - tick0;
+  vm.update = origVm;
+
   g.composer.render = realRender;
   g.clock = realClock; realClock.getDelta();     // 丢掉假时钟期间攒下的时间，别一恢复就补 8 步
   g.input.keys.KeyW = false; g.input.buttons = 0; g.paused = false;
   g.renderer.setAnimationLoop(() => g.frame());
-  return { rows, pause: { yawBefore, yawPaused, yawAfter, mdxLeft: g.input.mdx } };
+  return { rows, pause: { yawBefore, yawPaused, yawAfter, mdxLeft: g.input.mdx }, vm: { vmCalls, tickDelta } };
 }, { HZ, TICKS, seed });
 
 const KEYS = ['tick', 'simT', 'x', 'y', 'z', 'yaw', 'pitch', 'onGround', 'crouchT', 'rp', 'shotsInRow', 'mag', 'reserve', 'hp', 'aliveBots', 'draws'];
@@ -174,17 +186,19 @@ const refMatches60 = key(ref) === key(ref60);
 console.log(`  与 S2@60Hz 全等 = ${refMatches60}${refMatches60 ? '' : '   差异字段: ' + KEYS.filter(k => ref[k] !== ref60[k]).join(',')}`);
 console.log(`  与 S1@60Hz 全等 = ${key(ref) === key(out.rows.holdsF.find(r => r.hz === 60))}（不同输入脚本，本就该不等）`);
 
-const p = out.pause;
+const p = out.pause, v = out.vm;
 console.log('\n──────────────────────────────────────────────');
 console.log(`  暂停期狂甩鼠标 30 帧：yaw ${p.yawBefore.toFixed(5)} -> ${p.yawPaused.toFixed(5)}，解除后 ${p.yawAfter.toFixed(5)}（残余 mdx ${p.mdxLeft}）`);
+console.log(`  240Hz 下驱动 12 渲染帧：视图模型更新 ${v.vmCalls} 次，模拟只推进 ${v.tickDelta} 个 tick（手持画面不再被 60Hz 绑住）`);
 if (problems.length) console.log('  控制台异常:\n    ' + problems.slice(0, 12).join('\n    '));
 if (httpBad.length) console.log('  HTTP 4xx:\n    ' + [...new Set(httpBad)].slice(0, 8).join('\n    '));
 await page.waitForTimeout(1500);
 await page.screenshot({ path: 'test/fps_play.png' });   // 恢复真 RAF 后拍一帧，证明渲染没被测试搞坏
 
-const green = H.identical && refMatches60 && !HV.identical && Math.abs(p.yawAfter - p.yawBefore) < 1e-9 && p.mdxLeft === 0 && problems.length === 0;
+const green = H.identical && refMatches60 && !HV.identical && Math.abs(p.yawAfter - p.yawBefore) < 1e-9 && p.mdxLeft === 0 && problems.length === 0
+  && v.vmCalls === 12 && v.tickDelta > 0 && v.tickDelta <= 4;
 console.log(`\n  落点偏差：S1 固定 ${H.maxDist} m ／ S1 变步长 ${HV.maxDist} m ／ S2 固定 ${SF.maxDist} m ／ S2 变步长 ${SV.maxDist} m`);
 console.log(`  参照：玩家碰撞半径 0.35 m，门口约 1 m 宽。`);
-console.log(`  结论：${green ? '绿' : '红'}（要求：S1 固定档全等 / 参考行==客户端60Hz / 对照组必须漂 / 暂停不甩视角 / 零控制台错误）`);
+console.log(`  结论：${green ? '绿' : '红'}（要求：S1 固定档全等 / 参考行==客户端60Hz / 对照组必须漂 / 暂停不甩视角 / 视图模型每渲染帧一次 / 零控制台错误）`);
 await browser.close();
 process.exit(green ? 0 : 1);

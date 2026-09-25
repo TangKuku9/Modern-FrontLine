@@ -38,9 +38,10 @@ export class HeadlessGame {
   constructor(opts = {}) {
     this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, invertY: false }, opts.settings);
     this.scene = new THREE.Scene();
-    this.vmScene = new THREE.Scene();
+    // 故意不建 vmScene/vmCamera：WeaponSystem 没有 vmScene 就不构造 Viewmodel
+    // （js/weapons.js:11）。于是"权威服务端偷偷跑了画面代码"会变成当场抛错，
+    // 而不是安静地多算一份枪模。闸门里断言 game.player.ws.vm === null。
     this.camera = new THREE.PerspectiveCamera(78, 16 / 9, 0.05, 2500);
-    this.vmCamera = new THREE.PerspectiveCamera(56, 16 / 9, 0.01, 10);
     const s = makeStubs();
     Object.assign(this, s, { stubLog: s.log });
     this.renderer = makeAbsorbingRenderer(s.log);

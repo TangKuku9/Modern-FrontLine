@@ -5,11 +5,13 @@
 // A 播种后同进程跑两次        → 必须逐 tick 全等，否则 sim 里仍有墙钟/进程态依赖
 // B 中途故意多造 200 个 three 对象 → 轨迹必须仍然全等；这是 geoCache/UUID 那个
 //   实测缺陷的回归测试：只要玩法流还沾 Math.random，这条一定红
-// C 落盘 Node 轨迹            → 交给浏览器跑同一份代码后跨环境比对
+// E 整场对局（9 个实体 + 计分/重生/掉落）同种子两跑与加扰动物体都必须全等
+// G 权威进程里没有视图模型，且瞄具遮罩状态仍由模拟侧产出（P0-2 拆分的验收）
+// C/F 落盘 Node 轨迹          → 交给浏览器跑同一份代码后跨环境比对
 import './browser-shim.mjs';
 import * as THREE from 'three';
 import { runTrace, diffTraces, sampleFields, DT } from './sim-twin.mjs';
-import { rng } from './prng.mjs';
+import { rng, seedGameplayRng, resetGameplayRng } from './prng.mjs';
 import { writeFileSync } from 'node:fs';
 
 const TICKS = 300;
@@ -64,6 +66,67 @@ try {
     + String(err && err.stack || err).split('\n').slice(0, 7).join('\n     '));
 }
 
+hr('G. 权威进程里没有视图模型，且遮罩状态仍由模拟侧产出（P0-2 拆分的验收）');
+let passG = true;
+try {
+  const { HeadlessGame } = await import('./headless-game.mjs');
+  const THREE2 = await import('three');
+  const { Player } = await import('../js/player.js');
+  seedGameplayRng(4242);
+  const mk = (o) => Object.assign({
+    fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false,
+    fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
+    meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
+    interact: false, interactPressed: false, nvgPressed: false, streak: -1,
+    firePressed: false, adsPressed: false, mdx: 0, mdy: 0,
+  }, o);
+  const solo = async (wid) => {
+    const game = new HeadlessGame();
+    await game.loadMap('yard');
+    const pl = new Player(game, { pos: new THREE2.Vector3(0, 0, 0), yaw: 0 });
+    pl.pos.set(0, (game.world.groundHeight(0, 0, 50, 0.35) || 0) + 0.02, 0);
+    pl.eyeSmooth = pl.pos.y + 1.62;
+    pl.equip({ primary: { id: wid, att: {} }, secondary: { id: 'm1911', att: {} }, lethal: 'frag', tactical: 'flash', perks: [] });
+    game.player = pl;
+    return { game, pl, ws: pl.ws };
+  }
+
+  // G1 无 sink：枪模不该存在，渲染侧字段不该挂在权威对象上，但开火照常裁决
+  const a = await solo('ak');
+  const checks = [];
+  checks.push(['服务端 game 没有 vmScene', a.game.vmScene === undefined]);
+  checks.push(['WeaponSystem 未构造 Viewmodel (ws.vm === null)', a.ws.vm === null]);
+  checks.push(['渲染侧字段已离开权威对象 (vmKick/vmRot undefined)', a.ws.vmKick === undefined && a.ws.vmRot === undefined]);
+  const mag0 = a.ws.w.mag;
+  for (let i = 0; i < 60; i++) a.game.step(DT, mk({ fire: true }));
+  checks.push(['没有画面消费者时照常扣弹 (' + mag0 + '→' + a.ws.w.mag + ')', a.ws.w.mag < mag0]);
+  checks.push(['权威侧不积压表现事件 (sink 仍为 null)', a.ws.sink === null]);
+
+  // G2 接上 sink：事件确实投递，且带 tracers
+  const got = [];
+  a.ws.sink = (e) => got.push(e);
+  const mag1 = a.ws.w.mag;
+  for (let i = 0; i < 60; i++) a.game.step(DT, mk({ fire: true }));
+  checks.push(['接上 sink 后收到 ' + got.length + ' 个开火事件', got.length > 0 && a.ws.w.mag < mag1],);
+  checks.push(['事件带权威命中点列表', got.every(e => e.kind !== 'shot' || Array.isArray(e.tracers))]);
+
+  // G3 遮罩状态归模拟侧：main.js:422/425 靠它压 NVG/热成像，拆分后必须仍然产出
+  const b = await solo('l115');
+  for (let i = 0; i < 90; i++) b.game.step(DT, mk({ ads: true }));
+  checks.push(['狙击镜开镜后 game.scopeState = ' + JSON.stringify(b.game.scopeState) + '（模拟侧产出）', b.game.scopeState === 'sniper']);
+  for (let i = 0; i < 90; i++) b.game.step(DT, mk({}));
+  checks.push(['收镜后 scopeState 归 null', b.game.scopeState === null]);
+
+  for (const [label, ok] of checks) {
+    passG &&= ok;
+    console.log('  ' + (ok ? '✅' : '❌') + ' ' + label);
+  }
+  resetGameplayRng();
+} catch (err) {
+  passG = false;
+  console.log('  ❌ G 跑不起来：\n     ' + String(err && err.stack || err).split('\n').slice(0, 7).join('\n     '));
+}
+
 hr('F. 落盘供浏览器跨环境比对');
 writeFileSync(new URL('./trace-node.json', import.meta.url), JSON.stringify({ meta: a1.meta, digest: a1.digest, samples: a1.samples }));
 console.log('  server/trace-node.json 已写出（' + a1.samples.length + ' ticks，digest ' + a1.digest + '）');
@@ -72,5 +135,6 @@ hr('结论');
 console.log('  A 单飞轨迹同种子可复现 = ' + passA);
 console.log('  B 对 three 对象构造数量差异免疫 = ' + passB);
 console.log('  E 整场对局（含 8 个 bot 与计分/重生/掉落）可复现 = ' + passE);
-console.log('  三项全绿才叫"能把同一份 sim 搬到服务端跑权威"。');
-process.exit(passA && passB && passE ? 0 : 1);
+console.log('  G 权威侧无视图模型、遮罩状态仍归模拟 = ' + passG);
+console.log('  四项全绿才叫"能把同一份 sim 搬到服务端跑权威"。');
+process.exit(passA && passB && passE && passG ? 0 : 1);
