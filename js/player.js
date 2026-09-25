@@ -1,7 +1,7 @@
 // 玩家控制器
 import * as THREE from 'three';
 import { WeaponSystem } from './weapons.js';
-import { clamp, damp, lerp, raySphere, rayAABB, DEG } from './util.js';
+import { clamp, damp, lerp, raySphere, rayAABB, DEG, rng } from './util.js';
 import { WEAPONS, LETHALS, TACTICALS } from './data.js';
 
 export class Player {
@@ -206,7 +206,9 @@ export class Player {
     if (this.shakeT > 0) {
       this.shakeT -= dt;
       const a = this.shakeAmt * (this.shakeT / 0.6);
-      sx = (Math.random() - 0.5) * a * 0.05; sy = (Math.random() - 0.5) * a * 0.05;
+      // 震屏走玩法流：下一发的弹道是从 camera 取的（weapons.js 里
+      // cam.getWorldDirection()），所以这个抖动会影响命中，不是纯画面效果
+      sx = (rng.next() - 0.5) * a * 0.05; sy = (rng.next() - 0.5) * a * 0.05;
     }
     const spd = Math.hypot(this.vel.x, this.vel.z);
     const bob = this.onGround ? Math.sin(ws.bobPhase * 2) * 0.02 * Math.min(1, spd / 6) * (1 - ws.adsT) : 0;

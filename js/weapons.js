@@ -4,7 +4,7 @@ import { computeStats, WEAPONS } from './data.js';
 import { buildGun, buildArms } from './gunmodel.js';
 import { mat } from './materials.js';
 import { fireHitscan, Projectile } from './combat.js';
-import { clamp, damp, lerp, rand, spreadDir, DEG } from './util.js';
+import { clamp, damp, lerp, rand, spreadDir, DEG, rng } from './util.js';
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _q = new THREE.Quaternion();
 
@@ -141,7 +141,10 @@ export class WeaponSystem {
     this.triggerHeld = input.fire;
     if (w.mag === 0 && this.state === 'idle' && w.reserve > 0 && this.cool < -0.15) this.startReload();
     // 后坐力恢复
-    if (performance.now() - this.lastShot > 120) { this.rp = damp(this.rp, 0, 4, dt); this.shotsInRow = 0; }
+    // 用 sim 时间而不是 performance.now()：墙钟会让这个分支在两次相同输入下走不
+    // 同的路径，连带把 Math.random() 的消耗次数错开，服务端与客户端就无法复现
+    // 同一条轨迹。语义等价：原阈值 120ms → 0.12s。
+    if (this.game.time - this.lastShot > 0.12) { this.rp = damp(this.rp, 0, 4, dt); this.shotsInRow = 0; }
     this.vmKick = damp(this.vmKick, 0, 14, dt);
     this.vmRot = damp(this.vmRot, 0, 10, dt);
     this.flashT -= dt;
@@ -177,7 +180,7 @@ export class WeaponSystem {
     w.mag--;
     this.cool = 60 / st.rpm;
     if (st.fire === 'bolt' || st.fire === 'pump') { this.cycleT = 60 / st.rpm; }
-    this.lastShot = performance.now();
+    this.lastShot = this.game.time;
     this.shotsInRow++;
     pl.stats.shots++;
     const cam = game.camera;
@@ -213,7 +216,8 @@ export class WeaponSystem {
     // 后坐力
     const adsMul = lerp(1, 0.75, this.adsT) * (pl.crouchT > 0.5 ? 0.85 : 1);
     const kick = st.recoilV * 0.55 * DEG * adsMul;
-    const side = (Math.random() - 0.4) * st.recoilH * 0.5 * DEG * adsMul;
+    // 横向抖动刻意偏向一侧（-0.4 而非 -0.5），且走玩法随机流：它直接写进 pl.yaw
+    const side = (rng.next() - 0.4) * st.recoilH * 0.5 * DEG * adsMul;
     pl.pitch += kick * 0.55;
     this.rp += kick * 0.45;
     pl.yaw -= side;

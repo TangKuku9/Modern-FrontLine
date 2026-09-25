@@ -1,12 +1,12 @@
 // 通用工具：数学、随机、噪声
 import * as THREE from 'three';
+import { rng, mulberry32 } from './rng.js';
+// 随机相关的实现统一收在 rng.js（玩法流/画面流双流），此处转出以保持既有 import 不变
+export { mulberry32, crandRange, rng, crand, rand, randInt, pick } from './rng.js';
 
 export const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 export const lerp = (a, b, t) => a + (b - a) * t;
 export const damp = (a, b, k, dt) => lerp(a, b, 1 - Math.exp(-k * dt));
-export const rand = (a = 0, b = 1) => a + Math.random() * (b - a);
-export const randInt = (a, b) => Math.floor(rand(a, b + 1));
-export const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 export const DEG = Math.PI / 180;
 
 export function angleDiff(a, b) {
@@ -14,16 +14,6 @@ export function angleDiff(a, b) {
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
   return d;
-}
-
-// 可复现随机数
-export function mulberry32(seed) {
-  return function () {
-    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
 }
 
 // 可平铺值噪声
@@ -86,15 +76,15 @@ export function raySphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r) {
   return t >= 0 ? t : (tca + thc >= 0 ? 0 : -1);
 }
 
-// 在给定方向附近加扩散
+// 在给定方向附近加扩散（玩法流：决定弹道，必须可播种）
 const _tmpA = new THREE.Vector3(), _tmpB = new THREE.Vector3();
 export function spreadDir(dir, spreadRad, out = new THREE.Vector3()) {
   if (spreadRad <= 0) return out.copy(dir);
   const up = Math.abs(dir.y) > 0.99 ? _tmpA.set(1, 0, 0) : _tmpA.set(0, 1, 0);
   const right = _tmpB.crossVectors(dir, up).normalize();
   const up2 = up.crossVectors(right, dir).normalize();
-  const r = Math.sqrt(Math.random()) * Math.tan(spreadRad);
-  const a = Math.random() * Math.PI * 2;
+  const r = Math.sqrt(rng.next()) * Math.tan(spreadRad);
+  const a = rng.next() * Math.PI * 2;
   out.copy(dir).addScaledVector(right, Math.cos(a) * r).addScaledVector(up2, Math.sin(a) * r).normalize();
   return out;
 }

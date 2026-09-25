@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { mat } from './materials.js';
-import { rayAABB, BinaryHeap, TileNoise, mulberry32, clamp } from './util.js';
+import { rayAABB, BinaryHeap, TileNoise, mulberry32, clamp, rng } from './util.js';
 
 function boxGeo(w, h, d, s) {
   const g = new THREE.BoxGeometry(w, h, d);
@@ -619,7 +619,8 @@ export class World {
   }
   randomWalkable(cx = 0, cz = 0, rad = 1e9) {
     for (let i = 0; i < 60; i++) {
-      const x = cx + (Math.random() * 2 - 1) * Math.min(rad, this.half - 2), z = cz + (Math.random() * 2 - 1) * Math.min(rad, this.half - 2);
+      // 出生点/巡逻点/空袭落点都走这里 —— 玩法流，必须由服务端决定
+      const x = cx + (rng.next() * 2 - 1) * Math.min(rad, this.half - 2), z = cz + (rng.next() * 2 - 1) * Math.min(rad, this.half - 2);
       const [ix, iz] = this.cellOf(x, z);
       if (this.walkable(ix, iz) && this.ceilingHeight(x, z, 0, 0.3) > 2) return new THREE.Vector3(x, 0, z);
     }

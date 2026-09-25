@@ -1,7 +1,8 @@
 // 视觉特效：粒子、曳光弹、弹孔、爆炸、天气
 import * as THREE from 'three';
 import { particleTex } from './textures.js';
-import { rand } from './util.js';
+// 粒子/贴花/天气的随机全部走画面流：服务端不跑这一层，两边本来就不必一致
+import { crandRange as rand } from './util.js';
 
 class Particles {
   constructor(scene, max, tex, additive) {
