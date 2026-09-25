@@ -270,6 +270,12 @@ try {
   // 刻意不写成"repN > 0"：机器够快时真可以一次都不饿，那会在好机器上报假红。
   ok('rep 与饥饿同真同假（重复拍记账接到了线）', (q.starved > 0) === (q.repN > 0),
     `饥饿 ${q.starved} 包 · 报重复拍 ${q.repN} 包（单次最多 ${q.repMax} 拍）· 客户端补演 ${q.repsApplied} 拍 · 补不全的包 ${q.repSkipped}`);
+  // 每一次"服务端报了 N 拍而我没补满 N 拍"都必须落在两种说得出的情形上：
+  // 这一包是生死硬拉（不回滚，rep 无处可补）、或那份 hold 输入已被历史窗口挤掉。
+  // 客户端自己设的成本上限以前是 120，撞上限就是一种**静默少补** —— 少补的每一拍都会
+  // 原样变成一次校正位移，而它在这个名单上不留痕迹（现在上限跟服务端的 255 对齐了）。
+  ok('没有"静默少补"：每次没补满都归得因（硬拉 / hold 已被窗口挤掉）',
+    (q.repSkipWhy || []).every(s => s.hard || !s.hold), JSON.stringify((q.repSkipWhy || []).slice(0, 2)));
   ok('回滚窗口够用（journalMiss == 0）', q.journalMisses === 0, `退化硬拉 ${q.journalMisses} 次 · 末次回演 ${q.replayed} 拍`);
   if (q.missWhy.length) {
     const by = {};

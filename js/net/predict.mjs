@@ -37,7 +37,10 @@ export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
   // 第 start+rep 拍上（差 4 mm），稳态里近一成样本被这个假偏差污染，撞墙时放大到 0.9 m。
   // 用的输入就是它手里那份 = 我发到 ack 那一拍的 opts.hold，所以补出来是同一台机器上的
   // 同一次确定性演算，不是"猜"。
-  const rep = Math.max(0, Math.min(120, opts.rep | 0));
+  // 上限跟服务端那个 255（wire 上是 u8）对齐，不自作主张收得更紧：任何比它小的数都等于
+  // "我知道服务端多算了 N 拍，但我拒绝补" —— 少补的每一拍都会原样变成一次校正位移。
+  // 代价算过：最坏 255 拍 × 单人 update ≈ 十几毫秒，一个偶发卡顿；换来的是不用拽一次位置。
+  const rep = Math.max(0, Math.min(255, opts.rep | 0));
   let reps = 0;
   // 只在真的退回到日记本时才补演：没退回去的话 pl 是我"当前"的状态，再叠几拍就把
   // 未来又演了一遍。opts.hold 拿不到（那一拍的输入已被历史窗口挤掉）时也只能作罢 ——
