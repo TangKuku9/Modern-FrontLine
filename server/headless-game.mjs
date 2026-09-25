@@ -7,6 +7,7 @@
 //
 // 于是同一份 js/player.js + js/weapons.js + js/combat.js 既跑在浏览器里做预测，
 // 也跑在这里做权威裁决 —— 一致性来自"同一份代码"，不是来自"两边小心对齐"。
+import './browser-shim.mjs';            // js/textures.js 与 js/materials.js 要 document/canvas 才能 import
 import * as THREE from 'three';
 import { makeStubs, deepRecorder } from './stubs.mjs';
 import { buildGun } from '../js/gunmodel.js';
@@ -128,13 +129,17 @@ export class HeadlessGame {
   }
 
   // ---------- main.js:359-394 主循环，去掉表现层 ----------
-  step(dt, inp) {
+  // pairs = [{ pl, inp }]：联机时每个真人吃自己那份输入。
+  // 不传就是单机老用法（只有 game.player 一个人）—— 单人形式正是"这台机器上
+  // 只有一个玩家"的假设，服务端必须由调用方把列表交进来。
+  step(dt, inp, pairs) {
     this.time += dt;
     this.tick++;
     this.pathBudget = 3;
     if (this.noises.length) this.noises = this.noises.filter(n => this.time - n.t < 0.6);
-    const pl = this.player;
-    if (pl) { if (pl.alive) pl.update(dt, inp); }
+    for (const p of (pairs || (this.player ? [{ pl: this.player, inp }] : []))) {
+      if (p.pl.alive) p.pl.update(dt, p.inp);
+    }
     for (const b of this.bots) b.update(dt);
     for (const p of this.projectiles) p.update(dt);
     if (this.projectiles.some(p => !p.alive)) this.projectiles = this.projectiles.filter(p => p.alive);

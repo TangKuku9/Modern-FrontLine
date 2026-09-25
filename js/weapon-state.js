@@ -163,9 +163,10 @@ export class WeaponState {
     this.lastShot = this.game.time;
     this.shotsInRow++;
     pl.stats.shots++;
-    const cam = game.camera;
-    const origin = cam.position.clone();
-    const fwd = cam.getWorldDirection(new THREE.Vector3());
+    // 射线来自"这个玩家自己的视点与视线"，不是 game.camera —— 服务端同时跑 N 个
+    // 玩家时那块相机不存在，而且它本来就是本机玩家的派生量（player.js:eyePoint）
+    const origin = pl.eyePoint(new THREE.Vector3());
+    const fwd = pl.aimDir(new THREE.Vector3());
     const wantFx = !!this.sink;       // 没有视图模型就一个事件都不构造，服务端零分配
     if (st.projectile === 'rocket') {
       const p = new Projectile(game, 'rocket', origin.clone().addScaledVector(fwd, 0.8), fwd.clone().multiplyScalar(55), pl, 10);
@@ -200,15 +201,16 @@ export class WeaponState {
     pl.punch(st.recoilV * 0.004);
   }
   doMelee() {
-    const game = this.game, pl = this.owner, cam = game.camera;
-    const fwd = cam.getWorldDirection(new THREE.Vector3());
+    const game = this.game, pl = this.owner;
+    const fwd = pl.aimDir(new THREE.Vector3());
+    const eye = pl.eyePoint(new THREE.Vector3());
     let best = null, bd = 2.3;
     for (const e of game.entities) {
       if (!e.alive || e === pl || e.team === pl.team) continue;
       const c = e.chestPos(new THREE.Vector3());
-      const d = c.distanceTo(cam.position);
+      const d = c.distanceTo(eye);
       if (d > bd) continue;
-      const dir = c.clone().sub(cam.position).normalize();
+      const dir = c.clone().sub(eye).normalize();
       if (dir.dot(fwd) < 0.6) continue;
       best = e; bd = d;
     }
@@ -217,7 +219,7 @@ export class WeaponState {
       game.hud.hitmarker(killed, false); game.audio.hit(killed);
       game.effects.blood(best.chestPos(new THREE.Vector3()), fwd, false);
     } else {
-      const hit = game.world.raycast(cam.position, fwd, 1.8);
+      const hit = game.world.raycast(eye, fwd, 1.8);
       if (hit) { game.effects.impact(hit.point, hit.normal, hit.box.mat || 'concrete'); game.audio.click(700, 0.08, 0.4); }
     }
   }
@@ -253,11 +255,11 @@ export class WeaponState {
   releaseGrenade(inHand = false) {
     const g = this.grenade; if (!g) return;
     this.grenade = null;
-    const game = this.game, pl = this.owner, cam = game.camera;
-    const fwd = cam.getWorldDirection(new THREE.Vector3());
+    const game = this.game, pl = this.owner;
+    const fwd = pl.aimDir(new THREE.Vector3());
     const fuseBase = { frag: 3.0, semtex: 2.0, molotov: 99, flash: 1.4, smoke: 1.3 }[g.type];
     const fuse = g.type === 'frag' ? Math.max(0.05, fuseBase - this.cookT) : fuseBase;
-    const pos = cam.position.clone().addScaledVector(fwd, 0.4).add(new THREE.Vector3(0, -0.1, 0));
+    const pos = pl.eyePoint(new THREE.Vector3()).addScaledVector(fwd, 0.4).add(new THREE.Vector3(0, -0.1, 0));
     const vel = inHand ? new THREE.Vector3() : fwd.clone().multiplyScalar(17).add(new THREE.Vector3(0, 3.5, 0)).add(pl.vel.clone().multiplyScalar(0.5));
     game.projectiles.push(new Projectile(game, g.type, pos, vel, pl, fuse));
     if (inHand) { this.state = 'idle'; }

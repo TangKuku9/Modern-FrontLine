@@ -16,6 +16,10 @@ export class Player {
     this.maxHp = 100; this.hp = 100; this.alive = true;
     this.crouchT = 0; this.crouching = false; this.sprinting = false; this.sliding = false; this.slideT = 0;
     this.onGround = true; this.eyeH = 1.62; this.eyeSmooth = this.pos.y + 1.62;
+    // 视点与视线：updateCamera 每拍算一次，弹道从这里取。联机时每个玩家各有一份，
+    // 所以它必须是玩家状态而不是"去看那块相机"。
+    this.camPos = new THREE.Vector3(this.pos.x, this.eyeSmooth, this.pos.z);
+    this.aimYaw = this.yaw; this.aimPitch = 0;
     this.dmgT = 99; this.shakeT = 0; this.shakeAmt = 0; this.punchV = 0; this.landDip = 0;
     this.stepDist = 0; this.revealT = 0;
     this.perks = new Set(opts.perks || []);
@@ -196,7 +200,7 @@ export class Player {
     this.updateCamera(dt);
   }
   updateCamera(dt) {
-    const cam = this.game.camera, ws = this.ws;
+    const ws = this.ws;
     const eyeT = this.pos.y + this.curEye() - (this.sliding ? 0.25 : 0);
     this.eyeSmooth = damp(this.eyeSmooth, eyeT, 18, dt);
     if (Math.abs(this.eyeSmooth - eyeT) > 1) this.eyeSmooth = eyeT;
@@ -206,16 +210,23 @@ export class Player {
     if (this.shakeT > 0) {
       this.shakeT -= dt;
       const a = this.shakeAmt * (this.shakeT / 0.6);
-      // 震屏走玩法流：下一发的弹道是从 camera 取的（weapons.js 里
-      // cam.getWorldDirection()），所以这个抖动会影响命中，不是纯画面效果
+      // 震屏走玩法流：弹道就是从这条视线取的（weapon-state.js 的 aimDir），
+      // 所以这个抖动会影响命中，不是纯画面效果
       sx = (rng.next() - 0.5) * a * 0.05; sy = (rng.next() - 0.5) * a * 0.05;
     }
     const spd = Math.hypot(this.vel.x, this.vel.z);
     const bob = this.onGround ? Math.sin(ws.bobPhase * 2) * 0.02 * Math.min(1, spd / 6) * (1 - ws.adsT) : 0;
-    cam.position.set(this.pos.x, this.eyeSmooth - this.landDip + bob, this.pos.z);
+    // 视点与视线是"每个玩家各一份"的状态：联机时服务端同时跑 N 份，谁都能算出
+    // 自己的枪口射线；只有本机玩家才去写那块真相机。
+    this.camPos.set(this.pos.x, this.eyeSmooth - this.landDip + bob, this.pos.z);
+    this.aimYaw = this.yaw + sx;
+    this.aimPitch = this.pitch + ws.rp + this.punchV + sy;
+    if (this.game.player !== this) return;
+    const cam = this.game.camera;
+    cam.position.copy(this.camPos);
     cam.rotation.order = 'YXZ';
-    cam.rotation.y = this.yaw + sx;
-    cam.rotation.x = this.pitch + ws.rp + this.punchV + sy;
+    cam.rotation.y = this.aimYaw;
+    cam.rotation.x = this.aimPitch;
     cam.rotation.z = this.sliding ? -0.06 : (ws.sprintT * Math.sin(ws.bobPhase) * 0.01);
     const zoom = lerp(1, ws.w ? ws.w.stats.zoom : 1, ws.adsT * ws.adsT);
     const base = this.game.settings.fov;
@@ -223,5 +234,12 @@ export class Player {
     cam.fov = f + (this.sprinting ? 4 : 0) * (1 - ws.adsT);
     cam.updateProjectionMatrix();
     this.game.audio.setListener(cam.position, this.yaw);
+  }
+  // 权威弹道的唯一取射线入口。客户端预测与服务端裁决都必须走这两个函数，
+  // 不许再直接读 game.camera —— 那是"这台机器上只有一个玩家"的假设。
+  eyePoint(out) { return out.copy(this.camPos); }
+  aimDir(out) {
+    const cp = Math.cos(this.aimPitch);
+    return out.set(-Math.sin(this.aimYaw) * cp, Math.sin(this.aimPitch), -Math.cos(this.aimYaw) * cp);
   }
 }
