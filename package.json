@@ -11,6 +11,7 @@
     "start": "node server/net-server.mjs",
     "start:prod": "node server/net-server.mjs --prod",
     "probe": "node server/probe.mjs",
+    "soak": "node server/soak.mjs",
     "test": "node server/gate.mjs && node test/rollback.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs",
     "test:browser": "node test/net-play.mjs",
     "test:all": "node server/gate.mjs && node test/rollback.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs && node test/net-play.mjs"

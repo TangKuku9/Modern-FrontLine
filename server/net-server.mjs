@@ -85,9 +85,16 @@ async function cachedFile(file) {
 async function serveStatic(req, res) {
   const url = decodeURIComponent((req.url || '/').split('?')[0]);
   if (url === '/healthz' || url === '/health') {
+    // 逐房间健康度：扩容要的是"哪一间开始吃紧"，只看一个总数会藏住坏孩子。
+    const per = [];
+    for (const p of rooms.values()) {
+      const r = p.__room;
+      if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0) });
+    }
     const body = JSON.stringify({
       ok: true, uptime: Math.round(process.uptime()), rooms: rooms.size,
       clients: wss ? wss.clients.size : 0, map: CFG.map, tickHz: Math.round(1 / DT), draining,
+      heapMB: +(process.memoryUsage().heapUsed / 1048576).toFixed(1), per,
     });
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(body) });
     res.end(body);
@@ -149,6 +156,9 @@ async function getRoom(id) {
     if (draining) throw new Error('服务器正在下线，请重连');
     if (rooms.size >= CFG.maxRooms) throw new Error(`这台服务器已经有 ${rooms.size} 个房间，不再新建（MAX_ROOMS）`);
     p = createRoom(id);
+    // 健康页要逐房间读数，而表里存的是 promise —— 把解析出来的对象顺手挂在 promise 上，
+    // 观测这条路径就不必每拍 await（await 会把读数耦合到建房的那次异步启动上）。
+    p.then(r => { p.__room = r; }).catch(() => {});
     rooms.set(id, p);
     p.catch(() => rooms.delete(id));            // 起不来的房间不许留在表里反复失败
   }
@@ -179,10 +189,14 @@ function startRoomLoop(room, id) {
   let since = 0;
   room.__fails = 0;              // 不显式初始化：首拍就抛时 ++undefined = NaN，
   // 于是 "×1 || %60" 两个条件都不成立，一个静默死掉的房间正是最难查的那种红。
+  // 自我观测：一台机器上到底能跑几间，只能问"这一拍实际花了多久、循环比墙钟慢了多少"。
+  // 客户端侧数不出这个数 —— 它自己被事件循环拖慢时，看到的是同一个症状。
+  room.__hz = 0; room.__stepMs = 0; room.__behindMs = 0; room.__hzWin = 0; room.__hzT0 = Date.now();
   const tick = () => {
     if (room.__stop) return;
     // 一个坏 tick 不许静默杀掉整个房间：那症状是"所有人卡住但连接都在"，最难查。
     // 连续失败到阈值就报名字，而不是假装还在跑。
+    const t0 = performance.now();
     try {
       room.step();
       room.__fails = 0;
@@ -190,14 +204,23 @@ function startRoomLoop(room, id) {
       if (++room.__fails === 1 || room.__fails % 60 === 0) console.error(`[room ${id}] step 失败 ×${room.__fails}: ` + (e && e.stack || e));
       if (room.__fails >= 600) { console.error(`[room ${id}] 连续 600 tick 失败，停循环`); return; }
     }
+    const cost = performance.now() - t0;
+    // EMA：单拍的抖动没意义，"这一秒平均花掉预算的几成"才是扩容要看的那个数
+    room.__stepMs = room.__stepMs * 0.98 + cost * 0.02;
     if (room.tick % SNAP_EVERY === 0) {
       try { broadcast(room); }
       catch (e) { console.error(`[room ${id}] broadcast 失败: ` + (e && e.stack || e)); }
     }
-    since++;
-    if (since % 60 === 0 && room.clients.size) console.log(`[room ${id}] tick ${room.tick}  在线 ${room.clients.size}  事件队列 ${room.events.length}`);
+    since++; room.__hzWin++;
+    const now = Date.now();
+    if (now - room.__hzT0 >= 1000) {
+      room.__hz = room.__hzWin * 1000 / (now - room.__hzT0);
+      room.__hzWin = 0; room.__hzT0 = now;
+    }
+    if (since % 600 === 0 && room.clients.size) console.log(`[room ${id}] tick ${room.tick}  在线 ${room.clients.size}  ${room.__hz.toFixed(1)}Hz 每拍 ${room.__stepMs.toFixed(2)}ms 落后 ${room.__behindMs.toFixed(0)}ms`);
     next += DT * 1000;
     const late = Date.now() - next;
+    room.__behindMs = Math.max(0, late);       // 落后墙钟多少：60Hz 承诺唯一能被外部看到的症状
     // 刻意不 unref：这一拍定时器是"房间还活着"的凭据。unref 它会让进程在
     // 监听句柄关掉后悄悄退出，而那时下线广播还没发完 —— 访客看到的是集体卡死而不是"请重连"。
     setTimeout(tick, late > 200 ? (next = Date.now(), 0) : Math.max(0, -late));
