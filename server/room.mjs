@@ -9,6 +9,7 @@ import { Player } from '../js/player.js';
 import { MAPS } from '../js/maps.js';
 import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput } from '../js/quant.js';
+import { sanitizeLoadout } from '../js/loadout.mjs';
 
 export const TICK_HZ = 60;
 export const DT = 1 / TICK_HZ;
@@ -73,11 +74,15 @@ export class NetRoom {
     const cid = NEXT_CID++;
     const sp = this.spawnPoint(team);
     const pl = new Player(this.game, { team, pos: sp.pos, yaw: sp.yaw, name });
-    pl.equip(loadout || { primary: { id: 'm4', att: { optic: 'holo', under: 'vgrip' } }, secondary: { id: 'm1911', att: {} }, lethal: 'frag', tactical: 'flash', perks: [] });
+    // 装备以服务端查表重建为准（为什么要拦、拦掉的是什么，见 js/loadout.mjs）。
+    // 重建后这份要挂到人身上：welcome 得把同一个对象发回去，客户端按它配枪 —— 两边各自
+    // 拿一份副本算 stats，就是"本地打中了、权威说没有"那种没人报错的分歧。
+    const lo = sanitizeLoadout(loadout);
+    pl.equip(lo);
     this.game.entities.push(pl);
     if (!this.game.player) this.game.player = pl;   // 第一个人占住"本机玩家"那个老位置，
     // 其余的人靠 NetRoom.step 传的 pairs 列表被推进。
-    const c = { cid, pl, name, team, lastInput: decodeInputBits(0, 0), q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0 };
+    const c = { cid, pl, name, team, loadout: lo, lastInput: decodeInputBits(0, 0), q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0 };
     this.clients.set(cid, c);
     this.events.push({ e: 'join', cid, name, team, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw });
     return c;

@@ -11,6 +11,8 @@ import { get as httpGet } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { sanitizeLoadout, repairClass } from '../js/loadout.mjs';
+import { DEFAULT_CLASSES } from '../js/data.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const { withServer } = await import('../test/with-server.mjs');
@@ -36,13 +38,13 @@ const get = (path, headers = {}) => new Promise((res, rej) => {
 });
 // 一个能收到控制帧的客户端。room 传 'auto' 走自动分配，传真 id 走私有房。
 // 只收文本帧：二进制快照每 50ms 一份，混进控制帧里会把断言淹掉。
-const joiner = async (room, name, origin = 'http://127.0.0.1') => {
+const joiner = async (room, name, origin = 'http://127.0.0.1', payload = null) => {
   const ws = new WebSocket(srv.ws, { headers: { origin } });
   const msgs = []; const closed = []; let nAll = 0;
   ws.on('message', (m, isBinary) => { nAll++; if (!isBinary) msgs.push(String(m)); });
   ws.on('close', (code, reason) => closed.push([code, String(reason)]));
   await new Promise((res, rej) => { ws.on('open', res); ws.on('error', e => rej(new Error('握手失败：' + e.message))); });
-  ws.send(JSON.stringify({ t: 'join', room, name, team: 'A' }));
+  ws.send(JSON.stringify({ t: 'join', room, name, team: 'A', ...(payload || {}) }));
   for (let i = 0; i < 200 && !msgs.length; i++) await sleep(50);
   // all() 数的是**所有**下行：快照是二进制帧，只数文本的话"还在收包"这件事根本看不出来
   // （上一版就是这样，观察者一条都没漏，断言却报红了）。
@@ -190,6 +192,132 @@ try {
   for (let i = 0; i < 90 && (hR = JSON.parse(String((await get('/healthz')).buf))).rooms > 0; i++) await sleep(500);
   ok('人都走光的房间会被收掉（不回收就是"跑得越久越慢"的那种事故）', high > 0 && hR.rooms === 0, `高水位 ${high} 间 → 现在 ${hR.rooms} 间（ROOM_IDLE_MS=1500）`);
   ok('回收动作记进了日志（现场能查）', /\[room .*\] 空了 .*s，回收/.test(srv.log()), '');
+
+  console.log('\n── 进场装备闸门：一个人的坏数据不许打死别人的房间 ──');
+  {
+    // 配装是客户端递交的（?online=1 的访客把它那份 loadout 放进 join 帧），服务端只是
+    // pl.equip 一下。所以"闸门有没有砍到正门"和"闸门拦不拦得住"两件事都要量：
+    // 前者错了会造出两套 stats（本地按自己那套打、权威按另一套裁决 = 没人报错的 desync），
+    // 后者错了就是无限手雷 + 一条帧打死一屋子人。
+    // 深排序比较：键的插入顺序不算差异（computeStats 逐项乘，谁先谁后不影响结果），
+    // 内容差必须算差异。注意不能拿 Object.keys(顶层).sort() 当 JSON.stringify 的第二个参数 ——
+    // 那是"白名单键表"，会在每一层递归生效，掉一个配件也能"等值"通过，尺子就永远绿了。
+    const sorted = v => JSON.stringify(v, (k, val) => (val && typeof val === 'object' && !Array.isArray(val))
+      ? Object.fromEntries(Object.keys(val).sort().map(x => [x, val[x]])) : val);
+    ok('这把尺子分得开内容差（不是"任何两份都等值"的永远绿）',
+      sorted({ id: 'm4', att: { optic: 'holo' }, camo: 'none' }) !== sorted({ id: 'm4', att: {}, camo: 'none' })
+      && sorted({ id: 'm4', att: { optic: 'holo', muzzle: 'comp' } }) === sorted({ att: { muzzle: 'comp', optic: 'holo' }, id: 'm4' }), '');
+    const build = c => ({
+      primary: { id: c.primary, att: c.patt || {}, camo: c.pcamo || 'none' },
+      secondary: c.secondary ? { id: c.secondary, att: c.satt || {}, camo: c.scamo || 'none' } : null,
+      lethal: c.lethal, tactical: c.tactical, perks: c.perks || [],
+    });
+    const kept = DEFAULT_CLASSES.filter(c => {
+      const raw = build(c), out = sanitizeLoadout(raw);
+      return sorted(raw.primary) === sorted(out.primary) && sorted(raw.secondary) === sorted(out.secondary)
+        && raw.lethal === out.lethal && raw.tactical === out.tactical && JSON.stringify(raw.perks) === JSON.stringify(out.perks);
+    });
+    ok('五套预设职业原样通过闸门（砍到正门的白名单会以预测偏差的形式浮出来）', kept.length === DEFAULT_CLASSES.length,
+      `${kept.length}/${DEFAULT_CLASSES.length} 等值 · 不一致的：${DEFAULT_CLASSES.filter(c => !kept.includes(c)).map(c => c.name).join(',') || '无'}`);
+
+    // 同一份表也管着浏览器侧读存档（js/main.js 的 Game 构造函数拿 repairClass 修职业卡）：
+    // 一个不存在的枪 id 会让菜单在 new Menu → buildScene → buildGun 里抛，整个页面停在
+    // "初始化失败"。这条量的是"修完还是那五套预设"，也就是修桥不能顺手把桥面削了。
+    const repaired = DEFAULT_CLASSES.map(repairClass);
+    ok('五套预设职业过一遍存档修复（repairClass）内容不变', DEFAULT_CLASSES.every((c, i) => sorted(c) === sorted(repaired[i])),
+      DEFAULT_CLASSES.map((c, i) => (sorted(c) === sorted(repaired[i]) ? '' : c.name)).filter(Boolean).join(',') || '全部等值');
+    ok('存档里不存在的枪 id 会被放回合法值（菜单不再为手改的存档白屏）',
+      repairClass({ name: '坏', primary: 'desert_eagle', patt: {}, secondary: 'nope' }).primary === 'm4', JSON.stringify(repairClass({ name: '坏', primary: 'desert_eagle' })));
+    ok('存档形状不对（null）也不抛，回到第一套预设', (() => { try { return repairClass(null).primary === 'm4'; } catch (e) { return '抛了：' + e.message; } })(), '');
+    ok('单人玩法才有的字段（extraLethal）留在职业卡里，但进不了网络形状',
+      repairClass({ name: 'n', primary: 'm4', extraLethal: 3 }).extraLethal === 3 && sanitizeLoadout({ primary: { id: 'm4' }, extraLethal: 3 }).extraLethal === undefined, '');
+
+    const junk = sanitizeLoadout({
+      primary: { id: 'desert_eagle', att: { optic: 'sniper', muzzle: 12345, under: {evil: 1} } },
+      secondary: { id: 'pkm', att: {} },           // 没带"火力过载"，第二把主武器不该成立
+      lethal: 'nuke', tactical: 'airstrike', perks: ['ghost', 'ghost', 'ninja', 'not-a-perk', 'sleight', 'doubletime'],
+      extraLethal: 1e9, extraTac: 1e9,
+    });
+    ok('未知武器被放回默认，而不是带着坏 id 进模拟（computeStats 会为未知 id 抛）', junk.primary.id === 'm4', junk.primary.id);
+    ok('配件按"这支枪有没有这槽 + 表里有没有这个 id + 允许不允许"三重筛掉', Object.keys(junk.primary.att).length === 0, JSON.stringify(junk.primary.att));
+    ok('副武器规则由服务端执行：没带 overkill 就不能拿第二把主武器', junk.secondary.id === 'm1911', junk.secondary.id);
+    ok('perk 去重、剔未知、限三件', JSON.stringify(junk.perks) === JSON.stringify(['ghost', 'ninja', 'sleight']), JSON.stringify(junk.perks));
+    ok('客户端塞的 extraLethal/extraTac 进不去（那是"一条帧换无限手雷"）', junk.extraLethal === undefined && junk.extraTac === undefined, JSON.stringify(Object.keys(junk)));
+    for (const [label, bad] of [['null', null], ['字符串', 'gun'], ['数组', ['x']], ['数字', 42], ['undefined', undefined]]) {
+      let r = null, threw = null;
+      try { r = sanitizeLoadout(bad); } catch (e) { threw = e.message; }
+      ok(`畸形 loadout（${label}）不抛、给出可玩的默认`, !threw && r && r.primary.id === 'm4' && r.secondary.id === 'm1911', threw || sorted(r.primary));
+    }
+    const once = sanitizeLoadout({ primary: { id: 'ak', att: { muzzle: 'comp' } } });
+    ok('幂等：闸门输出再过一次闸门不变（否则"两边各算一套"的日子还在）', sorted(sanitizeLoadout(once)) === sorted(once), sorted(once));
+
+    // 端到端：这些载荷真的走一遍网络。判据不是"有没有报错"，而是**别人那一局还在不在跑** ——
+    // 一个能把房间打死的包，症状是所有人卡在静止世界里。
+    const bystander = await joiner('gear-1', '正牌');
+    const before = bystander.all();
+    const hostile = [];
+    for (const [i, p] of [
+      { loadout: { primary: { id: 'nope' }, extraLethal: 1e9 } },
+      { loadout: '不是对象' },
+      { loadout: { primary: { id: 'm4', att: { optic: 1, muzzle: {} } }, perks: 'x' } },
+      { loadout: { primary: { id: 'l115', att: { optic: 'thermal' } }, secondary: { id: 'rpg' }, lethal: 'molotov', tactical: 'stim', perks: ['overkill', 'ghost', 'ninja'] } },
+    ].entries()) hostile.push(await joiner('gear-1', '恶意' + i, 'http://127.0.0.1', p));
+    await sleep(1200);
+    const hz = JSON.parse(String((await get('/healthz')).buf));
+    const room = (hz.per || []).find(r => r.id === 'gear-1');
+    ok('恶意载荷进来之后这间还在按 60Hz 跑（没被任何一条打死）', !!room && room.hz > 45 && room.fails === 0, JSON.stringify(room || hz.per));
+    const got = bystander.all() - before;
+    ok('旁观者的快照一秒都没停（20Hz × 1.2s ≈ 24 帧）', got > 18, `旁观者收到 ${got} 帧`);
+    ok('畸形 join 不会把人挂在半路：每一条要么进场要么收到原因',
+      hostile.every(c => c.json().some(m => m.t === 'welcome' || m.t === 'err')),
+      JSON.stringify(hostile.map(c => c.json().map(m => m.t))));
+    const l4 = hostile[3].json().find(m => m.t === 'welcome');
+    ok('welcome 把服务端重建的那份装备发回去（两边只有一套 stats）', !!l4 && l4.loadout && l4.loadout.primary.id === 'l115'
+      && JSON.stringify(l4.loadout.perks) === JSON.stringify(['overkill', 'ghost', 'ninja']), JSON.stringify(l4 && l4.loadout));
+    for (const c of [bystander, ...hostile]) c.ws.close();
+    await sleep(300);
+  }
+
+  console.log('\n── 半开连接：放宽到 15 秒，但不是不清（判据两头都要量） ──');
+  {
+    // 心跳的判据从"这轮扫描时标志位"改成"上一次收到 pong 的时刻"之后，两件事都成立才算对：
+    //   方向 A：一个不回 pong 的连接最终还是要被拆掉 —— 否则半开连接会永久占着房间名额；
+    //   方向 B：一个刚刚建立、还没说过话的连接不许在 15 秒以内被拆 —— 那是"人多就莫名掉线"
+    //           那一类事故的形状，而浏览器侧真的观察到过一次单方面拆断（1006、wasClean=false）。
+    // 用手写握手的裸 socket：ws 库会自动回 pong，用它就没法造出"不回 pong 的客户端"。
+    const raw = () => new Promise((res, rej) => {
+      const s = netConnect(srv.port, '127.0.0.1');
+      // Sec-WebSocket-Key 必须是"16 字节随机数的 base64"，长度不对服务端直接 400（ws 会算给你看：
+      // 它解码后再编码，不是 16 字节就拒握手）。上一版给了 22 个字符，于是这条测试连门都没进。
+      const key = Buffer.from('0123456789abcdef').toString('base64');
+      const chunks = [];
+      let opened = 0;
+      s.on('data', d => {
+        chunks.push(d);
+        if (!opened && Buffer.concat(chunks).includes(Buffer.from('\r\n\r\n'))) {
+          const head = Buffer.concat(chunks).slice(0, 1024).toString('latin1');
+          opened = Date.now();
+          if (!/ 101 /.test(head)) { s.destroy(); rej(new Error('握手没到 101：' + head.split('\r\n')[0])); return; }
+          res({ socket: s, opened });
+        }
+      });
+      s.on('error', rej);
+      s.write(`GET /ws HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\nOrigin: http://127.0.0.1\r\n\r\n`);
+    });
+    const quiet = await raw();
+    let closed = 0;
+    const watch = new Promise(r => quiet.socket.on('close', () => { closed = Date.now() - quiet.opened; r(closed); }));
+    const raced = await Promise.race([watch, sleep(26000).then(() => 'timeout')]);
+    ok('方向 A：不回 pong 的连接会在 15~26 秒之间被拆掉（半开连接不能永久占名额）',
+      typeof closed === 'number' && closed > 14000 && closed < 26000, `沉默 ${closed}ms 后被拆（${raced === 'timeout' ? '本次到 26 秒仍未拆' : '已拆'}）`);
+    try { quiet.socket.destroy(); } catch (e) { /* 已经断了 */ }
+    const fresh = await raw();
+    await sleep(9000);
+    ok('方向 B：刚建立、还没说过话的连接不会被心跳拆掉（15 秒的宽限不是 5 秒）',
+      !fresh.socket.destroyed, `沉默 9 秒后这条连接还在（destroyed=${fresh.socket.destroyed}）`);
+    fresh.socket.destroy();
+    await sleep(200);
+  }
 
   console.log('\n── 优雅下线 ──');
   const rider = await joiner('bye-1', '乘客');

@@ -21,6 +21,7 @@ import { Player } from './player.js';
 import { NetClient } from './net/client.mjs';
 import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS } from './data.js';
+import { repairClass } from './loadout.mjs';
 import { damp } from './util.js';
 
 const GradeShader = {
@@ -63,6 +64,10 @@ class Game {
     this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true, fixedStep: true }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
     this.profile = Object.assign({ xp: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
     if (!this.profile.classes || this.profile.classes.length < 5) this.profile.classes = JSON.parse(JSON.stringify(DEFAULT_CLASSES));
+    // 存档里读出来的东西要过一遍表：mf_profile 是玩家能自己编辑的文件，一个不存在的枪 id
+    // 会让菜单在 new Menu → buildScene → buildGun 里抛，整个页面停在"初始化失败"。
+    // 同一张表也用在服务端进场（server/room.mjs），两边对"什么算合法"的答案必须同一个来源。
+    this.profile.classes = this.profile.classes.map(repairClass);
     this.state = 'loading';
     this.paused = false;
     this.time = 0;
@@ -161,8 +166,10 @@ class Game {
     this.loadMap(welcome.map || 'yard');
     this.mode = net;
     const sp = new THREE.Vector3(welcome.pos[0], welcome.pos[1], welcome.pos[2]);
-    const pl = this.player = new Player(this, { team: net.team, pos: sp, yaw: welcome.yaw, name: net.name, perks: loadout.perks });
-    pl.equip(net.loadout);
+    const pl = this.player = new Player(this, { team: net.team, pos: sp, yaw: welcome.yaw, name: net.name, perks: welcome.loadout.perks });
+    // 用服务端回声的那份，不是我自己发出去的那份：进场闸门（server/loadout.mjs）会按表
+    // 重建装备，两边各拿一份副本就意味着两套 stats —— 那是要以"预测偏差"形式浮出来的。
+    pl.equip(welcome.loadout);
     this.entities = [pl];
     this.state = 'play'; this.paused = false; this.dead = false; this.ending = false;
     this.time = 0; this.tick = 0; this.acc = 0; this.frameTicks = 0;

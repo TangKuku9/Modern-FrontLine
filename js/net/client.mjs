@@ -68,7 +68,9 @@ export class NetClient {
         if (this._closing) return;      // 我们自己拆的：原因已经在 reject 里说过了，别再报一次"断开"
         // 握手期就被关掉（来源检查 403、进程已死）：不结算的话 connect() 要空等到超时，
         // 玩家对着"正在连接"的转圈多等一整轮。welcome 之后这里是正常下场/断线，不该 reject。
-        if (!this.welcome) this.settleJoin(new Error(this._opened ? '连接被服务器关闭' : '没能连上对局服务（握手未完成）'));
+        if (!this.welcome) this.settleJoin(new Error(
+          !this._opened ? '没能连上对局服务（握手未完成）'
+            : (ev && ev.wasClean) ? '连接被服务器关闭' : '连接中断（服务器或中间的网关把这条连接拆了）'));
         this.markLost(ev && ev.code === 1001 ? 'lost' : 'closed', (ev && ev.reason) || this.serverNote || '');
       };
       this.connected = true;

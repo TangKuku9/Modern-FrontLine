@@ -89,7 +89,9 @@ async function serveStatic(req, res) {
     const per = [];
     for (const p of rooms.values()) {
       const r = p.__room;
-      if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0) });
+      // fails 是"这一间这一秒有多少拍在抛异常"：一个客户端的坏数据打死一屋子人之前，
+      // 这个数字会先动。运维要能一眼看见坏孩子，而不是等玩家发帖。
+      if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0), fails: r.__fails | 0 });
     }
     const body = JSON.stringify({
       ok: true, uptime: Math.round(process.uptime()), rooms: rooms.size,
@@ -153,8 +155,10 @@ async function createRoom(id) {
 async function getRoom(id) {
   let p = rooms.get(id);
   if (!p) {
-    if (draining) throw new Error('服务器正在下线，请重连');
-    if (rooms.size >= CFG.maxRooms) throw new Error(`这台服务器已经有 ${rooms.size} 个房间，不再新建（MAX_ROOMS）`);
+    // 这两种是"业务上就该拒绝"，不是故障：标一下，让下面的 catch 按拒绝记账而不是甩栈。
+    // 例行拒绝也甩堆栈的话，运维很快就学会无视所有堆栈 —— 那时真故障也跟着被无视。
+    if (draining) { const e = new Error('服务器正在下线，请重连'); e.refusal = true; throw e; }
+    if (rooms.size >= CFG.maxRooms) { const e = new Error(`这台服务器已经有 ${rooms.size} 个房间，不再新建（MAX_ROOMS）`); e.refusal = true; throw e; }
     p = createRoom(id);
     // 健康页要逐房间读数，而表里存的是 promise —— 把解析出来的对象顺手挂在 promise 上，
     // 观测这条路径就不必每拍 await（await 会把读数耦合到建房的那次异步启动上）。
@@ -202,7 +206,16 @@ function startRoomLoop(room, id) {
       room.__fails = 0;
     } catch (e) {
       if (++room.__fails === 1 || room.__fails % 60 === 0) console.error(`[room ${id}] step 失败 ×${room.__fails}: ` + (e && e.stack || e));
-      if (room.__fails >= 600) { console.error(`[room ${id}] 连续 600 tick 失败，停循环`); return; }
+      if (room.__fails >= 600) {
+        // 到这一步这间已经没救了，但里面的人还不知道 —— 停循环前先给他们一句话，
+        // 否则症状又是"站在一个静止的世界里"（客户端看门狗 2.5 秒后也会报，但那句话
+        // 说的是"服务器说它死了"，比"我猜它死了"有用）。
+        console.error(`[room ${id}] 连续 600 tick 失败，停循环`);
+        for (const c of room.clients.values()) {
+          try { c.ws.send(JSON.stringify({ t: 'note', msg: `对局 ${id} 服务端异常中止（第 ${room.tick} 拍）。请联系运维或稍后重进` })); c.ws.close(1011, 'room aborted'); } catch (e) { /* 已经在断了 */ }
+        }
+        return;
+      }
     }
     const cost = performance.now() - t0;
     // EMA：单拍的抖动没意义，"这一秒平均花掉预算的几成"才是扩容要看的那个数
@@ -267,8 +280,9 @@ const sweeper = setInterval(() => {
 sweeper.unref?.();
 
 wss.on('connection', (ws, req) => {
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  // "还活着"记成时间戳，不记成"这一轮扫描时标志位是不是 true"——见下面 heartbeats 的注释。
+  ws.__pongAt = Date.now();
+  ws.on('pong', () => { ws.__pongAt = Date.now(); });
   // 必须挂 error：ws 在超帧/协议错/写失败时是在这条连接上 emit 'error' 的，
   // 一个都没人接的 'error' 事件 = 未捕获异常 = 整个进程死掉。
   // 实测：以前只发一个 200 KB 的帧就能把对局服务连带所有人的房间一起打死。
@@ -300,7 +314,7 @@ wss.on('connection', (ws, req) => {
         c.ws = ws;                                // 反向也要有：广播按 room.clients 走
         ws.send(JSON.stringify({
           t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId,
-          pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw,
+          pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw, loadout: c.loadout,
           others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team })),
         }));
         console.log(`[join] ${c.name} → cid ${c.cid} @ ${room.id}（在线 ${room.clients.size}，本机 ${wss.clients.size} 连接 / ${rooms.size} 间）`);
@@ -310,7 +324,8 @@ wss.on('connection', (ws, req) => {
     } catch (e) {
       // 只把 message 发给客户端、把 stack 留在服务端日志：客户端不该看到栈，
       // 但没有栈的服务端日志在这种时候等于没写
-      console.error('[ws] ' + (e && e.stack || e));
+      if (e && e.refusal) console.log(`[ws] 拒绝：${e.message}`);
+      else console.error('[ws] ' + (e && e.stack || e));
       ws.send(JSON.stringify({ t: 'err', msg: String(e && e.message || e) }));
     }
   });
@@ -323,13 +338,25 @@ wss.on('connection', (ws, req) => {
 // 服务级的 error 同样不能没人接（握手阶段的错就发在这里）。
 wss.on('error', e => console.error('[wss] ' + (e && e.stack || e)));
 
-// 掉线的连接要收掉，否则半开连接会一直占着房间名额
+// 掉线的连接要收掉，否则半开连接会一直占着房间名额。
+// 判据用"上一次收到 pong 的时刻"，不用"这轮扫描时标志位是不是 false"：扫描本身跑在事件循环上，
+// 新建一间房（程序化材质 + 地图构建）或一次长 GC 就能让整轮推迟好几秒，那种时刻按标志位判死
+// 会把健康玩家踢出去 —— 症状是"人越多越容易莫名其妙掉线"，而这正是浏览器侧观察到过的那次
+// 1006 不干净关闭（那边只看到连接被单方面拆掉）。放宽到 3 个周期：真死的连接照样 15 秒内清掉。
+const HEARTBEAT_MS = 5000, PONG_STALE_MS = 15000;
 const heartbeats = setInterval(() => {
+  const now = Date.now();
   for (const ws of wss.clients) {
-    if (!ws.isAlive) { ws.terminate(); continue; }
-    ws.isAlive = false; ws.ping();
+    const quiet = now - (ws.__pongAt || now);
+    if (quiet > PONG_STALE_MS) {
+      // 报出来：运维看见"谁被踢、沉默了多久"，比只看见玩家消失有用得多
+      console.warn(`[hb] 拆掉 ${quiet}ms 没回 pong 的连接（cid ${ws.__cid ?? '-'}，房间 ${ws.__room ? ws.__room.id : '-'}）`);
+      try { ws.terminate(); } catch (e) { /* 已经断了 */ }
+      continue;
+    }
+    try { ws.ping(); } catch (e) { /* 已经断了 */ }
   }
-}, 5000);
+}, HEARTBEAT_MS);
 heartbeats.unref?.();
 
 // 优雅下线：云平台发 SIGTERM 后只有几秒，直接死的话访客看到的是"突然全冻住"。
