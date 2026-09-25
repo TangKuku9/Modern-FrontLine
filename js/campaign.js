@@ -4,7 +4,7 @@ import { Player } from './player.js';
 import { Bot } from './ai.js';
 import { buildHeli } from './mp.js';
 import { mat } from './materials.js';
-import { fmtTime, rand, pick } from './util.js';
+import { fmtTime, rand, pick, rng } from './util.js';
 
 const V = (x, z, y = 0) => new THREE.Vector3(x, y, z);
 
@@ -207,7 +207,7 @@ export class Campaign {
   }
   spawnAttacker(pos, target) {
     const game = this.game;
-    const b = game.addBot(new Bot(game, { team: 'B', name: pick(['叛军', '增援部队', '武装分子']), style: Math.random() < 0.3 ? 'enemy' : 'insurgent', weaponId: pick(['ak', 'ak', 'ak', 'pkm', 'm870', 'sks', 'mp5']), difficulty: this.diff, pos, yaw: 0, role: 'assault', assaultTarget: target.clone().add(V(rand(-3, 3), rand(-3, 3))), alerted: true, group: 'defense', grenades: this.diff > 0 ? 1 : 0 }));
+    const b = game.addBot(new Bot(game, { team: 'B', name: pick(['叛军', '增援部队', '武装分子']), style: rng.next() < 0.3 ? 'enemy' : 'insurgent', weaponId: pick(['ak', 'ak', 'ak', 'pkm', 'm870', 'sks', 'mp5']), difficulty: this.diff, pos, yaw: 0, role: 'assault', assaultTarget: target.clone().add(V(rand(-3, 3), rand(-3, 3))), alerted: true, group: 'defense', grenades: this.diff > 0 ? 1 : 0 }));
     (this.groups.defense = this.groups.defense || []).push(b);
     b.hint(game.player.pos);
     return b;
@@ -237,7 +237,7 @@ export class Campaign {
     } else if (s === 3) {
       if (this.hvt.alive) markers.push({ id: 'h', pos: this.hvt.pos.clone().setY(2.3), label: '✖', text: '铁蝎', cls: 'enemy' });
       hud.objective('当前目标', '突入大院，击毙高价值目标「铁蝎」', `院内敌人：${this.alive('compound')}`);
-      if (pl.pos.x > 44.5 && !this.alerted.compound && Math.random() < dt * 0.5) this.alertGroup('compound', pl.pos);
+      if (pl.pos.x > 44.5 && !this.alerted.compound && rng.next() < dt * 0.5) this.alertGroup('compound', pl.pos);
       if (!this.hvt.alive) this.nextStep();
     } else if (s === 4) {
       const lp = game.world.laptopPos;
@@ -317,7 +317,7 @@ export class Campaign {
       else game.hud.popup('击杀', '#fff');
       if (victim.isHVT) game.hud.popup('高价值目标已击毙', '', true);
     }
-    if (victim.team === 'B' && Math.random() < 0.7) game.spawnPickup(victim.weaponId, victim.att, victim.pos, Math.ceil(victim.stats.mag * 0.6), victim.stats.mag);
+    if (victim.team === 'B' && rng.next() < 0.7) game.spawnPickup(victim.weaponId, victim.att, victim.pos, Math.ceil(victim.stats.mag * 0.6), victim.stats.mag);
     game.hud.killfeed(killer, victim, weapon, head);
     if (victim.group && !this.alerted[victim.group]) {
       // 附近同伴察觉尸体

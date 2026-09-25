@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { createSoldierModel, animateSoldier, makeNameTag, applyFlashTex } from './soldier.js';
 import { computeStats, WEAPONS } from './data.js';
 import { fireHitscan, Projectile } from './combat.js';
-import { clamp, damp, rand, angleDiff, raySphere, rayAABB, spreadDir, DEG, pick } from './util.js';
+import { clamp, damp, rand, angleDiff, raySphere, rayAABB, spreadDir, DEG, pick, rng } from './util.js';
 
 const DIFF = [
   { react: 0.8, spread: 3.4, burst: [2, 4], pause: [0.6, 1.2], dmg: 0.55, view: 50, turn: 4 },
@@ -38,9 +38,9 @@ export class Bot {
     this.anim = { speed: 0, phase: Math.random() * 6, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0 };
     this.mag = this.stats.mag;
     this.target = null; this.targetVisible = false; this.lastSeenPos = null; this.lastSeenT = -99; this.acquireT = 0;
-    this.perceiveT = Math.random() * 0.2; this.fireT = 0; this.burstLeft = 0; this.reloadT = 0;
+    this.perceiveT = rng.next() * 0.2; this.fireT = 0; this.burstLeft = 0; this.reloadT = 0;
     this.path = null; this.pathT = -99; this.pathGoal = null; this.goal = null; this.goalT = 0;
-    this.strafeDir = Math.random() < 0.5 ? -1 : 1; this.strafeT = 0; this.wantCrouch = false; this.crouchT = 0;
+    this.strafeDir = rng.next() < 0.5 ? -1 : 1; this.strafeT = 0; this.wantCrouch = false; this.crouchT = 0;
     this.stunT = 0; this.flashT = 0; this.revealT = 0; this.grenades = o.grenades ?? 1; this.grenadeCD = rand(4, 10);
     this.home = o.home ? o.home.clone() : this.pos.clone();
     this.leash = o.leash || 0;
@@ -49,7 +49,7 @@ export class Bot {
     this.isHVT = !!o.isHVT;
     this.stuckT = 0; this.lastProgPos = this.pos.clone();
     this.kills = 0; this.deaths = 0; this.score = 0; this.streak = 0; this.captures = 0;
-    this.scanBase = this.yaw; this.scanT = Math.random() * 10;
+    this.scanBase = this.yaw; this.scanT = rng.next() * 10;
     this.static = !!o.static;
     this.accuracyMul = o.accuracyMul || 1;
     this.patrol = o.patrol || null; this.patrolI = 0;
@@ -224,7 +224,7 @@ export class Bot {
       return;
     }
     this.perceiveT -= dt;
-    if (this.perceiveT <= 0) { this.perceiveT = 0.15 + Math.random() * 0.08; this.perceive(); }
+    if (this.perceiveT <= 0) { this.perceiveT = 0.15 + rng.next() * 0.08; this.perceive(); }
     this.stunT -= dt; this.flashT -= dt; this.revealT -= dt; this.grenadeCD -= dt; this.reloadT -= dt;
     this.model.flash.visible = this.flashT > 0;
     A.recoil = damp(A.recoil, 0, 10, dt);
@@ -249,7 +249,7 @@ export class Bot {
       lookPitch = Math.atan2(dy, dist);
       // 移动：侧移 + 距离调整
       this.strafeT -= dt;
-      if (this.strafeT <= 0) { this.strafeT = rand(0.8, 2.2); this.strafeDir = Math.random() < 0.5 ? -1 : 1; this.wantCrouch = Math.random() < (this.stats.type === 'sniper' || this.stats.type === 'lmg' ? 0.6 : 0.3); }
+      if (this.strafeT <= 0) { this.strafeT = rand(0.8, 2.2); this.strafeDir = rng.next() < 0.5 ? -1 : 1; this.wantCrouch = rng.next() < (this.stats.type === 'sniper' || this.stats.type === 'lmg' ? 0.6 : 0.3); }
       wantCrouch = this.wantCrouch;
       if (!this.static) {
         const sx = Math.cos(lookYaw), sz = -Math.sin(lookYaw);
@@ -278,7 +278,7 @@ export class Bot {
       // 投掷手雷
       if (this.grenades > 0 && this.grenadeCD <= 0 && game.time - this.lastSeenT < 3 && this.difficulty > 0) {
         const d = lp.distanceTo(this.pos);
-        if (d > 8 && d < 26 && Math.random() < 0.35) this.throwGrenade(lp);
+        if (d > 8 && d < 26 && rng.next() < 0.35) this.throwGrenade(lp);
         this.grenadeCD = rand(8, 16);
       }
       if (this.mag < this.stats.mag * 0.5 && this.reloadT <= 0) this.reload();
@@ -398,7 +398,7 @@ export class Bot {
     // 瞄准
     const eye = this.eyePos(new THREE.Vector3());
     const aim = target.chestPos(new THREE.Vector3());
-    if (Math.random() < 0.18 + this.difficulty * 0.06) aim.y += 0.42; // 爆头尝试
+    if (rng.next() < 0.18 + this.difficulty * 0.06) aim.y += 0.42; // 爆头尝试
     const tv = target.vel ? Math.hypot(target.vel.x, target.vel.z) : 0;
     this.aimSettle = Math.max(0, (this.aimSettle || 0) - 0.18);
     let spread = this.diff.spread * (1 + tv / 6 * 0.8) * (1 + Math.hypot(this.vel.x, this.vel.z) / 5 * 0.4) * (1 + this.aimSettle * 1.2) * this.accuracyMul;

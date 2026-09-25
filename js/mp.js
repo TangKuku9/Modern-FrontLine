@@ -6,16 +6,16 @@ import { MAPS } from './maps.js';
 import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats } from './data.js';
 import { fireHitscan, Projectile } from './combat.js';
 import { mat } from './materials.js';
-import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB } from './util.js';
+import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, rng, shuffle } from './util.js';
 
 const BOT_WEAPONS = ['m4', 'm4', 'ak', 'ak', 'scar', 'mp5', 'mp5', 'vector', 'pkm', 'm870', 'sks', 'l115'];
 
 function randomAtt(wid) {
   const att = {};
-  const slots = WEAPONS[wid].slots.slice().sort(() => Math.random() - 0.5).slice(0, 3);
+  const slots = shuffle(WEAPONS[wid].slots.slice()).slice(0, 3);
   for (const s of slots) {
     const opts = ATTACHMENTS[s].filter(a => attachmentAllowed(wid, s, a));
-    if (opts.length && Math.random() < 0.7) att[s] = pick(opts).id;
+    if (opts.length && rng.next() < 0.7) att[s] = pick(opts).id;
   }
   return att;
 }
@@ -51,7 +51,7 @@ export class MPMatch {
     this.streakDefs = game.profile.streaks.map(id => KILLSTREAKS.find(k => k.id === id)).sort((a, b) => a.kills - b.kills);
     this.streakState = this.streakDefs.map(d => ({ id: d.id, ready: false, used: false, cost: Math.max(2, d.kills - (pl.hasPerk('hardline') ? 1 : 0)) }));
     // 机器人
-    const names = BOT_NAMES.slice().sort(() => Math.random() - 0.5);
+    const names = shuffle(BOT_NAMES.slice());
     let ni = 0;
     const allyCount = this.ffa ? 0 : this.cfg.allies ?? 5;
     const enemyCount = this.ffa ? (this.cfg.enemies ?? 7) : this.cfg.enemies ?? 6;
@@ -106,12 +106,12 @@ export class MPMatch {
     else cands = team === 'A' ? w.spawns.A : w.spawns.B;
     const enemies = this.game.entities.filter(e => e.alive && e.team !== team && e.pos);
     // 加入随机点提升多样性（占领/自由模式）
-    if (this.ffa || Math.random() < 0.25) for (let i = 0; i < 6; i++) cands = cands.concat([w.randomWalkable()]);
+    if (this.ffa || rng.next() < 0.25) for (let i = 0; i < 6; i++) cands = cands.concat([w.randomWalkable()]);
     let best = cands[0], bs = -1;
     for (const c of cands) {
       let md = 1e9;
       for (const e of enemies) md = Math.min(md, e.pos.distanceTo(c));
-      const s = Math.min(md, 60) + Math.random() * 8;
+      const s = Math.min(md, 60) + rng.next() * 8;
       if (s > bs) { bs = s; best = c; }
     }
     const pos = best.clone();
@@ -123,15 +123,15 @@ export class MPMatch {
   // ---------- 机器人目标 ----------
   botGoal(bot) {
     const w = this.game.world;
-    if (this.type === 'dom' && Math.random() < 0.75) {
+    if (this.type === 'dom' && rng.next() < 0.75) {
       const cands = this.flags.filter(f => f.owner !== bot.team);
       const list = cands.length ? cands : this.flags;
       list.sort((a, b) => a.pos.distanceTo(bot.pos) - b.pos.distanceTo(bot.pos));
-      const f = Math.random() < 0.7 ? list[0] : pick(list);
+      const f = rng.next() < 0.7 ? list[0] : pick(list);
       return f.pos.clone().add(new THREE.Vector3(rand(-2.5, 2.5), 0, rand(-2.5, 2.5)));
     }
     const enemies = this.enemiesOf(bot.team);
-    if (enemies.length && Math.random() < 0.55) {
+    if (enemies.length && rng.next() < 0.55) {
       const e = pick(enemies);
       return w.randomWalkable(e.pos.x, e.pos.z, 12);
     }
@@ -161,7 +161,7 @@ export class MPMatch {
       if (killer.isPlayer) { game.hud.popup('首杀', '', true); pl.stats.score += 50; }
     }
     // 掉落武器
-    if (!victim.isPlayer && victim.weaponId && Math.random() < 0.6) game.spawnPickup(victim.weaponId, victim.att, victim.pos, Math.ceil(victim.stats.mag * 0.5), victim.stats.mag);
+    if (!victim.isPlayer && victim.weaponId && rng.next() < 0.6) game.spawnPickup(victim.weaponId, victim.att, victim.pos, Math.ceil(victim.stats.mag * 0.5), victim.stats.mag);
     // 复活安排
     if (victim.isPlayer) {
       game.dead = true; game.deathKiller = killer;
@@ -175,7 +175,7 @@ export class MPMatch {
       if (document.pointerLockElement) document.exitPointerLock();
     } else {
       victim.streak = 0;
-      this.respawns.push({ e: victim, t: 4 + Math.random() * 2 });
+      this.respawns.push({ e: victim, t: 4 + rng.next() * 2 });
     }
     // FFA 分数
     if (this.ffa && killer && killer !== victim) {
@@ -364,7 +364,7 @@ export class MPMatch {
         }
       }
     }
-    if (this.wpT > 0) { this.wpT -= dt; game.grade.uniforms.wp.value = Math.min(1, this.wpT / 3) * 0.6; for (const e of this.enemiesOf(pl.team)) if (Math.random() < dt * 2) e.takeDamage(6, { attacker: pl, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) }); }
+    if (this.wpT > 0) { this.wpT -= dt; game.grade.uniforms.wp.value = Math.min(1, this.wpT / 3) * 0.6; for (const e of this.enemiesOf(pl.team)) if (rng.next() < dt * 2) e.takeDamage(6, { attacker: pl, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) }); }
     else game.grade.uniforms.wp.value = 0;
     // 连杀奖励
     for (const a of this.active) a.update(dt);
@@ -550,7 +550,7 @@ class Sentry {
 export class Heli {
   constructor(game, team, owner, opts = {}) {
     this.game = game; this.team = team; this.owner = owner; this.alive = true;
-    this.t = opts.duration || 45; this.ang = Math.random() * 6; this.fireT = 0; this.target = null; this.scanT = 0;
+    this.t = opts.duration || 45; this.ang = rng.next() * 6; this.fireT = 0; this.target = null; this.scanT = 0;
     this.radius = Math.min(28, game.world.half * 0.55); this.height = opts.height || 24;
     this.stats = { dmgNear: 26, dmgFar: 22, rangeNear: 30, rangeFar: 80, headMul: 1.2, name: '武装直升机' };
     this.mesh = buildHeli(team === game.player.team ? 0x3a4a3a : 0x2a2a2a);

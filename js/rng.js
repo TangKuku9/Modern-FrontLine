@@ -38,4 +38,16 @@ export const rand = (a = 0, b = 1) => a + rng.next() * (b - a);
 export const randInt = (a, b) => Math.floor(a + rng.next() * (b - a + 1));
 export const pick = arr => arr[Math.floor(rng.next() * arr.length)];
 
+// 就地洗牌，消耗恰好 n-1 次随机 —— 与引擎无关。
+// 不要用 arr.sort(() => rng.next() - 0.5)：那样"调用了几次比较器"由 V8 的排序
+// 实现决定，不同版本的 Node 与 Chrome 会对同一数组抽出不同次数的随机数，
+// 客户端与服务端的玩法流当场错位（实测过：tick 0 就差 4 次）。
+export function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng.next() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
 export const crandRange = (a = 0, b = 1) => a + crand.next() * (b - a);

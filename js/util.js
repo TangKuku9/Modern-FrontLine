@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import { rng, mulberry32 } from './rng.js';
 // 随机相关的实现统一收在 rng.js（玩法流/画面流双流），此处转出以保持既有 import 不变
-export { mulberry32, crandRange, rng, crand, rand, randInt, pick } from './rng.js';
+export { mulberry32, crandRange, rng, crand, rand, randInt, pick, shuffle } from './rng.js';
 
 export const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 export const lerp = (a, b, t) => a + (b - a) * t;
