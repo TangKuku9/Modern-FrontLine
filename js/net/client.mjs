@@ -330,6 +330,14 @@ export class NetClient {
     const steady = this.recIdx > 100 && (!starved || repOk) && !r.hard && !inGrace && !aliveFlip && hit;
     if (steady) {
       this.steadyN = (this.steadyN || 0) + 1; this.steadyMax = Math.max(this.steadyMax || 0, r.corrected);
+      // 结构性判据，不依赖位置读数：这一窗服务端推进的拍数比它从我这儿消费的输入数多
+      // （Δtick > Δack ⇒ 中间有空跑拍），而随包的 rep 字节是 0 ⇒ 权威状态里含我这边永远不会
+      // 补演的步数。旧定义把 rep 记成"末尾连拍"，于是 [重复,重复,新输入] 这种窗报 0，
+      // 残差恰好沿行进方向摊成 ~2 拍位移 —— 稳态尾部那两个样本就是这个形状。
+      if (!(e.rep | 0) && dTick > dAck) {
+        this.repUnder = (this.repUnder || 0) + 1;
+        if (!this.repUnderWhy) this.repUnderWhy = { dTick, dAck, d: +r.corrected.toFixed(4) };
+      }
       // 厘米级读数已经稳定在 0.08 附近，剩下那几个 0.15~0.22 的要能解释。
       // 光有 max 一个数不行：把"当时在做什么"记下来才分得开"多跑了一拍"和"预测器算错了"。
       if (r.corrected > 0.08) {

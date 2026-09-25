@@ -260,7 +260,7 @@ try {
   console.log('\n── 本地预测质量 ──');
   const q = await A.page.evaluate(() => {
     const n = window.game.net;
-    return { reconciles: n.reconciles || 0, replayed: n.replayed || 0, correctedMax: n.correctedMax || 0, steadyMax: n.steadyMax || 0, otherMax: n.otherMax || 0, starved: n.starved || 0, steadyN: n.steadyN || 0, aliveFlips: n.aliveFlips || 0, journalMisses: n.journalMisses || 0, caughtUp: n.caughtUp || 0, repN: n.repN || 0, repMax: n.repMax || 0, repsApplied: n.repsApplied || 0, repSkipped: n.repSkipped || 0, repForgotten: n.repForgotten || 0, qDrops: n.qDrops || 0, dupTicks: n.dupTicks || 0, repSkipWhy: n.repSkipWhy || [], missWhy: n.missWhy || [], snaps: n.snaps, ticks: window.game.tick, pair: n.pairProbe || null, worst: n.steadyWorst || [], flagMismatch: n.flagMismatch || 0, flagMismatchWhy: n.flagMismatchWhy || null };
+    return { reconciles: n.reconciles || 0, replayed: n.replayed || 0, correctedMax: n.correctedMax || 0, steadyMax: n.steadyMax || 0, otherMax: n.otherMax || 0, starved: n.starved || 0, steadyN: n.steadyN || 0, aliveFlips: n.aliveFlips || 0, journalMisses: n.journalMisses || 0, caughtUp: n.caughtUp || 0, repN: n.repN || 0, repMax: n.repMax || 0, repsApplied: n.repsApplied || 0, repSkipped: n.repSkipped || 0, repForgotten: n.repForgotten || 0, qDrops: n.qDrops || 0, dupTicks: n.dupTicks || 0, repSkipWhy: n.repSkipWhy || [], missWhy: n.missWhy || [], snaps: n.snaps, ticks: window.game.tick, pair: n.pairProbe || null, worst: n.steadyWorst || [], flagMismatch: n.flagMismatch || 0, flagMismatchWhy: n.flagMismatchWhy || null, repUnder: n.repUnder || 0, repUnderWhy: n.repUnderWhy || null };
   });
   ok('每一拍快照都做了回滚重放', q.reconciles > 20, `${q.reconciles} 次 / ${q.snaps} 包快照`);
   // rep 通路的"有牙齿"断言：这一包报了重复拍 ⇔ 服务端比我供得快（饥饿）。
@@ -291,6 +291,11 @@ try {
     `稳态最大 ${q.steadyMax.toFixed(4)} m（样本 ${q.steadyN}）· 排除项最大 ${q.otherMax.toFixed(3)} m · 饥饿 ${q.starved} · 生死翻转 ${q.aliveFlips}`);
   ok('基态旗标与权威端一致（rep=0 的稳态包：同一时刻两端状态同源）', q.flagMismatch === 0,
     `失步 ${q.flagMismatch} 次 / 稳态 ${q.steadyN} 包${q.flagMismatchWhy ? ` · 首次 ${JSON.stringify(q.flagMismatchWhy)}` : ''}（编码表与取值方式两边已对齐：Crouch 取 crouchT>0.5，不是同名布尔）`);
+  // rep 字节的契约是"服务端替我多走的每一拍都要能在这一字节里数出来"。Δtick>Δack 是它
+  // 确实多走了（队列有空跑拍）的直接读数，此时 rep=0 就是少报 —— 与位置无关的结构判据，
+  // 尾部那 0.13~0.15 m 若真由少报造成，这一条会先红，而且修好后它必须归零。
+  ok('服务端没有"多走了拍却没告诉我"的窗（Δtick>Δack ⇒ rep 必须非 0）', q.repUnder === 0,
+    `违例 ${q.repUnder} 包${q.repUnderWhy ? ` · 首次 Δtick${q.repUnderWhy.dTick} Δack${q.repUnderWhy.dAck} 残差 ${q.repUnderWhy.d} m` : ''}`);
   if (q.worst.length) {
     const top = [...q.worst].sort((a, b) => b.d - a.d).slice(0, 5);
     console.log(`  >8cm 的稳态校正 ${q.worst.length} 次，最大 5 次现场：`);
