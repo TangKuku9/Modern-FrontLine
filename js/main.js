@@ -53,17 +53,38 @@ const GradeShader = {
     }`,
 };
 
+const FIXED_DT = 1 / 60;           // 模拟步长，同时是服务端的权威步长
+const MAX_STEPS_PER_FRAME = 8;     // 单帧最多补几步，超出就丢时间
+
 class Game {
   constructor() {
-    this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
+    this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true, fixedStep: true }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
     this.profile = Object.assign({ xp: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
     if (!this.profile.classes || this.profile.classes.length < 5) this.profile.classes = JSON.parse(JSON.stringify(DEFAULT_CLASSES));
     this.state = 'loading';
     this.paused = false;
     this.time = 0;
+    this.tick = 0;
+    this.acc = 0;
+    this.frameTicks = 0;
+    this.netDebug = /[?&]netdebug=1/.test(location.search);
     this.entities = []; this.bots = []; this.projectiles = []; this.pickups = []; this.noises = [];
     this.mat = mat;
     this.input = { keys: {}, pressed: {}, mdx: 0, mdy: 0, buttons: 0, wheel: 0 };
+  }
+  updateNetDebug(raw) {
+    let el = document.getElementById('netDebug');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'netDebug';
+      el.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:9999;font:12px/1.5 ui-monospace,Consolas,monospace;color:#d4f24a;background:rgba(0,0,0,.55);padding:6px 8px;white-space:pre;pointer-events:none';
+      document.body.appendChild(el);
+    }
+    this._ndAcc = (this._ndAcc || 0) * 0.9 + raw * 0.1;
+    el.textContent =
+      `${this.settings.fixedStep ? 'FIXED 1/60' : 'VARIABLE'}  tick ${this.tick}  simT ${this.time.toFixed(2)}s\n` +
+      `fps ${(1 / Math.max(1e-4, this._ndFps)).toFixed(0).padStart(4)}   ticks/frame ${this.frameTicks}   leftover ${(this.acc * 1000).toFixed(1)}ms`;
+    this._ndFps = (this._ndFps || 0) * 0.9 + raw * 0.1;
   }
   saveProfile() { localStorage.setItem('mf_profile', JSON.stringify(this.profile)); }
   saveSettings() { localStorage.setItem('mf_settings', JSON.stringify(this.settings)); }
@@ -283,7 +304,7 @@ class Game {
     }
     this.mode.start();
     this.state = 'play'; this.paused = false; this.dead = false; this.ending = false;
-    this.time = 0;
+    this.time = 0; this.tick = 0; this.acc = 0; this.frameTicks = 0;
     this.hud.show(true);
     // 预热编译
     this.renderer.compile(this.scene, this.camera);
@@ -341,20 +362,47 @@ class Game {
   }
 
   // ---------- 主循环 ----------
+  // 固定步长：真实帧时长只决定"这一帧有机会跑几步"，不决定物理步长。
+  // 依据实测：变步长下同一份输入在 15/240Hz 之间落点最大差 1.79m（含蹲跳边沿），
+  // 且余弹数随帧率变（DPS 随帧率变）；固定 1/60 后所有帧率逐位相同。
+  // 服务端只按固定步长跑，客户端预测要走同一条离散化，否则两边永远对不上。
   frame() {
-    const dt = Math.min(0.05, this.clock.getDelta());
+    const raw = Math.min(0.25, this.clock.getDelta());   // 0.25 上限防"死亡螺旋"
+    // 渲染侧仍拿改造前那份取值（原来整个循环就用 min(0.05, delta)），
+    // 不让模拟步长偷偷改掉 composer/菜单动画的时间基准
+    const rdt = Math.min(0.05, raw);
     if (this.state === 'play') {
-      const inp = this.snapshotInput();
-      if (!this.paused) this.update(dt, inp);
+      if (!this.paused) {
+        if (this.settings.fixedStep === false) {
+          this.update(rdt, this.snapshotInput());         // 旧行为原样保留，供 A/B 对比
+        } else {
+          this.acc += raw;
+          let n = 0;
+          // 只在真的要推进一 tick 时才取走输入快照 —— 这样两次 tick 之间攒下的
+          // 鼠标位移会整份交给下一个 tick，总转向量与帧率无关
+          while (this.acc >= FIXED_DT && n < MAX_STEPS_PER_FRAME) {
+            this.update(FIXED_DT, this.snapshotInput());
+            this.acc -= FIXED_DT; this.tick++; n++;
+          }
+          if (n === MAX_STEPS_PER_FRAME) this.acc = 0;    // 落后太多就丢时间，不追帧
+          this.frameTicks = n;
+        }
+      } else {
+        // 暂停时也要排空：否则这几十秒的鼠标位移会攒着，解除暂停的瞬间甩飞视角
+        // （改造前每帧无条件 snapshotInput，这个不变量必须保住）
+        this.snapshotInput();
+        this.acc = 0;
+      }
       this.renderPass.scene = this.scene; this.renderPass.camera = this.camera; this.vmPass.enabled = !!(this.player && this.player.alive);
     } else if (this.state === 'menu') {
       this.snapshotInput();
-      this.menu.update(dt);
+      this.menu.update(rdt);
       this.renderPass.scene = this.menu.scene3d; this.renderPass.camera = this.menu.camera3d; this.vmPass.enabled = false;
       this.grade.uniforms.nvg.value = 0; this.grade.uniforms.hurt.value = 0; this.grade.uniforms.thermal.value = 0; this.grade.uniforms.wp.value = 0;
     }
+    if (this.netDebug) this.updateNetDebug(raw);
     this.grade.uniforms.time.value = performance.now() * 0.001;
-    this.composer.render(dt);
+    this.composer.render(rdt);
   }
   update(dt, inp) {
     this.time += dt;
