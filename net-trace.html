@@ -12,19 +12,17 @@
 <pre id="out">running…</pre>
 <script type="module">
   import('./server/sim-twin.mjs').then(async (m) => {
-    try {
-      const t = await m.runTrace({ seed: 2026, ticks: 300, mapId: 'yard' });
-      window.__TRACE = t;
-      document.getElementById('out').textContent =
-        'digest ' + t.digest + '\nmeta ' + JSON.stringify(t.meta) +
-        '\nfirst ' + t.firstSample + '\nlast ' + t.lastSample;
-    } catch (e) {
-      window.__TRACE = { error: String(e && e.stack || e) };
-      document.getElementById('out').textContent = 'ERROR: ' + (e && e.stack || e);
-    }
+    const mt = await import('./server/match-trace.mjs');
+    const t = await m.runTrace({ seed: 2026, ticks: 300, mapId: 'yard' });
+    const match = await mt.runMatchTrace({ seed: 777, ticks: 900, mapId: 'yard' });
+    window.__TRACE = t;
+    window.__MATCH = match;
+    document.getElementById('out').textContent =
+      'player digest ' + t.digest + '\nmatch digest ' + match.digest
+      + '\nmatch final ' + JSON.stringify(match.final) + '\nmeta ' + JSON.stringify(match.meta);
   }).catch(e => {
     window.__TRACE = { error: String(e && e.stack || e) };
-    document.getElementById('out').textContent = 'IMPORT ERROR: ' + (e && e.stack || e);
+    document.getElementById('out').textContent = 'ERROR: ' + (e && e.stack || e);
   });
 </script>
 </body>

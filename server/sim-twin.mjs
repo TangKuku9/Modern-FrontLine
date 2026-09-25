@@ -114,9 +114,14 @@ export function diffTraces(a, b) {
   const fields = sampleFields();
   for (let i = 0; i < n; i++) {
     if (a.samples[i] !== b.samples[i]) {
-      const sa = a.samples[i].split(','), sb = b.samples[i].split(',');
+      const sa = String(a.samples[i]).split(','), sb = String(b.samples[i]).split(',');
       const changed = [];
-      for (let k = 0; k < sa.length; k++) if (sa[k] !== sb[k]) changed.push(fields[k] + ': ' + sa[k] + ' vs ' + sb[k]);
+      // 只有单玩家轨迹（字段数对得上）才给具名字段；对局级轨迹按行原样对比
+      const labelable = sa.length === fields.length && sb.length === fields.length;
+      for (let k = 0; k < Math.max(sa.length, sb.length); k++) {
+        if (sa[k] === sb[k]) continue;
+        changed.push(labelable ? fields[k] + ': ' + sa[k] + ' vs ' + sb[k] : 'field#' + k + ': ' + sa[k] + ' vs ' + sb[k]);
+      }
       return { identical: false, firstDivergentTick: i, atSeconds: +(i * DT).toFixed(3), changed, digestA: a.digest, digestB: b.digest };
     }
   }

@@ -9,6 +9,9 @@
 // 也跑在这里做权威裁决 —— 一致性来自"同一份代码"，不是来自"两边小心对齐"。
 import * as THREE from 'three';
 import { makeStubs, deepRecorder } from './stubs.mjs';
+import { buildGun } from '../js/gunmodel.js';
+import { crand } from '../js/rng.js';
+import { DEFAULT_CLASSES, DEFAULT_STREAKS } from '../js/data.js';
 
 // 吸收型 renderer。
 //
@@ -57,6 +60,15 @@ export class HeadlessGame {
     this.noises = [];
     this.pathBudget = 3;
     this.playerSleeve = 'fab_ally';
+    // mp.js / ai.js 要求的其余权威状态（实测枚举得出，见 spawnPickup 上方注释）
+    this.profile = { xp: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null };
+    this.grade = { uniforms: { nvg: { value: 0 }, thermal: { value: 0 }, hurt: { value: 0 }, wp: { value: 0 }, vig: { value: 0.35 } } };
+    this.input = { keys: {}, pressed: {}, mdx: 0, mdy: 0, buttons: 0, wheel: 0 };
+    this.dead = false;
+    this.deathKiller = null;
+    this.ending = false;
+    this.botDmgMul = 1;
+    this.nightVisionForBots = false;
     this.world = null;
     this.player = null;
     this.mode = null;
@@ -79,6 +91,27 @@ export class HeadlessGame {
     this.entities = this.entities.filter(b => b !== bot);
   }
   setThermal() {}
+  lock() {}
+
+  // 下面这几项是 mp.js / ai.js 额外要求 game 具备的形状（实测枚举
+  // grep -ohE "game\.[a-zA-Z_]+" js/mp.js js/ai.js 得出）：
+  //   grade.input.lock.dead.deathKiller.ending.profile.saveProfile.spawnPickup
+  //   botDmgMul.nightVisionForBots.pathBudget
+  // 服务端专用对局里它们全都是权威状态的一部分，不能省。
+  saveProfile() { this.profileSaved = (this.profileSaved || 0) + 1; }
+
+  // 与 main.js:317-327 同形：掉落武器是真实体，拾取属权威裁决，不能只留在客户端
+  spawnPickup(weaponId, att, pos, mag, reserve) {
+    const info = buildGun(weaponId, att || {}, 'none', { low: true });
+    const m = info.group;
+    m.position.set(pos.x, (this.world ? this.world.groundHeight(pos.x, pos.z, pos.y + 1, 0.2) : 0) + 0.06, pos.z);
+    m.rotation.set(0, crand.next() * 6, Math.PI / 2);
+    this.scene.add(m);
+    const p = { weaponId, att: att || {}, mesh: m, pos: m.position.clone(), mag, reserve, t: 0 };
+    this.pickups.push(p);
+    if (this.pickups.length > 14) { const o = this.pickups.shift(); this.scene.remove(o.mesh); }
+    return p;
+  }
 
   // ---------- main.js:253-259 的同形实现（去天气、去音频环境音）----------
   async loadMap(id) {
@@ -114,10 +147,19 @@ function requireMaterials() {
   if (!_materials) throw new Error('HeadlessGame: 请先 await preloadMaterials()');
   return _materials;
 }
-export async function preloadMaterials() {
-  _materials = await import('../js/materials.js');
-  const t0 = Date.now();
-  await _materials.initTextures();
-  return { ms: Date.now() - t0, mat: _materials.mat };
+let _materialsPromise = null;
+export function preloadMaterials() {
+  // 只烘一次：材质字典 MATS/TEX 是 materials.js 的模块级单例，同一进程里跑第二场
+  // 对局不该重造一遍 —— 游戏自己（main.js:94）也是按单例用的
+  if (!_materialsPromise) {
+    _materialsPromise = (async () => {
+      const mod = await import('../js/materials.js');
+      _materials = mod;
+      const t0 = Date.now();
+      await mod.initTextures();
+      return { ms: Date.now() - t0, mat: mod.mat };
+    })();
+  }
+  return _materialsPromise;
 }
 export { deepRecorder };
