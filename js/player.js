@@ -1,7 +1,7 @@
 // 玩家控制器
 import * as THREE from 'three';
 import { WeaponSystem } from './weapons.js';
-import { clamp, damp, lerp, raySphere, rayAABB, DEG, rng } from './util.js';
+import { clamp, damp, lerp, raySphere, rayAABB, DEG, entStream } from './util.js';
 import { WEAPONS, LETHALS, TACTICALS } from './data.js';
 
 // 回滚重放的状态日记本字段清单。
@@ -18,6 +18,14 @@ export const J_EXCLUDE = {
   game: '环境引用', ws: '由 J_WS + ammo + cur 覆盖', isPlayer: '常量', name: '常量', team: '常量',
   maxHp: '常量', perks: '装备时定，对局中不变', stats: '服务端裁决，客户端只显示计数',
   lastAttacker: '对象引用，只用于 HUD', radius: '常量',
+  rng: '私有流实例（对象本身不可复制），要存的是游标 —— 走 j.rngState',
+  rngSeed: '常量（进场时定）', rngTag: '常量（cid）', rng0: '常量（流的起点，重生时拨回这里）',
+  // 下面三个是 test/net-journal.mjs 那道覆盖率守卫第一次跑就点出来的历史漏登记：
+  // 那时没有任何东西为"新字段没进 J_PL / 没进 J_EXCLUDE"变红，所以它们一路躲过了审查。
+  dmgMul: 'spawn 时定，对局中不变（联机恒为 1，战役里给机器人加权）',
+  loadout: '装备这份由服务端按表重建并经 welcome 回声（见 js/loadout.mjs），对局中不变；stats/弹药从它派生后各自进日记本',
+  // —— WeaponState ——
+  vm: '视图模型（第一人称枪模），只在有 vmScene 的一侧存在（js/weapons.js:14），不参与裁决 —— P0-2 拆它的本意就是这个',
   lethal: 'count 走 journal（id/max 是装备）', tactical: 'count 走 journal',
   camPos: 'updateCamera 每拍重算', aimYaw: 'updateCamera 每拍重算', aimPitch: 'updateCamera 每拍重算',
   eyeH: '常量',
@@ -69,6 +77,13 @@ export class Player {
     this.perks = new Set(opts.perks || []);
     this.stats = { kills: 0, deaths: 0, shots: 0, hits: 0, headshots: 0, score: 0, streak: 0, assists: 0, captures: 0 };
     this.dmgMul = opts.dmgMul || 1;
+    // 私有玩法流：后坐横向（写 pl.yaw）、弹道散布、震屏（进视线）这三处随机数直接决定命中，
+    // 不能跟公共流走 —— 服务端同一拍里还替别人抽数，客户端回滚只重放自己那份，两端就会从
+    // 同一条流的不同位置取值。为什么要分开见 js/rng.js:entStream 的注释。
+    // 两端用同一对播种值：服务端是 (room.seed, cid)，客户端从 welcome 里拿到的就是这两个。
+    this.rng = entStream(opts.rngSeed >>> 0, opts.rngTag >>> 0);
+    this.rngSeed = opts.rngSeed >>> 0; this.rngTag = opts.rngTag >>> 0;
+    this.rng0 = this.rng.state();      // 重生要把流拨回这一点，见 respawn()
     this.ws = new WeaponSystem(game, this);
     this.lethal = null; this.tactical = null;
     this.lastAttacker = null;
@@ -95,6 +110,10 @@ export class Player {
     if (this.lethal) this.lethal.count = this.lethal.max;
     if (this.tactical) this.tactical.count = this.tactical.max;
     this.ws.state = 'switch'; this.ws.stateT = 0; this.ws.stateDur = 0.5; this.ws.adsT = 0;
+    // 私有流跟着一起归位：两端都是在"服务端播报重生"这同一个事件上调用本函数的，所以这里是
+    // 唯一一处能把流的位置重新对齐的时刻 —— 死亡期间本机可能整拍不去演算这个人（见 main.js
+    // 的死亡视角分支），抽数次数会和权威端错开，不归零就会让死后第一枪的后坐永久对不上。
+    this.rng.setState(this.rng0);
   }
   eyePos(out) { return out.set(this.pos.x, this.pos.y + this.curEye(), this.pos.z); }
   chestPos(out) { return out.set(this.pos.x, this.pos.y + this.curEye() - 0.4, this.pos.z); }
@@ -134,6 +153,9 @@ export class Player {
   // 在 update 之前取，记的就是"这一拍开始时的我"，重放时才和当初逐字段同起点。
   journal() {
     const ws = this.ws, j = { time: this.game.time, cur: ws.cur, grenade: ws.grenade ? ws.grenade.type : null };
+    // 私有流的游标必须跟着日记本走：回滚重放会把后坐/散布那几发重新抽一遍，流不退回
+    // 同一位置就重算不出服务端那一拍的数（这才是"每实体一条流"能被回滚用上的前提）。
+    j.rngState = this.rng.state();
     for (const k of J_PL) j[k] = this[k];
     for (const k of J_WS) j['ws.' + k] = ws[k];
     j.pos = [this.pos.x, this.pos.y, this.pos.z];
@@ -146,6 +168,7 @@ export class Player {
   applyJournal(j) {
     const ws = this.ws;
     this.game.time = j.time;
+    this.rng.setState(j.rngState);            // 流跟着回滚走，见 journal() 里那行注释
     for (const k of J_PL) this[k] = j[k];
     for (const k of J_WS) ws[k] = j['ws.' + k];
     this.pos.set(j.pos[0], j.pos[1], j.pos[2]);
@@ -306,9 +329,9 @@ export class Player {
     if (this.shakeT > 0) {
       this.shakeT -= dt;
       const a = this.shakeAmt * (this.shakeT / 0.6);
-      // 震屏走玩法流：弹道就是从这条视线取的（weapon-state.js 的 aimDir），
-      // 所以这个抖动会影响命中，不是纯画面效果
-      sx = (rng.next() - 0.5) * a * 0.05; sy = (rng.next() - 0.5) * a * 0.05;
+      // 震屏走这个人自己的玩法流：弹道就是从这条视线取的（weapon-state.js 的 aimDir），
+      // 所以这个抖动会影响命中，不是纯画面效果 —— 影响命中的随机数一律不许走公共流。
+      sx = (this.rng.next() - 0.5) * a * 0.05; sy = (this.rng.next() - 0.5) * a * 0.05;
     }
     const spd = Math.hypot(this.vel.x, this.vel.z);
     const bob = this.onGround ? Math.sin(ws.bobPhase * 2) * 0.02 * Math.min(1, spd / 6) * (1 - ws.adsT) : 0;

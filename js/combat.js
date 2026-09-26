@@ -1,7 +1,11 @@
 // 战斗系统：弹道判定、伤害、爆炸、投掷物
 import * as THREE from 'three';
 import { mat } from './materials.js';
-import { rand, clamp } from './util.js';
+// rand 在这里必须是**画面流**（crandRange）：下面唯一的用处是手雷尾烟的粒子速度。
+// 走了玩法流的话，"这颗雷在飞"就会消耗权威随机数 —— 而有没有渲染器、渲染器这一帧跑不跑
+// 这段，两端本来就不一样，于是服务端和浏览器从流的不同位置取值，机器人下一秒的散布就分叉。
+// 实测：Node 比 Chrome 多抽 3 次，正好是这一行一次的量。
+import { crandRange as rand, clamp } from './util.js';
 
 const _p = new THREE.Vector3(), _q = new THREE.Vector3();
 

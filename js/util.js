@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import { rng, mulberry32 } from './rng.js';
 // 随机相关的实现统一收在 rng.js（玩法流/画面流双流），此处转出以保持既有 import 不变
-export { mulberry32, crandRange, rng, crand, rand, randInt, pick, shuffle } from './rng.js';
+export { mulberry32, crandRange, rng, crand, rand, randInt, pick, shuffle, entStream } from './rng.js';
 
 export const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 export const lerp = (a, b, t) => a + (b - a) * t;
@@ -78,13 +78,15 @@ export function raySphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r) {
 
 // 在给定方向附近加扩散（玩法流：决定弹道，必须可播种）
 const _tmpA = new THREE.Vector3(), _tmpB = new THREE.Vector3();
-export function spreadDir(dir, spreadRad, out = new THREE.Vector3()) {
+// stream 默认公共流；联机里"每个人各自要重算出同一个数"的那几处（枪的散布）必须传
+// 这个人自己的私有流，否则服务端替别人抽的数会把这条流的游标挪走。见 js/rng.js:entStream。
+export function spreadDir(dir, spreadRad, out = new THREE.Vector3(), stream = rng) {
   if (spreadRad <= 0) return out.copy(dir);
   const up = Math.abs(dir.y) > 0.99 ? _tmpA.set(1, 0, 0) : _tmpA.set(0, 1, 0);
   const right = _tmpB.crossVectors(dir, up).normalize();
   const up2 = up.crossVectors(right, dir).normalize();
-  const r = Math.sqrt(rng.next()) * Math.tan(spreadRad);
-  const a = rng.next() * Math.PI * 2;
+  const r = Math.sqrt(stream.next()) * Math.tan(spreadRad);
+  const a = stream.next() * Math.PI * 2;
   out.copy(dir).addScaledVector(right, Math.cos(a) * r).addScaledVector(up2, Math.sin(a) * r).normalize();
   return out;
 }
