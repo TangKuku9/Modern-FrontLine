@@ -282,12 +282,29 @@ export class NetClient {
     // opts.carry 那一段）。放在这里算而不是下面记账的位置，就是因为 rollback 要用。
     const dTick = this.lastSnapTick === undefined ? 0 : ((this.serverTick - this.lastSnapTick) >>> 0);
     const dAck = this.lastStart === undefined ? 1 : ((start - this.lastStart) & 0xffff);
-    // 缺口（空跑拍数）与"落在首次消费之前的那几拍"。上一包随快照下来的 rep（this.lastRep）
-    // 就是进这一窗之前已经欠下的空跑数，而本窗的 lead 部分 = 本窗总空跑 − 末尾连拍。
-    // 两个方向都夹住：deficit 为负说明 ack 跑得比拍号快（服务端跳过我的输入），
-    // lead 为负说明 rep 比"总空跑 + 上一包欠下的"还大 —— 两种都只可能是拍号接错线。
+    // 缺口（空跑拍数）与"落在首次消费之前的那几拍"。
+    // 这一窗要重演的首段空跑 = 本窗总空跑 deficit − 随包报回来的末尾连拍 rep。
+    // 两个方向都想夹住：deficit 为负说明 ack 跑得比拍号快（服务端跳过我的输入）——
+    // 这一头由 qDrop 单独记；lead 为负说明 rep 比本窗总空跑还大，只可能是拍号接错线。
     const deficit = Math.max(0, dTick - dAck);
-    const lead = Math.max(0, (this.lastRep | 0) + deficit - (e.rep | 0));
+    // ⚠ 这里曾经是 `max(0, lastRep + deficit − rep)`，把**上一包**随快照下来的末尾连拍
+    // 也算进本窗的 lead。那是重复计数：基态（无论 landed 还是 journal[b]）按定义就是
+    // "上一包那一刻"，上一窗那些空跑拍已经含在里面了，再加一次就多走 exactly lastRep 拍。
+    // 实测形状（真浏览器红样本，逐条对得上）：applySteps − dTick = lastRep，
+    // 且 corrected ≈ lastRep × 一拍位移；"非零偏差的包"与"applySteps ≠ dTick 的包"
+    // 在 tmp-carry-probe 里**逐条重合**。
+    // 正确写法 = 本窗自己那段空跑 = deficit − rep。前提 rep ≤ deficit 成立：
+    // rep 是"末尾那几拍连拍"，是总空跑的一个子集（dAck ≥ 1 时末尾段也在本窗的 dTick 里）。
+    const ownLead = Math.max(0, deficit - (e.rep | 0));
+    const lead = ownLead;
+    // 末尾连拍的**实际补演拍数**：dTick − dAck − lead。为什么不直接用 wire 上的 rep：
+    // rep 是"从最后一次消费起连着几拍没新输入"，它**跨窗累计** —— ack 不动时它每一份快照
+    // 都在涨。在 dAck = 0 的纯饥饿窗里它因此可以比这一窗的步数还大（真浏览器实测
+    // dTick3 dAck0 而 rep5 ⇒ 旧通路从 journal[start] 出发补了 5 拍、多走 2 拍，
+    // 偏差 0.1521 m = 2.05 拍）。按 dTick 拆出来，这两头就都自洽了：
+    //   lead + dAck + repUse = dTick，对 dAck ≥ 1 是 `rep`（恒等），对 dAck = 0 是
+    //   `min(rep, dTick)`（那一窗整段都是空跑）。算术见 test/reconcile-chain.mjs 的 A2/A7。
+    const repUse = Math.max(0, dTick - dAck - lead);
     // 基态那一格：start 往前 dAck 拍（= 上一包的 ack+1）。dAck 为 0 时它是 start 本身，
     // 也就是旧通路用的那一格，两条路在这里自然重合。
     // 死亡边沿：服务端把我定成死了，而我还按"活着"预测着往前走了几拍。
@@ -311,11 +328,24 @@ export class NetClient {
     // 交错了不会报错，只会在 applyJournal 里读 undefined[0] 炸掉整个 reconcile。
     const carryOf = () => {
       if (this.hardSnap) return 'hard';              // 整体重置：日记本本来就要重建
-      if (dAck < 1) return 'noAck';                  // 纯饥饿窗：ack 不动，dTick 步全是末尾连拍，rep 就是全部
       if (dAck > 8) return 'tickJump';               // 我的拍号跳了（客户端跑得比服务端快），两边的"第 k 拍"对不上
+      // dAck = 0 的纯饥饿窗**也走这条路**（不再像以前那样直接交给旧通路）：
+      // 它的基态同样是"上一包那一刻"，而旧通路从 journal[start] 出发、按 wire 上的 rep
+      // 补拍 —— rep 跨窗累计（ack 不动时一直涨），实测因此多走 rep − dTick 拍
+      // （真浏览器 d=0.1521 m = 2.05 拍，现场 dTick3 dAck0 reps5）。按 dTick 拆（上面的
+      // lead/repUse）之后这一窗整段都是空跑、且都拿 I_ack 那一份 —— 下面 pe 的取法
+      // 在 dAck=0 时恰好落到 start−1 = ack 上，正是服务端手里那份，不用特判。
       const b = (start - dAck) & 0xffff;
-      const je = this.history.find(h => h.tick === b && h.j);
-      if (!je) return 'basePruned';
+      // ★ 基态**优先取上一包重建出来的那一刻**（rollback 交回的 landed），只有在它不可用
+      // （第一包 / 上一包整体重置 / 上一包没对上拍号）时才退回日记本那一格。
+      // 为什么不直接用日记本：journal[b] 是**逐代推出来**的（见 predict.mjs 里 landed 那段），
+      // 它的真实时刻会随历史漂移 —— 实测一条链上 carry 基态 Δpos 从 −0.59 漂到 −1.22 m，
+      // 偏差跟着从 0.45 涨到 1.12 m。landed 是"和上一份快照同一时刻"的直接传递，不累积。
+      // lastLandingTick 恒等于 lastStart（b = start − dAck = 上一包的 start），这个等号是
+      // 上面 dAck 的定义给的，不是巧合；留成显式比较是为了在接错线时退回旧路而不是静默用错。
+      const useLanded = this.lastLanding && this.lastLandingTick === b;
+      const je = useLanded ? null : this.history.find(h => h.tick === b && h.j);
+      if (!useLanded && !je) return 'basePruned';
       const inp = [];
       for (let i = 0; i < dAck; i++) {
         const en = this.history.find(h => h.tick === ((b + i) & 0xffff));
@@ -324,12 +354,16 @@ export class NetClient {
       }
       const pe = lead > 0 ? this.history.find(h => h.tick === ((b - 1) & 0xffff)) : null;
       if (lead > 0 && !pe) return 'prevPruned';
-      return { j: je.j, inp, prevInp: pe ? pe.inp : null, lead, n: dAck };
+      return { j: useLanded ? this.lastLanding : je.j, inp, prevInp: pe ? pe.inp : null, lead, n: dAck, src: useLanded ? 'landed' : 'journal' };
     };
-    // 该不该用 carry：只在"这一窗真有消费"时才谈得上 —— dAck=0 的纯饥饿窗整段都是末尾连拍，
-    // 那条旧通路本来就对，进这条路反而多一处可能接错线。dAck≥1 时只要服务端跑了空跑
-    // （本窗空跑 deficit>0，或上一包还欠着 lastRep 拍）就必须走它。
-    const needCarry = dAck >= 1 && (deficit > 0 || (this.lastRep | 0) > 0);
+    // 该不该用 carry：dAck ≥ 1 时只要服务端跑了空跑（本窗 deficit>0，或上一包还欠着
+    // lastRep 拍）就必须走它；dAck = 0 的纯饥饿窗**也**要走（理由见 carryOf 里那段 ——
+    // 旧通路按 rep 补拍，而 rep 跨窗累计，会把人推多几拍）。都走不通（hard / tickJump /
+    // 料缺）才退回旧通路，且退回时留下名字。
+    const needCarry = this.hardSnap ? false
+      : dAck > 8 ? false
+      : dAck >= 1 ? (deficit > 0 || (this.lastRep | 0) > 0)
+      : deficit > 0;
     const got = needCarry ? carryOf() : null;
     const carry = got && typeof got === 'object' ? got : null;
     // 该补而没补上的，一律留下**名字**。这一条以前没有：旧写法在同样的窗里照样把
@@ -341,8 +375,19 @@ export class NetClient {
       if (this.carryWhy.length < 12) this.carryWhy.push({ why: got, dAck, dTick, deficit, lead, rep: e.rep | 0, lastRep: this.lastRep | 0, have: this.history.length });
     }
     const r = rollback(this.game, pl, win, start, e, this.lastRngState,
-      { hard: !!this.hardSnap, rep: e.rep | 0, hold: holdE && holdE.inp, carry, lead });
-    if (carry) { this.carryN = (this.carryN || 0) + 1; this.carryLead = (this.carryLead || 0) + r.led; }
+      { hard: !!this.hardSnap, rep: repUse, hold: holdE && holdE.inp, carry, lead });
+    // 下一窗的基态：这一窗重建出来的那一刻 = 和**这份快照**同一时刻。带着它对应的拍号走，
+    // 下一窗只会在这份状态"就是它那个时刻"时才用它（见 carryOf 里 useLanded 那段）。
+    this.lastLanding = r.landed || null;
+    this.lastLandingTick = r.landed ? start : null;
+    if (carry) {
+      this.carryN = (this.carryN || 0) + 1; this.carryLead = (this.carryLead || 0) + r.led;
+      // 基态是从哪来的：landed（上一包那一刻，不累积）还是退回日记本那一格（会累积漂移）。
+      // 两个数都要印：只印"用了几包 carry"的话，"carry 都在跑"和"carry 都在用会漂的基态"
+      // 在报表上长得一样，而这一轮的病根正是后者。
+      if (carry.src === 'landed') this.baseLanded = (this.baseLanded || 0) + 1;
+      else { this.baseFellBack = (this.baseFellBack || 0) + 1; if (!this.baseFallWhy) this.baseFallWhy = []; if (this.baseFallWhy.length < 8) this.baseFallWhy.push({ dAck, dTick, deficit, lead, start, lastStartAt: this.lastStart, lastLanding: !!this.lastLanding, lastLandingTick: this.lastLandingTick, b: (start - dAck) & 0xffff, hit: win.length > 0 && win[0].tick === start, have: this.history.length }); }
+    }
     this.hardSnap = false;
     this.reconciles = (this.reconciles || 0) + 1;
     // rep 通路读数 + 它的一个已知缺口。
@@ -363,6 +408,7 @@ export class NetClient {
     this.repsApplied = (this.repsApplied || 0) + r.reps;
     if (!(e.rep | 0) && this.lastRep) this.repForgotten = (this.repForgotten || 0) + this.lastRep;
     this.lastRep = e.rep | 0;
+    this.lastOwnLead = ownLead;                        // 留给下一包：它的基态就缺这一撮
     this.replayed = r.replayed;
     this.corrected = r.corrected;
     this.correctedMax = Math.max(this.correctedMax || 0, r.corrected);
@@ -389,6 +435,27 @@ export class NetClient {
     if (r.hard) this.grace = 2;                       // 重生之类整体重置之后两包：日记本在重建
     const inGrace = ((this.grace = Math.max(0, (this.grace || 0) - 1)) > 0);
     const hit = win.length > 0 && win[0].tick === start;
+    // carry 那条线的**结构性断言**：这一窗服务端真跑过的步数被一步不落地重演。
+    // 注意它的地位要说准 —— 在"基态取 landed + repUse 按 dTick 拆"这两件事成立时它是
+    // **按构造成立**的恒等式（lead + dAck + repUse = dTick 是代数，不是巧合），所以它是
+    // 断言不是判据：它的价值在于任何一次改动把这条代数弄坏时它会立刻响（上一轮正是
+    // 因为这条从没被比过，lastRep 的重复计数躲过了一整轮）。
+    // 只比"补演的料凑齐"的窗，而且**必须比到 hit**：hit 为假的窗是客户端还没产出 start
+    // 那一拍（win 切出来是空的），rollback 一拍都不会演 —— 那是 caughtUp 类，有自己的
+    // 命名账（上面 caughtUp/journalMisses），混进这里会把"客户端落后"与"重演记账错"
+    // 两种成因搅在一起（test/reconcile-chain.mjs 实测：14 笔"步数违例"全是前者）。
+    // hold 取不到时 reps 本来就会少，同理归 repSkipped，不在这里数。
+    // （这一块原先记在 rollback 刚返回的位置，那时 hit 还没算出来 —— 挪到这里才比得了。）
+    const stepsDone = r.led + r.reps;
+    const lastRepAt = this.lastRep | 0;     // 这一窗的"上一包 rep"，下面稳定现场要用
+    if (carry && holdE && holdE.inp && hit && stepsDone !== dTick) {
+      this.carryStepsBad = (this.carryStepsBad || 0) + 1;
+      this.carryStepsWhy = this.carryStepsWhy || [];
+      if (this.carryStepsWhy.length < 8) this.carryStepsWhy.push({
+        dTick, dAck, deficit, lead, rep: e.rep | 0, repUse, lastRep: this.lastRep | 0,
+        led: r.led, reps: r.reps, done: stepsDone, d: +r.corrected.toFixed(4),
+      });
+    }
     // 这一包处不处在"输入总线出过事"的窗口里：饥饿、跳过、上一包报过重复拍，
     // 或者**基态那条日记本写于一次漏计之前**（debt 戳，机制见 recordInput）。
     const staleDebt = hit && win[0].debt !== undefined && win[0].debt < (this.repForgotten | 0);
@@ -431,10 +498,15 @@ export class NetClient {
     }
     // 入场前 100 拍（5 秒）也不算：服务端从 addClient 起就在拿全零输入空跑这个人，
     // 而本地第 0 拍才刚开始，两边的"同一拍"根本不是同一件事。
-    // 饥饿那一拍**不再自动排除**：rep 补全之后那一拍的重建是完整的，它和别的包一样可比，
-    // 以前排除它是因为"那一拍我根本重建不出来"，现在这个理由没了。补不全（rep 对不上、
-    // 或那份被补演的输入已经被历史窗口挤掉）才继续排除 —— 排除项跟着机制一起收窄。
-    const repOk = (e.rep | 0) === r.reps;
+    // 饥饿那一拍**不再自动排除**：重建完整之后那一拍和别的包一样可比，以前排除它是因为
+    // "那一拍我根本重建不出来"，现在这个理由没了。补不全才继续排除 —— 排除项跟着机制收窄。
+    // "重建完整"的定义：走 carry 的窗，这一窗服务端真跑过的步数必须被一步不落地重演
+    // （applySteps = led + reps == dTick）；走旧通路的窗（deficit=0 的干净窗），仍按老口径
+    // "wire 上的 rep 有没有被完整补演"。**不是放宽**：carry 那条路的口径更严 —— 原来只
+    // 要求那个字节被补上，现在还要求 lead 那几段也在（缺料时 led/reps 会少，照样红）。
+    // 而 dAck=0 的纯饥饿窗以前按 `(e.rep === reps)` 比必然失配（rep 跨窗累计，比这一窗的
+    // 步数还大），于是被永久排除出稳态统计 —— 上面那条 rep−dTick 拍的错就是这么躲着的。
+    const repOk = carry ? (r.led + r.reps === dTick) : ((e.rep | 0) === r.reps);
     // 入场那 100 拍之前不算漏：页面还在加载材质，服务端已经拿全零输入空跑了一分多钟
     // 的量（实测 rep 到 160 拍），补演上限 120 必然撞。这一段本来就在稳态判据的
     // 排除窗里，把它记成"补不全"只是把同一个事实数两遍。
@@ -442,7 +514,7 @@ export class NetClient {
       this.repSkipped = (this.repSkipped || 0) + 1;
       this.repSkipWhy = this.repSkipWhy || [];
       if (this.repSkipWhy.length < 12) this.repSkipWhy.push({
-        rep: e.rep | 0, reps: r.reps, ack: e.ack & 0xffff, start, have: this.history.length,
+        rep: e.rep | 0, repUse, reps: r.reps, ack: e.ack & 0xffff, start, have: this.history.length,
         oldest: this.history.length ? this.history[0].tick : null, newest: this.localTick,
         hold: !!(holdE && holdE.inp), hard: !!r.hard, hit,
       });
@@ -523,6 +595,14 @@ export class NetClient {
           // 三个数必须自洽：led = lead + Δack，且 lead + Δack + reps = Δtick。不自洽就说明
           // carry 那条线的料接错了 —— 这是它唯一的内部一致性检查，比位置读数先红。
           deficit, lead, led: r.led,
+          // 本窗/上一窗的"首段空跑"，以及**本窗基态那一格**的 Δpos。
+          // dpBase 是这条线一直缺的那个读数：旧的判定块只打印 e − journal[start]（旧通路的基态），
+          // 而 carry 通路用的基态是 journal[start − dAck]，两者在这把刻度上根本不是同一格。
+          // 少了它，"多数了拍"和"基态自己就不在图里"在报表上完全同形。
+          ownLead, lastOwnLead: this.lastOwnLead | 0,
+          applySteps: stepsDone, lastRepAt: lastRepAt, baseSrc: carry ? carry.src : null,
+          dpBase: carry && carry.j ? [+((e.x - carry.j.pos[0]).toFixed(3)), +(e.y - carry.j.pos[1]).toFixed(3), +((e.z - carry.j.pos[2]).toFixed(3))] : null,
+          baseTick: carry ? ((start - dAck) & 0xffff) : null,
           dp: jb ? [+((e.x - jb.pos[0]).toFixed(3)), +(e.y - jb.pos[1]).toFixed(3), +((e.z - jb.pos[2]).toFixed(3))] : null,
           dYaw: jb ? +((e.yaw - jb.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI).toFixed(4) : null,
           dHp: jb ? +(e.hp - jb.hp).toFixed(1) : null,

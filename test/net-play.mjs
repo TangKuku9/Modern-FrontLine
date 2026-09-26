@@ -327,7 +327,8 @@ try {
   if (q.worst.length) {
     const top = [...q.worst].sort((a, b) => b.d - a.d).slice(0, 5);
     console.log(`  >8cm 的稳态校正 ${q.worst.length} 次，最大 5 次现场：`);
-    for (const w of top) console.log(`    ${w.d} m · 回演${w.replayed}拍/窗${w.win} · Δtick${w.dTick} Δack${w.dAck} · 报重复${w.rep}拍/实补${w.reps}拍${w.qDrop ? ' · 服务端跳拍' : ''} · 在途${w.inflight}拍 · 速度${w.spd}(vy${w.vy},${w.onG ? '地' : '空'}) · 开火${w.fire ? '是' : '否'}\n      基态差分量 Δpos=${JSON.stringify(w.dp)} Δyaw=${w.dYaw}rad Δhp=${w.dHp} 日记本旗标=${w.jFlags} 权威旗标=${w.eFlags}\n      权威端 ${JSON.stringify(w.auth)} · 本地各拍 ${JSON.stringify(w.traj)} · 基态正前方墙距 ${w.wallAhead} m`);
+    for (const w of top) console.log(`    ${w.d} m · 回演${w.replayed}拍/窗${w.win} · Δtick${w.dTick} Δack${w.dAck} · 报重复${w.rep}拍/实补${w.reps}拍${w.qDrop ? ' · 服务端跳拍' : ''} · 在途${w.inflight}拍 · 速度${w.spd}(vy${w.vy},${w.onG ? '地' : '空'}) · 开火${w.fire ? '是' : '否'}\n      基态差分量 Δpos=${JSON.stringify(w.dp)} Δyaw=${w.dYaw}rad Δhp=${w.dHp} 日记本旗标=${w.jFlags} 权威旗标=${w.eFlags}\n      空跑拆分：本窗首段${w.ownLead} 上一窗首段${w.lastOwnLead} · carry 基态(t${w.baseTick}) Δpos=${JSON.stringify(w.dpBase)}
+      重演步数：applySteps=${w.applySteps} vs dTick=${w.dTick}（差 ${w.applySteps - w.dTick}，其中上一包 rep=${w.lastRep}）\n      权威端 ${JSON.stringify(w.auth)} · 本地各拍 ${JSON.stringify(w.traj)} · 基态正前方墙距 ${w.wallAhead} m`);
   }
   // 尾部那几个样本要么归因给"服务端在这一包附近对我做了不规则处理"（跳拍、ack 比拍号跑得快），
   // 要么就是物理真的分叉了 —— 这两件事的修法完全相反，所以先把归因比例打出来再决定动哪里。
@@ -361,6 +362,7 @@ try {
     ok('配对契约：每一个错拍样本都落在输入总线事件上（否则就是配对规则本身有洞）', p.unexplained.length === 0,
       `不可归因 ${JSON.stringify(p.unexplained.slice(0, 2))}`);
     console.log(`  输入总线读数：饥饿 ${q.starved} 包 · 服务端跳过我的输入 ${q.qDrops} 包 · 漏计重复拍 ${q.repForgotten} · 补不全 ${q.repSkipped} 包 · 首段空跑用 carry 补了 ${q.carryN || 0} 包/${q.carryLead || 0} 拍`);
+    console.log(`  carry 步数一致性（applySteps 必须 == dTick）：违例 ${q.carryStepsBad || 0} 包 · 现场 ${JSON.stringify((q.carryStepsWhy || []).slice(0, 3))}`);
     // 恒等式：一拍一份输入。同一拍记两遍 ⇒ 回滚多演一步而服务端把第二份当重复包丢掉，
     // 表现出来就是"权威端比我的重建少走一拍"，且 rep 看不出（它没重复）。
     ok('输入总线没把同一拍记两遍（回滚窗口逐拍唯一）', q.dupTicks === 0, `重复记录 ${q.dupTicks} 拍 · 不可归因样本现场 ${JSON.stringify((p.unexplained || [])[0] || null)}`);

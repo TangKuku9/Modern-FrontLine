@@ -27,9 +27,11 @@ const DT = 1 / 60;
 // opts.hard：状态被服务端整体重置（重生、传送、回合重开）。这时 journal 里那一份
 // 是"上一个位置"的，退回去重演只会把人在纠正之后又拽回出生点前 —— 所以直接吃权威值，
 // 并且**不把这次位移记进预测偏差**：那是合法的传送，不是预测失败。
-// 返回 { replayed, reps, led, corrected, baseState, journalMiss }：replayed/reps/led/corrected
-// 只是给上层印的，不参与裁决；**baseState 例外** —— 它是"这一窗服务端跑过的 dTick 步重演完之后"
-// 那几个权威不下发的姿态量，client 侧拿它跟权威旗标比（位置/视线/血马上要被覆盖，比了没信息）。
+// 返回 { replayed, reps, led, corrected, baseState, landed, journalMiss }：replayed/reps/led/corrected
+// 只是给上层印的，不参与裁决；**baseState 与 landed 例外** ——
+//   · baseState 是"这一窗服务端跑过的 dTick 步重演完之后"那几个权威不下发的姿态量，
+//     client 侧拿它跟权威旗标比（位置/视线/血马上要被覆盖，比了没信息）。
+//   · landed 是**同一时刻的完整状态**，client 侧必须存成下一窗的基态（理由见下面那一段）。
 export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
   const hard = !!opts.hard;
   if (!pl) return { replayed: 0, reps: 0, led: 0, corrected: 0, baseState: null, journalMiss: false };
@@ -111,6 +113,21 @@ export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
   // 4 秒延迟里 —— 血条每收一份快照抖一格。
   if (e.hp < predictedHp - 1e-6) pl.dmgT = 0;
   if (rngState !== undefined) rng.setState(rngState);
+  // ★ **这一窗重建出来的那一刻的完整状态** —— 它必须是下一窗的基态（client 侧存成
+  // lastLanding 交回来）。为什么不再从日记本里取 journal[start−dAck]：
+  //   日记本那几格是**逐代推出来**的（win[i+1].j = pl.journal()，而 pl 的起点是上一包
+  //   那次重建的落点），所以"这一格落在哪一拍上"取决于几代之前那些包的记账。
+  //   实测的形状就是累积漂移：一条链上 carry 基态 Δpos 从 −0.59 → −0.95 → −1.22 m
+  //   一路长下去（net-play 现场），偏差跟着 0.45 → 0.75 → 1.12 m。
+  //   漂移量可以推出来（err_k = err_{k−2} − ownLead_{k−1} 那种递推），但每代长多少取决于
+  //   历史，**没有一项能补**：试过的两项只是把漂移换个方向 —— 去掉 lastRep 时每代漂 −deficit
+  //   （实测更差：6 次取样红 5 次、最大 1.12 m），留着它每代漂 −ownLead（小一些，但仍非零）。
+  //   而"上一包重建出来的那一刻"按定义就是"和上一份快照同一时刻"，也就是下一窗的基态；
+  //   它是**同一时刻的直接传递**，不经过日记本那条逐代推的路径，因此不累积。
+  // 取在权威覆盖**之后**：位置/速度/朝向/血这几维此刻就是权威读数，比重建值更准；
+  // 姿态类布尔（crouch/slide/sprint/onGround）与武器时间轴则由重演决定（上面刻意不覆盖）。
+  // 取在重演循环**之前**：循环会把 pl 推到 localTick，那不是"和快照同一时刻"了。
+  const landed = hit ? pl.journal() : null;
   // ── 这一拍（win[0] / tick=start）的账本**不能**在这里写回 ─────────────────────────
   // 这里原先有一行 `if (hit) win[0].j = pl.journal();`。它是错的，而且是那一族"权威端
   // 常数超前我一段"的直接来源：
@@ -131,5 +148,5 @@ export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
     game.time += DT; pl.update(DT, h.inp, { replay: true });
     if (win[i + 1]) win[i + 1].j = pl.journal();
   }
-  return { hard, noBase: win.length === 0, replayed: win.length, reps, led, baseState, corrected: Math.hypot(mine[0] - e.x, mine[1] - e.y, mine[2] - e.z), journalMiss: !hard && win.length > 0 && !hit };
+  return { hard, noBase: win.length === 0, replayed: win.length, reps, led, baseState, landed, corrected: Math.hypot(mine[0] - e.x, mine[1] - e.y, mine[2] - e.z), journalMiss: !hard && win.length > 0 && !hit };
 }
