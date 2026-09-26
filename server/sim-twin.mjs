@@ -111,6 +111,14 @@ export async function runTrace(opts = {}) {
   };
 }
 
+// 对局级轨迹每 10 拍才存一个样本，样本字符串带 "<tick>:" 前缀；单玩家轨迹每个 tick 一个样本、
+// 不带前缀。报"首处分歧"时必须给出**真拍号**：混着样报过一次，把 760 拍报成了 76 拍
+// （README 里"第 14 拍 / 第 76 拍"两处就是这么来的），排查时对着假拍号找了一圈。
+function tickOf(s) {
+  const m = /^(\d+):/.exec(String(s));
+  return m ? +m[1] : null;
+}
+
 export function diffTraces(a, b) {
   const n = Math.min(a.samples.length, b.samples.length);
   const fields = sampleFields();
@@ -124,8 +132,14 @@ export function diffTraces(a, b) {
         if (sa[k] === sb[k]) continue;
         changed.push(labelable ? fields[k] + ': ' + sa[k] + ' vs ' + sb[k] : 'field#' + k + ': ' + sa[k] + ' vs ' + sb[k]);
       }
-      return { identical: false, firstDivergentTick: i, atSeconds: +(i * DT).toFixed(3), changed, digestA: a.digest, digestB: b.digest };
+      const tick = tickOf(a.samples[i]);
+      return {
+        identical: false, sampleIndex: i,
+        firstDivergentTick: tick === null ? i : tick,
+        atSeconds: +((tick === null ? i : tick) * DT).toFixed(3),
+        changed, digestA: a.digest, digestB: b.digest,
+      };
     }
   }
-  return { identical: true, firstDivergentTick: -1, digestA: a.digest, digestB: b.digest };
+  return { identical: true, sampleIndex: -1, firstDivergentTick: -1, digestA: a.digest, digestB: b.digest };
 }
