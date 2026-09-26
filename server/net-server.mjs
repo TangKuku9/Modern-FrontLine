@@ -65,7 +65,11 @@ export const CFG = {
   // 邀请码留空 = 开放注册。默认值刻意**不**是空：让一个还没配好的部署默认带上门槛，
   // 比默认敞开、等人自己想起来要配要好。真要开放时显式设 JOIN_CODE=''。
   inviteCode: process.env.JOIN_CODE != null ? process.env.JOIN_CODE : 'mf2026',
+  // 上面那句默认值现在还留着一个"漂移的来源"：它到底是**环境变量给的**还是**源码里的**，
+  // 必须能被日志和判据分开 —— 见下面的 assertDeployConfig() 与启动日志里那一格。
+  inviteCodeFromEnv: process.env.JOIN_CODE != null,
   accountsDb: process.env.ACCOUNTS_DB || '',            // 留空 = 内存（能玩，重启就没）
+  accountsDbFromEnv: process.env.ACCOUNTS_DB != null,  // 与上面同理："" 是"我故意要内存库"，未设是"我忘了"
   cookieSecure: process.env.COOKIE_SECURE != null ? process.env.COOKIE_SECURE !== '0' : null,   // null = 跟随 prod
   // **代理层数**，不是布尔。设 0（默认）时完全忽略 X-Forwarded-For ——
   // 认了的话任何人都能随手写这个头，于是"按 IP 限流"变成"按攻击者自己填的字符串限流"。
@@ -91,6 +95,55 @@ export const CFG = {
   //    MAX_ROOMS 占满。房间是有主人的（谁第一个建的算谁的）。
   roomsPerUser: int(process.env.ROOMS_PER_USER, 2),
 };
+
+// ── 生产模式的"配置闸"：**"忘了设"不许长得和"设好了"一模一样** ──
+//
+// 这一段是判据逼出来的，不是"防御性编程"。上一版 `JOIN_CODE` 不设时取源码里的 `mf2026`，
+// 而启动日志只判断真值 ⇒ 打印 **"邀请码 已设"**。于是：
+//   · 忘了设环境变量的操作员，看到的是"已配好"；
+//   · 而那个码就写在仓库源码里 —— 读过 README 的人都进得来。
+// 这个形状（不报错、不崩、看起来对）正是这个仓库一路在抓的那一类，只不过这次落在部署配置上。
+//
+// 两类东西在**生产模式**下必须显式给值，否则拒绝启动：
+//   ① 邀请码：默认值是公开的字符串。要么给一个只有你知道的，要么显式设空表示"我就是要开放注册"。
+//   ② 账号库：留空 = 内存库，`REQUIRE_ACCOUNT=1` 时意味着**进程一重启所有人的账号一起消失** ——
+//      而这件事只在重启之后才看得出来，那时已经有真玩家了。要么给一个持久路径，要么显式声明访客可玩。
+// 开发模式（不设 NODE_ENV / 不带 --prod）不卡这两条：本机起服务不该被部署配置拦住，
+// 但启动日志必须**明说**"用的是源码里的默认值"/"内存库"。
+//
+// 之所以是"拒绝启动"而不是"打个 warnings 接着跑"：警告在 `docker logs` 里活不过三秒，
+// 而这两条配错的代价要么是"公开的门"要么是"某天早上所有人的账号没了"。
+// 与延迟补偿那一条同一个原则 —— 拒绝，而不是接受一个被伪造过的值。
+function assertDeployConfig() {
+  if (!CFG.prod) return;
+  const bad = [];
+  if (!CFG.inviteCodeFromEnv) {
+    bad.push([
+      '生产模式下必须显式设置 JOIN_CODE，拒绝启动。',
+      `  原因：不设时用的是源码里的默认邀请码，而它在仓库里谁都能读到 —— 日志却只会说"已设"，`,
+      `        于是"忘了设"和"设好了"长得一模一样。`,
+      `  两条出路（选一条）：`,
+      `    JOIN_CODE=<只有你知道的码>`,
+      `    JOIN_CODE=                 （显式设空 = 我就是要开放注册）`,
+    ]);
+  }
+  if (!CFG.accountsDbFromEnv && CFG.requireAccount) {
+    bad.push([
+      '生产模式下 REQUIRE_ACCOUNT=1（默认）却没有设 ACCOUNTS_DB，拒绝启动。',
+      `  原因：账号库留空 = 内存库。注册、登录、邀请码都照常工作，但进程一重启，`,
+      `        所有人的账号一起消失、会话失效 —— 而这件事只在重启之后才看得出来。`,
+      `  两条出路（选一条）：`,
+      `    ACCOUNTS_DB=/data/accounts.db   （给一个持久路径；容器里记得挂卷）`,
+      `    REQUIRE_ACCOUNT=0               （显式声明"这是个不存档案的访客服"）`,
+    ]);
+  }
+  if (!bad.length) return;
+  for (const lines of bad) console.error('[配置] ' + lines.join('\n'));
+  console.error('[配置] 这两格都是"忘了设不会报错、只会静默走错"的那种，所以在此停住。');
+  process.exit(1);
+}
+assertDeployConfig();
+
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -604,6 +657,13 @@ httpServer.listen(CFG.port, CFG.host, () => {
   console.log(`  静态根目录 ${ROOT}`);
   console.log(`  地图 ${CFG.map}  种子 ${CFG.seed}  端口 ${CFG.port}  绑 ${CFG.host}  ${CFG.prod ? '生产' : '开发'}模式`);
   console.log(`  上限 房间 ${CFG.maxRooms} · 连接 ${CFG.maxClients} · 单帧 ${CFG.maxPayload} B · 空房回收 ${CFG.roomIdleMs / 1000}s · 允许来源 ${CFG.origins.join(',') || '(不检查)'}`);
-  console.log(`  账号 ${auth.store.constructor.name}${CFG.accountsDb ? ' @ ' + CFG.accountsDb : '（内存，重启就丢）'} · 邀请码 ${CFG.inviteCode ? '已设' : '未设（开放注册）'} · 进对局必须登录 ${CFG.requireAccount ? '是' : '否'}`);
+  // 邀请码这一格以前只有两态（非空 ⇒ "已设"），于是"忘了设（用的是源码里的默认值）"和
+  // "设好了"打印出来一模一样。现在必须是三态，而且未设那一态要**把默认值本身印出来** ——
+  // 它不印出来，操作员就没有任何线索知道自己正拿着一个人人皆知的门槛。
+  const inviteDesc = !CFG.inviteCodeFromEnv
+    ? `**未设（在用源码里的默认值 ${CFG.inviteCode}，生产模式会拒绝启动）**`
+    : (CFG.inviteCode ? '已设（来自 JOIN_CODE）' : '已设为空串（开放注册）');
+  console.log(`  账号 ${auth.store.constructor.name}${CFG.accountsDb ? ' @ ' + CFG.accountsDb : '（内存，重启就丢）'}` +
+    `${CFG.accountsDbFromEnv ? '' : ' ← 未设 ACCOUNTS_DB'} · 邀请码 ${inviteDesc} · 进对局必须登录 ${CFG.requireAccount ? '是' : '否'}`);
   console.log(`  闸门 每 IP 连接 ${CFG.connsPerIp} · 每连接 ${CFG.wsMsgPerSec} 消息/秒 · 每人 ${CFG.roomsPerUser} 间房 · 代理层数 ${CFG.trustProxy}${CFG.trustProxy ? '' : '（忽略 X-Forwarded-For）'}`);
 });

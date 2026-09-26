@@ -14,3 +14,7 @@ server/match-node.json
 Dockerfile
 .dockerignore
 README.md
+# 真实的部署配置不进镜像：镜像会被推到仓库/注册表，而里面装着邀请码与来源白名单。
+# 部署时用 `docker run --env-file .env`（或 compose 的 env_file）在**运行时**喂进去。
+.env
+*.db

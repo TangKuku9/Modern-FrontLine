@@ -24,6 +24,9 @@ const srv = await withServer({
   NODE_ENV: 'production',
   MAX_ROOMS: '4', MAX_CLIENTS: '8', ROOM_IDLE_MS: '1500', MAX_PAYLOAD: '16384',
   ALLOW_ORIGIN: 'http://127.0.0.1', STATIC_MAX_AGE: '60',
+  // 邀请码要给：生产模式下**不设** JOIN_CODE 会被配置闸拒绝启动（那是有意的 ——
+  // 源码里那个默认码是公开的，而日志以前会说"已设"）。这条探针量的不是那一格。
+  JOIN_CODE: 'probe-invite-code',
   // 这个探针量的是**部署面**（静态白名单、压缩协商、来源检查、配额），用访客身份跑。
   // 账号与闸门那一层在 test/hardening.mjs 里专门量（那边还会单独起一个 prod 服）。
   REQUIRE_ACCOUNT: '0',

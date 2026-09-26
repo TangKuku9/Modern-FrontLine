@@ -1,5 +1,15 @@
 node_modules/
 
+# 真实的部署配置：里面是邀请码、账号库路径、来源白名单 —— 不进仓库。
+# 模板是 .env.example（那个要进，它是给部署的人看的清单）。
+.env
+.env.local
+
+# 账号库本身（本机调试时随手建的）
+*.db
+*.db-journal
+*.db-wal
+
 # 本地起服务时的日志，不是产物
 server-*.log
 

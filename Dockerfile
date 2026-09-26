@@ -4,7 +4,16 @@
 # 所以镜像里不需要 node-gyp、不需要打包器，只要 node 运行时 + 两个依赖（ws、three）。
 #
 #   docker build -t mw-room .
-#   docker run -d -p 8090:8090 -e ALLOW_ORIGIN=https://your.domain mw-room
+#
+# 跑起来（生产模式）。⚠ 不设 JOIN_CODE / ACCOUNTS_DB 的话进程会**拒绝启动**并打印两条出路 ——
+# 那是有意的：不设 JOIN_CODE 时源码里有个公开的默认邀请码，而日志会说"已设"，
+# 于是"忘了设"和"设好了"看起来一模一样。配置清单见仓库根的 .env.example。
+#
+#   docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
+#
+# ACCOUNTS_DB 指向的目录必须挂出来（上面那句把 /data 挂成命名卷）：
+# 账号库在容器层里的话，`docker rm` 一次所有人的账号就跟着没了 ——
+# 而症状只在重建之后出现，那时已经有真玩家了。
 #
 # CMD 直接是 node 而不是 npm start：docker stop 发的 SIGTERM 只会给到 PID 1，
 # 而 npm 会把信号留在自己的进程组里 —— 中间隔一层 npm，优雅下线（通知玩家重连、

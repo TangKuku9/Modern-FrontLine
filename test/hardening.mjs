@@ -9,7 +9,7 @@
 // 它们的共同点是：**打中了也不报错**。限流生效和"服务挂了"在玩家侧长得一模一样（都是进不去），
 // 畸形 URL 打死进程和"被人重启了"长得一模一样。所以每一条都必须从**外面**量，
 // 并且尽量落到 /healthz 的计数上 —— 那是运维唯一能看见它们的地方。
-import { withServer } from './with-server.mjs';
+import { withServer, freePort } from './with-server.mjs';
 import { request as httpRequest } from 'node:http';
 import WebSocket from 'ws';
 
@@ -73,6 +73,35 @@ async function waitFor(msgs, pred, ms = 4000) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) { const hit = msgs.find(pred); if (hit) return hit; await sleep(40); }
   return null;
+}
+
+// 起一个进程，把"它自己退了"和"它起来了"两件事都交出来 —— 这两条不能都用 with-server.mjs 量：
+// 那个在服务没起来时会抛"临时服务没起来"，退出码就丢了，而这里要量的**正是**退出码。
+// 端口给随机高位值：该拒绝启动的用例本该在 bind 之前就停住，端口没被占用才说明它死在配置闸上。
+//
+// spawn 的 env 里 `undefined` 到底是"删掉这个变量"还是"字符串 undefined"，跨 Node 版本不该由我们猜
+// —— 想要"这个变量不存在"就在这里显式 delete（这一段的 H1/H6 量的就是"没设"）。
+function childEnv(env) {
+  const e = { ...process.env, ...env };
+  for (const k of Object.keys(env)) if (env[k] === undefined) delete e[k];
+  return e;
+}
+async function bootRaw(env, { ms = 8000 } = {}) {
+  const { spawn } = await import('node:child_process');
+  // 端口用 with-server.mjs 那个"问内核要一个空闲端口"的办法，不自己随机：随机撞上别人占用的端口时，
+  // 进程会因为**别的**原因起不来，而 H5/H6 量的是"它该起来" —— 那种红查起来完全不讲道理。
+  const port = await freePort();
+  const s = spawn(process.execPath, ['server/net-server.mjs', String(port)], { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(env) });
+  let log = '', exitCode = null;
+  s.stdout.on('data', d => { log += d; });
+  s.stderr.on('data', d => { log += d; });
+  s.on('exit', c => { exitCode = c; });
+  const t0 = Date.now();
+  // 等两件事之一：它报出启动行（起来了），或者它自己退了（被配置闸拦住了）
+  while (Date.now() - t0 < ms && exitCode === null && !log.includes('权威对局服务')) await sleep(50);
+  const up = log.includes('权威对局服务');
+  if (!up) { const t = Date.now(); while (exitCode === null && Date.now() - t < 3000) await sleep(50); }
+  return { up, code: exitCode, port, base: `http://127.0.0.1:${port}`, log, kill: () => { try { s.kill(); } catch { /* 已经退了 */ } } };
 }
 
 const srv = await withServer({ JOIN_CODE: INVITE, CONNS_PER_IP: '3', WS_MSG_PER_SEC: '20', ROOMS_PER_USER: '1' });
@@ -453,7 +482,9 @@ try {
   // 在 dev 服上量它永远是绿的，而那条绿是假的。
   console.log(sec('F 生产模式'));
   {
-    const s3 = await withServer({ JOIN_CODE: INVITE, NODE_ENV: 'production' });
+    // ACCOUNTS_DB 显式给空串：这一段只量静态白名单，账号库与它无关，而**不设**的话
+    // 生产模式的配置闸会拒绝启动（那正是 H 段要量的东西，不该在这里撞上）。
+    const s3 = await withServer({ JOIN_CODE: INVITE, NODE_ENV: 'production', ACCOUNTS_DB: '' });
     try {
       const pkg = await rawPath(s3.base, '/package.json');
       chk(pkg.status === 404, 'F1 生产模式下 package.json 拿不到（依赖清单也是一份情报）', String(pkg.status));
@@ -472,6 +503,68 @@ try {
       chk(hz.ok === true && hz.gate && hz.gate.requireAccount === true,
         'F6 /healthz 在生产模式下也把闸门配置都说出来（运维要能一眼看见自己在跑什么配置）', JSON.stringify(hz.gate));
     } finally { s3.kill(); }
+  }
+
+  // ══════════ H 生产模式的"配置闸"：忘了设不许长得和设好了一样 ══════════
+  //
+  // 这一段的起因是一个**只有部署时才发作**的静默失效：`JOIN_CODE` 不设时取源码里的默认值
+  // （`mf2026`，在仓库里谁都能读到），而启动日志只判断真值 ⇒ 打印"邀请码 已设"。
+  // 于是忘了设环境变量的操作员看到的是"已配好"，而门是公开的。
+  // 同类还有 `ACCOUNTS_DB`：留空 = 内存库，而默认要求登录 ⇒ 重启一次所有人的账号一起消失。
+  //
+  // 判据的形状：**每一条"拒绝启动"都要配一条"该放行的必须放行"**（反证臂）。
+  // 只写前一半的话，把 prod 写成无条件 `process.exit(1)` 也能全绿 —— 那是把服务整个焊死。
+  // 这四条对照正好把"未设"与"显式设"分开：
+  //   未设 JOIN_CODE → 退；设了 → 起；显式设空（我就要开放注册）→ 起，且门槛计数是 0。
+  console.log(sec('H 生产模式的配置闸'));
+  {
+    // H1：生产 + 未设 JOIN_CODE ⇒ 拒绝启动，而且是**它自己退**（不是挂在那儿）
+    const a = await bootRaw({ NODE_ENV: 'production', JOIN_CODE: undefined, ACCOUNTS_DB: '' });
+    chk(a.code === 1 && /必须显式设置 JOIN_CODE/.test(a.log),
+      'H1 生产模式下没设 JOIN_CODE ⇒ 拒绝启动（退出码 1，并说清两条出路）',
+      `code=${a.code} up=${a.up}`);
+    // H2：**反证臂** —— 设了就起得来（不能因为"未设"的守卫把设了的也拒掉）
+    {
+      const s = await withServer({ NODE_ENV: 'production', JOIN_CODE: INVITE, ACCOUNTS_DB: '' });
+      try {
+        const hz = JSON.parse((await raw(s.base + '/healthz')).text);
+        chk(hz.ok === true && hz.auth.inviteRequired === true,
+          'H2 **反证臂**：生产模式下设了 JOIN_CODE 就照常起（守卫不能把设好的也拒掉）',
+          `inviteRequired=${hz.auth.inviteRequired}`);
+      } finally { s.kill(); }
+    }
+    // H3：**反证臂** —— 显式设空 = "我就是要开放注册"，那是被允许的一条出路
+    {
+      const s = await withServer({ NODE_ENV: 'production', JOIN_CODE: '', ACCOUNTS_DB: '' });
+      try {
+        const hz = JSON.parse((await raw(s.base + '/healthz')).text);
+        chk(hz.ok === true && hz.auth.inviteRequired === false,
+          'H3 **反证臂**：显式 JOIN_CODE=（空）在生产模式下起得来，且真的成了开放注册',
+          `inviteRequired=${hz.auth.inviteRequired}`);
+      } finally { s.kill(); }
+    }
+    // H4：生产 + 要账号 + 未设 ACCOUNTS_DB ⇒ 拒绝启动（"重启就丢"写在日志里，而重启之前没人看）
+    const b = await bootRaw({ NODE_ENV: 'production', JOIN_CODE: INVITE, ACCOUNTS_DB: undefined });
+    chk(b.code === 1 && /没有设 ACCOUNTS_DB/.test(b.log),
+      'H4 生产模式下要账号却没设 ACCOUNTS_DB ⇒ 拒绝启动（"重启就丢"不该以警告的形式出现）',
+      `code=${b.code} up=${b.up}`);
+    // H5：**反证臂** —— 明确说"这是个不存档案的访客服"就放行（访客可玩的服本来就不需要档案）。
+    // 这一条与 H4 是同一格的两个方向：ACCOUNTS_DB 都**没设**，差别只在 REQUIRE_ACCOUNT。
+    const c = await bootRaw({ NODE_ENV: 'production', JOIN_CODE: INVITE, ACCOUNTS_DB: undefined, REQUIRE_ACCOUNT: '0' });
+    try {
+      const hz = c.up ? JSON.parse((await raw(c.base + '/healthz')).text) : {};
+      chk(c.up && hz.auth && hz.auth.store === 'MemoryStore' && hz.gate.requireAccount === false,
+        'H5 **反证臂**：显式 REQUIRE_ACCOUNT=0 时，没设账号库也起得来（访客可玩的服不需要档案）',
+        `up=${c.up} ${hz.auth && hz.auth.store} requireAccount=${hz.gate && hz.gate.requireAccount}`);
+    } finally { c.kill(); }
+    // H6：开发模式不该被部署配置拦住 —— 但**日志必须自己说出来**用的是源码里的默认值。
+    // 这一条是整段的"被测对象"：以前它打印的是"已设"，和真的设好了的一模一样。
+    const d = await bootRaw({ JOIN_CODE: undefined });
+    try {
+      chk(d.up && /源码里的默认值/.test(d.log),
+        'H6 开发模式下没设 JOIN_CODE 也照常起，但日志必须写出"在用源码里的默认值"（以前这一格骗人）',
+        (d.log.split('\n').find(l => /邀请码/.test(l)) || '').trim().slice(0, 130));
+    } finally { d.kill(); }
   }
 
 } catch (e) {
