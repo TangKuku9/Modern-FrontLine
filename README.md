@@ -201,6 +201,10 @@ compose 的 `env_file`，或者手动 `set -a; . ./.env; set +a` —— **"我�
   服务端在**真的消费到一条新输入的那一拍**才处理它（饥饿时空跑复用的同一份输入里可能还留着上一次的请求，
   按"每拍看一次"写会让一个槽被连点）。@60Hz 再多 0.48 kbps。
 - 容量是压出来的，不是算出来的：`npm run soak`（阶梯 16 → 128 人，最后一档可 `node server/soak.mjs 16` 压到 256 人）。
+  也能压**远处的**服务器：`node server/soak.mjs --url=wss://your.domain`（本机压测走默认目标）。两个必踩的坑：
+  生产部署通常设了 `ALLOW_ORIGIN`，而 `ws` 库不发 Origin 头 ⇒ 会被全部 403 —— soak 对外部目标默认带上
+  "目标自己"这个来源，跨源压测用 `--origin=` 显式给；`CONNS_PER_IP` 默认 6，本机压测所有连接同一个 IP，
+  第 7 个就被拒 —— 本机读数是用 `CONNS_PER_IP=256` 跑出来的。
   读数以**服务端自报**为准（`/healthz` 逐间给 hz / 每拍耗时 / 落后墙钟毫秒），因为假客户端跑在压测进程里，
   从对面数出来的帧率分不清是服务器慢还是压测机自己慢。
 
@@ -260,15 +264,35 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 - ⚠ **上面这两条 docker 指令在这台开发机上没有构建验证过**：本机没装 docker。已验的是 `CMD`/`HEALTHCHECK` 依赖的那两条运行时事实（`node server/net-server.mjs` 的启动与 `/healthz` 读数、`SIGTERM` 走的是同一份 `shutdown()`），镜像本身要在有 docker 的机器上 `docker build` 一次才算数。
   ⚠ 这一段在 Windows 上**没被测过**：libuv 的 `child.kill()` 是直接 TerminateProcess，信号送不进子进程。Linux 上由 `server/deploy-probe.mjs` 的三条断言验收。
 
+### 真机部署闭环（清单与远程量具）
+
+把这套东西部署到一台真的云服务器上时，按 `docs/deploy-checklist.md` 走 —— 六节：先跑 `npm test`、
+起一台生产模式实例（配置闸"红了怎么看"的对照表）、`remote-probe` 远程体检、`soak --url` 远程压测、
+容器三步（**本机没有 docker，这一节是待做清单**：逐条命令 → 期望 → 红了怎么看）、上线后要盯的三个数。
+
+两个量具都是**从外面看**的（起进程 vs 验服务是两回事，能力边界写在清单第 6 节）：
+
+- `node server/remote-probe.mjs --base=http://ip:8090`：32 项只读体检（`/healthz` 各字段、静态资源闸门、
+  来源检查、限流、账号注册/登录往返……），加 `--register` 才做会写库的那几笔。
+- `node server/soak.mjs --url=...`：远程容量阶梯，读数仍以服务端自报为准（见上节两个坑）。
+
 ### 验收（改这套代码之前先看它绿不绿）
 
 ```bash
-npm test          # 不含浏览器：gate + rollback + net-journal + codec + lagcomp + mp-rules + net-probe + deploy-probe + xenv + fps + viewmodel
+npm test          # 不含浏览器：gate + rollback + reconcile-chain + net-journal + codec + lagcomp + mp-rules + net-probe + deploy-probe + xenv + fps + viewmodel
 npm run test:all  # 再加两个真浏览器测试（net-play 对打、net-drop 掉线，要下载 playwright 浏览器）
 ```
 
 - `server/deploy-probe.mjs` 61 项：静态白名单（含 `/server/*.mjs`、`/.git/config` 拿不到，且 dev 模式仍可取，证明拦网会 Discriminate）、ETag/304、gzip 往返一致、路径穿越、来源检查两个方向、超帧被断且**别人那一局不陪葬**、房间配额、自动分配、空房回收、优雅下线；外加进场装备闸门（21 条：五套预设职业原样通过 + 未知枪 id/未知配件/越权副武器/无限手雷数全被筛掉 + 端到端"恶意载荷进来之后这间还在 60Hz、旁观者一秒没停"）、心跳清理的两个方向（不回 pong 的连接 15~26 秒内被拆；刚建立沉默 9 秒的不许被拆）。
 - `test/rollback.mjs` 79 项：回滚重放与顺跑逐位相同（12 个 ack 点 × 46 字段）+ 七条反证臂。其中四组是历轮新立的：**C5 两代回滚**（证明"上一代纠正过的账本要写回去"，一代回滚读的是原始草稿、永远看不出账本过期）；**C6 首段空跑**（服务端一步二选一，"空跑落在首次消费之前"那几拍 `rep` 报不出来 —— 参照是一次把服务端真实输入序列展开的独立顺跑，旧通路差 0.1447 m、新通路逐位重合）；**C7 同一拍连拽三次**（饥饿窗里 ack 不动，真浏览器里实测 71 包都是这个形状；判据是幂等 + "这一格的账本对象不许被换掉"，注入老写法立刻 0/0.0855/0.1000 m 三代递增）；以及**每实体私有流**（证明"旁边有人开火不许挪动我的后坐"，判据两向：B 的私有流游标与 yaw 逐位不变，再用总抽数 18/36 反证同场真有第二个人在抽数）。
+- `test/reconcile-chain.mjs` 21 项：**快照链**上的回滚记账 —— 单包判据（C1~C7）看不到的那一类。
+  用一张显式排班表（每步"消费/空跑"二选一，含每 40 拍卡 5 步的停顿 —— 均匀节拍造不出 dAck=0
+  且 rep>dTick 的窗，真浏览器那条偶发红正是"页面卡一下"的形状）驱动生产代码跑 1200 步，判据按
+  **窗口形状**分开写：空跑全在首段/末尾的窗 ⇒ 逐位重合（< 1e-6）；空跑夹在中间的窗 ⇒ < 一拍位移
+  （c99f51f 立账的已知残差）。核心断言是 `applySteps = led + reps == dTick`（predict.mjs 一直声称、
+  此前没有任何地方真的比过的恒等式），每条判据都带反证臂：B1~B3 只把基态从 landed 换回日记本，
+  偏差必须从 0.00e+0 变成 0.22 m 且随链漂移；B4 只把补演拍数从 repUse 换回 wire 的 rep，纯饥饿窗
+  必须偏且 ≤ 多走拍数 × 满速一拍（上界是方程）。缺料（21 笔）逐笔归因到"客户端还没产出基态那一拍"。
 - `server/lagcomp.mjs` 自测 21 项 + `test/lagcomp.mjs` 126 项：**回溯裁决与"报哪一拍"这两半各自都有反证臂**。
   判据是二维矩阵（瞄哪一点 × 报哪一拍，7 格 × 3 档延迟）：只断言"瞄过去 + 报过去 ⇒ 中"是假绿高发区
   （万一回溯根本没生效、而瞄准点又恰好也在身上，它就绿了），而"瞄过去 + 不报 ⇒ 不中"更没用 ——

@@ -1,7 +1,21 @@
 // 容量实测：一台进程能扛多少间、多少人，这个问题只能压出来，不能算出来。
 //
-//   node server/soak.mjs            默认阶梯 16 / 32 / 64 / 128 人
-//   node server/soak.mjs 8          只压某一档（8 间 × 16 人）
+//   node server/soak.mjs                  起一台临时服，默认阶梯 16 / 32 / 64 / 128 人
+//   node server/soak.mjs 8                只压某一档（8 间 × 16 人）
+//   node server/soak.mjs --url=http://1.2.3.4:8090              压**已经在跑**的那一台
+//   node server/soak.mjs --url=https://fps.example.com --cookie=mf_sid=xxx --ladder=1,2,4
+//
+// 两个"真机上必然踩到"的坑，写在这里省得下一次再量一遍：
+//   · 来源白名单：生产部署一般会设 ALLOW_ORIGIN，而 ws 库默认**不**发 Origin 头 ⇒ 这台服
+//     会把压测当成陌生来源全部 403。所以对外部目标默认带上"目标自己"这个来源（浏览器
+//     同源访问时发的就是它），要压跨源部署时用 --origin= 显式给。
+//   · 每 IP 连接数：CONNS_PER_IP 默认 6，本机压测 = 所有连接同一个 IP ⇒ 第 7 个就被拒。
+//     容量测试要么把那一档调大，要么从多台机器压 —— 这不是"服务器扛不住"，是闸门在拦。
+//
+// 为什么要有 --url：真机闭环里"容器跑起来了"和"这台机器能扛多少人"是两件事，
+// 而后者只有在**那一台**上压才算数（本机没有 docker 时，docker build 那一步做不了，
+// 但这一压可以对着任何一台跑着的服务做 —— 包括本机以生产模式直接起的那个进程）。
+// 外部目标不会被 kill，日志行那条判据会自动跳过；房间回收只对**自己开的那些间**判。
 //
 // 读数以**服务端自报**为主（/healthz 里的每间 hz / 每拍耗时 / 落后墙钟多少毫秒）：
 // 假客户端跑在这个进程里，它自己也会被事件循环拖慢，从对面数出来的"帧率"分不清
@@ -11,8 +25,20 @@ import { withServer } from '../test/with-server.mjs';
 import { encodeInput, INPUT_SIZE, HEADER_SIZE, ENTITY_SIZE } from './codec.mjs';
 import { packInput } from '../js/quant.js';
 
+const argv = process.argv.slice(2);
+const flagArg = (k, d = null) => { const a = argv.find(x => x.startsWith('--' + k + '=')); return a ? a.slice(k.length + 3) : d; };
+// 位置参数只认纯数字那一档（老用法），其余一律按 --k=v 解析
+const positional = argv.find(x => !x.startsWith('--'));
+
 const PER_ROOM = 16;                               // 一张图满员 16 人
-const LADDER = process.argv[2] ? [Number(process.argv[2])] : [1, 2, 4, 8];
+const LADDER = flagArg('ladder') ? flagArg('ladder').split(',').map(Number)
+  : positional ? [Number(positional)] : [1, 2, 4, 8];
+const EXT = flagArg('url');                        // 外部目标 = 已经在跑的那一台
+const COOKIE = flagArg('cookie');                  // 外部目标要账号时带上门（mf_sid=...）
+const EXT_BASE = EXT ? EXT.replace(/\/$/, '') : '';
+// 外部目标默认带上"目标自己"这个来源：生产部署通常设了 ALLOW_ORIGIN，而 ws 不发 Origin
+// 就会被当成陌生来源全部 403 —— 那看起来像"压不动"，其实是闸门在按设计工作。
+const ORIGIN = flagArg('origin', EXT_BASE || null);
 const WARM_MS = 4000, SAMPLE_MS = 12000;
 const DT = 1000 / 60;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -37,7 +63,10 @@ class FakeClient {
     this.tick = 0; this.local = 0; this.snaps = 0; this.maxInflight = 0; this.cid = cid;
     this.lastAck = -1; this.lastTick = 0; this.err = null;
     this.keys = packInput({ fwd: true, right: true, sprint: true, fire: true });
-    this.ws = new WebSocket(url);
+    const hd = {};
+    if (COOKIE) hd.cookie = COOKIE;
+    if (ORIGIN) hd.origin = ORIGIN;
+    this.ws = new WebSocket(url, Object.keys(hd).length ? { headers: hd } : {});
     this.open = new Promise((res, rej) => { this.ws.on('open', res); this.ws.on('error', rej); });
     this.ws.on('message', (m, isBinary) => {
       if (isBinary) {
@@ -74,18 +103,26 @@ class FakeClient {
 let n = 0, bad = 0;
 const ok = (label, cond, extra = '') => { n++; if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${label}${extra ? '  | ' + extra : ''}`); }
 
-const srv = await withServer({ MAX_ROOMS: '16', MAX_CLIENTS: '400', ROOM_IDLE_MS: '3000' });
+const srv = EXT
+  // 外部目标：只借它一个 base/ws，kill 与日志都不是我们的事（那台机器不归这个进程管）
+  ? { base: EXT_BASE, ws: EXT_BASE.replace(/^http/, 'ws') + '/ws', kill: () => {}, log: () => '(外部目标：本机没有它的日志)' }
+  : await withServer({ MAX_ROOMS: '16', MAX_CLIENTS: '400', ROOM_IDLE_MS: '3000' });
+const STDNAME = `soak-${process.pid.toString(36)}`;      // 自己开的房间都带这个前缀，回收只认它们
 const clients = [];
+const myRooms = new Set();
 let code = 0;
 try {
-  console.log(`\n  ${'人数'.padStart(6)}  ${'间数'.padStart(4)}   每间Hz(服务端自报)      每拍ms     落后ms    快照Hz/人(下界)   最大在途   heapMB`);
+  console.log(`\n  目标：${EXT ? `外部 ${srv.base}` : '本机临时服'}${COOKIE ? ' · 带会话 cookie' : ''}${ORIGIN ? ` · 来源 ${ORIGIN}` : ''}`);
+  console.log(`  ${'人数'.padStart(6)}  ${'间数'.padStart(4)}   每间Hz(服务端自报)      每拍ms     落后ms    快照Hz/人(下界)   最大在途   heapMB`);
   const rows = [];
   for (const rooms of LADDER) {
     clients.length = 0;
     for (let r = 0; r < rooms; r++) {
+      const roomId = `${STDNAME}-${r}`;
+      myRooms.add(roomId);
       for (let i = 0; i < PER_ROOM; i++) {
-        const c = new FakeClient(srv.ws, `soak-${r}-${process.pid.toString(36)}`, r * PER_ROOM + i);
-        c.room = `soak-${r}`;
+        const c = new FakeClient(srv.ws, roomId, r * PER_ROOM + i);
+        c.room = roomId;
         await c.open.catch(() => {});
         clients.push(c);
       }
@@ -119,9 +156,13 @@ try {
   ok('至少一档是健康的（否则这台机器不该上线）', !!top);
   ok('一间满员(16 人)必须在预算内 —— 这是"能不能开一局"的底线', rows[0].hz >= 59 && rows[0].behind < 60, `${rows[0].hz.toFixed(1)}Hz · 落后 ${rows[0].behind}ms · 每拍 ${rows[0].step.toFixed(2)}ms`);
   const hEnd = await getJSON(srv.base);
-  for (let i = 0; i < 40 && (await getJSON(srv.base)).rooms > 0; i++) await sleep(500);
+  // 回收只看**自己开的那些间**：外部目标上可能还有别人的房间，"rooms 归零"在真机上
+  // 是个会假红的判据（它量的是"整台机器空不空"，不是"我开的房间收不收得掉"）。
+  const mineLeft = (h) => ((h.per || []).filter(p => String(p.id).startsWith(STDNAME)).length);
+  for (let i = 0; i < 40 && mineLeft(await getJSON(srv.base)) > 0; i++) await sleep(500);
   const hReaped = await getJSON(srv.base);
-  ok('压完之后房间能被收干净（长跑不会只涨不落）', hReaped.rooms === 0, `剩 ${hReaped.rooms} 间 · 堆 ${hReaped.heapMB} MB（回收前 ${hEnd.heapMB} MB）`);
+  ok('压完之后我开的房间能被收干净（长跑不会只涨不落）', mineLeft(hReaped) === 0,
+    `我剩 ${mineLeft(hReaped)} 间 / 全机 ${hReaped.rooms} 间 · 堆 ${hReaped.heapMB} MB（回收前 ${hEnd.heapMB} MB）`);
 } catch (e) {
   console.log('CRASH ' + (e && (e.stack || e.message)));
   console.log('── 服务端日志（尾 20 行）──\n' + srv.log().split('\n').slice(-20).join('\n'));
