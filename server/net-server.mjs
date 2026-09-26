@@ -91,7 +91,10 @@ async function serveStatic(req, res) {
       const r = p.__room;
       // fails 是"这一间这一秒有多少拍在抛异常"：一个客户端的坏数据打死一屋子人之前，
       // 这个数字会先动。运维要能一眼看见坏孩子，而不是等玩家发帖。
-      if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0), fails: r.__fails | 0 });
+      if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0), fails: r.__fails | 0,
+        // 延迟补偿的四项计数（定义见 server/room.mjs 的 this.lag）。带上它的理由和 hz/fails 一样：
+        // 这个玩家"永远没有补偿"在玩家侧的表现只是打不中，运维必须能在这里先看见。
+        lag: r.lag ? { shots: r.lag.shots, ok: r.lag.ok, noView: r.lag.noView, stale: r.lag.stale, poseMiss: r.lag.poseMiss, depth: [r.lag.dMin, r.lag.dMax, r.lag.ok ? +(r.lag.dSum / r.lag.ok).toFixed(1) : 0] } : null });
     }
     const body = JSON.stringify({
       ok: true, uptime: Math.round(process.uptime()), rooms: rooms.size,

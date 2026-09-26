@@ -5,9 +5,26 @@ import { mat } from './materials.js';
 // 走了玩法流的话，"这颗雷在飞"就会消耗权威随机数 —— 而有没有渲染器、渲染器这一帧跑不跑
 // 这段，两端本来就不一样，于是服务端和浏览器从流的不同位置取值，机器人下一秒的散布就分叉。
 // 实测：Node 比 Chrome 多抽 3 次，正好是这一行一次的量。
-import { crandRange as rand, clamp } from './util.js';
+import { crandRange as rand, clamp, raySphere, rayAABB } from './util.js';
 
 const _p = new THREE.Vector3(), _q = new THREE.Vector3();
+
+// 玩家命中盒的解析定义（头球 + 躯干 AABB）。**一处定义，四处用**：
+// 本机玩家的当下裁决（js/player.js:hitTest）、远端玩家的即时反馈（js/net/remote.mjs:hitTest）、
+// 服务端按历史姿态的回溯裁决（延迟补偿，server/room.mjs:shotRewind → traceBullet 的 rewind 回调）、
+// 以及判据里"这一枪该不该中"的预测（test/lagcomp.mjs 调的就是它）。
+// 参数抽成 (x,y,z,eye) 四个标量而不是整个 Player，是因为延迟补偿每拍要存的就只是这四个量
+// （见 server/lagcomp.mjs:PoseRing）—— 命中盒依赖什么，缓冲里就该存什么，多存是浪费，
+// 少存就是"回溯过去的盒子"和"当时的盒子"不是同一个，而那种错只会表现为偶尔打不中。
+export function hitTestPlayer(x, y, z, eye, o, d, maxT) {
+  const hy = y + eye + 0.02;
+  let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x, hy, z, 0.16);
+  if (t >= 0 && t < maxT) return { t, part: 'head' };
+  const b = { x0: x - 0.28, x1: x + 0.28, y0: y, y1: y + eye - 0.12, z0: z - 0.28, z1: z + 0.28 };
+  t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, maxT);
+  if (t >= 0) { const hy2 = o.y + d.y * t; return { t, part: hy2 < y + eye * 0.5 ? 'legs' : 'body' }; }
+  return null;
+}
 
 export function damageAt(stats, dist, part) {
   let d;
@@ -19,13 +36,17 @@ export function damageAt(stats, dist, part) {
   return d;
 }
 
-export function traceBullet(game, shooter, o, d, maxDist = 400) {
+// rewind：可选的取姿态函数 (entity) => [x, y, z, eye] | null —— 延迟补偿用。
+// 它返回非 null 的实体按**历史上的那个盒子**判，返回 null 的（不是玩家、缓冲里没有那一拍、
+// 就是开枪者本人）照旧按当下判。所以"没接补偿"的那条路走的是同一份 hitTest，不是复制品。
+export function traceBullet(game, shooter, o, d, maxDist = 400, rewind = null) {
   const wh = game.world.raycast(o, d, maxDist);
   let best = wh ? wh.t : maxDist, ent = null, part = null;
   for (const e of game.entities) {
     if (e === shooter || !e.alive) continue;
     if (shooter && e.team === shooter.team) continue;
-    const h = e.hitTest(o, d, best);
+    const p = rewind ? rewind(e) : null;
+    const h = p ? hitTestPlayer(p[0], p[1], p[2], p[3], o, d, best) : e.hitTest(o, d, best);
     if (h && h.t < best) { best = h.t; ent = e; part = h.part; }
   }
   const point = new THREE.Vector3().copy(o).addScaledVector(d, best);
@@ -34,7 +55,7 @@ export function traceBullet(game, shooter, o, d, maxDist = 400) {
 
 // 统一的射击：返回命中信息
 export function fireHitscan(game, shooter, o, d, stats, weaponName, opts = {}) {
-  const r = traceBullet(game, shooter, o, d, opts.maxDist || 400);
+  const r = traceBullet(game, shooter, o, d, opts.maxDist || 400, opts.rewind || null);
   if (r.ent) {
     const dmg = damageAt(stats, r.t, r.part) * (opts.dmgMul || 1);
     const killed = r.ent.takeDamage(dmg, { attacker: shooter, head: r.part === 'head', dir: d, weapon: weaponName, point: r.point });

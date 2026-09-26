@@ -188,10 +188,16 @@ export class WeaponState {
       const spread = this.currentSpread() * DEG * 0.5;
       let anyHit = false, kill = false, head = false;
       const tracers = wantFx ? [] : null;   // 交给视图模型画：命中点是权威结果，线段端点不是
+      // 延迟补偿：这一枪要在"开枪者当时看到的那一拍"上验，而不是当下。取料、四道拒绝与
+      // 上限都在 server/lagcomp.mjs + server/room.mjs:shotRewind —— 这里只问一句"有没有"。
+      // 为什么整发只问一次：同一发的所有弹丸瞄的是同一个世界，逐个去问会给出不同的拍号。
+      // 重放（客户端回滚）不问：那一发的命中权威端早就裁过了，重演第二遍只会是双倍伤害；
+      // 单机/战役的 mode 没有这个口子（mode=MPMatch/战役），于是照旧按当下裁决。
+      const hopts = { rewind: replay ? null : (game.mode && game.mode.shotRewind ? game.mode.shotRewind(pl) : null) };
       for (let i = 0; i < st.pellets; i++) {
         const d = spreadDir(fwd, spread, new THREE.Vector3(), pl.rng);
         if (replay) continue;
-        const r = fireHitscan(game, pl, origin, d, st, st.name);
+        const r = fireHitscan(game, pl, origin, d, st, st.name, hopts);
         if (r.ent) { anyHit = true; if (r.killed) kill = true; if (r.part === 'head') head = true; }
         if (wantFx && i < 3 && (this.shotsInRow % 2 === 1 || st.pellets > 1 || st.fire !== 'auto')) tracers.push(r.point.clone());
       }

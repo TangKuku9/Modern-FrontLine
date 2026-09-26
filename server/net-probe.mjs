@@ -7,7 +7,8 @@ import { spawn } from 'node:child_process';
 import { request } from 'node:http';
 import { createServer as netServer } from 'node:net';
 import { decodeSnapshot, encodeInput, INPUT_SIZE, HEADER_SIZE, ENTITY_SIZE } from './codec.mjs';
-import { KEY } from '../js/quant.js';
+import { KEY, BTN } from '../js/quant.js';
+import { LAG_MAX_TICKS } from './lagcomp.mjs';
 
 // 端口不能写死：这台机器上别的进程随时占着某个固定端口，写死会让探针"红得没有信息量"。
 // 先向内核要一个空出来的端口。
@@ -25,6 +26,14 @@ if (!srvLog.includes('权威对局服务')) { console.log('服务端没起来:\n
 
 const checks = [];
 const ok = (label, cond, extra = '') => { checks.push([!!cond, label + (extra ? '  ' + extra : '')]); return !!cond; };
+
+// /healthz 的取数口。延迟补偿的记账只在这里可见（定义见 server/room.mjs 的 this.lag）：
+// 它必须从"生产面的那个口子"读，而不是让探针自己去戳房间对象 —— 那样验的就不是上线的那条路。
+const get = (path) => new Promise((res) => {
+  const rq = request({ port: PORT, path }, r => { let b = ''; r.on('data', d => b += d); r.on('end', () => res({ code: r.statusCode, buf: b, headers: r.headers })); });
+  rq.on('error', e => res({ code: 'ERR', buf: String(e.message) }));
+  rq.end();
+});
 
 function client(name) {
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
@@ -168,6 +177,59 @@ ok(`模块按 text/javascript 发出（${js.ct}）`, js.code === 200 && /^text\/
     `不符 ${wrong.length} / ${aTail.length + bTail.length} 包，样本 ${JSON.stringify(wrong.slice(0, 3))}（应为 ${mine}）`);
   C.ws.close();
   await sleep(200);
+}
+
+// 延迟补偿的线上贯通：报拍号 → 编包 → 服务端闸门 → 姿态缓冲 → 裁决。
+// 为什么这一环在 test/lagcomp.mjs 之外还要再来一次：那边是在进程内直接调 room.applyInput，
+// 走不到"encode/decode 这一跳"和 /healthz 这两个面。而这里接错线的症状是**静默**的 ——
+// 服务端把出窗的报值一律拒掉，于是这个玩家永远没有补偿：不报错、不崩，只是打不中。
+// 读数直接来自 /healthz 的 lag 记账（定义见 server/room.mjs 的 this.lag）。
+{
+  const hz = async () => JSON.parse(String((await get('/healthz')).buf)).per.find(r => r.id === 'probe') || {};
+  const l0 = (await hz()).lag;
+  // 先决：这一节之前一发都没裁决过 —— 否则下面的读数分不清是这一节的还是别人的。
+  ok('先决：这一节之前房间还没裁决过任何一枪（lag.shots 为 0，计数不是在空转）',
+    !!l0 && l0.shots === 0, JSON.stringify(l0));
+
+  // 三个臂共用**一个弹匣**（m4 是 30 发，打完不会自己续），所以顺序是"先两个反证臂，再正臂"：
+  // 反证臂各自只需要 2~3 发，剩下的全留给正臂。臂与臂之间用**增量**比，不比绝对值。
+  const shot = async (n, view) => {
+    for (let i = 0; i < n; i++) {
+      // 每拍重算 view：正臂要的是"手上最新那一包往回 6 拍"（≈ INTERP_DELAY 0.10s × 60Hz），
+      // 冻结成一个常数的话，探针跑久了深度会自己漂 —— 那时量的就不是这条链路了。
+      send(A, encodeInput({ tick: ++tick, mdx: 0, mdy: 0, keys: 0, buttons: BTN.Fire, seq: i, view: view(A.last.tick) }));
+      await sleep(16);
+    }
+    await sleep(300);
+    return (await hz()).lag;
+  };
+
+  // 反证臂 A：报一个超窗的旧拍。它必须落进 stale —— 这一格同时证明 stale 这个计数**真的会动**，
+  // 否则后面"stale 没有增加"就是一条恒真的绿灯。
+  const l1 = await shot(12, (t) => Math.max(0, t - 200));
+  ok('反证臂：报超窗的旧拍（往回 200 拍 > 上限 60）⇒ 一发都不被接受，全落进 stale',
+    l1.ok === 0 && l1.stale > 0, `接受 ${l1.ok} / stale ${l1.stale}（LAG_MAX_TICKS=${LAG_MAX_TICKS}）`);
+  // 反证臂 B：不报拍号。这是"旧客户端"和"还没收到过快照"的形状 —— 必须是 noView，不是 stale
+  // （两者混在一起的话，"口径不合"就会被伪装成"正常退化"）。
+  const l2 = await shot(12, () => 0);
+  ok('反证臂：不报拍号（view=0）⇒ 一发都不被接受，全部退化成按当下判，且记成 noView 而不是 stale',
+    l2.ok === 0 && l2.noView > 0 && l2.stale === l1.stale,
+    `接受 ${l2.ok} / 没报 ${l2.noView} / stale ${l1.stale} → ${l2.stale}`);
+
+  // 正臂：报"最新那一包往回 6 拍"。这是真客户端（renderTick）算出来的那个量。
+  const l3 = await shot(90, (t) => Math.max(0, t - 6));
+  const fresh = { ok: l3.ok - l2.ok, stale: l3.stale - l2.stale };
+  ok('正臂：服务端真的按历史姿态裁决了（这条链路被走过很多次，不是一发两发）',
+    l3.shots - l2.shots > 10 && fresh.ok > 10,
+    `这一臂裁决 ${l3.shots - l2.shots} 发，其中接受 ${fresh.ok}（800rpm 跑 1.5 秒 ≈ 20 发，弹匣 30）`);
+  ok('正臂：报出去的拍号没有被闸门拒过一次（口径一致：客户端报的就是服务端拍号）',
+    fresh.stale === 0 && l3.noView === l2.noView,
+    `新增 stale ${fresh.stale} / 新增 noView ${l3.noView - l2.noView}`);
+  ok('正臂：回溯深度落在"INTERP_DELAY 加上在途"这个量级上（不是 0，也不是被拒之后的兜底）',
+    l3.depth[0] >= 1 && l3.depth[1] <= LAG_MAX_TICKS && l3.depth[2] > 3 && l3.depth[2] < 30,
+    `深度 ${JSON.stringify(l3.depth)} 拍（min/max/avg）· 报的是最新那一包往回 6 拍`);
+  ok('正臂：姿态缓冲里每一拍都查得到（缓冲不比窗短 —— 短了就是"延迟越大越打不中"）',
+    l3.poseMiss === 0, `查不到 ${l3.poseMiss} 次`);
 }
 
 // 断开要腾出名额

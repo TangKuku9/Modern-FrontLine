@@ -89,10 +89,16 @@ export function decodeSnapshot(buf) {
   return { tick, seq, worldFlags, rngState, entities, byteLength: o };
 }
 
-// 上行输入：一个 tick 一份，13 字节定长。
+// 上行输入：一个 tick 一份，15 字节定长。
 // buttons 从 8 位加宽到 16 位：投掷物要同时表达"按下"和"按住"，8 位装不下
 // （原来把 lethal 的按住位接到开火位上，按住右键就会掏手雷）。
-export const INPUT_SIZE = 13;
+// view（u16）：发出这一拍时，客户端屏幕上渲染的是服务端的哪一拍（低 16 位）。
+// 那是延迟补偿要的全部输入 —— 服务端据此把别人拨回开枪者当时看到的位置。
+// 为什么不是 u8 的"延迟多少拍"：那个量得由客户端把 INTERP_DELAY 和自己的帧时序折进去算，
+// 于是服务端和客户端各有一份"延迟模型"，改一个忘一个的症状是"高延迟下总是差一点"；
+// 直接报拍号则不需要任何模型，而且能被 lastSnapSent 卡住上限（服务端真发过的那些拍）。
+// 顺带一个好处：它让"客户端到底看的是哪一拍"这件事在排障时是可读的，而不是一个差值。
+export const INPUT_SIZE = 15;
 export function encodeInput(inp) {
   const v = new DataView(new ArrayBuffer(INPUT_SIZE));
   v.setUint32(0, inp.tick >>> 0, true);
@@ -100,7 +106,8 @@ export function encodeInput(inp) {
   v.setInt16(6, Q.packLook(inp.mdy), true);
   v.setUint16(8, inp.keys & 0xffff, true);
   v.setUint16(10, inp.buttons & 0xffff, true);
-  v.setUint8(12, inp.seq & 0xff, true);
+  v.setUint16(12, inp.view & 0xffff, true);
+  v.setUint8(14, inp.seq & 0xff, true);
   return v;
 }
 export function decodeInput(buf) {
@@ -111,7 +118,8 @@ export function decodeInput(buf) {
     mdy: Q.unpackLook(v.getInt16(6, true)),
     keys: v.getUint16(8, true),
     buttons: v.getUint16(10, true),
-    seq: v.getUint8(12),
+    view: v.getUint16(12, true),
+    seq: v.getUint8(14),
   };
 }
 
@@ -148,11 +156,18 @@ if (typeof process !== 'undefined' && __base(process.argv[1] || '') === __base(i
   console.log(`  快照：16 人 ${byteLength} 字节 = ${(byteLength / 16).toFixed(1)} B/人（含头 ${HEADER_SIZE} B）`);
   console.log(`        @20Hz 下行 ${(byteLength * 20 * 8 / 1000).toFixed(1)} kbps，@30Hz ${(byteLength * 30 * 8 / 1000).toFixed(1)} kbps`);
   console.log(`  最大量化误差：位置 ${(maxPos * 100).toFixed(2)} cm · yaw ${maxYaw.toExponential(1)} rad · pitch ${maxPitch.toExponential(1)} rad · 速度 ${maxVel.toFixed(3)} m/s`);
-  const inp = { tick: 4294967295, mdx: 3.7, mdy: -1.25, keys: 0b1011, buttons: 5, seq: 200 };
+  const inp = { tick: 4294967295, mdx: 3.7, mdy: -1.25, keys: 0b1011, buttons: 5, seq: 200, view: 65437 };
   const ib = decodeInput(encodeInput(inp));
-  const lossless = ib.tick === inp.tick && ib.keys === inp.keys && ib.buttons === inp.buttons && ib.seq === inp.seq;
-  console.log(`  输入包 ${INPUT_SIZE} B：整数字段${lossless ? '原样' : '失真'}，视线位移 ${inp.mdx}→${ib.mdx.toFixed(4)} / ${inp.mdy}→${ib.mdy.toFixed(4)}（步长 0.01）`);
+  const lossless = ib.tick === inp.tick && ib.keys === inp.keys && ib.buttons === inp.buttons && ib.seq === inp.seq && ib.view === inp.view;
+  console.log(`  输入包 ${INPUT_SIZE} B：整数字段${lossless ? '原样' : '失真'}（含延迟补偿的 view ${inp.view}→${ib.view}），视线位移 ${inp.mdx}→${ib.mdx.toFixed(4)} / ${inp.mdy}→${ib.mdy.toFixed(4)}（步长 0.01）`);
   if (!lossless) process.exit(1);
+  // view 是 u16 全量程的：延迟补偿要拿它跟服务端拍号对齐，所以它不是"小数字"，
+  // 两个端点必须原样回来（曾经有字段在这里被当成有符号数，回绕值直接变负）。
+  for (const v of [0, 1, 32767, 32768, 65535]) {
+    const got = decodeInput(encodeInput({ tick: 0, mdx: 0, mdy: 0, keys: 0, buttons: 0, seq: 0, view: v })).view;
+    if (got !== v) { console.log(`    ❌ view ${v} → ${got}（u16 全量程必须原样）`); process.exit(1); }
+  }
+  console.log('  view u16 全量程往返：0/1/32767/32768/65535 全部原样');
 
   // 按键映射往返：sim 的 input 有 21 个布尔字段，打包再解包必须逐个原样回来。
   // 这条是"按住右键掏手雷"那类错位的唯一防线 —— 位掩码写重了不会报错，只会手感怪。

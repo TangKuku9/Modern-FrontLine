@@ -364,6 +364,28 @@ try {
   } else {
     ok('没有"配错一拍"能解释的大偏差（探针未触发，说明没有 >5cm 的稳态校正）', true);
   }
+  // ---- 延迟补偿在真浏览器里的读数 ----
+  // 这是唯一一处"真 renderTick（受本机帧时序与 INTERP_DELAY 影响）→ 真 codec → 真闸门"的串联。
+  // 它错了是**静默**的：服务端把出窗的报值一律拒掉 ⇒ 这个玩家永远没有补偿，不报错、不崩、
+  // 只是打不中；而服务端那一侧看上去完全正常。读数从生产那个口子（/healthz）取，
+  // 不另外去戳房间对象 —— 要验的就该是上线的那条路。
+  console.log('\n── 延迟补偿 ──');
+  const hzj = await (await fetch(srv.base + '/healthz')).json();
+  const lag = (((hzj.per || []).find(r => r.id === ROOM) || {}).lag) || {};
+  const vs = await A.page.evaluate(() => ({ view: window.game.net.viewTick, log: window.game.net.snapLog.length, srvTick: window.game.net.serverTick }));
+  console.log(`  服务端记账：裁决 ${lag.shots} 发 · 接受 ${lag.ok}（回溯深度 ${JSON.stringify(lag.depth)} 拍 min/max/avg）`
+    + ` · 没报 ${lag.noView} · 出窗被拒 ${lag.stale} · 缓冲查不到 ${lag.poseMiss}`);
+  console.log(`  甲这一侧：viewTick=${vs.view} · 快照流水 ${vs.log} 条 · 服务端最新拍号 ${vs.srvTick}`);
+  // 阈值取得低（≥8）是有意的：这一臂要证明的是"链路被走过、且报值全部被接受"，
+  // 而发数由射速 × 弹匣 × 这一把的交战时长决定（实测两轮 33 / 22 发），拿它当判据线会在
+  // 一次短促的交火里报假红。真正有牙齿的是下面那条 stale（它必须恰好为 0）。
+  ok('真浏览器里这条链路真的被走过（裁决过，而且真的按历史姿态判的）', (lag.shots || 0) >= 8 && (lag.ok || 0) === (lag.shots || 0) && (lag.ok || 0) > 0, JSON.stringify(lag));
+  ok('客户端报的拍号一次都没被闸门拒过（真 renderTick 与服务端拍号同口径）', (lag.stale || 0) === 0,
+    `stale=${lag.stale}（唯一合法成因是客户端卡住 >1.2s，那条路在 test/lagcomp.mjs 的 ④ 里量过）`);
+  ok('回溯深度是"INTERP_DELAY + 在途"那个量级（不是 0 —— 报当下的症状正是深度为 0）',
+    lag.depth && lag.depth[0] >= 1 && lag.depth[1] <= 60 && lag.depth[2] > 3, JSON.stringify(lag.depth));
+  ok('姿态缓冲里每一拍都查得到（缓冲不比回溯窗短）', (lag.poseMiss || 0) === 0, `查不到 ${lag.poseMiss} 次`);
+
   const frozen = await A.page.evaluate(() => window.game.tick);
   await sleep(500);
   const ticks2 = await A.page.evaluate(() => window.game.tick);

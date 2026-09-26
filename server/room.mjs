@@ -10,6 +10,7 @@ import { MAPS } from '../js/maps.js';
 import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput } from '../js/quant.js';
 import { sanitizeLoadout } from '../js/loadout.mjs';
+import { PoseRing, rewindTick } from './lagcomp.mjs';
 
 export const TICK_HZ = 60;
 export const DT = 1 / TICK_HZ;
@@ -39,7 +40,19 @@ export class NetRoom {
     this.seed = (opts.seed ?? 20260925) >>> 0;
     this.tick = 0;
     this.clients = new Map();                     // cid -> { cid, pl, name, lastInput, dead, respawnT }
+    // 反查表（玩家对象 → 客户端条目）。用它而不是往 pl 上挂一个 __cid：加了 own key 会撞
+    // test/net-journal.mjs 那道"新字段必须登记"的守卫，而它本来就只是房间的簿记。
+    this.byPlayer = new Map();
     this.events = [];                             // 待下发的游戏事件，排干即清
+    // 延迟补偿的读数（/healthz 会带出去）。它必须落在生产代码里而不是只在探针里数：
+    // 这条链路**每一种失效方式都是静默的** —— 报值出窗 ⇒ 服务端一律拒绝 ⇒ 这个玩家永远
+    // 没有补偿，不报错、不崩，只是"我明明打中了"。四个计数各指一种成因，修法完全不同：
+    //   shots    裁决过多少发（0 = 这条链路根本没被走过，判据可能量的是空气）
+    //   ok       真的按历史姿态判的；depth 是回溯深度（INTERP_DELAY 被改成 0 这类事故的读数）
+    //   noView   客户端没报拍号（还没收到过快照 / 老客户端）—— 这是设计好的退化，不算故障
+    //   stale    报了**非零**拍号却被闸门拒 —— 口径不合或客户端卡住；健康链路上必须为 0
+    //   poseMiss 闸门放行了、姿态缓冲里却没有那一拍 —— 缓冲比窗短，症状是"延迟越大越打不中"
+    this.lag = { shots: 0, ok: 0, noView: 0, stale: 0, poseMiss: 0, dMin: 0, dMax: 0, dSum: 0, staleWhy: [] };
     this.started = false;
   }
 
@@ -85,8 +98,16 @@ export class NetRoom {
     this.game.entities.push(pl);
     if (!this.game.player) this.game.player = pl;   // 第一个人占住"本机玩家"那个老位置，
     // 其余的人靠 NetRoom.step 传的 pairs 列表被推进。
-    const c = { cid, pl, name, team, loadout: lo, lastInput: decodeInputBits(0, 0), q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0 };
+    const c = {
+      cid, pl, name, team, loadout: lo, lastInput: decodeInputBits(0, 0), q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0,
+      // —— 延迟补偿的三件簿记 ——
+      // pose：每拍的命中盒参数（见 server/lagcomp.mjs:PoseRing）
+      // view：这一拍消费掉的那份输入里，客户端说它当时在渲染哪一拍
+      // lastSnapSent：我最近一次给它下发快照时的拍号 —— rewindTick 拿它当"不可伪造的上界"
+      pose: new PoseRing(), view: 0, lastSnapSent: 0,
+    };
     this.clients.set(cid, c);
+    this.byPlayer.set(pl, c);
     this.events.push({ e: 'join', cid, name, team, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw });
     return c;
   }
@@ -97,6 +118,7 @@ export class NetRoom {
     c.pl.alive = false;
     const i = this.game.entities.indexOf(c.pl);
     if (i >= 0) this.game.entities.splice(i, 1);
+    this.byPlayer.delete(c.pl);
     this.clients.delete(cid);
     this.events.push({ e: 'leave', cid });
   }
@@ -107,6 +129,10 @@ export class NetRoom {
     const inp = decodeInputBits(net.keys, net.buttons);
     inp.mdx = net.mdx; inp.mdy = net.mdy;
     inp.tick = net.tick & 0xffff;
+    // 客户端说它发出这一拍时，屏幕上渲染的是服务端的哪一拍（低 16 位）。
+    // 它只在这里被搬进队列，真正生效是在 step() 里被消费的那一刻 —— 和输入本身同一时刻，
+    // 于是"打到的是当时看到的世界"这句话里的"当时"就是这一拍。
+    inp.view = net.view & 0xffff;
     // 16 位回绕下的"更新"：差值落在 (0, 2000) 才算后面，重复包和迟到旧包一律丢。
     // 基准刻意不是 c.ack：新玩家一进场 ack 就是 0，而他发出的第一拍也是 0 —— 用 ack 当基准
     // 会把第 0 拍当成重复包丢掉（实测：出生后的第一拍输入永远不被消费）。
@@ -137,6 +163,9 @@ export class NetRoom {
       // 这个定义仍然漏掉一类：折叠发生在"消费新输入之前"的那几拍（见 rep0 那条待办）。
       c.rep = fromQ ? 0 : (c.got ? Math.min(255, c.rep + 1) : 0);
       c.lastInput = inp;
+      // 这一拍生效的"看到了哪一拍"。取不到货（饿住）时沿用上一份输入的报值 —— 那是它最后
+      // 一次真的告诉过我们的东西，而 rewindTick 的上界（lastSnapSent）会兜住它不许无限变旧。
+      c.view = inp.view | 0;
       return { c, inp };
     });
     for (const { c, inp } of inputs) {
@@ -160,6 +189,48 @@ export class NetRoom {
     this.game.step(DT, inputs[0] ? inputs[0].inp : decodeInputBits(0, 0), inputs.map(({ c, inp }) => ({ pl: c.pl, inp })));
     this.tick++;
     this.drainKillFeed();
+    // 一拍一份姿态，拍号 = 这一拍刚产出的那个状态（this.tick 已经 ++，与快照头里的 tick 同义）。
+    // 必须写在 game.step 之后：在那之前这一拍的位移还没算出来，存下去的就是上一拍的姿态，
+    // 于是"回溯 N 拍"会系统性少一拍 —— 那种偏差只有半个身位，谁都不会报错。
+    for (const c of this.clients.values()) c.pose.record(this.tick, c.pl);
+  }
+
+  // 延迟补偿的取料口：js/weapon-state.js:fire 在裁决每一发之前问一句"这一发按哪一拍的姿态算"。
+  // 返回 null = 不回溯（照旧按当下），三种情况：不是本房间的人、客户端报的拍号出窗、
+  // 缓冲里查不到那一拍（后者在闭包里逐实体兜底）。
+  shotRewind(shooter) {
+    const c = this.byPlayer.get(shooter);
+    if (!c) return null;
+    // cur = "正在产出的那一拍"。此刻 this.tick 还没 ++，而 game.step 这一拍产出的状态
+    // 会被标成 this.tick+1 —— 和上面 record 用的是同一个编号口径，两边必须一致。
+    const cur = this.tick + 1;
+    const t = rewindTick(c.view, cur, c.lastSnapSent);
+    const L = this.lag;
+    L.shots++;
+    if (t < 0) {
+      // 拒绝的成因要分开数，因为"报 0"是设计好的退化（客户端还没收到过快照），
+      // 而"报了非零拍号却被拒"是可归因的故障（口径不合 / 客户端卡住）。
+      if (c.view) {
+        L.stale++;
+        // 留现场：这三个数就足以把"口径不合"（view 与 cur 差着一个数量级）与
+        // "客户端卡住"（view 只比窗沿旧一点）分开，不必再复现。
+        if (L.staleWhy.length < 6) L.staleWhy.push({ view: c.view, cur, lastSnapSent: c.lastSnapSent, tick: this.tick });
+      } else L.noView++;
+      return null;
+    }
+    L.ok++;
+    const depth = cur - t;                          // 回溯了几拍。它必须 ≈ INTERP_DELAY×60 + 在途
+    if (L.ok === 1 || depth < L.dMin) L.dMin = depth;
+    if (depth > L.dMax) L.dMax = depth;
+    L.dSum += depth;
+    return (e) => {
+      if (e === shooter) return null;                 // 不回溯开枪者自己：它瞄的是自己预测的位置
+      const oc = this.byPlayer.get(e);
+      if (!oc) return null;
+      const p = oc.pose.at(t);                        // 那一拍不在缓冲里 → 交回 null（= 按当下判）
+      if (!p) L.poseMiss++;
+      return p;
+    };
   }
 
   drainKillFeed() {
@@ -178,7 +249,13 @@ export class NetRoom {
   // 一份完整的下行快照：实体表 + 权威端玩法随机流的当前内部状态。
   // 客户端回滚重放时要把它拨回同一拍，否则重放多抽的随机数会让两边永久错开。
   snapshot() {
-    return { tick: this.tick, rngState: rng.state(), worldFlags: 0, entities: this.snapshotEntities() };
+    // 盖章"这一刻的状态已经发给本房间每个人了"（net-server:broadcast 就是遍历 room.clients）。
+    // 它是延迟补偿唯一**不可伪造**的上界：客户端不可能渲染过一份它还没收到的快照，
+    // 所以 rewindTick 用它当窗的右端。盖在这里而不是 broadcast 里，是因为多房间时
+    // 广播路径上有好几处，而"哪一拍的状态"只有这份对象自己知道。
+    const tick = this.tick;
+    for (const c of this.clients.values()) c.lastSnapSent = tick;
+    return { tick, rngState: rng.state(), worldFlags: 0, entities: this.snapshotEntities() };
   }
 
   snapshotEntities() {

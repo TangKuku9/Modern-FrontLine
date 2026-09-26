@@ -11,7 +11,8 @@
 import * as THREE from 'three';
 import { createSoldierModel, animateSoldier, makeNameTag, applyFlashTex } from '../soldier.js';
 import { WEAPONS } from '../data.js';
-import { angleDiff, clamp, lerp, rayAABB, raySphere, DEG } from '../util.js';
+import { angleDiff, clamp, lerp, DEG } from '../util.js';
+import { hitTestPlayer } from '../combat.js';
 import { FLAG, WEAPON_IDS } from '../quant.js';
 
 export const INTERP_DELAY = 0.10;                   // 渲染回退量，秒
@@ -74,17 +75,11 @@ export class NetPlayer {
   chestPos(out) { return out.set(this.pos.x, this.pos.y + this.curEye() - 0.4, this.pos.z); }
   forward(out) { return out.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)); }
 
-  // 与 js/player.js:hitTest 同一套解析盒（头球 + 躯干 AABB）。
-  // 权威裁决在服务端，本机这份只影响"打到了"的即时反馈。
+  // 命中盒与权威裁决**共用一处定义**（js/combat.js:hitTestPlayer）。本机这份只影响"打到了"
+  // 的即时反馈（真值在服务端），但盒子必须是同一个：抄一份的症状是"改了常数之后本地反馈说中、
+  // 权威说没中"，而两边都不报错。延迟补偿的缓冲里存的也正是这个函数的四个入参。
   hitTest(o, d, maxT) {
-    const eye = this.curEye();
-    const hy = this.pos.y + eye + 0.02;
-    let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, this.pos.x, hy, this.pos.z, 0.16);
-    if (t >= 0 && t < maxT) return { t, part: 'head' };
-    const b = { x0: this.pos.x - 0.28, x1: this.pos.x + 0.28, y0: this.pos.y, y1: this.pos.y + eye - 0.12, z0: this.pos.z - 0.28, z1: this.pos.z + 0.28 };
-    t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, maxT);
-    if (t >= 0) { const yy = o.y + d.y * t; return { t, part: yy < this.pos.y + eye * 0.5 ? 'legs' : 'body' }; }
-    return null;
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), o, d, maxT);
   }
   // 客户端不裁决伤害：只记下"我这一枪大概打掉多少"用于反馈，真值等服务器快照。
   takeDamage(dmg, info) {

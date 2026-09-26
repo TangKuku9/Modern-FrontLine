@@ -1,7 +1,8 @@
 // 玩家控制器
 import * as THREE from 'three';
 import { WeaponSystem } from './weapons.js';
-import { clamp, damp, lerp, raySphere, rayAABB, DEG, entStream } from './util.js';
+import { hitTestPlayer } from './combat.js';
+import { clamp, damp, lerp, DEG, entStream } from './util.js';
 import { WEAPONS, LETHALS, TACTICALS } from './data.js';
 
 // 回滚重放的状态日记本字段清单。
@@ -119,15 +120,10 @@ export class Player {
   chestPos(out) { return out.set(this.pos.x, this.pos.y + this.curEye() - 0.4, this.pos.z); }
   curEye() { return lerp(1.62, 1.05, this.crouchT); }
   forward(out) { return out.set(-Math.sin(this.yaw) * Math.cos(this.pitch), Math.sin(this.pitch), -Math.cos(this.yaw) * Math.cos(this.pitch)); }
+  // 命中盒在这里只剩"把当下姿态喂给公共定义"这一件事 —— 延迟补偿要拿历史姿态调同一个
+  // 函数（js/combat.js:hitTestPlayer），所以它必须是纯函数而不是这个类的方法。
   hitTest(o, d, maxT) {
-    const eye = this.curEye();
-    const hy = this.pos.y + eye + 0.02;
-    let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, this.pos.x, hy, this.pos.z, 0.16);
-    if (t >= 0 && t < maxT) return { t, part: 'head' };
-    const b = { x0: this.pos.x - 0.28, x1: this.pos.x + 0.28, y0: this.pos.y, y1: this.pos.y + eye - 0.12, z0: this.pos.z - 0.28, z1: this.pos.z + 0.28 };
-    t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, maxT);
-    if (t >= 0) { const hy2 = o.y + d.y * t; return { t, part: hy2 < this.pos.y + eye * 0.5 ? 'legs' : 'body' }; }
-    return null;
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), o, d, maxT);
   }
   takeDamage(dmg, info) {
     if (!this.alive || this.game.godMode) return false;

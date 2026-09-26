@@ -5,7 +5,7 @@
 // 把状态恢复到快照那一 tick，再把那之后已经产生的输入逐个重跑一遍。
 // 之所以重放得起，是因为 P0 那几件事：固定步长、玩法随机流可播种、
 // 权威侧不碰渲染。重放时把世界侧副作用（命中、特效、噪声）关掉，只重跑自身状态。
-import { NetPlayer } from './remote.mjs';
+import { NetPlayer, INTERP_DELAY } from './remote.mjs';
 import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG } from '../quant.js';
 import { rollback } from './predict.mjs';
@@ -29,6 +29,10 @@ export class NetClient {
     this.localTick = 0;
     this.history = [];                                // {tick, inp}
     this.snaps = 0; this.snapGap = 0; this.rtt = 0; this.serverTick = 0;
+    // 快照的（到达时刻 → 服务端拍号）流水。它不是给插值用的（插值在 remote.mjs 里各人一份），
+    // 只为了回答一个问题：**我这一帧渲染的是服务端的哪一拍**。延迟补偿要用它（见 renderTick）。
+    this.snapLog = [];
+    this.viewTick = 0;
     this.events = [];                                 // 交给上层做 HUD/音效
     this.type = 'online'; this.ffa = false;
     this.scores = { A: 0, B: 0 };
@@ -128,10 +132,37 @@ export class NetClient {
 
   sendPing() { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'ping', c: performance.now() })); }
 
+  // 我这一帧渲染的是服务端的哪一拍 —— 这正是延迟补偿要的量。
+  //
+  // 它是"渲染时刻往回退 INTERP_DELAY 之后落在哪两包之间"插出来的。之所以让客户端报这个
+  // 拍号而不是让服务端按 ping 估，是因为"我比服务端晚多少"里有 INTERP_DELAY（本文件的常数）
+  // 和本机帧率两部分，写在服务端就成了两份会各自漂移的真相；而拍号是客户端手上现成的，
+  // 且服务端能用"我确实发过这一拍"把它卡死（server/lagcomp.mjs:rewindTick）。
+  //
+  // 落在最新一包之后（本机卡了一帧）就报最新那一拍：服务端会当成"你看的就是当下"，不回溯。
+  // 那是对的 —— 那种时刻客户端屏幕上就是最后一包的状态外推出来的，没有更旧的真相可用。
+  renderTick(now = performance.now() / 1000) {
+    const b = this.snapLog;
+    if (!b.length) return 0;
+    const last = b[b.length - 1];
+    const target = now - INTERP_DELAY;
+    if (target >= last.t) return last.tick;
+    if (target <= b[0].t) return b[0].tick;
+    let i = b.length - 1;
+    while (i > 0 && b[i - 1].t > target) i--;
+    const a = b[i - 1], z = b[i];
+    const k = clamp((target - a.t) / Math.max(1e-4, z.t - a.t), 0, 1);
+    return a.tick + (z.tick - a.tick) * k;
+  }
+
   // 每个模拟 tick 调一次：记历史 + 排队上行
   recordInput(tick, inp) {
     this.localTick = tick;
     const t16 = tick & 0xffff;
+    // 报给服务端的"我看到哪一拍"。时钟口径是**服务端拍号**，不是本机 tick —— 两者差着一个
+    // 任意的起点偏移，把它混进延迟补偿会让回溯量整体偏掉一个常数（而那个常数随每个人
+    // 进场时刻不同），症状是"有的人打得中、有的人永远差半步"。
+    this.viewTick = Math.round(this.renderTick()) & 0xffff;
     // 恒等式：一拍一份输入。同一拍记两次 ⇒ 回滚时多演一步，而服务端把第二份当重复包丢掉
     // （server/room.mjs 的 d===0 判据），于是权威端永远比我的重建"少走一拍" —— 这类错
     // 不会崩，只会在偏差表上伪装成网络抖，所以要计数而不是靠人去看。
@@ -144,7 +175,7 @@ export class NetClient {
     this.history.push({ tick: t16, inp, j: this.game.player ? this.game.player.journal() : null, debt: this.repForgotten | 0 });
     if (this.history.length > HISTORY) this.history.shift();
     const packed = packInput(inp);
-    this.pending.push({ tick: t16, mdx: inp.mdx, mdy: inp.mdy, keys: packed.keys, buttons: packed.buttons, seq: t16 & 0xff });
+    this.pending.push({ tick: t16, mdx: inp.mdx, mdy: inp.mdy, keys: packed.keys, buttons: packed.buttons, view: this.viewTick, seq: t16 & 0xff });
   }
   flush() {
     if (!this.ws || this.ws.readyState !== 1 || !this.pending.length) return;
@@ -159,6 +190,9 @@ export class NetClient {
 
   onSnapshot(snap, now) {
     this.snaps++; this.snapGap = 0; this.serverTick = snap.tick;
+    // 到达时刻是渲染时刻的坐标原点（remote.mjs 的插值也用它），所以流水在这里记。
+    this.snapLog.push({ t: now, tick: snap.tick });
+    if (this.snapLog.length > 24) this.snapLog.shift();
     this.lastSnap = snap;                               // 测试与 netdebug 要看原始下行
     this.lastRngState = snap.rngState >>> 0;
     const seen = new Set();
