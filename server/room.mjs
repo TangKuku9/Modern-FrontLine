@@ -73,7 +73,10 @@ export class NetRoom {
   addClient({ name = '士兵', team = 'A', loadout = null } = {}) {
     const cid = NEXT_CID++;
     const sp = this.spawnPoint(team);
-    const pl = new Player(this.game, { team, pos: sp.pos, yaw: sp.yaw, name });
+    // rngSeed/rngTag：这个人那条私有玩法流的播种对（见 js/player.js 构造函数）。客户端要用
+    // 同一对值才算得出同一个后坐/散布，而 cid 是它从 welcome 里拿到的那个 —— 服务端这里
+    // 必须在建人之前就把 cid 交出去，两端才不会出现"流对不上"的第三种版本。
+    const pl = new Player(this.game, { team, pos: sp.pos, yaw: sp.yaw, name, rngSeed: this.seed, rngTag: cid });
     // 装备以服务端查表重建为准（为什么要拦、拦掉的是什么，见 js/loadout.mjs）。
     // 重建后这份要挂到人身上：welcome 得把同一个对象发回去，客户端按它配枪 —— 两边各自
     // 拿一份副本算 stats，就是"本地打中了、权威说没有"那种没人报错的分歧。

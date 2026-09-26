@@ -313,7 +313,7 @@ wss.on('connection', (ws, req) => {
         ws.__cid = c.cid; ws.__room = room;      // 存对象本身：rooms 里存的是 promise
         c.ws = ws;                                // 反向也要有：广播按 room.clients 走
         ws.send(JSON.stringify({
-          t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId,
+          t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId, seed: room.seed,
           pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw, loadout: c.loadout,
           others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team })),
         }));

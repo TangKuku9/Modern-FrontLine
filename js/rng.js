@@ -41,6 +41,32 @@ export const rng = {
   setState(s) { gstate = s >>> 0; },
 };
 
+// 每个"两端各自演算的人物"一条私有流。为什么必须私有：
+// 后坐横向直接写 pl.yaw（weapon-state.js:211）、散布决定弹道（spreadDir）、震屏进视线
+// （player.js:311）—— 这三处都影响命中裁决。它们若走公共流，服务端在同一拍里还要替
+// 别人抽数，而客户端回滚时只重放自己那一份 ⇒ 同一个"我这一拍的后坐"两端会从流的不同
+// 位置取值，症状就是"本地打中了、权威说没有"，且没人报错。
+// 私有流的进度只由这个人自己演算过的拍数决定，所以回滚时能随日记本一起存取复原
+// （见 js/player.js 的 j.rngState），两端必然重算出同一个数。
+// 抽数仍并进 rng.draws：工具量的是"这一拍玩法抽了几次随机"，不该因为换了哪条流而少算。
+export function entStream(seed, tag) {
+  // 播种混合：两个 32 位常数把 (seed, tag) 打散，避免 1 号玩家和 2 号玩家从相邻状态起步
+  // （mulberry32 的步长是加常数，相邻种子会产出高度相似的序列）。
+  let s = (Math.imul((seed >>> 0) ^ 0x9E3779B9, 0x85EBCA6B) + Math.imul((tag >>> 0) + 0x1000193, 0xC2B2AE35)) | 0;
+  return {
+    draws: 0,
+    next() {
+      rng.draws++; this.draws++;
+      s |= 0; s = s + 0x6D2B79F5 | 0;
+      let t = Math.imul(s ^ s >>> 15, 1 | s);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    },
+    state() { return s >>> 0; },
+    setState(v) { s = v >>> 0; },
+  };
+}
+
 // 画面流：始终用宿主 Math.random，不参与播种，不进快照
 export const crand = {
   next: () => Math.random(),

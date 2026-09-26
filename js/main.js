@@ -166,7 +166,7 @@ class Game {
     this.loadMap(welcome.map || 'yard');
     this.mode = net;
     const sp = new THREE.Vector3(welcome.pos[0], welcome.pos[1], welcome.pos[2]);
-    const pl = this.player = new Player(this, { team: net.team, pos: sp, yaw: welcome.yaw, name: net.name, perks: welcome.loadout.perks });
+    const pl = this.player = new Player(this, { team: net.team, pos: sp, yaw: welcome.yaw, name: net.name, perks: welcome.loadout.perks, rngSeed: welcome.seed, rngTag: welcome.cid });
     // 用服务端回声的那份，不是我自己发出去的那份：进场闸门（server/loadout.mjs）会按表
     // 重建装备，两边各拿一份副本就意味着两套 stats —— 那是要以"预测偏差"形式浮出来的。
     pl.equip(welcome.loadout);

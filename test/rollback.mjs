@@ -63,7 +63,7 @@ function extCalls(g) {
 
 // 客户端要断言的完整自身状态
 function stateVec(pl, g) {
-  const ws = pl.ws, v = { time: g.time, rng: rng.state(), cur: ws.cur };
+  const ws = pl.ws, v = { time: g.time, rng: rng.state(), prng: pl.rng.state(), cur: ws.cur };
   for (const k of J_PL) v['pl.' + k] = pl[k];
   for (const k of J_WS) v['ws.' + k] = ws[k];
   v.pos = [pl.pos.x, pl.pos.y, pl.pos.z].join(',');
@@ -243,6 +243,52 @@ async function main() {
     const d5 = diff(refB, stateVec(pl, g));
     chk(d5.length === 0, 'C5 连着两代回滚之后仍与权威那一跑逐位相同',
       d5.length ? d5.slice(0, 3).join(' | ') : `${Object.keys(refB).length} 字段全等`);
+  }
+
+  // ---------- 每实体私有流：别人开火不许挪动我的后坐 ----------
+  // 后坐横向直接写 pl.yaw（weapon-state.js:211）、散布决定弹道（spreadDir）、震屏进视线
+  // （player.js:311）—— 这些随机数过去全走公共流。服务端同一拍要替房间里每个人都抽，
+  // 客户端回滚却只重演自己那个人，于是"我这拍的后坐"两端会从流的不同位置取值：
+  // 症状是"本地打中了、权威说没有"，且没有任何一处会报错。
+  // 判据必须是两向的：① B 单独跑 vs B 与开火的 A 同拍 interleaved 跑，B 的私有流游标和
+  // yaw 要逐位相同；② 同两次运行里**公共流**游标必须不同 —— 缺了 ②，① 就只是"B 根本没
+  // 被影响"的恒真绿灯，那条反证臂在这里不是可选项。
+  {
+    const mk = (name, tag, x, z) => {
+      const p = new Player(g, { team: 'A', pos: new THREE.Vector3(x, 0, z), yaw: 0.7, name, rngSeed: 987654321, rngTag: tag });
+      p.equip({ primary: { id: 'm4', att: {} }, secondary: { id: 'm1911', att: {} }, lethal: 'frag', tactical: 'flash', perks: [] });
+      p.pos.y = g.world.groundHeight(p.pos.x, p.pos.z, p.pos.y + 1, p.radius);
+      return p;
+    };
+    const runB = (withA) => {
+      rng.seed(5150);
+      const B = mk('乙', 2, 6, 6), A = withA ? mk('甲', 1, 20, -14) : null;
+      const fresh = B.rng.state();                   // 刚建好、一发没打时的私有流游标
+      g.entities.push(B); if (A) g.entities.push(A);
+      const idle = script(7);                        // 切枪动画 0.5 秒内开不了枪，先空跑一段
+      const bIn = Object.assign(script(121), { fire: true });
+      const aIn = Object.assign(script(131), { fire: true, fwd: true });
+      for (let i = 0; i < 70; i++) {
+        g.time += DT;
+        B.update(DT, i < 40 ? idle : bIn);
+        if (A) A.update(DT, i < 40 ? idle : aIn);    // 同一拍里另一个人也在开枪
+      }
+      const out = { fresh, prng: B.rng.state(), yaw: B.yaw, hp: B.hp, shots: B.stats.shots, gstate: rng.state(), draws: rng.draws };
+      g.entities.splice(g.entities.indexOf(B), 1); if (A) g.entities.splice(g.entities.indexOf(A), 1);
+      return out;
+    };
+    const solo = runB(false), both = runB(true);
+    chk(solo.shots > 0 && both.shots > 0, '先决：B 这两次真的都开了枪（私有流被抽过）', `单跑 ${solo.shots} 发 · 同场 ${both.shots} 发`);
+    chk(solo.prng !== solo.fresh, '先决：B 的开火确实推进了自己的流（不是拿初始值比初始值）',
+      `${solo.fresh} → ${solo.prng}`);
+    chk(solo.prng === both.prng && solo.yaw === both.yaw, 'B 的私有流游标与 yaw：旁边有人开火也逐位不变',
+      `prng ${solo.prng}→${both.prng} · yaw ${solo.yaw.toFixed(6)}→${both.yaw.toFixed(6)}`);
+    // 反向那条要问的是"A 到底开没开枪"，不是"公共流有没有被挪"。改完之后没有人物的
+    // 弹道随机数走公共流了（公共游标两次都是同一个值，这本身是这次改动的正面结论），
+    // 能证明同场确实有第二个人在抽数的，是总抽数：少了它，上面那条"B 逐位不变"就只是
+    // 两次都没开枪的恒真绿灯 —— 这正是第一版在这里翻车的地方（B 卡在 0.5 秒切枪动画里）。
+    chk(both.draws - solo.draws > 0, '反证臂：同场那次真的有第二个人在抽数（上面不是恒真绿灯）',
+      `总抽数 单跑 ${solo.draws} / 同场 ${both.draws} · 公共游标 ${solo.gstate} vs ${both.gstate}（人物弹道已不碰它）`);
   }
 
   console.log(`\n${fails ? 'RED' : 'GREEN'}  ${checks - fails}/${checks} 通过`);

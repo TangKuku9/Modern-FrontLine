@@ -43,8 +43,19 @@ export function worldDigest(game) {
   lines.push(`#scores ${JSON.stringify(m?.scores ?? null)} streakKills ${F(m?.streakKills ?? 0, 2)} respawnQ ${(m?.respawns || []).length}`);
   lines.push(`#time ${F(m?.timeLeft ?? -1, 2)} flags ${(m?.flags || []).map(f => f.name + ':' + (f.owner ?? '-') + ':' + F(f.prog, 3)).join(',')}`);
   lines.push(`#pickups ${game.pickups.map(p => p.weaponId).join(',')} proj ${game.projectiles.length} noises ${game.noises.length} t=${F(game.time, 3)}`);
-  // 把玩法随机流的消耗量也放进摘要：一旦两边走了不同分支，这里会先于状态分歧暴露出来
-  lines.push(`#draws ${rng.draws}`);
+  // 把玩法随机流的消耗量也放进摘要：一旦两边走了不同分支，这里会先于状态分歧暴露出来。
+  // 拆成"公共/人物"两份是 2026-09-25 加的：人物弹道改走私有流之后，光看总数分不清
+  // "某个人的开火次数不一致"和"公共流被只在一侧存在的代码抽走"（后者是特效偷玩法流那类），
+  // 而这两件事的修法完全相反。
+  const entDraws = game.entities.reduce((s, e) => s + (e.rng ? e.rng.draws : 0), 0);
+  lines.push(`#draws ${rng.draws} 公共 ${rng.draws - entDraws} 人物 ${entDraws}`);
+  // 世界几何签名：命中判定拿的是 world.raycast，服务端（headless）和浏览器（真渲染，会做
+  // LOD）如果碰到的碰撞体集合不一样，"这一发打中墙还是打人"就会分环境 —— 那种分叉不报错，
+  // 只表现为"某一拍之后两端人物状态开始漂"。所以把碰撞体数量和位置校验和放进摘要。
+  const bx = game.world.boxes || [];
+  let hash = 0;
+  for (const b of bx) hash = (Math.imul(hash + (Math.round(b.x0 * 64) | 0), 0x01000193) + (Math.round(b.z1 * 64) | 0) + (Math.round(b.y1 * 64) | 0)) | 0;
+  lines.push(`#world ${bx.length}/${hash >>> 0}`);
   return lines.join('\n');
 }
 

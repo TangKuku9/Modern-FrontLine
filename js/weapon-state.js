@@ -12,7 +12,7 @@
 import * as THREE from 'three';
 import { computeStats } from './data.js';
 import { fireHitscan, Projectile } from './combat.js';
-import { clamp, damp, lerp, spreadDir, DEG, rng } from './util.js';
+import { clamp, damp, lerp, spreadDir, DEG } from './util.js';
 
 export class WeaponState {
   constructor(game, owner) {
@@ -86,7 +86,7 @@ export class WeaponState {
     // replay：客户端回滚重放。这一拍**所有自身状态与随机数都照原样推进**，
     // 只有外部出口关掉（见 fire/doMelee/releaseGrenade）。
     // 为什么不能整段跳过开火（我最初就是这么写的，错得很难看）：
-    // 后坐横向 side 和散布 spreadDir 各抽一次玩法随机流，并写进 pl.yaw / pl.pitch / this.rp。
+    // 后坐横向 side 和散布 spreadDir 各抽一次这个人自己的玩法流（pl.rng），并写进 pl.yaw / pl.pitch / this.rp。
     // 跳过 → 重放窗口里那几发的后坐在回滚后凭空消失，每收一份快照就"吃一次枪口"，
     // 而且两边的随机流消耗次数从此差 N 次，之后每一发弹道都在不同的分支上。
     const replay = this.replay = !!opts.replay;
@@ -189,7 +189,7 @@ export class WeaponState {
       let anyHit = false, kill = false, head = false;
       const tracers = wantFx ? [] : null;   // 交给视图模型画：命中点是权威结果，线段端点不是
       for (let i = 0; i < st.pellets; i++) {
-        const d = spreadDir(fwd, spread, new THREE.Vector3());
+        const d = spreadDir(fwd, spread, new THREE.Vector3(), pl.rng);
         if (replay) continue;
         const r = fireHitscan(game, pl, origin, d, st, st.name);
         if (r.ent) { anyHit = true; if (r.killed) kill = true; if (r.part === 'head') head = true; }
@@ -208,7 +208,7 @@ export class WeaponState {
     const adsMul = lerp(1, 0.75, this.adsT) * (pl.crouchT > 0.5 ? 0.85 : 1);
     const kick = st.recoilV * 0.55 * DEG * adsMul;
     // 横向抖动刻意偏向一侧（-0.4 而非 -0.5），且走玩法随机流：它直接写进 pl.yaw
-    const side = (rng.next() - 0.4) * st.recoilH * 0.5 * DEG * adsMul;
+    const side = (pl.rng.next() - 0.4) * st.recoilH * 0.5 * DEG * adsMul;
     pl.pitch += kick * 0.55;
     this.rp += kick * 0.45;
     pl.yaw -= side;
