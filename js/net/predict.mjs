@@ -68,6 +68,16 @@ export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
   // 4 秒延迟里 —— 血条每收一份快照抖一格。
   if (e.hp < predictedHp - 1e-6) pl.dmgT = 0;
   if (rngState !== undefined) rng.setState(rngState);
-  for (const h of win) { game.time += DT; pl.update(DT, h.inp, { replay: true }); }
+  // 重放不能只把人算回来：**被重放的那些拍的日记本要换成纠正之后的那份**。
+  // 漏了这一步是这里最隐蔽的一个洞：win[i].j 还留着"纠正之前的预测值"，下一次回滚只要
+  // 落回这些拍，就会把上一次的纠正整个丢掉 —— 于是权威端读数永远比我的基态超前若干拍，
+  // 而且超前的方向沿着同一条路径、长度每次一样（实测重复出现 Δpos≈[-1.187,0,-0.62] 这种
+  // 等长常量），看上去像物理分叉，其实是我自己拿旧草稿当成了账本。
+  if (hit) win[0].j = pl.journal();       // 权威值覆盖之后，这一拍才算有真相
+  for (let i = 0; i < win.length; i++) {
+    const h = win[i];
+    game.time += DT; pl.update(DT, h.inp, { replay: true });
+    if (win[i + 1]) win[i + 1].j = pl.journal();
+  }
   return { hard, noBase: win.length === 0, replayed: win.length, reps, corrected: Math.hypot(mine[0] - e.x, mine[1] - e.y, mine[2] - e.z), journalMiss: !hard && win.length > 0 && !hit };
 }

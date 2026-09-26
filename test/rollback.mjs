@@ -211,6 +211,40 @@ async function main() {
     console.log(`      （C4 详情：少补 ${extra} 拍 ⇒ 基态差 ${(rr2.corrected * 100).toFixed(1)} cm，正是 ${extra} 拍的位移）`);
   }
 
+  // ---------- C5 两代回滚：上一代纠正过的账本必须写回去，否则第二代把它整个丢掉 ----------
+  // 这条是为 predict.mjs 里"重放时刷新 win[i].j"那三行专门立的。删掉它，前面 60 多条断言
+  // 一条都不会红 —— 因为它们全都是"一代回滚"，而一代回滚读的是原始草稿，看不出账本过期。
+  // 浏览器里那个"权威端常数超前我 ~1.3 m、方向沿同一条路径、长度每次一样"的洞就是它：
+  // 第一次纠正把折叠的位移补回来了，日记本里那些拍却还是纠正前的预测草稿，下一次回滚
+  // 落回这些拍就等于把上次的纠正作废，于是同一笔位移被反复重犯（实测补演拍数 3282/把）。
+  {
+    const ackA = 60, ackB = 90, extra = 3;
+    // 参照 = 服务端那一跑：两个时刻都因为收不到新输入而各折叠 extra 拍
+    let EA = null, RA = null, EB = null, RB = null;
+    pl.applyJournal(J[0]); rng.setState(RNG0[0]); g.time = 0;
+    for (let i = 0; i < N; i++) {
+      g.time += DT; pl.update(DT, inputs[i]);
+      if (i === ackA) { for (let k = 0; k < extra; k++) { g.time += DT; pl.update(DT, inputs[ackA]); } EA = entityOf(pl); RA = rng.state(); }
+      if (i === ackB) { for (let k = 0; k < extra; k++) { g.time += DT; pl.update(DT, inputs[ackB]); } EB = entityOf(pl); RB = rng.state(); }
+    }
+    const refB = stateVec(pl, g);
+    // 本地这一跑没有那两笔折叠（我根本没被告知），先把它恢复到草稿末态
+    pl.applyJournal(J[0]); rng.setState(RNG0[0]); g.time = 0;
+    for (let i = 0; i < N; i++) { g.time += DT; pl.update(DT, inputs[i]); }
+    const H = histFrom(ackA + 1);
+    const r1 = rollback(g, pl, H, ackA + 1, EA, RA, { rep: extra, hold: inputs[ackA] });
+    chk(r1.reps === extra && r1.corrected < 1e-4, 'C5 第一代：补演折叠拍之后重建与权威逐位重合',
+      `reps=${r1.reps} · corrected=${r1.corrected.toFixed(6)} m —— 有偏反而说明基线不干净，第二代就没法解释`);
+    const H2 = H.slice(ackB - ackA);
+    const r2 = rollback(g, pl, H2, ackB + 1, EB, RB, { rep: extra, hold: inputs[ackB] });
+    chk(r2.corrected < 1e-4, 'C5 第二代的基态与权威读数重合（说明上一代把账本写回去了）',
+      `corrected=${r2.corrected.toFixed(6)} m —— 写回被删时这里非零（注入对照实测 0.004148 m：这一格里上一代只补回 4 mm，`
+      + `真实网络里折叠发生在饿很久之后，同一处漏写回会让基态差一整段折叠位移，浏览器实测 1.34 m）`);
+    const d5 = diff(refB, stateVec(pl, g));
+    chk(d5.length === 0, 'C5 连着两代回滚之后仍与权威那一跑逐位相同',
+      d5.length ? d5.slice(0, 3).join(' | ') : `${Object.keys(refB).length} 字段全等`);
+  }
+
   console.log(`\n${fails ? 'RED' : 'GREEN'}  ${checks - fails}/${checks} 通过`);
   process.exit(fails ? 1 : 0);
 }

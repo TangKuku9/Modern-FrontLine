@@ -123,19 +123,16 @@ export class NetRoom {
       const fromQ = c.q.length;
       const inp = fromQ ? c.q.shift() : c.lastInput;
       if (inp.tick !== undefined) c.ack = inp.tick;
-      // rep = "我这一拍没有你的新输入，又拿上一份折叠了一次"。
-      // 只看 ack 客户端看不出这件事：它以为服务端折叠的序列就是我发到 ack 的那几拍，
-      // 于是每包都被往前拽 rep 拍 —— 实测权威读数恰好等于我日记本第 start+2 拍的位置
-      // （差 4 mm），稳态里 ~9% 的样本错 1~3 拍，撞墙时放大成 0.9 m 的硬拉。
-      // 预测回滚的前提是"服务端折叠过的输入序列客户端能逐拍重建"，这一字节就是前提本身。
-      // 只从收到过第一份输入起计数：新人进场那几拍服务端在拿全零输入空跑，
-      // 那不是一次"重复"，而是一段客户端根本没有日记本的过去。
-      // 计数刻意**不在拿到新输入时归零**，而归零点放在广播之后（见 snapshot()）：
-      // 一个快照窗里 [重复,重复,新输入] 按"末尾连拍"定义报 0，可那两拍的位移实实在在进了
-      // 权威状态，客户端却永远不会补 —— 实测 20/754 包如此，残差沿行进方向摊成 0.07~0.16 m。
-      // 累计值到"自上次告知以来"正是客户端该补的数目；WS 走 TCP，每包必达，所以这个归零点
-      // 不丢账，且上限就是 SNAP_EVERY 拍，u8 绰绰有余。
-      if (!fromQ && c.got) c.rep = Math.min(255, c.rep + 1);
+      // rep = 从"ack 那一拍的状态"到"这份快照要编的状态"之间，服务端拿旧输入多折叠了几拍。
+      // 判据端推导过一遍才敢写死：客户端的基态是 journal[ack+1] = "消费完 I_ack 之后"，而
+      // ack 之后再发生的每一步都只能是折叠（一旦又消费到新输入，ack 就前进了、rep 归零），
+      // 所以**末尾连拍**这个定义对"持续饥饿"是唯一正确的量：饿得越久 rep 越大，客户端每拍
+      // 都从同一个基态重算，两边对齐。
+      // 曾经改成"自上次广播以来累计、打包后归零"，那是错的：长时间饿住时 ack 不动，
+      // 客户端每份快照都从同一个 journal[ack+1] 出发却只补这一窗的 3 拍，权威端每来一份
+      // 快照就多走一整份（实测偏差正好是 0.2236 m = 4.46 m/s × 3 拍 的整数倍，一路累积到 1.56 m）。
+      // 这个定义仍然漏掉一类：折叠发生在"消费新输入之前"的那几拍（见 rep0 那条待办）。
+      c.rep = fromQ ? 0 : (c.got ? Math.min(255, c.rep + 1) : 0);
       c.lastInput = inp;
       return { c, inp };
     });
@@ -178,12 +175,7 @@ export class NetRoom {
   // 一份完整的下行快照：实体表 + 权威端玩法随机流的当前内部状态。
   // 客户端回滚重放时要把它拨回同一拍，否则重放多抽的随机数会让两边永久错开。
   snapshot() {
-    const entities = this.snapshotEntities();
-    // 打包即销账：rep 的含义是"自上次告知以来服务端替这个客户端多走的拍数"，告知之后客户端
-    // 就不欠补演了。归零必须和广播绑死（全仓库只有 net-server.mjs 的 broadcast() 调这里，
-    // 走 TCP 必达）；放回 step() 里"拿到新输入就归零"就退回成末尾连拍那个错定义。
-    for (const c of this.clients.values()) c.rep = 0;
-    return { tick: this.tick, rngState: rng.state(), worldFlags: 0, entities };
+    return { tick: this.tick, rngState: rng.state(), worldFlags: 0, entities: this.snapshotEntities() };
   }
 
   snapshotEntities() {

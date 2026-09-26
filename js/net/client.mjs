@@ -336,7 +336,13 @@ export class NetClient {
       // 残差恰好沿行进方向摊成 ~2 拍位移 —— 稳态尾部那两个样本就是这个形状。
       if (!(e.rep | 0) && dTick > dAck) {
         this.repUnder = (this.repUnder || 0) + 1;
-        if (!this.repUnderWhy) this.repUnderWhy = { dTick, dAck, d: +r.corrected.toFixed(4) };
+        // 缺口最多能有多大：这一窗服务端替我多走、而我这边补不着的拍数。它必须始终是
+        // "一次性"的量（≤ 一份快照 SNAP_EVERY 拍）—— 一旦看到它随快照数往上涨，就说明
+        // 折叠拍的记账又变成"每份快照重新欠一遍"那种会永久累积的错（b3e25b6 就犯过这个）。
+        const deficit = dTick - dAck;
+        this.repUnderMax = Math.max(this.repUnderMax || 0, deficit);
+        this.repUnderWhy = this.repUnderWhy || [];
+        if (this.repUnderWhy.length < 8) this.repUnderWhy.push({ dTick, dAck, deficit, d: +r.corrected.toFixed(4) });
       }
       // 厘米级读数已经稳定在 0.08 附近，剩下那几个 0.15~0.22 的要能解释。
       // 光有 max 一个数不行：把"当时在做什么"记下来才分得开"多跑了一拍"和"预测器算错了"。
