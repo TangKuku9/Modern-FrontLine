@@ -94,7 +94,14 @@ async function serveStatic(req, res) {
       if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0), fails: r.__fails | 0,
         // 延迟补偿的四项计数（定义见 server/room.mjs 的 this.lag）。带上它的理由和 hz/fails 一样：
         // 这个玩家"永远没有补偿"在玩家侧的表现只是打不中，运维必须能在这里先看见。
-        lag: r.lag ? { shots: r.lag.shots, ok: r.lag.ok, noView: r.lag.noView, stale: r.lag.stale, poseMiss: r.lag.poseMiss, depth: [r.lag.dMin, r.lag.dMax, r.lag.ok ? +(r.lag.dSum / r.lag.ok).toFixed(1) : 0] } : null });
+        lag: r.lag ? { shots: r.lag.shots, ok: r.lag.ok, noView: r.lag.noView, stale: r.lag.stale, poseMiss: r.lag.poseMiss, depth: [r.lag.dMin, r.lag.dMax, r.lag.ok ? +(r.lag.dSum / r.lag.ok).toFixed(1) : 0] } : null,
+        // 连杀奖励的三项计数（定义见 server/room.mjs 的 this.streak）。它和 lag 是同一类
+        // 东西：**失效是全静默的** —— 玩家按 3 没反应，既不报错也不崩，运维只能从这里看见。
+        // calls=0 尤其要留意：那说明上行那一位根本没接通（客户端旧版本、或按了没发出去）。
+        // 恒等式 accepted + rejected === calls 必须永远成立；不成立说明有条分支没记账。
+        streak: r.streak ? { calls: r.streak.calls, accepted: r.streak.accepted, rejected: r.streak.rejected, byId: r.streak.byId } : null,
+        // 快照头里那一个字节的当前值：UAV 是哪一队、白磷弹在不在、对局结束没有。
+        worldFlags: r.rules ? r.rules.worldFlags() : 0 });
     }
     const body = JSON.stringify({
       ok: true, uptime: Math.round(process.uptime()), rooms: rooms.size,
@@ -318,6 +325,10 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({
           t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId, seed: room.seed,
           pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw, loadout: c.loadout,
+          // 连杀奖励的槽位表。**必须由服务端给**：按 3/4/5 各是什么、每个要几杀，
+          // 这两件事的真相在权威端（规则内核里）；客户端自己按 data.js 那份渲染的话，
+          // 服务端换一项、客户端还显示旧的，症状是"按了没反应"——正是这一轮要消灭的东西。
+          streaks: room.streakDefs.map(d => ({ id: d.id, name: d.name, icon: d.icon, kills: d.kills })),
           others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team })),
         }));
         console.log(`[join] ${c.name} → cid ${c.cid} @ ${room.id}（在线 ${room.clients.size}，本机 ${wss.clients.size} 连接 / ${rooms.size} 间）`);

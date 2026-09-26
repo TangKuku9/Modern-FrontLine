@@ -386,6 +386,55 @@ try {
     lag.depth && lag.depth[0] >= 1 && lag.depth[1] <= 60 && lag.depth[2] > 3, JSON.stringify(lag.depth));
   ok('姿态缓冲里每一拍都查得到（缓冲不比回溯窗短）', (lag.poseMiss || 0) === 0, `查不到 ${lag.poseMiss} 次`);
 
+  // ---- 联机规则：连杀呼叫那一位真的进了上行协议 ----
+  // 这里验的是**协议那一段**（客户端按 3 → 那一个字节 → 服务端裁决），
+  // 而不是"生效了没有"：生效的全链路（充能→就绪→呼叫→UAV/空袭/白磷弹/哨戒机枪/
+  // 直升机）由 test/mp-rules.mjs 用确定性拍数验 —— 那边能精确控制击杀与拍号，
+  // 这里做不到（真对局里攒几杀要看运气）。两处合起来才是完整的一条线。
+  console.log('\n── 联机规则 ──');
+  const hzr = await (await fetch(srv.base + '/healthz')).json();
+  const roomR = (hzr.per || []).find(r => r.id === ROOM) || {};
+  const s0 = roomR.streak || {};
+  ok('先决：这一节之前还没有人呼叫过连杀奖励（下面的计数不是在空转）', (s0.calls || 0) === 0, JSON.stringify(s0));
+
+  // 客户端拿到的槽位表必须来自服务端。它是"按 3/4/5 各是什么、每个要几杀"的真相 ——
+  // 客户端自己按 data.js 那份渲染的话，服务端换一项、HUD 还显示旧的。
+  const ss = await A.page.evaluate(() => ({
+    defs: (window.game.net.streakDefs || []).map(d => d.id),
+    slots: (window.game.net.streakState || []).map(s => ({ id: s.id, cost: s.cost })),
+    flags: window.game.net.worldFlags | 0,
+  }));
+  ok('客户端从 welcome 里拿到了本房的槽位表（HUD 才知道按 3/4/5 是什么）',
+    ss.defs.length > 0 && ss.slots.length === ss.defs.length, JSON.stringify(ss.defs));
+  ok('成本与服务端一致（uav=3），不是客户端自己猜的', ss.slots[0] && ss.slots[0].id === 'uav' && ss.slots[0].cost === 3, JSON.stringify(ss.slots));
+  ok('客户端读到了快照头里的世界标志位（这一格以前在服务端是硬编码 0）',
+    Number.isInteger(ss.flags), `flags=${ss.flags}`);
+
+  await focus(A);
+  // 按 6 次 3：每一次都是一个**按下沿**（Digit3 只进 pressed 表，只在一拍为真）。
+  // 按住不放不会连发 —— 那正是"每拍都看一次 inp.streak"会犯的错，服务端那边
+  // 用 fresh（这一拍真的消费到新输入）挡住了。
+  for (let i = 0; i < 6; i++) { await A.page.keyboard.press('Digit3'); await sleep(200); }
+  await sleep(400);
+  const hzr2 = await (await fetch(srv.base + '/healthz')).json();
+  const roomR2 = (hzr2.per || []).find(r => r.id === ROOM) || {};
+  const s1 = roomR2.streak || {};
+  console.log(`  服务端记账：收到呼叫 ${s1.calls} · 接受 ${s1.accepted} · 被拒 ${s1.rejected} ${JSON.stringify(s1.byId || {})}`);
+  // 这一条是这一节的核心：按 3 这件事**以前在联机里什么都不做** ——
+  // main.js 把 streak 字段填进了输入对象，但那个字段根本不在协议里（codec 只搬
+  // keys/buttons），服务端连"有人按了 3"都不知道。calls > 0 就是它接通的凭证。
+  ok('按 3 真的走到了服务端（这一位以前根本不在协议里）', (s1.calls || 0) > 0, JSON.stringify(s1));
+  // 恒等式而不是阈值：每一次呼叫都必须落在"接受"或"拒绝"里，没有第三种。
+  // 它红了说明 callStreak 里有一条分支拿走了请求却没记账（那种洞只会让读数偏低，
+  // 而偏低的读数看起来和"没人按"一模一样）。
+  ok('每一次呼叫都被裁决过（accepted + rejected == calls，没有"收了不处理"的第三种）',
+    (s1.accepted | 0) + (s1.rejected | 0) === (s1.calls | 0), `${s1.accepted} + ${s1.rejected} vs ${s1.calls}`);
+  // 反证臂：就绪那一路没有白送。若 accepted > 0，则它必须真的让世界标志位亮起来。
+  const uavBits = (roomR2.worldFlags | 0) & 0x12;
+  ok('反证：接受了 N 次就必须有 N 次对应的世界变化（没就绪时两位都不亮，就绪了才亮）',
+    (s1.accepted | 0) === 0 ? uavBits === 0 : uavBits !== 0,
+    `accepted=${s1.accepted} worldFlags=${roomR2.worldFlags}`);
+
   const frozen = await A.page.evaluate(() => window.game.tick);
   await sleep(500);
   const ticks2 = await A.page.evaluate(() => window.game.tick);

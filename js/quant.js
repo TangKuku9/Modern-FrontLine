@@ -43,8 +43,29 @@ export const BTN = {
   LethalPressed: 64, LethalHeld: 128, TacticalPressed: 256, TacticalHeld: 512,
 };
 
-// 世界级位标志（快照头里的一个字节）
-export const WORLD = { Night: 1, UAV: 2, WhitePhosphorus: 4, MatchOver: 8 };
+// 世界级位标志（快照头里的一个字节）。
+//
+// 它是**全局**的：一份快照编一次、发给一屋子人（server/net-server.mjs:broadcast），
+// 不按接收者过滤。所以"敌我"要靠两位分开表达 —— UAV 的效果只对放它的那一队有用，
+// 而所有客户端拿到的是同一个字节。位 2 归 A 队、位 16 归 B 队，客户端按自己 team 查。
+// 曾经想过按人各编一份（encodeSnapshot 的 scratch 参数就是为那种用法准备的），但那是
+// 每人 20Hz 一次全表编码，256 人的房间里纯属浪费 —— 而两个位就够表达这件事。
+export const WORLD = { Night: 1, UAV: 2, WhitePhosphorus: 4, MatchOver: 8, UAV_B: 16 };
+
+// 队伍 → UAV 那一位。两端必须用**同一句**：服务端按 'A' 置位、客户端按 'A' 查位，
+// 各写一遍的症状是"UAV 该亮的时候不亮"，不会报错。
+export const uavBit = (team) => (team === 'B' ? WORLD.UAV_B : WORLD.UAV);
+
+// 连杀呼叫（上行输入包里那一个字节）。
+//   0 ... n-1 = 呼叫第几个槽（与 js/main.js 的 Digit3/4/5 对应）
+//   0xff      = 这一拍没有请求
+// 为什么不是 u8 的 -1：装不下负数。为什么不是 3/4/5 直接当值：槽位下标是 0 起的，
+// 且服务端要能一眼区分"下标 0"与"没请求"这两件事。上限 8 是挡乱报用的 ——
+// KILLSTREAKS 一共 5 项，越界值走 StreakBook.take 的边界检查，不会变成第 n 个槽。
+export const STREAK_NONE = 0xff;
+export const STREAK_MAX = 8;
+export const packStreak = (v) => (Number.isInteger(v) && v >= 0 && v < STREAK_MAX ? v : STREAK_NONE);
+export const unpackStreak = (n) => (n === STREAK_NONE ? -1 : n);
 
 // sim 的 input 对象 ⇄ 位包。客户端打包、服务端解包必须用这里的同一对函数：
 // 两边各写一份 switch 的结局是"按键含义悄悄错位"，而这种错位不会报错，只会手感怪。

@@ -12,9 +12,9 @@
     "start:prod": "node server/net-server.mjs --prod",
     "probe": "node server/probe.mjs",
     "soak": "node server/soak.mjs",
-    "test": "node server/gate.mjs && node test/rollback.mjs && node test/net-journal.mjs && node server/codec.mjs && node server/lagcomp.mjs && node test/lagcomp.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs",
+    "test": "node server/gate.mjs && node test/rollback.mjs && node test/net-journal.mjs && node server/codec.mjs && node server/lagcomp.mjs && node test/lagcomp.mjs && node test/mp-rules.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs",
     "test:browser": "node test/net-play.mjs && node test/net-drop.mjs",
-    "test:all": "node server/gate.mjs && node test/rollback.mjs && node test/net-journal.mjs && node server/codec.mjs && node server/lagcomp.mjs && node test/lagcomp.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs && node test/net-play.mjs && node test/net-drop.mjs"
+    "test:all": "node server/gate.mjs && node test/rollback.mjs && node test/net-journal.mjs && node server/codec.mjs && node server/lagcomp.mjs && node test/lagcomp.mjs && node test/mp-rules.mjs && node server/net-probe.mjs && node server/deploy-probe.mjs && node server/xenv.mjs && node test/fps.mjs && node test/viewmodel.mjs && node test/net-play.mjs && node test/net-drop.mjs"
   },
   "keywords": [],
   "author": "",

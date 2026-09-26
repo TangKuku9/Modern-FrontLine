@@ -4,9 +4,10 @@ import { Player } from './player.js';
 import { Bot } from './ai.js';
 import { MAPS } from './maps.js';
 import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats } from './data.js';
-import { fireHitscan, Projectile } from './combat.js';
+import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, rng, shuffle } from './util.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, KILL_POINTS } from './match-rules.js';
 
 const BOT_WEAPONS = ['m4', 'm4', 'ak', 'ak', 'scar', 'mp5', 'mp5', 'vector', 'pkm', 'm870', 'sks', 'l115'];
 
@@ -24,19 +25,24 @@ export class MPMatch {
   constructor(game, cfg) {
     this.game = game; this.cfg = cfg;
     this.type = cfg.mode; this.ffa = cfg.mode === 'ffa';
-    this.scoreLimit = cfg.scoreLimit || (cfg.mode === 'dom' ? 200 : cfg.mode === 'ffa' ? 25 : 50);
-    this.timeLeft = (cfg.timeLimit || 10) * 60;
-    this.scores = { A: 0, B: 0 };
+    // 分数/时限/连杀槽/按拍排程都来自规则内核（js/match-rules.js）——权威端 NetRoom
+    // 用的是同一个类。这里刻意让 this.scores 指到 rules.scores 那一个对象上，而不是
+    // 各自留一份副本：两份分数不会报错，只会在"谁先更新"上分叉。
+    this.rules = new MatchRules(cfg);
+    this.scoreLimit = this.rules.scoreLimit;
+    this.scores = this.rules.scores;
     this.respawns = [];
     this.flags = null;
-    this.uav = {}; this.active = [];
+    this.active = [];
     this.canChangeClass = true;
     this.nextLoadout = null;
-    this.firstBlood = false;
     this.targeting = null;
     this.over = false;
-    this.lastKillTimes = [];
+    this.streakKills = 0;             // 只给 HUD 读的镜像（真值在 streakBook.progress）
   }
+  // 剩下多少秒。改成取值而不是每拍自减：以前它和 rules.tick 是同一件事的两种写法，
+  // 差一拍不会报错，只会让记分板上的时间比 HUD 上的计时器早一格。
+  get timeLeft() { return this.rules.timeLeft(); }
   start() {
     const game = this.game, w = game.world, def = MAPS[this.cfg.map];
     const pteam = this.ffa ? 'P' : 'A';
@@ -47,9 +53,13 @@ export class MPMatch {
     const pl = game.player = new Player(game, { team: pteam, pos: sp.pos, yaw: sp.yaw, name: '你' });
     pl.equip(lo);
     game.entities.push(pl);
-    // 连杀
-    this.streakDefs = game.profile.streaks.map(id => KILLSTREAKS.find(k => k.id === id)).sort((a, b) => a.kills - b.kills);
-    this.streakState = this.streakDefs.map(d => ({ id: d.id, ready: false, used: false, cost: Math.max(2, d.kills - (pl.hasPerk('hardline') ? 1 : 0)) }));
+    // 连杀：簿记在 StreakBook 里（js/match-rules.js），联机的权威端用的是同一个类。
+    // streakState 留一个别名给 HUD —— hud.streaks() 读的就是 slots 的那几个字段，
+    // 于是表现层一行都不用改，而"什么时候算就绪"这件事只剩一份实现。
+    this.streakDefs = game.profile.streaks.map(id => KILLSTREAKS.find(k => k.id === id));
+    this.streakBook = new StreakBook(this.streakDefs, pl.hasPerk('hardline') ? 1 : 0);
+    this.streakState = this.streakBook.slots;
+    this.streakKills = 0;
     // 机器人
     const names = shuffle(BOT_NAMES.slice());
     let ni = 0;
@@ -118,7 +128,7 @@ export class MPMatch {
     const yaw = Math.atan2(pos.x, pos.z); // 面向中心
     return { pos, yaw };
   }
-  uavActive(team) { return (this.uav[team] || 0) > 0; }
+  uavActive(team) { return this.rules.uavActive(team); }
 
   // ---------- 机器人目标 ----------
   botGoal(bot) {
@@ -156,8 +166,8 @@ export class MPMatch {
       const d = victim.dmgTaken.get(pl);
       if (d && killer !== pl) { pl.stats.assists++; pl.stats.score += 25; game.hud.popup('+25 助攻', '#ddd'); this.chargeStreak(0.5); }
     }
-    if (!this.firstBlood && killer && killer !== victim) {
-      this.firstBlood = true;
+    if (!this.rules.firstBlood && killer && killer !== victim) {
+      this.rules.firstBlood = true;
       if (killer.isPlayer) { game.hud.popup('首杀', '', true); pl.stats.score += 50; }
     }
     // 掉落武器
@@ -171,6 +181,7 @@ export class MPMatch {
       document.getElementById('killerInfo').innerHTML = killer && killer !== victim ? `被 <b>${killer.name}</b> 使用 ${weapon || ''} ${head ? '爆头' : ''}击杀` : '你自杀了';
       pl.stats.streak = 0;
       this.streakKills = 0;
+      this.streakBook.onDeath();
       this.updateStreakHUD();
       if (document.pointerLockElement) document.exitPointerLock();
     } else {
@@ -186,45 +197,50 @@ export class MPMatch {
   playerKill(victim, weapon, head, info) {
     const game = this.game, pl = game.player;
     pl.stats.kills++; pl.stats.streak++;
-    let pts = 100;
-    game.hud.popup('+100 击杀', '#fff');
-    if (head) { pl.stats.headshots++; pts += 50; game.hud.popup('爆头 +50', '', true); }
-    if (info && info.melee) { pts += 50; game.hud.popup('近战击杀', '', true); }
-    const dist = victim.pos.distanceTo(pl.pos);
-    if (dist > 40 && !info.explosive) { pts += 50; game.hud.popup('远距离击杀 +50', '', true); }
-    const now = game.time;
-    this.lastKillTimes = this.lastKillTimes.filter(t => now - t < 4); this.lastKillTimes.push(now);
-    const n = this.lastKillTimes.length;
-    if (n >= 2) { const names = ['', '', '双杀', '三杀', '四杀', '暴走', '无人可挡']; game.hud.popup(names[Math.min(n, 6)] + ` +${n * 50}`, '', true); pts += n * 50; game.audio.say(names[Math.min(n, 6)]); }
-    if (pl.lastAttacker === victim) { game.hud.popup('复仇 +50', '', true); pts += 50; pl.lastAttacker = null; }
+    const n = this.rules.killChain();
+    // 分值来自 js/match-rules.js:killScore（联机权威端问的是同一句）。
+    // 规则只说"这一下挣了什么"，文案留在这里 —— 联机不发这些弹窗，它靠事件。
+    const sc = killScore({
+      head: !!head, melee: !!(info && info.melee), explosive: !!(info && info.explosive),
+      dist: victim.pos.distanceTo(pl.pos), chain: n, revenge: pl.lastAttacker === victim,
+    });
+    if (pl.lastAttacker === victim) pl.lastAttacker = null;
+    if (head) pl.stats.headshots++;
+    const CHAIN_NAME = ['', '', '双杀', '三杀', '四杀', '暴走', '无人可挡'];
+    game.hud.popup(`+${KILL_POINTS.kill} 击杀`, '#fff');
+    if (sc.tags.includes('head')) game.hud.popup(`爆头 +${KILL_POINTS.head}`, '', true);
+    if (sc.tags.includes('melee')) game.hud.popup('近战击杀', '', true);
+    if (sc.tags.includes('longshot')) game.hud.popup(`远距离击杀 +${KILL_POINTS.longshot}`, '', true);
+    if (n >= 2) { const nm = CHAIN_NAME[Math.min(n, 6)]; game.hud.popup(nm + ` +${n * KILL_POINTS.chain}`, '', true); game.audio.say(nm); }
+    if (sc.tags.includes('revenge')) game.hud.popup(`复仇 +${KILL_POINTS.revenge}`, '', true);
     if (pl.stats.streak % 5 === 0) game.hud.popup(`连杀 ×${pl.stats.streak}`, '', true);
-    pl.stats.score += pts;
+    pl.stats.score += sc.points;
     if (pl.hasPerk('scavenger')) { pl.ws.refill(0.35); if (pl.lethal && pl.lethal.count < pl.lethal.max) pl.lethal.count++; game.hud.popup('拾荒者：弹药补给', '#9cf'); }
     if (pl.hasPerk('quickfix')) { pl.dmgT = 99; pl.hp = Math.min(pl.maxHp, pl.hp + 40); }
     if (this.type === 'ffa') { }
     this.chargeStreak(1);
   }
   chargeStreak(v) {
-    this.streakKills = (this.streakKills || 0) + v;
-    for (const s of this.streakState) {
-      if (!s.ready && !s.used && this.streakKills >= s.cost) {
-        s.ready = true;
-        const def = KILLSTREAKS.find(k => k.id === s.id);
-        this.game.hud.announce(def.name + ' 就绪', `按 [${this.streakState.indexOf(s) + 3}] 呼叫`, 2.5);
-        this.game.audio.say(def.name + '已就绪');
-        this.game.audio.beep(3);
-      }
+    // 就绪判定在 StreakBook 里（联机权威端用的是同一份）。这里只负责**播报** ——
+    // 规则说"第 i 个槽刚就绪"，表现层说"屏幕左上角弹一行字、播一声"。分开之后
+    // 联机侧就不必再抄一遍 cost/progress 的比较。
+    this.streakKills = this.streakBook.progress;
+    for (const i of this.streakBook.charge(v)) {
+      const def = KILLSTREAKS.find(k => k.id === this.streakState[i].id);
+      this.game.hud.announce(def.name + ' 就绪', `按 [${i + 3}] 呼叫`, 2.5);
+      this.game.audio.say(def.name + '已就绪');
+      this.game.audio.beep(3);
     }
     this.updateStreakHUD();
   }
   updateStreakHUD() {
-    this.game.hud.streaks(this.streakState, Math.floor(this.streakKills || 0));
+    this.game.hud.streaks(this.streakState, Math.floor(this.streakBook.progress));
   }
   botStreak(bot) {
     const game = this.game;
     const team = bot.team;
     if (bot.streak === 3) {
-      this.uav[team] = 25;
+      this.rules.uavStart(team, 25 * 60);
       if (team !== game.player.team) { game.hud.announce('敌方UAV已上线', '保持移动或使用幽灵Perk', 3); game.audio.say('敌方无人机已上线'); }
       else game.hud.announce('友方UAV已上线', '', 2);
     } else if (bot.streak === 5) {
@@ -245,53 +261,55 @@ export class MPMatch {
     const s = this.streakState[i];
     if (!s || !s.ready) return;
     const game = this.game, pl = game.player;
-    if (s.id === 'uav') { this.uav[pl.team] = 30; game.hud.announce('UAV 已上线', '', 2); game.audio.say('无人机已上线'); }
-    else if (s.id === 'cluster') { this.targeting = { s, type: 'cluster' }; game.hud.announce('选择空袭目标', '左键确认 · 右键取消', 2.5); return; }
-    else if (s.id === 'sentry') {
+    // 两种"不能呼叫即消耗"的：
+    //  · 集束空袭要先选目标，改主意（右键）就不该扣掉；
+    //  · 哨戒机枪要先确认站位放得下（不然是白扣一个槽）。
+    // 它们各自在确认为真的那一刻才 consume —— 规则内核提供的两个入口之一，
+    // 谁都不许直接改 s.ready（改了不会报错，只会让联机与单机的账对不上）。
+    if (s.id === 'cluster') {
+      this.targeting = { s, type: 'cluster' };
+      game.hud.announce('选择空袭目标', '左键确认 · 右键取消', 2.5);
+      return;
+    }
+    if (s.id === 'sentry') {
       const f = pl.forward(new THREE.Vector3()); f.y = 0; f.normalize();
       const p = pl.pos.clone().addScaledVector(f, 2);
       if (game.world.lineBlocked(pl.pos.clone().setY(pl.pos.y + 0.5), p.clone().setY(p.y + 0.5))) { game.hud.popup('无法在此部署', '#f66'); return; }
+      if (!this.streakBook.consume(s)) return;
       this.active.push(new Sentry(game, p, pl));
       game.audio.say('哨戒机枪已部署');
-    } else if (s.id === 'heli') { this.spawnHeli(pl.team, pl); game.audio.say('武装直升机已就位'); }
+      this.updateStreakHUD();
+      return;
+    }
+    if (!this.streakBook.take(i)) return;
+    if (s.id === 'uav') { this.rules.uavStart(pl.team); game.hud.announce('UAV 已上线', '', 2); game.audio.say('无人机已上线'); }
+    else if (s.id === 'heli') { this.spawnHeli(pl.team, pl); game.audio.say('武装直升机已就位'); }
     else if (s.id === 'wp') this.whitePhosphorus(pl);
-    s.ready = false; s.used = true;
     this.updateStreakHUD();
   }
   spawnHeli(team, owner) { this.active.push(new Heli(this.game, team, owner)); }
-  clusterStrike(pos, owner, ang) {
-    const game = this.game;
-    const dir = new THREE.Vector3(Math.cos(ang), 0, Math.sin(ang));
-    game.audio.whoosh(pos);
-    setTimeout(() => {
-      if (!game.world) return;
-      for (let i = 0; i < 9; i++) {
-        const p = pos.clone().addScaledVector(dir, (i - 4) * 3.2).add(new THREE.Vector3(rand(-1.5, 1.5), 0, rand(-1.5, 1.5)));
-        const start = p.clone().addScaledVector(dir, -25); start.y = 45;
-        const v = p.clone().sub(start); const T = 1.6;
-        const vel = new THREE.Vector3(v.x / T, (v.y + 0.5 * 12 * T * T) / T, v.z / T);
-        setTimeout(() => { if (game.world) game.projectiles.push(new Projectile(game, 'bomb', start, vel, owner, 10)); }, i * 110);
-      }
-    }, 1400);
-  }
+  // 弹幕中心与方向由调用方给（单机是玩家在地图上点的那一点，联机是呼叫者视线前方
+  // 一段距离）——那是**输入**；"呼叫之后会发生什么"两边共用 js/combat.js 那一份。
+  clusterStrike(pos, owner, ang) { spawnCluster(this.game, this.rules.clock, pos, owner, ang); }
   whitePhosphorus(owner) {
     const game = this.game;
     game.hud.announce('白磷弹投放', '', 3); game.audio.say('白磷弹来袭');
-    this.wpT = 10;
-    for (const e of this.enemiesOf(owner.team)) {
-      e.takeDamage(55, { attacker: owner, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) });
-    }
-    for (let i = 0; i < 12; i++) {
-      const p = game.world.randomWalkable();
-      setTimeout(() => { if (game.world) { game.effects.explosion(p, 0.8); game.audio.explosion(p, 0.5); game.effects.addFireSource(p.clone().setY(0.1), 1.5, 8); } }, i * 250);
-    }
+    // 计时器归规则内核（联机权威端读的是同一个字段），落火与即时灼烧归共用那一段
+    this.rules.wpTicks = WP_SECONDS * 60;
+    phosphorusSweep(game, this.rules.clock, owner, this.enemiesOf(owner.team));
   }
 
   // ---------- 更新 ----------
   update(dt, inp) {
     const game = this.game, pl = game.player;
     if (this.over) { return; }
-    this.timeLeft -= dt;
+    // 规则时钟每拍走一格：UAV/白磷弹的剩余时间、以及按拍排程的空袭投弹都在这里推进。
+    // 放在 update 的最前面（而不是末尾）：排程回调会往 game.projectiles 里塞炸弹，
+    // 而 projectiles 的 update 在 **game.update 里、mode.update 之前**跑过 —— 所以
+    // 这一拍排出来的弹要等下一拍才飞。这和 setTimeout 版的时序是同一件事（那时它更是
+    // 完全脱拍的），但"早一拍照样是晚一拍"这件事值得写下来，免得以后有人拿
+    // "投弹数对不对"去查时序。
+    this.rules.step();
     // 复活
     for (let i = this.respawns.length - 1; i >= 0; i--) {
       const r = this.respawns[i];
@@ -300,7 +318,7 @@ export class MPMatch {
         document.getElementById('respawnText').textContent = r.t > 0 ? `${Math.ceil(r.t)} 秒后重新部署…` : '按 [空格] 重新部署';
         if (r.t <= 0 && (game.input.keys.Space || r.t < -4)) {
           const sp = this.spawnPoint(pl.team);
-          if (this.nextLoadout) { pl.equip(this.nextLoadout); this.nextLoadout = null; this.streakState.forEach(s => s.cost = Math.max(2, KILLSTREAKS.find(k => k.id === s.id).kills - (pl.hasPerk('hardline') ? 1 : 0))); }
+          if (this.nextLoadout) { pl.equip(this.nextLoadout); this.nextLoadout = null; this.streakBook.setDiscount(pl.hasPerk('hardline') ? 1 : 0); }
           pl.respawn(sp.pos, sp.yaw);
           game.dead = false;
           document.getElementById('deathScreen').classList.add('hidden');
@@ -350,21 +368,20 @@ export class MPMatch {
         if (f.owner) this.scores[f.owner === pl.team ? 'A' : 'B'] += dt * 0.6;
       }
     }
-    // UAV
-    for (const t in this.uav) {
-      this.uav[t] -= dt;
-      if (this.uav[t] > 0 && t !== pl.team) {
-        this.uavPing = (this.uavPing || 0) - dt;
-        if (this.uavPing <= 0) {
-          this.uavPing = 2.5;
-          for (const b of game.bots) if (b.team === t && b.alive) {
-            const tg = this.enemiesOf(t).filter(e => !(e.isPlayer && e.hasPerk('ghost')));
-            if (tg.length) { tg.sort((a, c) => a.pos.distanceTo(b.pos) - c.pos.distanceTo(b.pos)); b.hint(tg[0].pos); }
-          }
+    // 敌方 UAV 给我的敌人报点（我方 UAV 的效果走小地图，见 hud.drawMinimap）。
+    // 计时本身在 rules.step() 里 —— 以前它在这里自减，于是"还剩多久"有两个来源。
+    for (const t of ['A', 'B']) {
+      if (t === pl.team || !this.rules.uavActive(t)) continue;
+      this.uavPing = (this.uavPing || 0) - dt;
+      if (this.uavPing <= 0) {
+        this.uavPing = 2.5;
+        for (const b of game.bots) if (b.team === t && b.alive) {
+          const tg = this.enemiesOf(t).filter(e => !(e.isPlayer && e.hasPerk('ghost')));
+          if (tg.length) { tg.sort((a, c) => a.pos.distanceTo(b.pos) - c.pos.distanceTo(b.pos)); b.hint(tg[0].pos); }
         }
       }
     }
-    if (this.wpT > 0) { this.wpT -= dt; game.grade.uniforms.wp.value = Math.min(1, this.wpT / 3) * 0.6; for (const e of this.enemiesOf(pl.team)) if (rng.next() < dt * 2) e.takeDamage(6, { attacker: pl, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) }); }
+    if (this.rules.wpTicks > 0) { game.grade.uniforms.wp.value = Math.min(1, this.rules.wpTicks / (3 * 60)) * 0.6; for (const e of this.enemiesOf(pl.team)) if (rng.next() < dt * 2) e.takeDamage(6, { attacker: pl, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) }); }
     else game.grade.uniforms.wp.value = 0;
     // 连杀奖励
     for (const a of this.active) a.update(dt);
@@ -376,15 +393,10 @@ export class MPMatch {
     const markers = [];
     if (this.flags) for (const f of this.flags) markers.push({ id: 'f' + f.name, pos: f.pos.clone().setY(f.mesh.position.y + 3.6), label: f.name, cls: 'flag ' + (f.owner === pl.team ? 'ally' : f.owner ? 'enemy' : 'neutral') });
     game.hud.setMarkers(markers);
-    // 结束
-    if (!this.ffa) {
-      if (this.scores.A >= this.scoreLimit) this.end('A');
-      else if (this.scores.B >= this.scoreLimit) this.end('B');
-    }
-    if (this.timeLeft <= 0) {
-      if (this.ffa) { const all = this.ranking(); this.end(all[0].e); }
-      else this.end(this.scores.A > this.scores.B ? 'A' : this.scores.B > this.scores.A ? 'B' : 'draw');
-    }
+    // 结束判定。团队模式走规则内核（分数到线 / 时间到，都是"谁赢了"这件事的定义），
+    // 自由混战的"谁赢了"取决于名次而名次里有人 —— 那不是规则能判的，留在上层。
+    if (!this.ffa) { const w = this.rules.checkEnd(); if (w) this.end(w); }
+    else if (this.rules.timeUp) { const all = this.ranking(); this.end(all[0].e); }
   }
   updateTargeting(inp) {
     const game = this.game, t = this.targeting;
@@ -400,7 +412,7 @@ export class MPMatch {
     game.hud.prompt('<b>左键</b>确认空袭目标 · <b>右键</b>取消');
     if (inp.firePressed && hit) {
       this.clusterStrike(hit.point.clone(), game.player, game.player.yaw + Math.PI / 2);
-      t.s.ready = false; t.s.used = true; this.targeting = null; game.hud.prompt(null);
+      this.streakBook.consume(t.s); this.targeting = null; game.hud.prompt(null);
       game.audio.say('集束空袭已确认'); this.updateStreakHUD();
       game.player.ws.cool = 0.3;
     } else if (inp.adsPressed) { this.targeting = null; game.hud.prompt(null); }
@@ -441,6 +453,10 @@ export class MPMatch {
   end(winner) {
     if (this.over) return;
     this.over = true;
+    // 规则侧那份"这局结束了"也要置上：快照头的 MatchOver 位读的是它，联机侧靠那一位
+    // 知道该收工。自由混战传进来的是**实体**（名次第一的那个人），换算成队伍只是为了让
+    // 规则侧有一个值 —— 它不用这个值做什么。
+    this.rules.forceEnd(typeof winner === 'string' ? winner : ((winner && winner.team) || 'draw'));
     const game = this.game, pl = game.player;
     game.ending = true;
     let win;
@@ -463,17 +479,26 @@ export class MPMatch {
     }, 2500);
   }
   dispose() {
+    // 排掉的定时任务要清掉：新的 MPMatch 会带一份新的 MatchRules，但旧实例上的回调
+    // 闭包里抓着的 game/world 可能已经被 clearWorld 换过了 —— 那种回调跑起来就是往
+    // 新一局里投上一局的弹。
+    this.rules.clock.jobs.length = 0;
     for (const a of this.active) a.dispose && a.dispose();
     this.game.hud.progress(null);
   }
 }
 
 // ---------- 哨戒机枪 ----------
-class Sentry {
-  constructor(game, pos, owner) {
+// 联机下它有两个身份，靠 opts.dumb 分：
+//   · 权威端（server/room.mjs）建的是**真**的：自己找目标、自己开火，伤害在这一台机器上算。
+//   · 客户端收到 spawnTurret 事件后建一个同形副本，dumb=true：只转向、只放枪口火光与音效，
+//     **不开火**。少了这个开关，两边会各打一份伤害 —— 那不会报错，只会让所有东西都快一倍死。
+export class Sentry {
+  constructor(game, pos, owner, opts = {}) {
     this.game = game; this.owner = owner; this.team = owner.team; this.name = '哨戒机枪'; this.isTurret = true;
+    this.dumb = !!opts.dumb;
     this.pos = pos.clone(); this.pos.y = game.world.groundHeight(pos.x, pos.z, pos.y + 0.5, 0.3);
-    this.hp = 300; this.alive = true; this.t = 60; this.yaw = owner.yaw; this.fireT = 0; this.target = null; this.scanT = 0;
+    this.hp = 300; this.alive = true; this.t = opts.duration || 60; this.yaw = owner.yaw; this.fireT = 0; this.target = null; this.scanT = 0;
     this.stats = { dmgNear: 20, dmgFar: 16, rangeNear: 20, rangeFar: 50, headMul: 1.2, name: '哨戒机枪' };
     const g = new THREE.Group();
     for (let i = 0; i < 3; i++) { const l = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1.1, 6), mat('darkMetal')); const a = i / 3 * Math.PI * 2; l.position.set(Math.cos(a) * 0.3, 0.45, Math.sin(a) * 0.3); l.rotation.set(Math.sin(a) * 0.5, 0, -Math.cos(a) * 0.5); g.add(l); }
@@ -535,10 +560,13 @@ class Sentry {
       if (Math.abs(da) < 0.15 && this.fireT <= 0) {
         this.fireT = 0.1;
         const dir = spreadDir(c.sub(eye).normalize(), 2.2 * DEG, new THREE.Vector3());
-        const r = fireHitscan(game, this.owner.alive !== undefined ? this.owner : this, eye, dir, this.stats, '哨戒机枪');
         const m = this.muzzle.getWorldPosition(new THREE.Vector3());
-        game.effects.tracer(m, r.point, [2, 1.4, 0.6]); game.effects.muzzle(m, dir, 0.7, false);
+        game.effects.muzzle(m, dir, 0.7, false);
         game.audio.shot('turret', this.pos);
+        // 客户端的表现副本到这里为止：它没有权力裁决伤害（见类头注释）
+        if (this.dumb) return;
+        const r = fireHitscan(game, this.owner.alive !== undefined ? this.owner : this, eye, dir, this.stats, '哨戒机枪');
+        game.effects.tracer(m, r.point, [2, 1.4, 0.6]);
         if (r.ent && this.owner.isPlayer) { game.hud.hitmarker(r.killed); }
       }
     } else this.yaw += dt * 0.6;
@@ -547,11 +575,18 @@ class Sentry {
 }
 
 // ---------- 武装直升机 ----------
+// dumb 的含义与 Sentry 相同：权威端那一个真的开火，客户端那一个只飞、只放曳光。
 export class Heli {
   constructor(game, team, owner, opts = {}) {
     this.game = game; this.team = team; this.owner = owner; this.alive = true;
-    this.t = opts.duration || 45; this.ang = rng.next() * 6; this.fireT = 0; this.target = null; this.scanT = 0;
-    this.radius = Math.min(28, game.world.half * 0.55); this.height = opts.height || 24;
+    this.dumb = !!opts.dumb;
+    this.t = opts.duration || 45;
+    // ang 是航线的相位。它是**每个实例各自的随机起点**，所以联机下必须由创造它的那一端
+    // 决定并广播出去（事件里带 ang）—— 客户端各抽一次的话，两边的直升机不在同一条航线上。
+    this.ang = opts.ang !== undefined ? opts.ang : rng.next() * 6;
+    this.fireT = 0; this.target = null; this.scanT = 0;
+    this.radius = opts.radius || Math.min(28, game.world.half * 0.55);
+    this.height = opts.height || 24;
     this.stats = { dmgNear: 26, dmgFar: 22, rangeNear: 30, rangeFar: 80, headMul: 1.2, name: '武装直升机' };
     this.mesh = buildHeli(team === game.player.team ? 0x3a4a3a : 0x2a2a2a);
     this.rotor = this.mesh.userData.rotor; this.tail = this.mesh.userData.tail;
@@ -592,10 +627,13 @@ export class Heli {
       if (this.fireT <= 0 && this.enter <= 0) {
         this.fireT = 0.09;
         const dir = spreadDir(c.clone().sub(this.pos).normalize(), 2.6 * DEG, new THREE.Vector3());
-        const shooter = { team: this.team, isPlayer: false, name: '武装直升机', kills: undefined, alive: true };
-        const res = fireHitscan(game, this.owner && this.owner.isPlayer ? this.owner : shooter, this.pos.clone().add(new THREE.Vector3(0, -1, 0)), dir, this.stats, '武装直升机');
-        game.effects.tracer(this.pos.clone().add(new THREE.Vector3(0, -1.2, 0)), res.point, [2, 1.3, 0.5]);
+        const muzzle = this.pos.clone().add(new THREE.Vector3(0, -1, 0));
         game.audio.shot('turret', this.pos);
+        // 客户端的表现副本：曳光打到"我本地看到的那个人"身上就够，不裁决伤害
+        if (this.dumb) { game.effects.tracer(muzzle, c.clone(), [2, 1.3, 0.5]); return; }
+        const shooter = { team: this.team, isPlayer: false, name: '武装直升机', kills: undefined, alive: true };
+        const res = fireHitscan(game, this.owner && this.owner.isPlayer ? this.owner : shooter, muzzle, dir, this.stats, '武装直升机');
+        game.effects.tracer(muzzle, res.point, [2, 1.3, 0.5]);
         if (res.ent && this.owner && this.owner.isPlayer) game.hud.hitmarker(res.killed);
       }
     } else look = this.ang + Math.PI;

@@ -1,11 +1,13 @@
 // 战斗系统：弹道判定、伤害、爆炸、投掷物
 import * as THREE from 'three';
 import { mat } from './materials.js';
-// rand 在这里必须是**画面流**（crandRange）：下面唯一的用处是手雷尾烟的粒子速度。
+// crand 在这里必须是**画面流**（crandRange）：下面唯一的用处是手雷尾烟的粒子速度。
 // 走了玩法流的话，"这颗雷在飞"就会消耗权威随机数 —— 而有没有渲染器、渲染器这一帧跑不跑
 // 这段，两端本来就不一样，于是服务端和浏览器从流的不同位置取值，机器人下一秒的散布就分叉。
 // 实测：Node 比 Chrome 多抽 3 次，正好是这一行一次的量。
-import { crandRange as rand, clamp, raySphere, rayAABB } from './util.js';
+// rand 是**玩法流**，只有连杀奖励的落点抖动用它 —— 那件事在权威端要可复现（见
+// clusterStrike 上方），所以在两端都跑得到的那条流上。
+import { crandRange as crand, rand, clamp, raySphere, rayAABB } from './util.js';
 
 const _p = new THREE.Vector3(), _q = new THREE.Vector3();
 
@@ -155,7 +157,7 @@ export class Projectile {
         this.pos.copy(next);
       }
       this.vel.y -= 1.5 * dt;
-      g.effects.smoke.emit({ x: this.pos.x, y: this.pos.y, z: this.pos.z, vx: rand(-0.3, 0.3), vy: rand(0, 0.4), vz: rand(-0.3, 0.3), drag: 1, life: 1.6, s0: 0.2, s1: 1.2, c0: [0.7, 0.7, 0.7], a0: 0.4 });
+      g.effects.smoke.emit({ x: this.pos.x, y: this.pos.y, z: this.pos.z, vx: crand(-0.3, 0.3), vy: crand(0, 0.4), vz: crand(-0.3, 0.3), drag: 1, life: 1.6, s0: 0.2, s1: 1.2, c0: [0.7, 0.7, 0.7], a0: 0.4 });
       g.effects.add.emit({ x: this.pos.x, y: this.pos.y, z: this.pos.z, vx: 0, vy: 0, vz: 0, life: 0.06, s0: 0.4, s1: 0.2, c0: [5, 3, 1], a0: 1 });
       this.mesh.position.copy(this.pos);
       this.mesh.lookAt(_p.copy(this.pos).add(this.vel));
@@ -238,4 +240,74 @@ export class Projectile {
     }
   }
   remove() { this.alive = false; this.game.scene.remove(this.mesh); }
+}
+
+// ---------- 连杀奖励：呼叫之后要发生什么 ----------
+//
+// 这一对函数是"呼叫 → 生效"这条链路的**后半段**；前半段（谁有资格呼叫、什么时候就绪）
+// 在 js/match-rules.js:StreakBook。单机 js/mp.js 与联机 server/room.mjs 共用这一对。
+//
+// 为什么后半段也要共用：只共用一半等于没共用。联机里的空袭晚到一秒、白磷弹少烧一个人，
+// 这种差异不会报错，只会让"联机是不是个残废版"这个疑问一直挂着 —— 而这正是这一轮
+// 要收掉的那类**静默失效**。
+//
+// 两个函数都只依赖 game / clock / owner 这三样，所以权威端（HeadlessGame + NetRoom）
+// 拿来就能跑：game.effects / game.audio 在那边是桩，投弹是真的（进 game.projectiles，
+// 由 HeadlessGame.step 每拍推进并爆炸）。
+
+// 集束空袭的一串常数：它们互相咬合（落点间隔 × 9 颗 ≈ 弹幕宽度），改一个要连着看。
+const CLUSTER_N = 9;             // 九颗
+const CLUSTER_SPACING = 3.2;     // 落点沿弹道方向间隔（m）
+const CLUSTER_ALT = 45;          // 投放高度（m）
+const CLUSTER_FALL = 1.6;        // 从投放高度落到地面要几秒
+const CLUSTER_LEAD = 84;         // 呼叫到开始投弹：1.4 s @60Hz
+const CLUSTER_STAGGER = 110 / 1000 * 60;   // 每颗之间 110 ms = 6.6 拍
+
+// pos 是弹幕中心，ang 是弹幕铺开的方向（弧度，世界 XZ 平面）。
+// 九颗的落点与初速**在这一刻全部算好**，clock 只负责"什么时候投" —— 抽数与投弹绑在
+// 一起的话，随机流的位置就跟"第几拍投"挂钩，而那条时序以前是墙钟的。
+export function clusterStrike(game, clock, pos, owner, ang) {
+  const dir = new THREE.Vector3(Math.cos(ang), 0, Math.sin(ang));
+  game.audio.whoosh(pos);
+  const drops = [];
+  for (let i = 0; i < CLUSTER_N; i++) {
+    const p = pos.clone().addScaledVector(dir, (i - (CLUSTER_N - 1) / 2) * CLUSTER_SPACING)
+      .add(new THREE.Vector3(rand(-1.5, 1.5), 0, rand(-1.5, 1.5)));
+    const start = p.clone().addScaledVector(dir, -25); start.y = CLUSTER_ALT;
+    const v = p.clone().sub(start); const T = CLUSTER_FALL;
+    drops.push({ start, vel: new THREE.Vector3(v.x / T, (v.y + 0.5 * 12 * T * T) / T, v.z / T) });
+  }
+  // 九颗的投放时刻**一次排完**（第 84 拍起，每颗隔 6.6 拍），而不是"第 84 拍的回调里
+  // 再排剩下八颗"：排程器的到期队列是在这一轮走完之后才收新任务的，嵌套排程会让
+  // 第二颗起整体多等一拍 —— 而"弹幕的节奏"是手感的一部分，不是可以晚一拍的东西。
+  for (let i = 0; i < CLUSTER_N; i++) {
+    const d = drops[i];
+    clock.after(CLUSTER_LEAD + Math.round(i * CLUSTER_STAGGER), () => {
+      if (game.world) game.projectiles.push(new Projectile(game, 'bomb', d.start, d.vel, owner, 10));
+    });
+  }
+}
+
+// 白磷弹：立刻给 targets 每人 55 点（无视掩体的灼烧），再按拍点着 12 处火。
+// 火的**位置**也在这里抽好，理由同上。
+// 注意伤害是在**这一拍**结清的，而"持续灼烧"由调用方按 wpTicks 在 update 里每拍结算 ——
+// 后者读的是规则内核里的那个计时器，不是这里。
+export function phosphorusSweep(game, clock, owner, targets, spread = 12, staggerTicks = 15) {
+  for (const e of targets) {
+    e.takeDamage(55, { attacker: owner, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) });
+  }
+  const spots = [];
+  for (let i = 0; i < spread; i++) spots.push(game.world.randomWalkable());
+  for (let i = 0; i < spread; i++) {
+    const p = spots[i];
+    // 第一处火排在**下一拍**而不是"这一拍立刻"：排程器的到期队列是在这一轮走完之后
+    // 才收新任务的，所以 0 拍就是"下一次 step"。写 Math.max(1, …) 是为了让这个语义
+    // 显式可见 —— 它和 0 的结果一样，但读的人不必去推排程器内部。
+    clock.after(Math.max(1, i * staggerTicks), () => {
+      if (!game.world) return;
+      game.effects.explosion(p, 0.8);
+      game.audio.explosion(p, 0.5);
+      game.effects.addFireSource(p.clone().setY(0.1), 1.5, 8);
+    });
+  }
 }

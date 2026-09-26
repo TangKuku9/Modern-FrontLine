@@ -3,7 +3,7 @@
 // 定死小端 + 定点量化，不用 JSON：联网的第一原则是"包大小可预测"。
 // 量化定义在 js/quant.js，两端 import 同一份 —— 两边各抄一份的症状是"对面的人在抖"，
 // 而不是报错。每个 pack/unpack 的最大误差由本文件的自测实测印出，不写猜的数。
-import { Q, FLAG, packInput, unpackInput } from '../js/quant.js';
+import { Q, FLAG, packInput, unpackInput, packStreak, unpackStreak, STREAK_NONE, STREAK_MAX } from '../js/quant.js';
 
 export { Q, FLAG };
 
@@ -89,7 +89,7 @@ export function decodeSnapshot(buf) {
   return { tick, seq, worldFlags, rngState, entities, byteLength: o };
 }
 
-// 上行输入：一个 tick 一份，15 字节定长。
+// 上行输入：一个 tick 一份，16 字节定长。
 // buttons 从 8 位加宽到 16 位：投掷物要同时表达"按下"和"按住"，8 位装不下
 // （原来把 lethal 的按住位接到开火位上，按住右键就会掏手雷）。
 // view（u16）：发出这一拍时，客户端屏幕上渲染的是服务端的哪一拍（低 16 位）。
@@ -98,7 +98,12 @@ export function decodeSnapshot(buf) {
 // 于是服务端和客户端各有一份"延迟模型"，改一个忘一个的症状是"高延迟下总是差一点"；
 // 直接报拍号则不需要任何模型，而且能被 lastSnapSent 卡住上限（服务端真发过的那些拍）。
 // 顺带一个好处：它让"客户端到底看的是哪一拍"这件事在排障时是可读的，而不是一个差值。
-export const INPUT_SIZE = 15;
+// streak（u8）：这一拍按了 3/4/5 里的哪一个（0/1/2），没按是 0xff。
+// 它必须是**按下沿**而不是"按住"：Digit3 只进 main.js 的 pressed 表，只在一拍为真，
+// 所以上行的每一条里最多有一条带请求 —— 服务端不需要自己做边沿检测，也就没有
+// "按住不放会一直呼叫"那种错。以前这个字段只存在于客户端（js/main.js:snapshotInput），
+// 从来没进过协议，于是联机下按 3 呼叫 UAV 是**真的什么都不做**。
+export const INPUT_SIZE = 16;
 export function encodeInput(inp) {
   const v = new DataView(new ArrayBuffer(INPUT_SIZE));
   v.setUint32(0, inp.tick >>> 0, true);
@@ -108,6 +113,7 @@ export function encodeInput(inp) {
   v.setUint16(10, inp.buttons & 0xffff, true);
   v.setUint16(12, inp.view & 0xffff, true);
   v.setUint8(14, inp.seq & 0xff, true);
+  v.setUint8(15, packStreak(inp.streak ?? -1), true);
   return v;
 }
 export function decodeInput(buf) {
@@ -120,6 +126,7 @@ export function decodeInput(buf) {
     buttons: v.getUint16(10, true),
     view: v.getUint16(12, true),
     seq: v.getUint8(14),
+    streak: unpackStreak(v.getUint8(15)),
   };
 }
 
@@ -156,11 +163,20 @@ if (typeof process !== 'undefined' && __base(process.argv[1] || '') === __base(i
   console.log(`  快照：16 人 ${byteLength} 字节 = ${(byteLength / 16).toFixed(1)} B/人（含头 ${HEADER_SIZE} B）`);
   console.log(`        @20Hz 下行 ${(byteLength * 20 * 8 / 1000).toFixed(1)} kbps，@30Hz ${(byteLength * 30 * 8 / 1000).toFixed(1)} kbps`);
   console.log(`  最大量化误差：位置 ${(maxPos * 100).toFixed(2)} cm · yaw ${maxYaw.toExponential(1)} rad · pitch ${maxPitch.toExponential(1)} rad · 速度 ${maxVel.toFixed(3)} m/s`);
-  const inp = { tick: 4294967295, mdx: 3.7, mdy: -1.25, keys: 0b1011, buttons: 5, seq: 200, view: 65437 };
+  const inp = { tick: 4294967295, mdx: 3.7, mdy: -1.25, keys: 0b1011, buttons: 5, seq: 200, view: 65437, streak: 2 };
   const ib = decodeInput(encodeInput(inp));
-  const lossless = ib.tick === inp.tick && ib.keys === inp.keys && ib.buttons === inp.buttons && ib.seq === inp.seq && ib.view === inp.view;
-  console.log(`  输入包 ${INPUT_SIZE} B：整数字段${lossless ? '原样' : '失真'}（含延迟补偿的 view ${inp.view}→${ib.view}），视线位移 ${inp.mdx}→${ib.mdx.toFixed(4)} / ${inp.mdy}→${ib.mdy.toFixed(4)}（步长 0.01）`);
+  const lossless = ib.tick === inp.tick && ib.keys === inp.keys && ib.buttons === inp.buttons && ib.seq === inp.seq && ib.view === inp.view && ib.streak === inp.streak;
+  console.log(`  输入包 ${INPUT_SIZE} B：整数字段${lossless ? '原样' : '失真'}（含延迟补偿的 view ${inp.view}→${ib.view}、连杀呼叫 ${inp.streak}→${ib.streak}），视线位移 ${inp.mdx}→${ib.mdx.toFixed(4)} / ${inp.mdy}→${ib.mdy.toFixed(4)}（步长 0.01）`);
   if (!lossless) process.exit(1);
+  // streak 的边界：它是一个 u8，而"没请求"用 0xff 表示 —— 这两个值必须分得开，
+  // 因为服务端拿它当"要不要呼叫连杀奖励"的唯一输入。回绕成 255 当成了槽位下标，
+  // 症状是"按了别的键也会呼叫"，而 StreakBook.take 的边界检查会挡住它。
+  for (const s of [-1, 0, 2, 7, 8, 99, STREAK_NONE]) {
+    const got = decodeInput(encodeInput({ tick: 0, mdx: 0, mdy: 0, keys: 0, buttons: 0, seq: 0, view: 0, streak: s })).streak;
+    const want = s === STREAK_NONE ? -1 : (s >= 0 && s < STREAK_MAX ? s : -1);
+    if (got !== want) { console.log(`    ❌ streak ${s} → ${got}（应为 ${want}）`); process.exit(1); }
+  }
+  console.log(`  连杀呼叫 u8 往返：-1/0/2/7 原样，8/99/0xff 一律落到"没请求"`);
   // view 是 u16 全量程的：延迟补偿要拿它跟服务端拍号对齐，所以它不是"小数字"，
   // 两个端点必须原样回来（曾经有字段在这里被当成有符号数，回绕值直接变负）。
   for (const v of [0, 1, 32767, 32768, 65535]) {

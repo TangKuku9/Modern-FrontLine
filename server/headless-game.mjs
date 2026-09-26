@@ -85,7 +85,9 @@ export class HeadlessGame {
     this.events.push({ e: 'kill', tick: this.tick, killer: killer && killer.name, victim: victim && victim.name, weapon, head: !!head });
     if (this.mode && this.mode.onKill) this.mode.onKill(killer, victim, weapon, head, info || {});
   }
-  alertGroup(g, pos) { if (this.mode && this.mode.alertGroup) this.mode.alertGroup(g, pos); }
+  // ai.js 不看返回值，但**判据要看**：它是"这一跳真的接通了、扩散了几个人"的唯一读数。
+  // 一个不返回值的转发会让 test/mp-rules.mjs 只能去数副作用，而那正是"量空气"的形状。
+  alertGroup(g, pos) { return this.mode && this.mode.alertGroup ? this.mode.alertGroup(g, pos) : undefined; }
   addBot(bot) { this.bots.push(bot); this.entities.push(bot); return bot; }
   removeBot(bot) {
     if (bot.dispose) bot.dispose();

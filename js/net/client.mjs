@@ -5,11 +5,13 @@
 // 把状态恢复到快照那一 tick，再把那之后已经产生的输入逐个重跑一遍。
 // 之所以重放得起，是因为 P0 那几件事：固定步长、玩法随机流可播种、
 // 权威侧不碰渲染。重放时把世界侧副作用（命中、特效、噪声）关掉，只重跑自身状态。
-import { NetPlayer, INTERP_DELAY } from './remote.mjs';
-import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
-import { packInput, teamId, weaponId, FLAG } from '../quant.js';
+import * as THREE from 'three';
+import { NetPlayer, INTERP_DELAY } from './remote.mjs';import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
+import { packInput, teamId, weaponId, FLAG, WORLD, uavBit } from '../quant.js';
+import { uavFromFlags } from '../match-rules.js';
 import { rollback } from './predict.mjs';
 import { clamp } from '../util.js';
+import { Sentry, Heli } from '../mp.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
 // 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
@@ -40,6 +42,17 @@ export class NetClient {
     this.cfg = { map: 'yard', mode: 'tdm' };
     this.streakState = [];
     this.over = false;
+    // —— 对局规则（连杀奖励 / UAV / 记分板）——
+    // 规则的真相全在权威端（server/room.mjs + js/match-rules.js），客户端这边只做两件事：
+    //   ① 把"我按了 3/4/5"编进上行输入（streak 那一个字节）；
+    //   ② 把服务端下发的规则事件翻译成 HUD/音效/本地实体。
+    // 以前这里连槽位表都没有（streakState = []），而 main.js 的 snapshotInput 照样在报
+    // 3/4/5 —— 报了也没人收（那一位根本不在协议里）。症状是"按了没反应"，不报错。
+    this.streakDefs = [];
+    this.streakProgress = 0;
+    this.worldFlags = 0;
+    this.board = null;                                // 最近一份记分板（每 2 秒一条事件）
+    this.turrets = new Map();                         // netId -> 本地表现副本（哨戒机枪 / 直升机）
   }
 
   connect() {
@@ -102,6 +115,14 @@ export class NetClient {
     if (j.t === 'welcome') {
       this.cid = j.cid; this.serverTick = j.tick; this.mapId = j.map;
       this.welcome = j;
+      // 连杀奖励的槽位表由服务端给：**按 3/4/5 各是什么、每个要几杀**，这两件事的真相
+      // 在权威端（js/match-rules.js 的账本里）。客户端自己按 data.js 那份渲染的话，
+      // 服务端换一项、客户端还显示旧的 —— 症状是"按了没反应"，正是这一轮要消灭的东西。
+      // 成本里含"强硬路线"的减 1：净化后的 loadout 在 j.loadout 里（服务端重建的那一份，
+      // 客户端按它配枪，所以也按它算成本）。
+      const disc = (((j.loadout || {}).perks) || []).includes('hardline') ? 1 : 0;
+      this.streakDefs = Array.isArray(j.streaks) ? j.streaks : [];
+      this.streakState = this.streakDefs.map(d => ({ id: d.id, ready: false, used: false, cost: Math.max(2, d.kills - disc) }));
       // 名字不在二进制快照里（变长字段会毁掉定长包），靠 welcome + join 事件带
       for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team });
       this.snapGap = 0;         // 看门狗的基线：从进场这一刻开始数"多久没收到快照"
@@ -175,7 +196,12 @@ export class NetClient {
     this.history.push({ tick: t16, inp, j: this.game.player ? this.game.player.journal() : null, debt: this.repForgotten | 0 });
     if (this.history.length > HISTORY) this.history.shift();
     const packed = packInput(inp);
-    this.pending.push({ tick: t16, mdx: inp.mdx, mdy: inp.mdy, keys: packed.keys, buttons: packed.buttons, view: this.viewTick, seq: t16 & 0xff });
+    // streak = "这一拍我按了 3/4/5 里的哪一个"（没按是 -1，编码后 0xff）。
+    // 它必须是**按下沿**：Digit3 只进 main.js 的 pressed 表，只在一拍为真，所以上行的
+    // 每一条里最多有一条带请求 —— 服务端不需要自己再做边沿检测。不在这里过滤
+    // "我这边觉得就绪了吗"：唯一的裁决者是服务端，客户端自己拦会把
+    // /healthz 的 streak.rejected 读数搞脏（那个数存在的意义正是"客户端与服务端的账对不上"）。
+    this.pending.push({ tick: t16, mdx: inp.mdx, mdy: inp.mdy, keys: packed.keys, buttons: packed.buttons, view: this.viewTick, seq: t16 & 0xff, streak: inp.streak });
   }
   flush() {
     if (!this.ws || this.ws.readyState !== 1 || !this.pending.length) return;
@@ -195,6 +221,10 @@ export class NetClient {
     if (this.snapLog.length > 24) this.snapLog.shift();
     this.lastSnap = snap;                               // 测试与 netdebug 要看原始下行
     this.lastRngState = snap.rngState >>> 0;
+    // 世界标志位：UAV（按队两位）、白磷弹、对局结束。**一个字节**，不按接收者过滤，
+    // 所以"哪一队有 UAV"要用两位分开表达（js/quant.js:WORLD 的注释）。
+    // 小地图读的就是它（hud.drawMinimap → mode.uavActive → 这里）。
+    this.worldFlags = snap.worldFlags | 0;
     const seen = new Set();
     for (const e of snap.entities) {
       seen.add(e.id);
@@ -584,14 +614,101 @@ export class NetClient {
         this.roster.set(ev.cid, { name: ev.name, team: ev.team });
         const r = this.remotes.get(ev.cid);
         if (r) r.setName && r.setName(ev.name, ev.team);
+      } else if (ev.e === 'streakReady') {
+        // 充能到线。槽位状态**由服务端推**，客户端不自己比 progress >= cost ——
+        // 那会让"什么时候算就绪"有两个真相，而两者对不上时玩家按下去没反应。
+        this.setStreakSlot(ev.id, { ready: true });
+        if (ev.cid === this.cid) {
+          const i = this.streakState.findIndex(s => s.id === ev.id);
+          this.game.hud.announce(`${ev.name} 就绪`, `按 [${i + 3}] 呼叫`, 2.5);
+          this.game.audio.say(ev.name + '已就绪'); this.game.audio.beep(3);
+        }
+      } else if (ev.e === 'streak') {
+        this.setStreakSlot(ev.id, { ready: false, used: true });
+        if (ev.cid === this.cid) this.game.audio.say(ev.name + '已呼叫');
+      } else if (ev.e === 'turret') {
+        this.spawnTurret(ev);
+      } else if (ev.e === 'gone') {
+        this.removeTurret(ev.netId);
+      } else if (ev.e === 'announce') {
+        // team 是**呼叫者的队**，是按接收者过滤不了的那种广播 —— 所以"敌方"这个词
+        // 在这里加，而不是让服务端给每个人各编一份文案。
+        const mine = ev.team === this.team;
+        this.game.hud.announce(ev.text, mine ? '' : '敌方', 2.5);
+        this.game.audio.say((mine ? '' : '敌方') + ev.text);
+      } else if (ev.e === 'firstBlood') {
+        if (ev.cid === this.cid) this.game.hud.popup('首杀', '', true);
+      } else if (ev.e === 'board') {
+        this.board = ev;
+        this.scores.A = ev.scores.A; this.scores.B = ev.scores.B;
+        this.timeLeft = ev.timeLeft;
+        const me = (ev.rows || []).find(r => r.cid === this.cid);
+        this.streakProgress = me ? (me.sk | 0) : 0;
+      } else if (ev.e === 'matchOver') {
+        this.over = true; this.matchWinner = ev.winner;
+        const mine = ev.winner === this.team;
+        this.game.hud.announce(mine ? '胜利' : ev.winner === 'draw' ? '平局' : '失败', '', 4);
+        this.game.audio.say(mine ? '胜利' : '失败');
+        this.game.hud.showScoreboard(true);
       }
     }
     if (this.events.length > 64) this.events.splice(0, this.events.length - 64);
   }
 
-  // 作为 game.mode 的接口：对局推进在服务端，本地按拍没有额外要做的事。
-  // 远端实体的插值刻意不放这里 —— 那要按渲染帧走才会顺。
-  update(dt, inp) {}
+  // 作为 game.mode 的接口：对局推进在服务端，本地按拍没有额外要算的东西 ——
+  // 但**规则侧读数要刷到屏幕上**：连杀槽、比分/时间条、白磷弹的屏幕效果。
+  // 它们全都来自服务端的推送（事件 + 世界标志位），这里一行判断都不做。
+  // 判断留在这边的话，"什么时候算就绪"就有了两个真相。
+  update(dt, inp) {
+    const hud = this.game.hud;
+    hud.streaks(this.streakDefs.length ? this.streakState : null, Math.floor(this.streakProgress));
+    // 比分条按 6Hz 刷（每 10 拍）而不是每拍：它是 innerHTML 赋值，60Hz 刷会白掉帧。
+    // 时间条走到秒都看得见，6Hz 足够。
+    if ((this.localTick % 10) === 0) {
+      const t = Math.max(0, this.timeLeft | 0);
+      const mm = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+      hud.scorebar(`<div class="sb-team a">${Math.floor(this.scores.A)}</div><div class="sb-time">${mm}</div><div class="sb-team b">${Math.floor(this.scores.B)}</div>`);
+    }
+    // 白磷弹的屏幕效果：权威端在放它时把 WhitePhosphorus 位置 10 秒，快照每拍带过来。
+    // 这一位以前从来没被写过（server/room.mjs 的 worldFlags 硬编码 0），于是联机里
+    // 白磷弹除了扣血什么表现都没有。
+    this.game.grade.uniforms.wp.value = (this.worldFlags & WORLD.WhitePhosphorus) ? 0.6 : 0;
+  }
+
+  // ---------- 连杀奖励在本地的表现 ----------
+  setStreakSlot(id, patch) {
+    const s = this.streakState.find(x => x.id === id);
+    if (s) Object.assign(s, patch);
+  }
+
+  // 权威端放的哨戒机枪 / 武装直升机，在客户端建一个**不开火**的同形副本（dumb）。
+  // 位置/相位/寿命都来自事件 —— 客户端各抽一份的话，两边的直升机不在同一条航线上；
+  // 而"谁被它打中"这件事只有权威端说了算（副本开火会打出第二份伤害，快到没人能察觉
+  // 是它错了，只会觉得"这一局死得特别快"）。
+  spawnTurret(ev) {
+    const g = this.game;
+    if (!g.world) return;                              // 地图还没加载完的窗口里收到一条迟到的事件
+    const mine = ev.team === (g.player && g.player.team);
+    const owner = { team: ev.team, isPlayer: mine, alive: true, yaw: ev.yaw || 0 };
+    let ent;
+    if (ev.kind === 'sentry') {
+      ent = new Sentry(g, new THREE.Vector3(ev.x, ev.y, ev.z), owner, { dumb: true, duration: ev.dur });
+    } else {
+      ent = new Heli(g, ev.team, owner, { dumb: true, duration: ev.dur, ang: ev.ang, height: ev.height, radius: ev.radius });
+    }
+    ent.netId = ev.netId;
+    this.turrets.set(ev.netId, ent);
+  }
+
+  removeTurret(netId) {
+    const t = this.turrets.get(netId);
+    if (!t) return;
+    if (t.dispose) t.dispose();
+    if (t.mesh && t.mesh.parent) t.mesh.parent.remove(t.mesh);
+    const i = this.game.entities.indexOf(t);
+    if (i >= 0) this.game.entities.splice(i, 1);
+    this.turrets.delete(netId);
+  }
 
   // 每渲染帧一次：驱动远端实体的插值
   frameUpdate(dt) {
@@ -608,11 +725,31 @@ export class NetClient {
       if (this.snapGap > 2.5) this.markLost('stale', '已经 2.5 秒没收到服务器状态');
     }
     for (const r of this.remotes.values()) r.update(dt, now);
+    // 连杀奖励的表现副本按渲染帧走（它们只做动画与朝向，没有要裁决的东西）。
+    // 寿命到点由权威端的 gone 事件说了算，这里的 this.t 只是兜底。
+    for (const t of this.turrets.values()) t.update(dt);
   }
 
   spawnPoint() { return { pos: this.game.player ? this.game.player.pos.clone() : null, yaw: 0 }; }
-  uavActive() { return false; }
+
+  // 小地图的 UAV 效果。hud.drawMinimap 拿它决定"要不要把敌人画出来"，
+  // 而敌人位置本来就在客户端手上（remotes 的插值结果）—— 所以这里只需要回答
+  // 一个问题：**我的队现在有没有 UAV**。答案在世界标志位里（两位，按队查）。
+  uavActive(team) { return uavFromFlags(this.worldFlags, team || this.team); }
+
+  minimapMarkers() { return []; }
+
+  scoreboardHTML() {
+    const row = (r) => `<tr class="${r.cid === this.cid ? 'me' : ''}"><td>${r.name}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>-</td></tr>`;
+    const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
+    const rows = (this.board && this.board.rows) || [];
+    const A = rows.filter(r => r.team === this.team), B = rows.filter(r => r.team !== this.team);
+    return head(`我方 · ${Math.floor(this.scores.A)}`, 'A') + A.map(row).join('') + '</table>'
+      + head(`敌方 · ${Math.floor(this.scores.B)}`, 'B') + B.map(row).join('') + '</table>';
+  }
+
   dispose() {
+    for (const t of [...this.turrets.values()]) this.removeTurret(t.netId);
     for (const r of this.remotes.values()) r.dispose();
     this.remotes.clear();
     if (this.ws) this.ws.close();
