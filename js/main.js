@@ -23,6 +23,7 @@ import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS } from './data.js';
 import { repairClass } from './loadout.mjs';
 import { damp } from './util.js';
+import { Account } from './account.js';
 
 const GradeShader = {
   uniforms: { tDiffuse: { value: null }, time: { value: 0 }, nvg: { value: 0 }, thermal: { value: 0 }, hurt: { value: 0 }, vig: { value: 0.35 }, wp: { value: 0 }, res: { value: new THREE.Vector2(1, 1) } },
@@ -76,6 +77,9 @@ class Game {
     this.frameTicks = 0;
     this.netDebug = /[?&]netdebug=1/.test(location.search);
     this.online = /[?&]online=1/.test(location.search);
+    // 账号：只用来决定菜单显示什么。**它不是权限** —— 判定在服务端每一次请求里重做，
+    // 客户端把自己标成"已登录"改不动任何东西。这一点是设计，不是遗漏。
+    this.account = new Account();
     this.entities = []; this.bots = []; this.projectiles = []; this.pickups = []; this.noises = [];
     this.mat = mat;
     this.input = { keys: {}, pressed: {}, mdx: 0, mdy: 0, buttons: 0, wheel: 0 };
@@ -132,6 +136,27 @@ class Game {
     txt.textContent = '正在构建菜单场景…';
     await new Promise(r => setTimeout(r, 10));
     this.menu = new Menu(this);
+    // ── 账号状态**不在启动时问**。这一条是量出来的，不是审美 ──
+    // 原先这里在构造函数里就连着问一次 /api/status 和 /api/me。代价是：
+    // **每一次进入对战页（?online=1，包括 test/net-play.mjs）都在页面加载里多挤两次 HTTP 请求**，
+    // 而那正好是权威端 addClient 与客户端第 0 拍对齐的那一瞬间。
+    // 实测（同一台机器，同一份代码）：
+    //   · 带着这两次请求：net-play 的"稳态预测与权威端同刻偏差" 5 次里红 4 次（0.144 ~ 0.223 m）；
+    //   · 把这两次请求摘掉：2 次全绿（0.0108 / 0.0742 m）；
+    //   · HEAD（b79aeb6，根本没有账号层）：3 次全绿（0.0110 / 0.0763 / 0.0120 m）。
+    // 红的那一条是**已知形状**：残差 0.1484 m ÷ 4.46 m/s × 60Hz = 2.00 拍，方向沿行进方向 ——
+    // 就是 c99f51f 修掉的那条"空跑落在首次消费之前"的 2 拍残差（见 js/net/predict.mjs 的 opts.carry）。
+    // 也就是说这两次请求本身没算错任何东西，它改的是**客户端第 0 拍相对权威端的相位**，
+    // 让那几拍的补演顺序落回了会露出 2 拍残差的排布上。
+    //
+    // 成因只追到这一层：**"摘掉它就好了"是实测**，我**没有**把它追进 predict 的账本，
+    // 所以这里不写"因为相位所以账本如何如何"那种话 —— 那是没量过的归因。
+    // （要接着追的话，判据是 net-play 的 `稳态最大` 与 `客户端补演` 两栏一起看。）
+    //
+    // 而账号状态本来就**只在画菜单时才需要**：大厅要按"这个服要不要账号、我登没登录"渲染，
+    // 主菜单的档案卡要显示服务端那份经验值 —— 两件都发生在菜单上。
+    // 所以改成**按需拉**（showMain / renderAccountPanel）。顺带两个好处：
+    // ?online=1 直接进对局那条路上一次 /api/* 都不发；单机玩家不来问这件事。
     // 预编译着色器
     fill.style.width = '100%';
     window.addEventListener('resize', () => this.onResize());
@@ -143,6 +168,21 @@ class Game {
     else this.menu.showMain();
   }
 
+  // 按需拉一次账号状态（幂等）。**刻意不在构造函数里调** —— 成因与实测见上面那段。
+  // 两个调用点：menu.showMain()（主菜单的档案卡要服务端那份经验值）、
+  // renderAccountPanel（大厅要按策略渲染）。返回 promise 只为让调用方能等；
+  // 调用方都**不该**阻塞在它上面：连不上服务器不是错误，单机照玩。
+  accountSync() {
+    if (!this.account) return Promise.resolve();
+    if (this._acctSync) return this._acctSync;
+    this._acctSync = this.account.status().then(() => this.account.me()).then(() => {
+      // 登录之后把服务端那份经验值同步到本地档案上（显示用）。本地那份仍然可以被玩家改，
+      // 但它现在只是**一个显示用的副本** —— 真正的数在服务端，下一次 me() 会把它盖回去。
+      if (this.account.user) { this.profile.xp = this.account.user.xp | 0; this.saveProfile(); }
+    }).catch(() => { /* 连不上服务器不是启动错误：单机照玩 */ });
+    return this._acctSync;
+  }
+
   // ---------- 联机：?online=1 ----------
   // 本机玩家照常跑完整模拟（预测），远端玩家由 NetClient 喂插值，权威裁决在服务端。
   async startOnline() {
@@ -152,6 +192,11 @@ class Game {
     // 不交的话服务端按默认配置给你发枪 —— 于是"权威那侧的速度/射速/伤害"和你本地
     // 预测用的根本不是同一把枪，位置每收一份快照被拽一下，弹匣数字也对不上。
     const loadout = this.buildNetLoadout(this.profile.classes[this.profile.selClass] || DEFAULT_CLASSES[0]);
+    // name 仍然从 URL 读，但它在**要账号的服上不是身份** —— 服务端从握手时验过的会话里取呼号，
+    // join 帧里这一格不会被看（server/net-server.mjs 的 joinName）。
+    // 留着它有两个用处：访客可玩的服上它**就是**这一局的显示名（那条路上没有会话可依），
+    // 以及"连接中"那一屏能显示一个名字而不是"士兵"。
+    // 两种情况下真正的呼号都在连上之后由 welcome 覆盖（见 NetClient 的 onControl('welcome')）。
     const net = this.net = new NetClient(this, { name: q.get('name') || '士兵', team: q.get('team') || 'A', loadout });
     // 不带 ?room= 时交给服务端自动分配（fill-first，见 server/net-server.mjs:pickRoom）。
     // 默认写死一个房号会让每台新实例都从"互相看不见"开始。

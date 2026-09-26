@@ -16,7 +16,11 @@ const PORT = await new Promise((res, rej) => {
   const s = netServer();
   s.on('error', rej); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); });
 });
-const srv = spawn(process.execPath, ['server/net-server.mjs', String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAP: 'yard' } });
+// REQUIRE_ACCOUNT=0：这个探针量的是**游戏层**（加入 → 上行输入 → 快照 → 延迟补偿），
+// 所以刻意用访客身份跑。账号与闸门那一层由 test/hardening.mjs 专门量，两边不重复。
+// 不显式写这一条的话，服务端默认要求登录，下面每一条都会在"连不上"上红 ——
+// 而那看起来像网络问题。
+const srv = spawn(process.execPath, ['server/net-server.mjs', String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAP: 'yard', REQUIRE_ACCOUNT: '0' } });
 let srvLog = '';
 srv.stdout.on('data', d => { srvLog += d; });
 srv.stderr.on('data', d => { srvLog += d; });
@@ -60,9 +64,14 @@ const send = (c, buf) => c.ws.send(buf, { binary: true });
 
 const A = client('A'), B = client('B');
 await new Promise(r => setTimeout(r, 300));
-A.ws.send(JSON.stringify({ t: 'join', room: 'probe', name: '甲', team: 'A' }));
+// ── join 里的 name 必须是合法呼号（白名单 2~16 个字）──
+// 这个探针跑在访客可玩的服上（REQUIRE_ACCOUNT=0，见文件头），那条路上呼号没有会话可依、
+// 只能用自报的这个，于是服务端拿注册用的同一个白名单验它，不合法就直接**拒绝进场**。
+// 所以不能再写 '甲'：单字会被拒，而症状是"两个客户端都拿不到 cid"——看起来像网络坏了。
+// 第一版就是这么红的，红的是量具不是被测对象。名字具体叫什么无所谓，这里只要求它合法。
+A.ws.send(JSON.stringify({ t: 'join', room: 'probe', name: '探针甲', team: 'A' }));
 await sleep(200);
-B.ws.send(JSON.stringify({ t: 'join', room: 'probe', name: '乙', team: 'B' }));
+B.ws.send(JSON.stringify({ t: 'join', room: 'probe', name: '探针乙', team: 'B' }));
 for (let i = 0; i < 60 && !(A.cid && B.cid); i++) await sleep(50);
 ok('两个客户端都拿到 cid', A.cid === 1 && B.cid === 2, `A=${A.cid} B=${B.cid}`);
 ok('welcome 里带出生点', Array.isArray(A.welcome?.pos) && A.welcome.pos.length === 3);
@@ -162,7 +171,7 @@ ok(`模块按 text/javascript 发出（${js.ct}）`, js.code === 200 && /^text\/
   const C = client('丙');
   await sleep(150);
   const markC = (C.idsets || []).length;
-  C.ws.send(JSON.stringify({ t: 'join', room: 'other-' + PORT, name: '丙', team: 'A' }));
+  C.ws.send(JSON.stringify({ t: 'join', room: 'other-' + PORT, name: '探针丙', team: 'A' }));
   for (let i = 0; i < 60 && !(C.cid && A.idsets.length > markA + 4 && B.idsets.length > markB + 4); i++) await sleep(50);
   await sleep(250);
   const aTail = A.idsets.slice(markA), bTail = B.idsets.slice(markB), cTail = C.idsets.slice(markC);

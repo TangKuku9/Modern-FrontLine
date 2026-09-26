@@ -42,19 +42,29 @@ async function openPage(browser, name, team) {
   page.on('console', m => { if (m.type() === 'error' || m.type() === 'warning') logs.push(m.type() + ': ' + m.text()); });
   page.on('pageerror', e => logs.push('pageerror: ' + (e.stack || e.message)));
   page.on('response', r => { if (r.status() >= 400) logs.push(`HTTP ${r.status()} ${r.url()}`); });
+  // ── name 走 URL，它必须是**一个合法的呼号**（白名单 2~16 个字）──
+  // 这一份跑在访客可玩的服上（GUEST），那条路上呼号没有会话可依、只能用自报的这个，
+  // 于是服务端会拿注册用的同一个白名单去验它，不合法就**拒绝进场**（不是悄悄改成"访客"）。
+  // 所以这里不能再写 '甲'：单字会被拒，而症状是"两个窗口都拿不到 cid" —— 看起来像网络坏了。
+  // 第一版就是这么红的，红的是量具不是被测对象。
   await page.goto(`${BASE}?online=1&room=${ROOM}&name=${encodeURIComponent(name)}&team=${team}`, { waitUntil: 'domcontentloaded' });
   return { page, logs };
 }
 // 每个交互前把窗口带到前台：后台标签页的 rAF 会被降频，而降频会直接改变下面的读数
 const focus = async (p) => { await p.page.bringToFront(); await sleep(150); };
 
-const srv = await withServer();
+// 这些用例量的是**游戏层**（预测回滚、命中裁决、联机规则），所以刻意用访客身份跑
+// （REQUIRE_ACCOUNT=0）。账号与两道闸门由 test/hardening.mjs 专门量，两边不重复 ——
+// 而在这里再登一次录只会让每个用例都多一个和被测对象无关的失败面。
+// 不显式写这一条的话，服务端默认要求登录，下面全都会在"连不上"上红，看起来像网络问题。
+const GUEST = { REQUIRE_ACCOUNT: '0' };
+const srv = await withServer(GUEST);
 BASE = srv.base + '/index.html';
 const browser = await launch();
 let code = 0;
 try {
-  const A = await openPage(browser, '甲', 'A');
-  const B = await openPage(browser, '乙', 'B');
+  const A = await openPage(browser, '甲兵', 'A');
+  const B = await openPage(browser, '乙兵', 'B');
 
   // ---- 先决断言：两边都真的进了对局并拿到 cid。做不到就把控制台倒出来直接红 ----
   const boot = async (p) => {

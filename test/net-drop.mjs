@@ -14,6 +14,11 @@ import { DEFAULT_CLASSES } from '../js/data.js';
 const ARGS = ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--mute-audio',
   '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--disable-background-timer-throttling'];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 这四段量的是**掉线的可见性**（连接关掉、半开、进场被拒、存档被手改），
+// 所以刻意用访客身份跑（REQUIRE_ACCOUNT=0）。账号与两道闸门由 test/hardening.mjs
+// 专门量，不在这一份里重复 —— 在这里登一次录只会给每个用例多加一个无关的失败面。
+// 不显式写这一条的话服务端默认要求登录，四段全会在"连不上"上红，而那看着像网络问题。
+const GUEST = { REQUIRE_ACCOUNT: '0' };
 let n = 0, bad = 0;
 const ok = (label, cond, extra = '') => { n++; if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${label}${extra ? '  | ' + extra : ''}`); };
 
@@ -55,13 +60,15 @@ const newPage = async (browser, srv, tag, profile, query, viewport) => {
     }).observe(document, { childList: true, subtree: true, characterData: true });
   });
   // query 可以整段换掉：E 段量的是"从主菜单点进联机"，那第一页就不该带 ?online=1
-  await page.goto(`${srv.base}/index.html${query === undefined ? '?online=1&room=' + tag + '&name=甲&team=A' : query}`, { waitUntil: 'domcontentloaded' });
+  // name 必须是合法呼号（≥2 字）：这一份跑在访客可玩的服上，那条路上服务端会用注册的同一个
+  // 白名单验自报呼号，单字会被**拒绝进场**。详见 test/net-play.mjs 的 openPage 注释。
+  await page.goto(`${srv.base}/index.html${query === undefined ? '?online=1&room=' + tag + '&name=访客甲&team=A' : query}`, { waitUntil: 'domcontentloaded' });
   return { page, logs, ctx };
 };
 
 // 起一套"服务 + 页面"，并等到真的进了对局、拿到了快照
 async function boot(browser, tag) {
-  const srv = await withServer();
+  const srv = await withServer(GUEST);
   const { page, logs } = await newPage(browser, srv, 'drop-' + tag);
   for (let i = 0; i < 160; i++) {
     const s = await page.evaluate(() => !!(window.game && window.game.net && window.game.net.cid && window.game.net.snaps > 5));
@@ -154,7 +161,7 @@ try {
     // 了一个类方法里根本不存在的 rej（那是 connect() 里 Promise 执行函数的局部变量）——
     // 症状不是报错而是**永远停在"正在连接对局服务…"**：throw 发生在 clearTimeout 之后，
     // 于是 connect() 既没 resolve 也没 reject，await 挂死。两头都要断言：页面上有原因、且没 pageerror。
-    const srv = await withServer({ MAX_CLIENTS: '1' });
+    const srv = await withServer({ ...GUEST, MAX_CLIENTS: '1' });
     const first = await newPage(browser, srv, 'cap-c');
     let gotIn = false;
     for (let i = 0; i < 160; i++) {
@@ -202,7 +209,7 @@ try {
     //       两端共用同一张表之后深比较永远成立，那就什么都没量到）。
     // 闸门本身的重建规则由 server/deploy-probe.mjs 用原始 ws 帧量 —— 浏览器发不出非法配装，
     // 因为它自己就先按同一张表修好了。
-    const srv = await withServer();
+    const srv = await withServer(GUEST);
     // 五套职业是 Game 构造函数守着的不变量（js/main.js:65：classes.length<5 就整套换回默认），
     // 所以"越权"只能长在一份合法形状的 profile 里 —— 只给一套的话读到的全是系统预设，
     // 这一段会全绿而什么都没量到（上一版就是这么错的，我还先怪到了 Playwright 头上）。
@@ -258,7 +265,7 @@ try {
     console.log('\n── E：联机入口在菜单里，不用手打网址 ──');
     // 联机的代码早就在了，但要玩家自己敲 ?online=1&room=… 才算真的有这个模式吗？不算。
     // 这一段就从主菜单开始用鼠标点：联网对战 → 填呼号 → 选阵营 → 加入对局，看它到不到得了局内。
-    const srv = await withServer();
+    const srv = await withServer(GUEST);
     // 视口给成玩家真会用的大小：480×270 是其余几段为了软件渲染快用的，那种尺寸下
     // 菜单本来就滚不到按钮，拿它来点"加入对局"只会量到视口，量不到入口。
     const { page, logs } = await newPage(browser, srv, 'menu-e', null, '', { width: 1280, height: 720 });
@@ -294,7 +301,7 @@ try {
     ok('点"加入对局"之后真的换页进了局内（拿到 cid 且在收快照）',
       /online=1/.test(landed.url) && !!landed.cid && landed.snaps > 3, JSON.stringify(landed).slice(0, 150));
     ok('大厅里选的阵营带进了对局（B 队不是写在表单上就完事）', landed.team === 'B', 'team=' + landed.team + ' url=' + landed.url);
-    ok('呼号带进去了（服务端按 24 字截，中文不该被截坏）', landed.name === '菜单甲', JSON.stringify(landed.name));
+    ok('呼号带进去了（服务端按白名单收 2~16 字，中文不该被截坏）', landed.name === '菜单甲', JSON.stringify(landed.name));
     ok('没填房间时不往 URL 里塞 room=（让服务端去做 fill-first 分配）', !/room=/.test(landed.url), landed.url);
     ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
     srv.kill();

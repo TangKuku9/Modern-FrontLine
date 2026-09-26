@@ -18,6 +18,26 @@ import { gzipSync } from 'node:zlib';
 import { WebSocketServer } from 'ws';
 import { NetRoom, DT, SNAP_EVERY } from './room.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
+import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
+import { normalizeName, validName, NAME_RULE_TEXT } from './accounts.mjs';
+
+// ── 进房时那个呼号从哪来：一个来源，但分两种情况，而且判据只有这一处 ──
+//   · 要账号的服（默认）：来自**握手那一刻验过的会话**，join 里的 name 一格都不看。
+//   · 访客可玩的服（REQUIRE_ACCOUNT=0）：没有会话可依，自报呼号是唯一的来源 ——
+//     但它仍然要过注册用的**同一个白名单**。两套规则各写一份的症状是
+//     "注册时不让叫的名字，访客模式能叫得出来"，而这两种名字进的是同一个记分板。
+//
+// 不合法的名字**不静默替换成"访客"**：那样玩家看到的是"我明明填了名字，进去却叫访客"，
+// 而"被改掉了"和"没生效"是同一副长相 —— 这一轮要消灭的正是这个形状。说清楚比改掉他好。
+// 没带名字（手写 ?online=1 的、或是老客户端）不算错，按"访客"进：那不是有人在攻击，
+// 只是有人没填。这条区分是有意的，"名字不合法"和"没给名字"不该得到同一个结果。
+function joinName(user, raw) {
+  if (user) return user.name;
+  if (raw == null || raw === '') return '访客';
+  const n = normalizeName(raw);
+  if (!validName(n)) { const e = new Error(NAME_RULE_TEXT); e.refusal = true; throw e; }
+  return n;
+}
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const int = (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; };
@@ -40,6 +60,36 @@ export const CFG = {
   // --prod 与 NODE_ENV=production 等价：前者在 Windows 的 cmd/PowerShell 里也能写进
   // npm script（"NODE_ENV=production node ..." 那种形式只在 POSIX shell 里成立）。
   prod: process.env.NODE_ENV === 'production' || process.argv.includes('--prod'),
+
+  // ── 账号 ──
+  // 邀请码留空 = 开放注册。默认值刻意**不**是空：让一个还没配好的部署默认带上门槛，
+  // 比默认敞开、等人自己想起来要配要好。真要开放时显式设 JOIN_CODE=''。
+  inviteCode: process.env.JOIN_CODE != null ? process.env.JOIN_CODE : 'mf2026',
+  accountsDb: process.env.ACCOUNTS_DB || '',            // 留空 = 内存（能玩，重启就没）
+  cookieSecure: process.env.COOKIE_SECURE != null ? process.env.COOKIE_SECURE !== '0' : null,   // null = 跟随 prod
+  // **代理层数**，不是布尔。设 0（默认）时完全忽略 X-Forwarded-For ——
+  // 认了的话任何人都能随手写这个头，于是"按 IP 限流"变成"按攻击者自己填的字符串限流"。
+  trustProxy: Number(process.env.TRUST_PROXY) > 0 ? Number(process.env.TRUST_PROXY) : 0,
+  // 进对局要不要账号。默认要 —— 部署目标就是"有身份"。设 REQUIRE_ACCOUNT=0 可以放开成访客可玩，
+  // 但那样账号之后的所有东西（战绩、封人、配额）都跟着失效，所以只在本地调试时用。
+  requireAccount: process.env.REQUIRE_ACCOUNT !== '0',
+  // 两个限流窗口。按部署可调：私有服把上限压到"每小时 3 次注册"就够挡脚本，
+  // 公开服调大就等于把这条防线拆掉 —— 所以它得是一个能看见、能改的数，不是一个藏在代码里的常数。
+  regPerHour: int(process.env.REG_PER_HOUR, 8),
+  loginPer5Min: int(process.env.LOGIN_PER_5MIN, 12),
+
+  // ── 长连接的三个闸门（这是真正会被打的那一面）──
+  // ① 每连接每秒消息数。HTTP 洪水打的是静态文件（有 etag/gzip/缓存，很便宜），
+  //    而 WS 洪水打的是**每拍推进整个 sim**。正常客户端 60 帧/秒，一帧一个包，
+  //    留 4 倍余量给"卡一下之后攒着发"。超了就拆连接：一个正常客户端永远到不了这个数，
+  //    而留着一个正在灌的 socket 比拆掉它贵得多。
+  wsMsgPerSec: int(process.env.WS_MSG_PER_SEC, 240),
+  // ② 每 IP 连接数。maxClients 是进程级的，一个人开满 128 条就没人进得来 ——
+  //    这不是"负载问题"，是"他一个人就能把你关门"。
+  connsPerIp: int(process.env.CONNS_PER_IP, 6),
+  // ③ 每个账号能同时拥有的房间数。房间 id 由客户端随便写 ⇒ 换着 id 建房就能把
+  //    MAX_ROOMS 占满。房间是有主人的（谁第一个建的算谁的）。
+  roomsPerUser: int(process.env.ROOMS_PER_USER, 2),
 };
 
 const MIME = {
@@ -82,8 +132,38 @@ async function cachedFile(file) {
 // 缓存策略只有一种"必须每次回源"：入口文档。其余走 ETag 再验证 ——
 // 命中就是 304 且不带 body，所以"发文件"不再和对局抢 CPU。
 // 上一版全部 no-store：16 人 20Hz 才 66 kbps，而每个访客要重新拉 1.2 MB 的 three。
+// 账号层。放在这里而不是内联进来，是为了让"规则"和"接线"分开：
+// 注册/登录/限流的规则在 server/accounts.mjs，存储语义在 server/store.mjs，
+// 这一层只管 HTTP 的形状（状态码、cookie、content-type）。
+const auth = await createAuth({ cfg: CFG });
+
+// 每 IP 的连接数，和四个"拒绝"计数。
+// 计数要落在生产面上（/healthz 的 gate{}）：限流生效的样子和"服务挂了"在玩家侧完全一样，
+// 都是"进不去" —— 没有计数就只能靠猜。
+const connsByIp = new Map();
+const gate = { connIp: 0, msgFlood: 0, roomQuota: 0, noAuth: 0 };
+
+// ── 这个 try/catch 是必须的，不是"防御性编程" ──
+// 下面第一句 `decodeURIComponent('%')` 会抛 URIError。而 createServer(handler) **不理会**
+// handler 返回的 promise —— 一次 reject 就是一次 unhandledRejection，
+// 而 Node 15+ 的默认行为是**整个进程退出**。
+// 也就是说 `curl 'http://这台服务器/%'` 一行就能把对局服务打死（实测见 test/hardening.mjs）。
+// 这条和"狂发输入帧"是同一类洞：**一个人的坏输入不该有能力影响其他所有人**。
+async function handleRequest(req, res) {
+  try { await serveStatic(req, res); }
+  catch (e) {
+    console.error('[http] ' + (e && e.stack || e));
+    try {
+      if (!res.headersSent) { res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }); res.end('bad request'); }
+      else res.end();
+    } catch { /* 连接已经没了 */ }
+  }
+}
+
 async function serveStatic(req, res) {
   const url = decodeURIComponent((req.url || '/').split('?')[0]);
+  // 账号接口走前面 —— 不然 /api/login 会被当成一个文件路径去找。
+  if (await auth.handle(req, res, url)) return;
   if (url === '/healthz' || url === '/health') {
     // 逐房间健康度：扩容要的是"哪一间开始吃紧"，只看一个总数会藏住坏孩子。
     const per = [];
@@ -107,6 +187,16 @@ async function serveStatic(req, res) {
       ok: true, uptime: Math.round(process.uptime()), rooms: rooms.size,
       clients: wss ? wss.clients.size : 0, map: CFG.map, tickHz: Math.round(1 / DT), draining,
       heapMB: +(process.memoryUsage().heapUsed / 1048576).toFixed(1), per,
+      // 账号与外围防护的计数。挂在运维面上的理由和前两组（lag / streak）一样：
+      // 这些失效**全是静默的** —— 限流把所有人挡在外面、连接被拆、房间建不出来，
+      // 玩家侧看到的都是"进不去"，而原因各不相同，只能从这里分辨。
+      auth: { ...apiCounters(), users: auth.store.countUsers(), sessions: auth.store.countSessions(),
+        // 库是"内存版"还是落盘的，直接写出来：没落盘的部署重启就丢账号，
+        // 而这件事不写在页面上，运维会在第一次重启之后才发现。
+        store: auth.store.constructor.name, inviteRequired: !!CFG.inviteCode },
+      gate: { connsPerIp: CFG.connsPerIp, ips: connsByIp.size, wsMsgPerSec: CFG.wsMsgPerSec,
+        roomsPerUser: CFG.roomsPerUser, requireAccount: CFG.requireAccount,
+        refusedConn: gate.connIp, refusedMsg: gate.msgFlood, refusedRoom: gate.roomQuota, refusedAuth: gate.noAuth },
     });
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(body) });
     res.end(body);
@@ -135,21 +225,61 @@ async function serveStatic(req, res) {
   res.writeHead(200, base).end(e.buf);
 }
 
-const httpServer = createServer(serveStatic);
+const httpServer = createServer(handleRequest);
+// 慢速攻击（slowloris）：一个连接每次只发几个字节、永远不发完。不设上限的话每个这样的连接
+// 都占着一个 socket，几百个就能把文件描述符吃光。Node 的默认值是 300s/60s，太宽。
+httpServer.requestTimeout = 30000;
+httpServer.headersTimeout = 15000;
+httpServer.keepAliveTimeout = 10000;
 // maxPayload 是"单个帧"的上限：没设的话默认 100 MiB，一个乱发的客户端就能把进程内存吃掉。
+// 注意它**不是**每连接速率上限 —— 那个是下面 message 处理里的 wsMsgPerSec。
 const wss = new WebSocketServer({
   server: httpServer, path: '/ws', maxPayload: CFG.maxPayload,
-  verifyClient: ({ origin }, done) => {
-    if (!CFG.origins.length) return done(true);
-    // 浏览器必带 Origin；不带（curl、同级进程、健康探针）放行，脚本伪造 Origin 本来也容易，
-    // 这一层拦的是"别的网站的访客"，不是"攻击者"。真正的配额与鉴权见 README 的未完成段。
-    if (!origin) return done(true);
-    const ok = CFG.origins.some(o => o === origin || origin.endsWith(o.replace(/^\*\.?/, '.')));
-    done(ok, 403, 'origin not allowed');
+  verifyClient: ({ req, origin }, done) => {
+    // ── 顺序有讲究：先挡最便宜的，再挡要查会话的 ──
+    // 把要 await 的鉴权放在最前面的话，一个洪水源可以让每个连接都触发一次会话查找。
+    if (CFG.origins.length && origin) {
+      // 浏览器必带 Origin；不带（curl、同级进程、健康探针）放行，脚本伪造 Origin 本来也容易，
+      // 这一层拦的是"别的网站的访客"，不是"攻击者"。
+      if (!CFG.origins.some(o => o === origin || origin.endsWith(o.replace(/^\*\.?/, '.')))) {
+        return done(false, 403, 'origin not allowed');
+      }
+    }
+    const ip = clientIp(req, CFG.trustProxy);
+    if ((connsByIp.get(ip) | 0) >= CFG.connsPerIp) {
+      gate.connIp++;
+      // 429 而不是 403：这是一个**配额**问题，客户端可以等一下再来。
+      return done(false, 429, 'too many connections from this address');
+    }
+    // ── 身份在**握手那一刻**定下来，不听 join 帧里自报的呼号 ──
+    // 这是本轮最要紧的一处接线：以前 name 是客户端随便写的字符串，服务端只是截到 24 字。
+    // 现在它来自会话，join 里的 name 字段直接不看。
+    if (!CFG.requireAccount) { req.__user = null; return done(true); }
+    // verifyClient 支持异步 done —— 会话查找要走内存表，但仍是 async 的，不能同步完成。
+    // 这里**不能**把 done(true) 提前（"先放进来，join 时再验"）：那等于让未登录的连接
+    // 先占住名额、先进房间，而"拒绝"就退化成了一句服务端自己听的广播。
+    sessionOf(req, auth.accounts)
+      .then(u => {
+        if (!u) { gate.noAuth++; return done(false, 401, 'login required'); }
+        req.__user = u;
+        done(true);
+      })
+      .catch(() => { gate.noAuth++; done(false, 500, 'auth error'); });
   },
 });
 const rooms = new Map();
+// 房间归谁 —— 房间 id 由客户端随便写，所以"换着 id 建房就能把 MAX_ROOMS 占满"这条口
+// 只能靠配额堵，而配额要有个"归谁"才能算。谁第一个把这一间建起来就算谁的。
+// 刻意**不做** userKey -> Set 的簿记：那样每多一条增删路径就多一处会漏的账
+// （房间被回收、连接断了、服务重启……），而按 maxRooms 的规模现算一遍是常数级的。
+const roomOwner = new Map();
 let draining = false;
+
+function ownedRooms(userKey) {
+  let n = 0;
+  for (const id of rooms.keys()) if (roomOwner.get(id) === userKey) n++;
+  return n;
+}
 
 // map 里存的是"启动完成"这个 promise，而不是房间对象本身。
 // 之前先 set 再 await start()，第二个加入者会在材质预加载那 ~0.8s 窗口里
@@ -162,18 +292,26 @@ async function createRoom(id) {
   console.log(`[room ${id}] 权威模拟启动，${(1 / DT).toFixed(0)}Hz，每 ${SNAP_EVERY} tick 下一次快照`);
   return room;
 }
-async function getRoom(id) {
+async function getRoom(id, user = null) {
   let p = rooms.get(id);
   if (!p) {
-    // 这两种是"业务上就该拒绝"，不是故障：标一下，让下面的 catch 按拒绝记账而不是甩栈。
+    // 这三种是"业务上就该拒绝"，不是故障：标一下，让下面的 catch 按拒绝记账而不是甩栈。
     // 例行拒绝也甩堆栈的话，运维很快就学会无视所有堆栈 —— 那时真故障也跟着被无视。
     if (draining) { const e = new Error('服务器正在下线，请重连'); e.refusal = true; throw e; }
     if (rooms.size >= CFG.maxRooms) { const e = new Error(`这台服务器已经有 ${rooms.size} 个房间，不再新建（MAX_ROOMS）`); e.refusal = true; throw e; }
+    // 建房配额只在**新建**时检查：已经在用的房间不占新额度，
+    // 否则"每进一次房就扣一次"会把老玩家在第三局时挡在门外。
+    if (user && ownedRooms(user.key) >= CFG.roomsPerUser) {
+      gate.roomQuota++;
+      const e = new Error(`你已经有 ${CFG.roomsPerUser} 个房间了，先进其中一个玩，或者等它空出来被回收`);
+      e.refusal = true; throw e;
+    }
     p = createRoom(id);
     // 健康页要逐房间读数，而表里存的是 promise —— 把解析出来的对象顺手挂在 promise 上，
     // 观测这条路径就不必每拍 await（await 会把读数耦合到建房的那次异步启动上）。
     p.then(r => { p.__room = r; }).catch(() => {});
     rooms.set(id, p);
+    if (user) roomOwner.set(id, user.key);
     p.catch(() => rooms.delete(id));            // 起不来的房间不许留在表里反复失败
   }
   return p;
@@ -184,7 +322,7 @@ async function getRoom(id) {
 // 另给一条自动分配的通路（这就是联机大厅缺的那半，见任务 P1 余下部分）。
 // 自动分配按**人最多且没满**的那间塞（fill-first）：对局类服务要的是把人凑一起，
 // 而不是负载均衡 —— 按最少人数分会让每个访客都开一间新房，永远碰不到人。
-async function pickRoom(requested) {
+async function pickRoom(requested, user = null) {
   const id = String(requested == null ? 'auto' : requested).slice(0, 48).replace(/[^A-Za-z0-9_.-]/g, '') || 'auto';
   if (id === 'auto') {
     let best = null, bestN = -1;
@@ -195,7 +333,7 @@ async function pickRoom(requested) {
     }
     if (best) return best;
   }
-  return getRoom(id);
+  return getRoom(id, user);
 }
 
 function startRoomLoop(room, id) {
@@ -282,6 +420,7 @@ const sweeper = setInterval(() => {
       else if (now - (room.__lastBusy || now) > CFG.roomIdleMs) {
         room.__stop = true;
         rooms.delete(id);
+        roomOwner.delete(id);          // 不删的话配额会永久占着，而房间早就没了
         console.log(`[room ${id}] 空了 ${Math.round((now - room.__lastBusy) / 1000)}s，回收（剩 ${rooms.size} 间）`);
       }
     }).catch(() => {});
@@ -289,7 +428,32 @@ const sweeper = setInterval(() => {
 }, 5000);
 sweeper.unref?.();
 
+// ── 对局结果落库 ──
+// 跑在 tick 循环**外面**（1 秒一轮），所以它花多久都不影响任何一间的拍。
+// 为什么不在 endMatch 里直接写：见 server/room.mjs:endMatch 上面那一段 ——
+// 简单说就是"60 拍/秒的循环里只做 O(1) 内存记账"。
+// 丢一局的代价有上限（那一局的经验值），而卡住一整间房没有上限。
+const resultDrain = setInterval(() => {
+  for (const p of rooms.values()) {
+    const room = p.__room;
+    if (!room || !room.takeResults) continue;
+    for (const batch of room.takeResults()) {
+      for (const row of batch.rows) {
+        const p2 = auth.accounts.addResult(row.account, row);
+        if (p2) console.log(`[result] ${row.account} +${row.xp} xp（${row.kills}/${row.deaths}${row.win ? ' 胜' : ''}）→ 累计 ${p2.xp}`);
+      }
+    }
+  }
+}, 1000);
+resultDrain.unref?.();
+
 wss.on('connection', (ws, req) => {
+  // 身份来自**握手时验过的会话**，不是 join 帧里的自报字段。二者差一个数量级：
+  // 前者是一条会被封的实名记录，后者只是一个字符串。
+  ws.__user = (req && req.__user) || null;
+  ws.__ip = clientIp(req || { socket: {} }, CFG.trustProxy);
+  connsByIp.set(ws.__ip, (connsByIp.get(ws.__ip) | 0) + 1);
+  ws.__msgWin = { t: Date.now(), n: 0 };
   // "还活着"记成时间戳，不记成"这一轮扫描时标志位是不是 true"——见下面 heartbeats 的注释。
   ws.__pongAt = Date.now();
   ws.on('pong', () => { ws.__pongAt = Date.now(); });
@@ -299,6 +463,20 @@ wss.on('connection', (ws, req) => {
   // 单个访客的坏包不该有能力影响其他房间 —— 这正是部署前必须堵的那个洞。
   ws.on('error', e => { console.error(`[ws error] ${(req && req.socket && req.socket.remoteAddress) || '?'}: ` + (e && e.message || e)); try { ws.terminate(); } catch { /* 已经断了 */ } });
   ws.on('message', async (data, isBinary) => {
+    // ── 每连接消息速率闸门 ──
+    // 放在最前面，在**任何解析之前**：这一层要挡的正是解析要花的那些 CPU。
+    // 一个 64 KB 的帧 = 4096 个输入包，每个都要解一遍位域 —— 而队列本身是有上限的
+    // （INPUT_QUEUE=60，多出来的直接丢），所以"狂发"真正烧的是解码，不是内存。
+    // 超限就拆连接：正常客户端是 60 帧/秒，永远到不了这个数，
+    // 而留着一个正在灌的 socket 比拆掉它贵得多。
+    const nowMs = Date.now();
+    const w = ws.__msgWin;
+    if (nowMs - w.t >= 1000) { w.t = nowMs; w.n = 0; }
+    if (++w.n > CFG.wsMsgPerSec) {
+      gate.msgFlood++;
+      try { ws.close(1008, 'rate limited'); } catch { /* 已经断了 */ }
+      return;
+    }
     try {
       if (isBinary) {
         if (ws.__cid == null) return;
@@ -318,12 +496,28 @@ wss.on('connection', (ws, req) => {
         if (ws.__cid != null) { ws.send(JSON.stringify({ t: 'err', msg: '这条连接已经进过房间了' })); return; }
         if (draining) { ws.send(JSON.stringify({ t: 'err', msg: '服务器正在下线，请稍后重连' })); return; }
         if (wss.clients.size > CFG.maxClients) { ws.send(JSON.stringify({ t: 'err', msg: `这台服务器已满（${CFG.maxClients} 人）` })); return; }
-        const room = await pickRoom(msg.room);
-        const c = room.addClient({ name: String(msg.name || '士兵').slice(0, 24), team: msg.team === 'B' ? 'B' : 'A', loadout: msg.loadout || null });
+        const user = ws.__user;
+        if (CFG.requireAccount && !user) { ws.send(JSON.stringify({ t: 'err', msg: '需要先登录' })); return; }
+        // 呼号的来源见文件头 joinName 的注释。不合法时它会抛一个 refusal，
+        // 由下面那个 catch 变成一条 {t:'err'} —— 客户端在加载页上原样显示这一句。
+        // 所以访客不会"填了名字却变成访客"：他会当场看到规则，回去改。
+        const name = joinName(user, msg.name);
+        const room = await pickRoom(msg.room, user);
+        const c = room.addClient({
+          // 要账号的服上这一格来自会话；访客可玩的服上是自报呼号（已过白名单）。
+          // 两条路都**不用再 slice(0,24)**：白名单本身限了 2~16 个字。
+          name,
+          team: msg.team === 'B' ? 'B' : 'A',
+          loadout: msg.loadout || null,
+          account: user ? user.key : null,
+        });
         ws.__cid = c.cid; ws.__room = room;      // 存对象本身：rooms 里存的是 promise
         c.ws = ws;                                // 反向也要有：广播按 room.clients 走
         ws.send(JSON.stringify({
           t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId, seed: room.seed,
+          // 你的呼号由**服务端**告诉你，而不是你告诉服务端。客户端拿到之后把它盖到本地那份上 ——
+          // 不盖的话 HUD 上会一直显示 URL 里那个名字，而记分板上是另一个，玩家会以为串号了。
+          name: c.name,
           pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw, loadout: c.loadout,
           // 连杀奖励的槽位表。**必须由服务端给**：按 3/4/5 各是什么、每个要几杀，
           // 这两件事的真相在权威端（规则内核里）；客户端自己按 data.js 那份渲染的话，
@@ -344,6 +538,10 @@ wss.on('connection', (ws, req) => {
     }
   });
   ws.on('close', () => {
+    // 连接计数必须**在这里**减：放在别处（比如房间移除那一步）的话，
+    // 一个"连上但不 join"的连接就永远占着配额 —— 而那种连接恰好是最便宜的攻击形状。
+    const n = (connsByIp.get(ws.__ip) | 0) - 1;
+    if (n > 0) connsByIp.set(ws.__ip, n); else connsByIp.delete(ws.__ip);
     const room = ws.__room;
     if (room && ws.__cid != null) { room.removeClient(ws.__cid); console.log(`[leave] cid ${ws.__cid} 断开（在线 ${room.clients.size}）`); }
   });
@@ -381,7 +579,10 @@ async function shutdown(sig) {
   draining = true;
   console.log(`[server] ${sig}：开始下线（宽限 ${CFG.shutdownGraceMs}ms）`);
   httpServer.close();
-  clearInterval(sweeper); clearInterval(heartbeats);
+  clearInterval(sweeper); clearInterval(heartbeats); clearInterval(resultDrain);
+  // 落库要在拆连接之前收尾：close() 会把脏数据推下去、并 checkpoint 一次 WAL。
+  // 不做的话"正常关服"和"被 kill -9"一样丢最近那一批写入 —— 那"最多丢 250ms"就成了空话。
+  try { auth.close(); } catch (e) { console.error('[auth] 关库出错：' + (e && e.message || e)); }
   for (const ws of wss.clients) {
     try { ws.send(JSON.stringify({ t: 'note', msg: '服务器维护中，请刷新重连' })); ws.close(1001, 'bye'); } catch { /* 已经在关了 */ }
   }
@@ -403,4 +604,6 @@ httpServer.listen(CFG.port, CFG.host, () => {
   console.log(`  静态根目录 ${ROOT}`);
   console.log(`  地图 ${CFG.map}  种子 ${CFG.seed}  端口 ${CFG.port}  绑 ${CFG.host}  ${CFG.prod ? '生产' : '开发'}模式`);
   console.log(`  上限 房间 ${CFG.maxRooms} · 连接 ${CFG.maxClients} · 单帧 ${CFG.maxPayload} B · 空房回收 ${CFG.roomIdleMs / 1000}s · 允许来源 ${CFG.origins.join(',') || '(不检查)'}`);
+  console.log(`  账号 ${auth.store.constructor.name}${CFG.accountsDb ? ' @ ' + CFG.accountsDb : '（内存，重启就丢）'} · 邀请码 ${CFG.inviteCode ? '已设' : '未设（开放注册）'} · 进对局必须登录 ${CFG.requireAccount ? '是' : '否'}`);
+  console.log(`  闸门 每 IP 连接 ${CFG.connsPerIp} · 每连接 ${CFG.wsMsgPerSec} 消息/秒 · 每人 ${CFG.roomsPerUser} 间房 · 代理层数 ${CFG.trustProxy}${CFG.trustProxy ? '' : '（忽略 X-Forwarded-For）'}`);
 });

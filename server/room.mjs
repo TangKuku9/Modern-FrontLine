@@ -65,6 +65,10 @@ export class NetRoom {
     // test/net-journal.mjs 那道"新字段必须登记"的守卫，而它本来就只是房间的簿记。
     this.byPlayer = new Map();
     this.events = [];                             // 待下发的游戏事件，排干即清
+    // 待落库的对局结果。**刻意和 events 分开**：events 每拍就被排干发给客户端，
+    // 而这个是给"循环外面"的账号层去处理的。混在一起的话，某次排干 events 顺手把它也清掉，
+    // 症状是"打了一晚上战绩一点没涨"，而且不报错。
+    this.__results = [];
     // 延迟补偿的读数（/healthz 会带出去）。它必须落在生产代码里而不是只在探针里数：
     // 这条链路**每一种失效方式都是静默的** —— 报值出窗 ⇒ 服务端一律拒绝 ⇒ 这个玩家永远
     // 没有补偿，不报错、不崩，只是"我明明打中了"。四个计数各指一种成因，修法完全不同：
@@ -126,7 +130,7 @@ export class NetRoom {
     return { pos, yaw: Math.atan2(pos.x, pos.z) };
   }
 
-  addClient({ name = '士兵', team = 'A', loadout = null } = {}) {
+  addClient({ name = '士兵', team = 'A', loadout = null, account = null } = {}) {
     const cid = NEXT_CID++;
     const sp = this.spawnPoint(team);
     // rngSeed/rngTag：这个人那条私有玩法流的播种对（见 js/player.js 构造函数）。客户端要用
@@ -150,6 +154,10 @@ export class NetRoom {
       // 联机侧没有任何地方记 —— 于是记分板是空的。
       book: new StreakBook(this.streakDefs, pl.hasPerk('hardline') ? 1 : 0),
       kills: 0, deaths: 0, score: 0,
+      // account 是**握手时验过的会话**给出的账号 key（不是 join 帧里自报的）。
+      // 它是"这个人是谁"在权威侧的唯一凭据，也是战绩唯一能落到谁头上的依据；
+      // 访客（REQUIRE_ACCOUNT=0）这里是 null，于是这一局的数字**只进记分板、不进档案**。
+      account,
       // —— 延迟补偿的三件簿记 ——
       // pose：每拍的命中盒参数（见 server/lagcomp.mjs:PoseRing）
       // view：这一拍消费掉的那份输入里，客户端说它当时在渲染哪一拍
@@ -387,6 +395,37 @@ export class NetRoom {
     if (this.matchOverSent) return;
     this.matchOverSent = true;
     this.events.push({ e: 'matchOver', winner });
+    // ── 战绩**不在这里落库**，只把名单和数字挂到队列上 ──
+    // 这里跑在 60 拍/秒的权威循环里。写账号这一步以后完全可能（也理应）变成一次
+    // 真的磁盘/网络调用 —— 那时这一行就会吃掉每一拍。所以规则是：
+    // **这一侧只做 O(1) 的内存记账，真正的写由 net-server 在 tick 循环外面做。**
+    // 加多少经验、单人上限多少，那一处定义在 accounts.addResult 里，这里不重复一份。
+    const rows = [];
+    for (const c of this.clients.values()) {
+      if (!c.account) continue;                 // 访客没有档案可写（REQUIRE_ACCOUNT=0 时）
+      rows.push({
+        account: c.account,                       // 账号 key，不是呼号 —— 呼号可以改，key 不行
+        xp: Math.round(c.score),
+        kills: c.kills, deaths: c.deaths,
+        // winner 是队名（'A'/'B'）或 null（FFA、或者时间到了还没分出队伍赢家）。
+        // 写成"winner === null 就不给胜场"，而不是拿进球的队去猜 —— 猜的那一版会把
+        // 每一局平局都记成一方的胜场，而表现只是"胜率慢慢偏高"，没人会去查。
+        win: !!winner && winner === c.team,
+      });
+    }
+    this.__results.push({ tick: this.tick, winner: winner || null, rows });
+    // 队列要有上限：一局结束只推一条，但万一 matchOver 被反复触发（守卫失效），
+    // 无上限的数组会把房间变成内存泄漏 —— 而且它泄漏得很安静。
+    if (this.__results.length > 8) this.__results.splice(0, this.__results.length - 8);
+  }
+
+  // 由 net-server 在 tick 循环外面调用。返回并清空 —— 排干语义和 events 一样，
+  // 但**只有这一个入口**能动这个数组。
+  takeResults() {
+    if (!this.__results.length) return [];
+    const out = this.__results;
+    this.__results = [];
+    return out;
   }
 
   pushBoard() {

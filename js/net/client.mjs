@@ -115,6 +115,9 @@ export class NetClient {
     if (j.t === 'welcome') {
       this.cid = j.cid; this.serverTick = j.tick; this.mapId = j.map;
       this.welcome = j;
+      // 呼号以**服务端说的**为准。以前这里是客户端自己那份（URL 里读来的），
+      // 于是"我屏幕上叫甲、记分板上叫乙"是常态 —— 而玩家只会以为自己串号了。
+      if (j.name) { this.name = j.name; if (this.game) this.game.playerName = j.name; }
       // 连杀奖励的槽位表由服务端给：**按 3/4/5 各是什么、每个要几杀**，这两件事的真相
       // 在权威端（js/match-rules.js 的账本里）。客户端自己按 data.js 那份渲染的话，
       // 服务端换一项、客户端还显示旧的 —— 症状是"按了没反应"，正是这一轮要消灭的东西。

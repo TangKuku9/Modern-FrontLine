@@ -213,6 +213,12 @@ export class Menu {
 
   // ---------------- 主菜单 ----------------
   showMain() {
+    // 档案卡要显示服务端那份经验值，所以进主菜单时**按需**拉一次账号状态。
+    // 刻意不放在 main.js 的构造函数里：那会让 ?online=1 这条路（直接进对局、根本不画主菜单）
+    // 也在页面加载时多发两次请求，而那两次请求会把客户端第 0 拍相对权威端的相位挪掉 ——
+    // 实测代价见 js/main.js 里那段（net-play 的稳态偏差 5 次里红 4 次）。
+    // 这里不 await：拉不到就显示本地那份，单机照玩。
+    this.game.accountSync && this.game.accountSync();
     this.setCam('main');
     this.setSoldier(this.game.profile.classes[this.game.profile.selClass || 0]);
     const best = this.game.profile.campaignBest;
@@ -330,11 +336,10 @@ export class Menu {
         <div class="lobby-body">
           <div class="lobby-col" style="flex:1;max-width:560px">
             <div class="panel"><div class="opts">
-              <div>呼号</div><input id="onName" maxlength="12" placeholder="士兵" value="${esc(L.name)}" style="${inp}">
               <div>阵营</div>
               <div class="seg" id="onTeam"><div data-v="A" class="${L.team === 'B' ? '' : 'sel'}">A 队</div><div data-v="B" class="${L.team === 'B' ? 'sel' : ''}">B 队</div></div>
               <div>房间号（留空 = 由服务器塞进人最少的一间）</div><input id="onRoom" maxlength="32" placeholder="auto" value="${esc(L.room || '')}" style="${inp}">
-              <div style="font-size:12px;color:#888;line-height:1.7">地图与模式由服务器决定。掉线或服务器更新时屏幕上会写明原因，按 Enter 重连。</div>
+              <div class="note-wide">地图与模式由服务器决定。掉线或服务器更新时屏幕上会写明原因，按 Enter 重连。</div>
             </div></div>
             <div class="panel">
               <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备（服务端会按表重建这一份）</div>
@@ -343,6 +348,14 @@ export class Menu {
                 <button class="btn small ghost" data-a="loadout">编辑</button>
               </div>
             </div>
+          </div>
+          <!-- 账号单独占右列。**这不是排版偏好，是尺寸**：账号面板有三种形态，其中"要账号"那一支
+               （默认部署）有 3 个输入框 + 按钮 + 两行说明，实测 264 px 高；和左边那两栏叠在同一列里
+               总高 629 px，而 1280×720 下大厅只有 534 px —— 底部的"加入对局"会被顶出视口，
+               而它看起来像"点不动"而不是"看不见"（Playwright 原话：element is outside of the viewport）。
+               分两列之后两列各 341 / 264 px，富余 190 px；顺带把原先空着的右半边用上了。 -->
+          <div class="lobby-col" style="flex:1;max-width:430px">
+            <div class="panel" id="acctPanel"></div>
             <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button><button class="btn" data-a="join">加入对局</button></div>
           </div>
         </div>
@@ -352,15 +365,135 @@ export class Menu {
     }));
     this.on(r, '[data-a=back]', () => this.showMain());
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('online'));
+    this.renderAccountPanel(r, L);
     this.on(r, '[data-a=join]', () => {
-      const name = String(r.querySelector('#onName').value || '士兵').trim().slice(0, 12) || '士兵';
+      const A = this.game.account;
+      // 要账号的服上没登录就不让进 —— 服务端本来也会在握手那一刻把连接拒掉（401），
+      // 但让玩家点一下、等两秒、再看到一句"需要先登录"，是把一个已经知道的事实变成了惩罚。
+      if (A.requireAccount && !A.loggedIn) { this.acctMsg(r, '先登录或者注册一个账号'); return; }
       const room = String(r.querySelector('#onRoom').value || '').trim().slice(0, 32);
-      L.name = name; L.room = room;
-      const q = new URLSearchParams({ online: '1', name, team: L.team === 'B' ? 'B' : 'A' });
+      L.room = room;
+      // 呼号框：要账号时它是**账号名**（上面已经登录过了，这一格此时只是重画时的记忆），
+      // 访客可玩时它是**这一局的显示名**。两种情况下都把它记下来，免得切回去时丢了。
+      const nameEl = r.querySelector('#onName');
+      if (nameEl) L.name = String(nameEl.value || '').trim() || L.name;
+      const q = new URLSearchParams({ online: '1', team: L.team === 'B' ? 'B' : 'A' });
+      // name 只在**访客可玩**的服上才带进 URL。要账号的服上服务端从会话取呼号，
+      // join 帧里那一格根本不会被看 —— 继续带着它是在暗示"这一格有用"，
+      // 而下一个接手的人会照着这个假契约往下写（这一段注释上一版就是这么写的，现在它多了一个例外，
+      // 因为访客模式下**没有会话可依**，自报呼号是唯一来源；规则仍只在服务端一处）。
+      if (!A.requireAccount) q.set('name', L.name || '士兵');
       if (room) q.set('room', room);
       this.showLoadingOverlay('正在进入对局…');
       location.href = location.pathname + '?' + q.toString();
     });
+  }
+
+  acctMsg(root, text) {
+    const el = root.querySelector('#acctMsg');
+    if (el) el.textContent = text || '';
+  }
+
+  // 账号区。三种形态，由**服务端说的策略**决定（/api/status 的 requireAccount）：
+  //   · 已登录      —— 账号卡（呼号 / 经验 / 场次 / 胜 / 登出）；
+  //   · 要账号      —— 呼号 + 密码（+ 有邀请码时的邀请码栏）与登录/注册按钮；
+  //   · 不要账号    —— 只给一个呼号框（REQUIRE_ACCOUNT=0，本地调试与对战测试走这条）。
+  //
+  // 第三种不是"偷懒的降级"，而是必须的：那种服上玩家**根本没有账号可填**。
+  // 摆一个登录框的代价很具体 —— 玩家填不出来、进不去，而错误信息还是"呼号或密码不对"，
+  // 于是他会去怀疑自己密码打错了，而真相是"这个服不需要密码"。
+  //
+  // 登录之后呼号输入框就消失了 —— 那时呼号由服务端说（welcome.name 覆盖本地那份）。
+  // 留一个改不动的框在那儿，等于骗玩家说"这里能改名字"。
+  //
+  // 而没登录时的错误信息一律**原样显示服务端那一句**：这个模块不翻译、不复述。
+  // 翻译的那一版会把"邀请码不对"和"服务器忙"揉成同一句"登录失败"，
+  // 于是服主永远收不到"我邀请码是多少"这个真正的问题。
+  renderAccountPanel(root, L) {
+    const box = root.querySelector('#acctPanel');
+    if (!box) return;
+    const A = this.game.account;
+    const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
+    const btn = root.querySelector('[data-a=join]');
+    const setJoin = (on) => { if (btn) { btn.disabled = !on; btn.style.opacity = on ? '' : '.5'; } };
+
+    // 策略还没回来：**先不画**。画了就是在猜，而猜错的那一边（把登录框画在不要账号的服上）
+    // 会让玩家面对一个填不出来的框。这一屏通常只存在几毫秒 —— 它在页面加载时就发出去了。
+    if (!A.statusKnown) {
+      box.innerHTML = `<div class="opts"><div>账号</div><div style="font-size:12px;color:#888">正在读取服务器策略…</div></div>`;
+      setJoin(false);
+      // 回来之后只重画这一块，不动旁边已经填好的房间号 / 阵营。
+      // 顺着把 me() 也拉上：这条路径要在"主菜单还没画过"时也能自给自足
+      //（showMain 里那次 accountSync 是正常入口，这里是不依赖它的兜底）。
+      Promise.resolve(this.game.accountSync ? this.game.accountSync() : A.status()).then(() => {
+        if (this.screen === 'online') this.renderAccountPanel(root, L);
+      });
+      return;
+    }
+
+    if (A.loggedIn) {
+      const p = A.user;
+      box.innerHTML = `<div class="opts"><div>账号</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+          <div><b style="letter-spacing:2px">${esc(p.name)}</b>
+            <span style="color:#999;font-size:12px;margin-left:8px">经验 ${p.xp | 0} · 场次 ${p.matches | 0} · 胜 ${p.wins | 0}</span></div>
+          <button class="btn small ghost" data-a="logout">登出</button>
+        </div>
+        <div class="note-wide">战绩与经验存在服务端 —— 换台机器、换个浏览器都还在，也改不动。</div>
+      </div>`;
+      this.on(box, '[data-a=logout]', async () => {
+        await A.logout();
+        this.renderAccountPanel(root, L);
+      });
+      setJoin(true);
+      return;
+    }
+
+    if (!A.requireAccount) {
+      // 访客可玩：一个呼号框，没有密码、没有邀请码。
+      box.innerHTML = `<div class="opts"><div>呼号</div>
+        <input id="onName" maxlength="16" placeholder="2~16 个汉字 / 字母 / 数字" value="${esc(L.name || '士兵')}" style="${inp}">
+        <div class="note-wide">这个服务器不需要账号（访客可玩），呼号只在这局里显示，战绩不存到任何地方。不合法的呼号会被服务器拒掉，并说明规则。</div>
+      </div>`;
+      setJoin(true);
+      return;
+    }
+
+    const note = `进对局需要账号${A.inviteRequired ? '，注册要邀请码，由服主给你' : ''}。`;
+    box.innerHTML = `<div class="opts">
+      <div>呼号</div><input id="onName" maxlength="16" placeholder="2~16 个字" value="${esc(L.name || '')}" style="${inp}">
+      <div>密码</div><input id="acctPw" type="password" maxlength="128" placeholder="至少 8 位" style="${inp}">
+      ${A.inviteRequired ? `<div>邀请码</div><input id="acctCode" placeholder="问服主要" style="${inp}">` : ''}
+      <div></div><div style="display:flex;gap:8px"><button class="btn small" data-a="login">登录</button><button class="btn small ghost" data-a="reg">注册新号</button></div>
+      <div class="note-wide" id="acctMsg">${esc(A.lastError || '')}</div>
+      <div class="note-wide">${note}</div>
+    </div>`;
+    const grab = () => ({
+      name: String((root.querySelector('#onName') || {}).value || '').trim(),
+      password: String((root.querySelector('#acctPw') || {}).value || ''),
+      code: String((root.querySelector('#acctCode') || {}).value || ''),
+    });
+    const submit = async (kind) => {
+      const f = grab();
+      L.name = f.name || L.name;
+      this.acctMsg(root, (kind === 'reg' ? '正在注册…' : '正在登录…'));
+      const r2 = kind === 'reg'
+        ? await A.register({ name: f.name, password: f.password, code: f.code })
+        : await A.login({ name: f.name, password: f.password });
+      if (!r2.ok) { this.acctMsg(root, r2.message || '失败了'); return; }
+      // 登录之后把服务端那份经验值同步到本地档案上（显示用）。
+      // 本地那份仍然可以被玩家改，但它现在只是**一个显示用的副本** ——
+      // 真正的数在服务端，下一次 /api/me 会把它盖回去。
+      if (A.user) { this.game.profile.xp = A.user.xp | 0; this.game.saveProfile(); }
+      this.renderAccountPanel(root, L);
+      this.acctMsg(root, `已登录：${A.user ? A.user.name : ''}`);
+      setTimeout(() => this.acctMsg(root, ''), 2500);
+    };
+    this.on(box, '[data-a=login]', () => submit('login'));
+    this.on(box, '[data-a=reg]', () => submit('reg'));
+    const pw = root.querySelector('#acctPw');
+    if (pw) pw.addEventListener('keydown', e => { if (e.key === 'Enter') submit('login'); });
+    setJoin(false);
   }
 
   perk(id) { for (const col of PERKS) for (const p of col) if (p.id === id) return p; return { name: id, desc: '', icon: '' }; }

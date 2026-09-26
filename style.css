@@ -61,7 +61,10 @@ html, body { position: fixed; inset: 0; }
 
 /* 多人大厅 */
 .lobby { padding: 50px 60px; width: 100%; display: flex; flex-direction: column; }
-.lobby-body { display: flex; gap: 30px; margin-top: 26px; flex: 1; min-height: 0; }
+/* min-height:0 是让这两列**能**比内容矮的前提（不写的话 flex 子项的自动最小高度是内容高，
+   于是它永远不会缩，溢出只会往下堆）；overflow-y:auto 是兜底：视口再矮也不会把底部的按钮
+   变成"看不见但存在"。实测 1280×720 下两列都不溢出 —— 这条只在更矮的窗口里才起作用。 */
+.lobby-body { display: flex; gap: 30px; margin-top: 26px; flex: 1; min-height: 0; overflow-y: auto; }
 .lobby-col { display: flex; flex-direction: column; gap: 12px; }
 .sect-t { font-size: 12px; color: #888; letter-spacing: 4px; margin: 8px 0 4px; }
 .modes { display: flex; gap: 10px; }
@@ -77,6 +80,14 @@ html, body { position: fixed; inset: 0; }
 .mapc .mapinfo b { font-size: 20px; letter-spacing: 3px; }
 .mapc .mapinfo span { display: block; font-size: 11px; color: #ccc; }
 .opts { display: grid; grid-template-columns: 110px 1fr; gap: 10px 14px; align-items: center; font-size: 14px; }
+/* .opts 里那些"占一整行"的说明文字（**必须跨两列**）。
+   .opts 是「110px 标签列 + 1fr」的两列网格，auto-placement 会把第 3 个子元素放进第 2 行
+   **第 1 列**（110px 宽），于是这段说明被折成十几行、面板无谓地高出上百 px。
+   症状取决于面板的位置：在联网大厅最下面那一栏上，它把"加入对局"顶出了 1280×720 的视口 ——
+   那个按钮不是点不动，是根本看不见（Playwright 的报错原文：element is outside of the viewport）。
+   所以在 .opts 里写自由文字时，要么给它这个类，要么自己写 grid-column:1/-1。 */
+.note-wide { grid-column: 1 / -1; font-size: 12px; color: #888; line-height: 1.7; min-height: 16px; }
+#acctMsg { color: #e6a8c8; }
 .seg { display: flex; }
 .seg div { padding: 7px 14px; background: rgba(255,255,255,.06); cursor: pointer; font-size: 13px; border: 1px solid rgba(255,255,255,.08); }
 .seg div.sel { background: var(--acc); color: #111; font-weight: 700; }

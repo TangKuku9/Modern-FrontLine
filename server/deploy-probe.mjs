@@ -24,6 +24,9 @@ const srv = await withServer({
   NODE_ENV: 'production',
   MAX_ROOMS: '4', MAX_CLIENTS: '8', ROOM_IDLE_MS: '1500', MAX_PAYLOAD: '16384',
   ALLOW_ORIGIN: 'http://127.0.0.1', STATIC_MAX_AGE: '60',
+  // 这个探针量的是**部署面**（静态白名单、压缩协商、来源检查、配额），用访客身份跑。
+  // 账号与闸门那一层在 test/hardening.mjs 里专门量（那边还会单独起一个 prod 服）。
+  REQUIRE_ACCOUNT: '0',
 });
 const base = srv.base;
 // 不用 fetch：undici 会自动解压并把 content-encoding 头抹掉，那正好是要断言的东西。
@@ -109,7 +112,7 @@ try {
     /^HTTP\/1.1 404/m.test(t1) && /^HTTP\/1.1 404/m.test(tgit), `${t1.split('\r\n')[0]} / ${tgit.split('\r\n')[0]}`);
   // 反方向：白名单必须是"白名单"而不是"全关"。开发模式（不设 NODE_ENV）仍然能取到
   // server/ 与 net-trace.html —— xenv 那一套跨环境实证就靠这两个活着。
-  const dev = await withServer();
+  const dev = await withServer({ REQUIRE_ACCOUNT: '0' });
   try {
     const dSrc = await new Promise((res, rej) => {
       const r = httpGet(dev.base + '/server/net-server.mjs', rr => { rr.resume(); res(rr.statusCode); });
@@ -168,9 +171,12 @@ try {
   small.ws.close(); watch.ws.close();
 
   console.log('\n── 房间配额与自动分配 ──');
-  const r1 = await joiner('quota-1', '甲');
-  const r2 = await joiner('quota-2', '乙');
-  const r3 = await joiner('quota-3', '丙');
+  // 名字要合法（白名单 2~16 字）：这一份跑在访客可玩的服上，呼号只能用自报的那个，
+  // 而服务端会拿注册用的同一个白名单验它 —— 单字（原来写的 '甲'/'乙'/'丙'）会被拒绝进场，
+  // 于是下面量到的不是"房间配额"而是"名字不合法"，而它看起来只是"进不去"。
+  const r1 = await joiner('quota-1', '配额甲');
+  const r2 = await joiner('quota-2', '配额乙');
+  const r3 = await joiner('quota-3', '配额丙');
   await sleep(300);
   const denied = r3.json().find(m => m.t === 'err');
   ok('超过 MAX_ROOMS 的新房被拒（客户端可以随便编房间号）', !!denied, JSON.stringify(denied || r3.json()));
@@ -178,8 +184,8 @@ try {
   ok('被拒的那一次没有把房间表撑破', hQ.rooms === 4, `rooms=${hQ.rooms}（MAX_ROOMS=4：sec-ok + watch-1 + quota-1 + quota-2）`);
   r1.ws.close(); r2.ws.close();
   await sleep(300);
-  const autoA = await joiner('auto', '甲');
-  const autoB = await joiner('auto', '乙');
+  const autoA = await joiner('auto', '自动甲');
+  const autoB = await joiner('auto', '自动乙');
   const wa = autoA.json().find(m => m.t === 'welcome'), wb = autoB.json().find(m => m.t === 'welcome');
   ok('room=auto 时第二个人被分到同一个房间（否则大厅形同虚设）', !!wa && !!wb && wa.room === wb.room, `${wa && wa.room} vs ${wb && wb.room}`);
   ok('同一个房间里的两个人拿到不同 cid', !!wa && !!wb && wa.cid !== wb.cid, `${wa && wa.cid}/${wb && wb.cid}`);
