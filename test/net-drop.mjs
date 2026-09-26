@@ -44,6 +44,7 @@ const newPage = async (browser, srv, tag, profile, query, viewport) => {
     },
   });
   const page = await ctx.newPage();
+  OPENED.push({ ctx, page });
   const logs = [];
   page.on('pageerror', e => logs.push('pageerror: ' + (e.stack || e.message)));
   page.on('console', m => { if (m.type() === 'error') logs.push('console: ' + m.text()); });
@@ -87,6 +88,28 @@ const only = (process.argv[2] || 'ABCDE').toUpperCase();
 const skip = t => !only.includes(t);
 
 const realErrs = (logs) => logs.filter(l => !/favicon|WebGL|AudioContext|pointer lock|ERR_NETWORK|ERR_INTERNET|Failed to load/i.test(l));
+
+// 这一份里造出来的每个页面都记在这儿，供 closeOpened() 收尾。
+const OPENED = [];
+
+// 收掉前面几段留下的页面。为什么要有这一步 —— 2026-09-26 实测（E 段点不动那次）：
+// 这几段各留一个还在渲染的画布页，到 E 段时同一浏览器里开着 6 个，E 页只剩 **2 fps**
+// （单独跑这一段是 6 fps）。这时 Playwright 的 locator.click 会**在 30 秒里不返回**，
+// 调用日志停在 "performing click action"，一条 "element intercepts pointer events" 都没有 ——
+// 那就不是"被别的东西盖住"，而是派发这条路没回来。同一时刻同一个页面上：
+//   · evaluate 往返 1 ms ⇒ 事件循环是好的，不是页面卡死；
+//   · bringToFront() 之后再点，照样挂 ⇒ 不是"这一页不在最前面"；
+//   · page.mouse.click 能点进去，page.close() 也是毫秒级 ⇒ 是那段派发路径在重载下不行。
+// 单跑 `node test/net-drop.mjs E` 每次都绿，也就是"没有其余 5 个画布页"这个状态是好的。
+// 所以修法不是改判据（那会变成把"入口点不动"这条悄悄放过），而是**让每个用例自己收尾**。
+async function closeOpened() {
+  const keep = OPENED.splice(0, OPENED.length);
+  for (const o of keep) {
+    try { await o.page.close(); } catch { /* 已经关掉的就算了 */ }
+    try { await o.ctx.close(); } catch { /* 同上 */ }
+  }
+  if (keep.length) console.log(`  （收掉前面几段留下的 ${keep.length} 个页面）`);
+}
 
 const browser = await launch();
 try {
@@ -265,6 +288,9 @@ try {
     console.log('\n── E：联机入口在菜单里，不用手打网址 ──');
     // 联机的代码早就在了，但要玩家自己敲 ?online=1&room=… 才算真的有这个模式吗？不算。
     // 这一段就从主菜单开始用鼠标点：联网对战 → 填呼号 → 选阵营 → 加入对局，看它到不到得了局内。
+    // 先收掉前面几段的页面：这一段是唯一要点鼠标的，而"6 个画布页同时软件渲染"会让
+    // Playwright 的点击派发卡住 —— 读数与排除过程见文件开头 closeOpened() 的注释。
+    await closeOpened();
     const srv = await withServer(GUEST);
     // 视口给成玩家真会用的大小：480×270 是其余几段为了软件渲染快用的，那种尺寸下
     // 菜单本来就滚不到按钮，拿它来点"加入对局"只会量到视口，量不到入口。
@@ -276,6 +302,13 @@ try {
     }
     const hasEntry = await page.evaluate(() => !!document.querySelector('[data-a=online]'));
     ok('主菜单上有"联网对战"这一项（不是只能靠 ?online=1 的隐藏入口）', hasEntry);
+    // 先决：这一页还答得上话。没有它的话，"按钮点不动"与"页面自己卡住了"分不开 ——
+    // 而这两件事一个是入口坏了、一个是我们自己的量具在重载下失效（上次的红就属于后者）。
+    await page.bringToFront();
+    const t0 = Date.now();
+    await page.evaluate(() => 1);
+    const rt = Date.now() - t0;
+    ok('先决：E 页还答得上话（卡死的页面上"点不动"归因不到入口）', rt < 500, `evaluate 往返 ${rt} ms`);
     await page.click('[data-a=online]');
     await sleep(500);
     const form = await page.evaluate(() => ({
