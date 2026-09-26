@@ -27,10 +27,12 @@ const DT = 1 / 60;
 // opts.hard：状态被服务端整体重置（重生、传送、回合重开）。这时 journal 里那一份
 // 是"上一个位置"的，退回去重演只会把人在纠正之后又拽回出生点前 —— 所以直接吃权威值，
 // 并且**不把这次位移记进预测偏差**：那是合法的传送，不是预测失败。
-// 返回 { replayed, corrected, journalMiss }，只是给上层印的，不参与裁决。
+// 返回 { replayed, reps, led, corrected, baseState, journalMiss }：replayed/reps/led/corrected
+// 只是给上层印的，不参与裁决；**baseState 例外** —— 它是"这一窗服务端跑过的 dTick 步重演完之后"
+// 那几个权威不下发的姿态量，client 侧拿它跟权威旗标比（位置/视线/血马上要被覆盖，比了没信息）。
 export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
   const hard = !!opts.hard;
-  if (!pl) return { replayed: 0, corrected: 0, journalMiss: false };
+  if (!pl) return { replayed: 0, reps: 0, led: 0, corrected: 0, baseState: null, journalMiss: false };
   const before = { x: pl.pos.x, y: pl.pos.y, z: pl.pos.z };
   const hit = !hard && win.length > 0 && win[0].tick === startTick;
   // ── 基态整段往前挪 dAck 拍（opts.carry）─────────────────────────────────────
