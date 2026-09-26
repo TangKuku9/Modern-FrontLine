@@ -208,6 +208,21 @@ export class NetClient {
     const start = ((e.ack >>> 0) + 1) & 0xffff;
     const ahead = (t) => ((t - start) & 0xffff);
     const win = this.history.filter(h => h.j && ahead(h.tick) < 2000);
+    // 这两条**必须**在调 rollback 之前算出来：它是"这一窗服务端到底跑了什么"的全部信息 ——
+    // 服务端从上一包到这包推进了 dTick 步，其中 dAck 步消费了我的输入，剩下的 deficit 步
+    // 是拿手里那份空跑（见 server/room.mjs:step）。随包的 rep 只报末尾连拍，落在首次消费
+    // 之前的那几拍它报不出来 ⇒ 客户端得靠这三个量自己补（机制与实测见 js/net/predict.mjs
+    // opts.carry 那一段）。放在这里算而不是下面记账的位置，就是因为 rollback 要用。
+    const dTick = this.lastSnapTick === undefined ? 0 : ((this.serverTick - this.lastSnapTick) >>> 0);
+    const dAck = this.lastStart === undefined ? 1 : ((start - this.lastStart) & 0xffff);
+    // 缺口（空跑拍数）与"落在首次消费之前的那几拍"。上一包随快照下来的 rep（this.lastRep）
+    // 就是进这一窗之前已经欠下的空跑数，而本窗的 lead 部分 = 本窗总空跑 − 末尾连拍。
+    // 两个方向都夹住：deficit 为负说明 ack 跑得比拍号快（服务端跳过我的输入），
+    // lead 为负说明 rep 比"总空跑 + 上一包欠下的"还大 —— 两种都只可能是拍号接错线。
+    const deficit = Math.max(0, dTick - dAck);
+    const lead = Math.max(0, (this.lastRep | 0) + deficit - (e.rep | 0));
+    // 基态那一格：start 往前 dAck 拍（= 上一包的 ack+1）。dAck 为 0 时它是 start 本身，
+    // 也就是旧通路用的那一格，两条路在这里自然重合。
     // 死亡边沿：服务端把我定成死了，而我还按"活着"预测着往前走了几拍。
     // 这和重生是同一类事 —— 一次我这边不可能预测到的状态机跳转，所以同样按"整体重置"
     // 处理：退掉日记本、直接吃权威读数。以前只把重生当重置，死亡那几包就被留在
@@ -221,8 +236,46 @@ export class NetClient {
     // 后者可能已经不一样了，拿它补就是在猜。找不到（被历史窗口挤掉）时只能不补，
     // 那次校正会被记成偏差而不是被抹平。
     const holdE = this.history.find(h => h.tick === (e.ack & 0xffff));
+    // 基态往前那一段的料：journal[start-dAck]、那 dAck 条真输入、以及它们前面那一份
+    // （首段空跑用的就是它）。任何一件凑不齐就把**成因**交回去 —— 上层会把它记成一次命名
+    // 的未补偿并印出来，而不是悄悄按旧通路走完（旧通路少算的那几拍会原样变成一次校正
+    // 位移，在报表上和"预测错了"完全同形）。
+    // 注意 j: je.j —— je 是 history 里那条记录（{tick, inp, j, debt}），日记本是它的 .j。
+    // 交错了不会报错，只会在 applyJournal 里读 undefined[0] 炸掉整个 reconcile。
+    const carryOf = () => {
+      if (this.hardSnap) return 'hard';              // 整体重置：日记本本来就要重建
+      if (dAck < 1) return 'noAck';                  // 纯饥饿窗：ack 不动，dTick 步全是末尾连拍，rep 就是全部
+      if (dAck > 8) return 'tickJump';               // 我的拍号跳了（客户端跑得比服务端快），两边的"第 k 拍"对不上
+      const b = (start - dAck) & 0xffff;
+      const je = this.history.find(h => h.tick === b && h.j);
+      if (!je) return 'basePruned';
+      const inp = [];
+      for (let i = 0; i < dAck; i++) {
+        const en = this.history.find(h => h.tick === ((b + i) & 0xffff));
+        if (!en) return 'inputPruned';
+        inp.push(en.inp);
+      }
+      const pe = lead > 0 ? this.history.find(h => h.tick === ((b - 1) & 0xffff)) : null;
+      if (lead > 0 && !pe) return 'prevPruned';
+      return { j: je.j, inp, prevInp: pe ? pe.inp : null, lead, n: dAck };
+    };
+    // 该不该用 carry：只在"这一窗真有消费"时才谈得上 —— dAck=0 的纯饥饿窗整段都是末尾连拍，
+    // 那条旧通路本来就对，进这条路反而多一处可能接错线。dAck≥1 时只要服务端跑了空跑
+    // （本窗空跑 deficit>0，或上一包还欠着 lastRep 拍）就必须走它。
+    const needCarry = dAck >= 1 && (deficit > 0 || (this.lastRep | 0) > 0);
+    const got = needCarry ? carryOf() : null;
+    const carry = got && typeof got === 'object' ? got : null;
+    // 该补而没补上的，一律留下**名字**。这一条以前没有：旧写法在同样的窗里照样把
+    // corrected 记成一个数，于是"少补了几拍"与"预测器算错了"在报表上完全同形 ——
+    // 那一族 0.15~0.44 m 的假偏差就是这么被误判成物理分叉的。
+    if (needCarry && !carry) {
+      this.carryMiss = (this.carryMiss || 0) + 1;
+      this.carryWhy = this.carryWhy || [];
+      if (this.carryWhy.length < 12) this.carryWhy.push({ why: got, dAck, dTick, deficit, lead, rep: e.rep | 0, lastRep: this.lastRep | 0, have: this.history.length });
+    }
     const r = rollback(this.game, pl, win, start, e, this.lastRngState,
-      { hard: !!this.hardSnap, rep: e.rep | 0, hold: holdE && holdE.inp });
+      { hard: !!this.hardSnap, rep: e.rep | 0, hold: holdE && holdE.inp, carry, lead });
+    if (carry) { this.carryN = (this.carryN || 0) + 1; this.carryLead = (this.carryLead || 0) + r.led; }
     this.hardSnap = false;
     this.reconciles = (this.reconciles || 0) + 1;
     // rep 通路读数 + 它的一个已知缺口。
@@ -248,13 +301,13 @@ export class NetClient {
     this.correctedMax = Math.max(this.correctedMax || 0, r.corrected);
     this.recIdx = (this.recIdx || 0) + 1;
     // 输入饥饿的**准确**签名：服务端从上一包到这包跑了 dTick 拍，而我的 ack 只前进 dAck 拍。
-    // 差的那些拍是它拿我上一份输入替我空跑的 —— 每空跑一拍，它的位置就比 journal[ack+1]
-    // 那一拍多走一步（实测 0.19~0.30 m），和"预测错了"在报表上完全同形。
+    // 差的那些拍是它拿我上一份输入替我空跑的 —— 每空跑一拍，它的位置就比我那个基态多走一步
+    // （实测 0.0770 m = 4.46 m/s ÷ 60），和"预测错了"在报表上完全同形。
     // 只看"ack 动不动"抓不到它：三格里消费两拍、空跑一拍，ack 照样在动 —— 第一版就这么漏过。
-    // 这不是配对错、也不是预测器错，而是客户端供不上输入；要修的是输入总线（任务 P1-b）。
-    // 这里单独计数并排除出偏差统计，而不是放宽阈值 —— 放宽会把真错一起埋掉。
-    const dTick = this.lastSnapTick === undefined ? 0 : ((this.serverTick - this.lastSnapTick) >>> 0);
-    const dAck = this.lastStart === undefined ? 1 : ((start - this.lastStart) & 0xffff);
+    // 这条**不再是**"只能记下来排除"的读数了：dTick/dAck 上面已经算过，deficit 与 lead 都
+    // 交给 predict 去重演（这一窗服务端真跑过的 dTick 步一步不落），所以它现在的角色是
+    // **形状判据** —— 稳态里残留的偏差是否还等于 deficit 拍的位移，直接看这里的计数与
+    // net-play 的"单窗缺口 ≤ 一份快照"那条。
     const prevStart = this.lastStart;                  // 覆盖前先留一份，探针要用
     this.lastSnapTick = this.serverTick >>> 0;
     this.lastStart = start;
@@ -331,25 +384,46 @@ export class NetClient {
     if (steady) {
       this.steadyN = (this.steadyN || 0) + 1; this.steadyMax = Math.max(this.steadyMax || 0, r.corrected);
       // 结构性判据，不依赖位置读数：这一窗服务端推进的拍数比它从我这儿消费的输入数多
-      // （Δtick > Δack ⇒ 中间有空跑拍），而随包的 rep 字节是 0 ⇒ 权威状态里含我这边永远不会
-      // 补演的步数。旧定义把 rep 记成"末尾连拍"，于是 [重复,重复,新输入] 这种窗报 0，
-      // 残差恰好沿行进方向摊成 ~2 拍位移 —— 稳态尾部那两个样本就是这个形状。
+      // （Δtick > Δack ⇒ 中间有空跑拍），而随包的 rep 字节是 0 ⇒ 权威状态里含着 rep
+      // **报不出来**的那几拍（空跑落在首次消费之前）。旧定义把 rep 记成"末尾连拍"，
+      // 于是 [空跑,空跑,新输入] 这种窗报 0，残差恰好沿行进方向摊成 2 拍位移 ——
+      // 稳态尾部那两个样本就是这个形状。现在这几拍由 carry 重演掉了，所以这条从
+      // "已知缺口"变成了**形状判据**：缺口仍然必须是一次性的、不许随快照累积。
       if (!(e.rep | 0) && dTick > dAck) {
         this.repUnder = (this.repUnder || 0) + 1;
-        // 缺口最多能有多大：这一窗服务端替我多走、而我这边补不着的拍数。它必须始终是
+        // 缺口最多能有多大：这一窗服务端替我多走、而我这边得自己补的拍数。它必须始终是
         // "一次性"的量（≤ 一份快照 SNAP_EVERY 拍）—— 一旦看到它随快照数往上涨，就说明
         // 折叠拍的记账又变成"每份快照重新欠一遍"那种会永久累积的错（b3e25b6 就犯过这个）。
-        const deficit = dTick - dAck;
-        this.repUnderMax = Math.max(this.repUnderMax || 0, deficit);
+        const def = dTick - dAck;
+        this.repUnderMax = Math.max(this.repUnderMax || 0, def);
         this.repUnderWhy = this.repUnderWhy || [];
-        if (this.repUnderWhy.length < 8) this.repUnderWhy.push({ dTick, dAck, deficit, d: +r.corrected.toFixed(4) });
+        if (this.repUnderWhy.length < 8) this.repUnderWhy.push({ dTick, dAck, deficit: def, lead, carry: !!carry, led: r.led, d: +r.corrected.toFixed(4) });
+      }
+      // 空跑窗的残差判据 —— 这一轮的**红线**就是它。
+      // 补偿没做到位时，残差会**恰好等于 deficit 拍的位移**（0.1539 m = 2 拍 × 4.46/60，
+      // 且 Δpos 与相邻两拍差分同向）。所以这里要一个能自己量出来的尺子，而不是"小于某个
+      // 米数"：尺子就是我日记本里相邻两拍的距离（我自己走的，和判据无关）。
+      // 判据形状：空跑窗的残差必须**小于一拍位移**。补偿漏了则残差 ≥ deficit 拍 ≥ 1 拍。
+      if (dTick > dAck || (this.lastRep | 0) > 0) {
+        // 相邻两拍的位移：取基态那一格和它后一拍。取不到（窗口太短）就退回速度换算。
+        const a = this.history.find(h => h.j && h.tick === start);
+        const b2 = this.history.find(h => h.j && h.tick === ((start + 1) & 0xffff));
+        const stepMeasured = a && b2 ? Math.hypot(b2.j.pos[0] - a.j.pos[0], b2.j.pos[2] - a.j.pos[2]) : null;
+        const step = stepMeasured !== null ? stepMeasured : Math.hypot(pl.vel.x, pl.vel.z) / 60;
+        this.foldN = (this.foldN || 0) + 1;
+        this.foldMax = Math.max(this.foldMax || 0, r.corrected);
+        if (r.corrected > step) {
+          this.foldBad = (this.foldBad || 0) + 1;
+          this.foldWhy = this.foldWhy || [];
+          if (this.foldWhy.length < 8) this.foldWhy.push({ d: +r.corrected.toFixed(4), step: +step.toFixed(4), stepMeasured: stepMeasured !== null, deficit, lead, dTick, dAck, rep: e.rep | 0, carry: carry ? 'yes' : got, led: r.led, have: this.history.length });
+        }
       }
       // 厘米级读数已经稳定在 0.08 附近，剩下那几个 0.15~0.22 的要能解释。
       // 光有 max 一个数不行：把"当时在做什么"记下来才分得开"多跑了一拍"和"预测器算错了"。
       if (r.corrected > 0.08) {
         // 光有大小不够：0.8 m 的校正到底是"沿地面被推了一下"（dy≈0）、"落地/台阶的高度差"
         // （dz 或 dy 主导）、还是"两边 yaw 已经不同所以走的不是同一条线"，只有分量能分开。
-        const jb = win.length ? win[0].j : null;
+        const jb = win.length ? win[0].j : null;      // 基态那一格的账本（诊断用）
         // 旗标两边必须用**同一张编码表**。这条以前是本地自己拼的位序（alive*1、onGround*2、
         // sliding*4…），而 e.flags 走的是 js/quant.js 的 FLAG —— 第 2 位在表里是 Crouch 不是
         // OnGround。于是打印出的"日记本 3 / 权威 81"看着像两边状态打架，其实是同一个
@@ -359,10 +433,15 @@ export class NetClient {
         // Firing 是 time - lastShot < 0.08。日记本里那几个同名布尔读出来直接对，就会在每一次
         // 蹲下/起身的过渡里（0 < crouchT ≤ 0.5）稳定报"两边打架"——那是量具在量自己的阈值差，
         // 不是失步。所以这里镜像服务端的表达式，而不是抄同名字段。
-        const jf = jb ? ((jb.alive ? FLAG.Alive : 0) | (jb.crouchT > 0.5 ? FLAG.Crouch : 0) | (jb.sprinting ? FLAG.Sprint : 0)
-          | (jb.onGround ? FLAG.OnGround : 0) | (jb.sliding ? FLAG.Sliding : 0)) : null;
-        // 只在"基态和快照是同一时刻"（rep=0）时才计数：rep>0 时基态本就早 rep 拍，不等是对的。
-        if (steady && !(e.rep | 0) && hit && jb && jf !== (e.flags & FLAG_BASE_MASK)) {
+        // 第三个坑（这一轮才踩到）：比的对象得是**重建出来那一刻**的姿态，不是账本那一格。
+        // 两者在 deficit>0 的空跑窗里差着一整个空跑段（账本比权威端早 deficit 拍），拿它比
+        // 就是在量两件不同的事。重建值由 predict 交回来（rollback 的 baseState）—— 它是
+        // "这一窗服务端跑过的 dTick 步重演完之后"的姿态，才是真正和权威同一时刻的那一份。
+        const bs = r.baseState;
+        const jf = bs ? ((bs.alive ? FLAG.Alive : 0) | (bs.crouchT > 0.5 ? FLAG.Crouch : 0) | (bs.sprinting ? FLAG.Sprint : 0)
+          | (bs.onGround ? FLAG.OnGround : 0) | (bs.sliding ? FLAG.Sliding : 0)) : null;
+        // 只在"基态和快照是同一时刻"时才计数：rep>0 时基态本就早 rep 拍，不等是对的。
+        if (steady && !(e.rep | 0) && hit && jf !== null && jf !== (e.flags & FLAG_BASE_MASK)) {
           this.flagMismatch = (this.flagMismatch || 0) + 1;
           if (!this.flagMismatchWhy) this.flagMismatchWhy = { jf, auth: e.flags & FLAG_BASE_MASK, dp: jb.pos && [+e.x.toFixed(2), +e.z.toFixed(2)] };
         }
@@ -372,6 +451,11 @@ export class NetClient {
           win: win.length, dTick, dAck, inflight: ((this.localTick - e.ack) & 0xffff),
           spd: +Math.hypot(pl.vel.x, pl.vel.y, pl.vel.z).toFixed(2), vy: +pl.vel.y.toFixed(2),
           rep: e.rep | 0, reps: r.reps, qDrop, onG: !!pl.onGround, fire: !!(e.flags & FLAG.Firing),
+          // 这一窗服务端真跑过的那 dTick 步被拆成了哪几段：deficit 是空跑总拍数（= Δtick−Δack），
+          // lead 是其中落在"首次消费之前"的那几段（rep 报不出来的就是它），led 是实际重演了几拍。
+          // 三个数必须自洽：led = lead + Δack，且 lead + Δack + reps = Δtick。不自洽就说明
+          // carry 那条线的料接错了 —— 这是它唯一的内部一致性检查，比位置读数先红。
+          deficit, lead, led: r.led,
           dp: jb ? [+((e.x - jb.pos[0]).toFixed(3)), +(e.y - jb.pos[1]).toFixed(3), +((e.z - jb.pos[2]).toFixed(3))] : null,
           dYaw: jb ? +((e.yaw - jb.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI).toFixed(4) : null,
           dHp: jb ? +(e.hp - jb.hp).toFixed(1) : null,

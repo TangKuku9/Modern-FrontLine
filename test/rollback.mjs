@@ -4,12 +4,15 @@
 // 结果必须和"从头顺跑到末态"逐位相同。** 不相同就说明预测会被每一份快照往错误的方向
 // 拽一次 —— 那种错不会崩，只会手感怪，而且没人报错。
 //
-// 四条反证臂，为了让主命题不是空断言：
+// 七条反证臂（C1~C7），为了让主命题不是空断言：
 //   C1 不恢复武器时间轴（简易回滚的样子）      → 必须偏
 //   C2 起点配错一格（journal[k] 配 S_{k+1}）    → 必须偏，并把偏多少米印出来
 //   C3 不重置回血计时（让 dmgT 留在打之前）      → 血量必须被演回满，从而暴露缺陷
 //   C4 权威端在我供不上输入时"按住上一份不放"多算了几拍 → 补演 rep 拍必须重建得逐位相同，
 //      不补则必须偏（这一臂的另一半同时是正证：参照是一次独立顺跑，不共享被测代码的错）
+//   C5 两代回滚：上一代纠正过的账本必须写回去    → 不写回，第二代就把上一代的纠正整个丢掉
+//   C6 空跑落在"首次消费之前"那几拍（rep 报不出来的那一撮）→ 见下面那一节
+//   C7 同一拍上连拽三次（饥饿窗里 ack 不动）      → 必须幂等；老写法会让偏差每代线性增长
 // 外加量具自身的先决断言：重放期间静音替身必须真的被调用过（n>0），否则
 // "重放没碰到 audio/hud" 只是什么都没测。
 //
@@ -243,6 +246,85 @@ async function main() {
     const d5 = diff(refB, stateVec(pl, g));
     chk(d5.length === 0, 'C5 连着两代回滚之后仍与权威那一跑逐位相同',
       d5.length ? d5.slice(0, 3).join(' | ') : `${Object.keys(refB).length} 字段全等`);
+  }
+
+  // ---------- C6：空跑落在"首次消费之前"的那几拍 ----------
+  // 服务端每步是二选一：队列有货就消费一条、没有就拿手里那份空跑（server/room.mjs:step）。
+  // 所以两包之间它跑的 dTick 步里，空跑可以出现在**消费的前面**。随包的 rep 只报"末尾连拍"，
+  // 这几拍它报不出来 —— 而客户端过去的基态 journal[ack+1] 已经把那些消费算进去了，
+  // 只把 rep 补在末尾就等于把这几个空跑排到了消费之后。输入不交换，位置就差整整 deficit 拍。
+  // 真浏览器实测的那一包正是这个形状：dTick=3 Δack=1 deficit=2 rep=0，差 0.1539 m
+  // （= 2 拍 × 4.46 m/s ÷ 60 = 0.1487，且 Δpos 与相邻两拍差分同向）。
+  // 参照是一次**独立的顺跑**：把服务端真正施加的输入序列展开（I_0..I_118, I_118, I_118, I_119, …），
+  // 不用日记本、不用 replay，所以它不和被测代码共享同一个错。
+  {
+    const ack = 118, extra = 2, start = ack + 2;         // 窗形 [空跑, 空跑, 消费]：dAck = 1
+    const srv = [];
+    for (let i = 0; i < N; i++) { srv.push(inputs[i]); if (i === ack) srv.push(inputs[ack], inputs[ack]); }
+    // 这一窗的末尾 = 服务端消费到 I_{ack+1} 那一步 = srv 里第 ack+3 个
+    pl.applyJournal(J[0]); rng.setState(RNG0[0]); g.time = 0;
+    let E6 = null, R6 = null;
+    for (let k = 0; k < srv.length; k++) {
+      g.time += DT; pl.update(DT, srv[k]);
+      if (k === ack + 3) { E6 = entityOf(pl); R6 = rng.state(); }
+    }
+    const ref6 = stateVec(pl, g);
+    const carry6 = { j: J[ack + 1], inp: [inputs[ack + 1]], prevInp: inputs[ack], lead: extra, n: 1 };
+    chk(carry6.j === J[ack + 1] && start === ack + 2, '先决 C6：基态那一格 = start − dAck = ack+1，正是"消费完 I_ack"那一刻');
+    // (a) 反证：只补末尾 rep（= 旧通路）⇒ 那两个空跑被排到消费之后，必须偏
+    pl.applyJournal(J[0]); rng.setState(RNG0[0]); g.time = 0;
+    for (let i = 0; i < N; i++) { g.time += DT; pl.update(DT, inputs[i]); }
+    const r6a = rollback(g, pl, histFrom(start), start, E6, R6, { rep: 0, hold: inputs[ack + 1] });
+    const d6a = diff(ref6, stateVec(pl, g));
+    chk(r6a.corrected > 0.05, '反证 C6：只补末尾 rep 时，首段空跑被排到消费之后 ⇒ 必须偏（不是零偏差）',
+      `corrected=${r6a.corrected.toFixed(4)} m · 末态偏 ${d6a.length} 个字段（${extra} 拍 × 约 4.4 m/s ÷ 60 ≈ ${(extra * 4.4 / 60).toFixed(3)} m）`);
+    // (b) 正证：基态前移 dAck 拍、按 lead → 真输入 → rep 的顺序重演
+    pl.applyJournal(J[0]); rng.setState(RNG0[0]); g.time = 0;
+    for (let i = 0; i < N; i++) { g.time += DT; pl.update(DT, inputs[i]); }
+    const r6b = rollback(g, pl, histFrom(start), start, E6, R6, { rep: 0, hold: inputs[ack + 1], carry: carry6, lead: extra });
+    chk(r6b.led === extra + 1, 'C6：这一窗服务端真跑过的步子被一步不落地重演（lead + dAck = 3 = Δtick）', `led=${r6b.led}`);
+    chk(r6b.corrected < 1e-9, 'C6：基态前移 dAck 拍 + 首段空跑重演之后，重建与权威读数逐位重合',
+      `corrected=${r6b.corrected.toExponential(2)} m（旧通路是 ${r6a.corrected.toFixed(4)} m）`);
+    const d6b = diff(ref6, stateVec(pl, g));
+    chk(d6b.length === 0, 'C6：整段之后仍与权威那一跑逐位相同', d6b.length ? d6b.slice(0, 3).join(' | ') : `${Object.keys(ref6).length} 字段全等`);
+  }
+
+  // ---------- C7：同一拍上被连拽三次，结果必须完全一样 ----------
+  // 饥饿窗口里服务端的 ack 不动 ⇒ start 不动 ⇒ 我会对着**同一格基态**连做多次回滚
+  // （真浏览器里实测 71 包都是这个形状）。这条就是那个形状：同一份快照、同一批历史对象、三次。
+  // 它是 predict.mjs 里"这一拍（win[0] / tick=start）的账本**不能**在这里写回"那一段的守卫。
+  // 那一行加回去时，每一代都把账本整体往前挪 rep 拍，第二次开始偏差就长起来 ——
+  // 注入对照实测三次是 0 / 0.0855 / 0.1000 m，删掉即三个 0。
+  // 这条判据不可替代：注入的量级（~0.09 m）**跨不过** net-play 那条 0.12 m 判据线，
+  // 而且它在"刚起步"的拍上还会更小（把 ack 换成 100 时注入只有 0.060 / 0.049 m）——
+  // 靠"稳态最大偏差"去抓它是抓不住的。
+  // 三条里第一条是语义（幂等），第二条是直接指纹（那一格的账本对象被换掉），
+  // 两条都单独能红 —— 一起留着是因为它们红的时机不同：语义那条要靠位置读数，
+  // 账本对象那条不依赖任何物理量，接错线时先红。
+  {
+    // ack 选在"已在行走段里跑了一段"的位置（脚本里 97~166 是行走段）：折叠两拍 ≈ 2 拍位移，
+    // 量级清楚。选在刚起步的拍上（如 100）位移只有一半，注入对照的量级会小到跨不过
+    // net-play 那条 0.12 m 判据线 —— 这也是这条专用判据不能被"稳态最大偏差"替代的原因。
+    const ack = 110, extra = 2, start = ack + 1;
+    pl.applyJournal(J[0]); rng.setState(RNG0[0]); g.time = 0;
+    let E7 = null, R7 = null;
+    for (let i = 0; i < N; i++) {
+      g.time += DT; pl.update(DT, inputs[i]);
+      if (i === ack) { for (let k = 0; k < extra; k++) { g.time += DT; pl.update(DT, inputs[ack]); } E7 = entityOf(pl); R7 = rng.state(); }
+    }
+    const ref7 = stateVec(pl, g);
+    // 本地这一跑没有那两笔空跑
+    pl.applyJournal(J[0]); rng.setState(RNG0[0]); g.time = 0;
+    for (let i = 0; i < N; i++) { g.time += DT; pl.update(DT, inputs[i]); }
+    const H7 = histFrom(start);
+    const c7 = [];
+    for (let k = 0; k < 3; k++) c7.push(rollback(g, pl, H7, start, E7, R7, { rep: extra, hold: inputs[ack] }).corrected);
+    chk(c7.every(x => x < 1e-9), 'C7：连拽三次的偏差始终为零（回滚对固定基态幂等）',
+      `三次 corrected=${c7.map(x => x.toExponential(2)).join(' / ')} m`);
+    chk(H7[0].j === J[start], 'C7：这一格（tick=start）的账本对象没被回滚换掉',
+      H7[0].j === J[start] ? '仍是同一个对象' : '被换成了新对象 —— 老写法 win[0].j = pl.journal() 的指纹');
+    const d7 = diff(ref7, stateVec(pl, g));
+    chk(d7.length === 0, 'C7：连拽三次之后仍与权威那一跑逐位相同', d7.length ? d7.slice(0, 3).join(' | ') : `${Object.keys(ref7).length} 字段全等`);
   }
 
   // ---------- 每实体私有流：别人开火不许挪动我的后坐 ----------

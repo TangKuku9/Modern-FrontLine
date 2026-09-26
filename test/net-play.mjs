@@ -260,7 +260,10 @@ try {
   console.log('\n── 本地预测质量 ──');
   const q = await A.page.evaluate(() => {
     const n = window.game.net;
-    return { reconciles: n.reconciles || 0, replayed: n.replayed || 0, correctedMax: n.correctedMax || 0, steadyMax: n.steadyMax || 0, otherMax: n.otherMax || 0, starved: n.starved || 0, steadyN: n.steadyN || 0, aliveFlips: n.aliveFlips || 0, journalMisses: n.journalMisses || 0, caughtUp: n.caughtUp || 0, repN: n.repN || 0, repMax: n.repMax || 0, repsApplied: n.repsApplied || 0, repSkipped: n.repSkipped || 0, repForgotten: n.repForgotten || 0, qDrops: n.qDrops || 0, dupTicks: n.dupTicks || 0, repSkipWhy: n.repSkipWhy || [], missWhy: n.missWhy || [], snaps: n.snaps, ticks: window.game.tick, pair: n.pairProbe || null, worst: n.steadyWorst || [], flagMismatch: n.flagMismatch || 0, flagMismatchWhy: n.flagMismatchWhy || null, repUnder: n.repUnder || 0, repUnderMax: n.repUnderMax || 0, repUnderWhy: n.repUnderWhy || [] };
+    return { reconciles: n.reconciles || 0, replayed: n.replayed || 0, correctedMax: n.correctedMax || 0, steadyMax: n.steadyMax || 0, otherMax: n.otherMax || 0, starved: n.starved || 0, steadyN: n.steadyN || 0, aliveFlips: n.aliveFlips || 0, journalMisses: n.journalMisses || 0, caughtUp: n.caughtUp || 0, repN: n.repN || 0, repMax: n.repMax || 0, repsApplied: n.repsApplied || 0, repSkipped: n.repSkipped || 0, repForgotten: n.repForgotten || 0, qDrops: n.qDrops || 0, dupTicks: n.dupTicks || 0, repSkipWhy: n.repSkipWhy || [], missWhy: n.missWhy || [], snaps: n.snaps, ticks: window.game.tick, pair: n.pairProbe || null, worst: n.steadyWorst || [], flagMismatch: n.flagMismatch || 0, flagMismatchWhy: n.flagMismatchWhy || null, repUnder: n.repUnder || 0, repUnderMax: n.repUnderMax || 0, repUnderWhy: n.repUnderWhy || [],
+      // 首段空跑（rep 报不出来的那几拍）的补偿读数：补了几包、共几拍、以及残差超尺子的现场
+      carryN: n.carryN || 0, carryLead: n.carryLead || 0, carryMiss: n.carryMiss || 0, carryWhy: n.carryWhy || [],
+      foldN: n.foldN || 0, foldMax: n.foldMax || 0, foldBad: n.foldBad || 0, foldWhy: n.foldWhy || [] };
   });
   ok('每一拍快照都做了回滚重放', q.reconciles > 20, `${q.reconciles} 次 / ${q.snaps} 包快照`);
   // rep 通路的"有牙齿"断言：这一包报了重复拍 ⇔ 服务端比我供得快（饥饿）。
@@ -293,12 +296,24 @@ try {
     `失步 ${q.flagMismatch} 次 / 稳态 ${q.steadyN} 包${q.flagMismatchWhy ? ` · 首次 ${JSON.stringify(q.flagMismatchWhy)}` : ''}（编码表与取值方式两边已对齐：Crouch 取 crouchT>0.5，不是同名布尔）`);
   // 折叠拍记账的**形状**判据，不是"有没有"判据。Δtick>Δack 而 rep=0 的窗确实存在：
   // 服务端是"先折叠几拍、再消费新输入"，而 rep 按定义只能报"ack 之后的末尾连拍"，
-  // 所以那几拍折叠的位置我这边补不回来（要有第二个字节 rep0 才能修，见任务 P1-b 头号缺陷）。
+  // 所以那几拍折叠的位置我这边补不回来（客户端现在靠 Δtick/Δack 自己算 deficit 并重演，
+  // 机制见 js/net/predict.mjs 的 opts.carry；下面还有一条专门量它的残差）。
   // 这里要拦的不是它，而是它**变成每份快照都欠一遍**那种会永久累积的错 —— 那是把 rep
   // 改成"自上次广播累计"时真发生过的事故（偏差按 0.2236 m = 一份快照的位移一路涨到 1.56 m）。
   // 判据：单窗缺口不得超过一份快照的拍数（SNAP_EVERY=3）；超了就是在累积，必须红。
   ok('折叠拍缺口是一次性的（单窗 ≤ 一份快照 3 拍），不许随快照累积', q.repUnderMax <= 3,
     `违例 ${q.repUnder} 包 · 单窗最大缺口 ${q.repUnderMax} 拍 · 明细 ${JSON.stringify(q.repUnderWhy)}`);
+  // 空跑窗的**量**判据 —— 这一轮的红线就是它。尺子是客户端自己量的（日记本里相邻两拍的距离，
+  // 见 client.mjs 的 foldMax/foldWhy），不是"小于某个米数"这种可以随机器抖的阈值。
+  // 牙齿在哪：补偿漏掉时残差恰好等于 deficit 拍的位移，deficit ≥ 1 就跨过这把尺子；
+  // 而 deficit ≥ 2（实测那一包）是 2 倍尺子，怎么抖都跨得过去。反过来，补偿做到位时
+  // 残差只剩量化误差（位置量化 0.23 cm），离尺子差一个量级。
+  ok('空跑窗的残差小于"我自己走一拍"（首段空跑被重演掉了，不是丢掉）', (q.foldBad || 0) === 0,
+    `空跑窗 ${q.foldN || 0} 个 · 最大残差 ${(q.foldMax || 0).toFixed(4)} m · 超尺子 ${q.foldBad || 0} 个`
+    + `${(q.foldWhy || []).length ? ' · 明细 ' + JSON.stringify(q.foldWhy) : ''}`);
+  // 该补而没补的，必须留下名字（旧写法在同样的窗里照样记一个 corrected，于是"少补了几拍"
+  // 和"预测器算错了"在报表上完全同形）。这条只印不裁：真正裁的是上面那条量判据。
+  if (q.carryMiss) console.log(`  ⚠ 未补偿的空跑窗 ${q.carryMiss} 个（用 carry 补了 ${q.carryN || 0} 包 / 共 ${q.carryLead || 0} 拍）· 成因 ${JSON.stringify((q.carryWhy || []).slice(0, 4))}`);
   if (q.worst.length) {
     const top = [...q.worst].sort((a, b) => b.d - a.d).slice(0, 5);
     console.log(`  >8cm 的稳态校正 ${q.worst.length} 次，最大 5 次现场：`);
@@ -309,9 +324,15 @@ try {
   // 判据线本身不动：排除项必须由独立测到的服务端事件定义，不能为了让它绿而挪阈值。
   {
     const big = q.worst.filter(w => w.d > 0.12);
-    const attr = big.filter(w => w.qDrop || w.dAck > w.dTick).length;
-    if (big.length) console.log(`  >0.12 m（判据线）的归因：${attr}/${big.length} 落在服务端不规则事件（跳拍或 Δack>Δtick）上` +
-      ` · 明细 ${JSON.stringify(big.map(w => ({ d: w.d, drop: !!w.qDrop, ahead: w.dAck - w.dTick, inflight: w.inflight, reps: w.reps })))}`);
+    // 归因谓词以前写的是 `w.qDrop || w.dAck > w.dTick` —— 两个项是同一个条件（qDrop 的定义
+    // 就是 dAck > dTick），所以它只能抓到"服务端跳过了我的输入"那一头，而**抓不到**它在注释里
+    // 点名的另一头：空跑（Δtick > Δack）。于是那一族样本永远显示"不可归因"，看着像物理分叉 ——
+    // 这一轮拆掉的那族 0.15 m 就是这么被误判了一轮。正确判据是"服务端这一窗不是一拍一条输入"：
+    // Δtick ≠ Δack。两个方向都是**独立测到的**（serverTick 差与 ack 差都直接来自 wire），
+    // 不是为了让谁变绿而挪的阈值。
+    const attr = big.filter(w => w.dTick !== w.dAck).length;
+    if (big.length) console.log(`  >0.12 m（判据线）的归因：${attr}/${big.length} 落在服务端不规则事件（Δtick ≠ Δack：跳拍或空跑）上` +
+      ` · 明细 ${JSON.stringify(big.map(w => ({ d: w.d, dTick: w.dTick, dAck: w.dAck, deficit: w.deficit, lead: w.lead, inflight: w.inflight, reps: w.reps })))}`);
   }
   if (q.pair && q.pair.n) {
     const p = q.pair, n = p.n;
@@ -329,7 +350,7 @@ try {
     console.log(`    定罪条件"另一拍解释力强一倍"：错拍 ${p.nMis} 包（argmin 非 0 的裸数 ${n - p.nZero}，多数只是量化噪声），其中可归因队列事件 ${p.attributed}，不可归因 ${p.unexplained.length}`);
     ok('配对契约：每一个错拍样本都落在输入总线事件上（否则就是配对规则本身有洞）', p.unexplained.length === 0,
       `不可归因 ${JSON.stringify(p.unexplained.slice(0, 2))}`);
-    console.log(`  输入总线读数：饥饿 ${q.starved} 包 · 服务端跳过我的输入 ${q.qDrops} 包 · 漏计重复拍 ${q.repForgotten} · 补不全 ${q.repSkipped} 包`);
+    console.log(`  输入总线读数：饥饿 ${q.starved} 包 · 服务端跳过我的输入 ${q.qDrops} 包 · 漏计重复拍 ${q.repForgotten} · 补不全 ${q.repSkipped} 包 · 首段空跑用 carry 补了 ${q.carryN || 0} 包/${q.carryLead || 0} 拍`);
     // 恒等式：一拍一份输入。同一拍记两遍 ⇒ 回滚多演一步而服务端把第二份当重复包丢掉，
     // 表现出来就是"权威端比我的重建少走一拍"，且 rep 看不出（它没重复）。
     ok('输入总线没把同一拍记两遍（回滚窗口逐拍唯一）', q.dupTicks === 0, `重复记录 ${q.dupTicks} 拍 · 不可归因样本现场 ${JSON.stringify((p.unexplained || [])[0] || null)}`);
