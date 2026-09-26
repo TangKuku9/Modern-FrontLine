@@ -199,6 +199,31 @@ try {
   let foreign = 'connected';
   try { const e = await joiner('probeX', { origin: 'http://evil.example' }); foreign = 'connected'; e.ws.close(); }
   catch (e) { foreign = e.message; }
+  // 服务端在 /healthz 的 gate.originCheck 上**自报**来源检查开没开。自报与实测必须一致 ——
+  // 但"实测"必须隔离出**来源这一道闸**：拒一个握手的原因有很多（来源 403、没会话 401），
+  // 只看"被拒了"的话，一台要账号的服（没设 ALLOW_ORIGIN）会被自己的会话闸拒成 401，
+  // 于是"自报关 · 实测拒绝"假不一致 —— 第一次对 8126 跑就抓到了这个混淆。判据用的是
+  // 状态码：来源闸关人 = 403（verifyClient 里来源检查失败写死的那个码）。
+  // 这条判据的起因是 ALLOW_ORIGIN 留空**没有做拒绝启动的闸**（决策记录在 README）——
+  // "忘了设"以前只能靠人盯启动日志，现在部署面上机器可查。
+  const originSelf = !!(hj && hj.gate && hj.gate.originCheck);
+  const foreign403 = /403/.test(foreign);
+  if (!(hj && hj.gate && 'originCheck' in hj.gate)) {
+    skip('来源检查的自报与实测互相印证', '这台机器的 /healthz 没有 gate.originCheck（版本较老，先升级再验）');
+  } else {
+    ok('来源检查：healthz 自报与陌生来源被 403 的实测一致（两处不一致说明有一边在撒谎）',
+      originSelf === foreign403,
+      `自报 ${originSelf ? '开' : '关'} · 陌生来源被拒的方式 ${foreign === 'connected' ? '放行' : foreign.slice(-40)}`);
+    // 生产形状的判据：/server/ 源码取不到 = 这台是生产模式（开发模式本来就发源码）。
+    // 生产 + 不检查来源 = 对所有网站开放这台炮台，从外面看这是**红**，不只是"现状"。
+    const prodShape = src.status !== 200 && !/WebSocketServer|assertDeployConfig/.test(src.buf.toString());
+    if (prodShape) {
+      ok('生产模式下来源检查必须开（ALLOW_ORIGIN 已设）', originSelf && foreign403,
+        originSelf ? '' : '公网生产服不检查来源 = 别的网站可以把它嵌进自己页面当免费炮台（healthz 的 gate.originCheck 也是关的，操作员改完配置重启即可转绿）');
+    } else {
+      skip('生产模式下来源检查必须开', '这台机器取得到 /server/ 源码 —— 是开发模式，不检查来源是设计行为');
+    }
+  }
   if (foreign === 'connected') {
     console.log(`  ⚠ 陌生来源的握手被放行了 —— 这台机器**没开来源检查**（ALLOW_ORIGIN 为空）。`);
     console.log('    这不是探针失败，是部署现状：WS 不吃 CORS，不拦就等于替别人开放了这个炮台。');

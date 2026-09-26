@@ -362,7 +362,14 @@ try {
     ok('配对契约：每一个错拍样本都落在输入总线事件上（否则就是配对规则本身有洞）', p.unexplained.length === 0,
       `不可归因 ${JSON.stringify(p.unexplained.slice(0, 2))}`);
     console.log(`  输入总线读数：饥饿 ${q.starved} 包 · 服务端跳过我的输入 ${q.qDrops} 包 · 漏计重复拍 ${q.repForgotten} · 补不全 ${q.repSkipped} 包 · 首段空跑用 carry 补了 ${q.carryN || 0} 包/${q.carryLead || 0} 拍`);
-    console.log(`  carry 步数一致性（applySteps 必须 == dTick）：违例 ${q.carryStepsBad || 0} 包 · 现场 ${JSON.stringify((q.carryStepsWhy || []).slice(0, 3))}`);
+    // 这一条以前只打印不断言（立过账的缺口）：applySteps = led + reps 必须 == dTick 是
+    // predict.mjs 一直声称的恒等式 —— 上一轮就是因为它从没被比过，lastRep 的重复计数
+    // 躲过一整轮。单窗链上的版本在 test/reconcile-chain.mjs 的 A2；这里是真浏览器那一半。
+    // hit 为假的窗（客户端落后、win 为空）不在此账上 —— 那是 caughtUp 类，client.mjs 的
+    // carryStepsBad 已按口径把这两类分开。
+    ok('carry 步数一致性：重演步数恰好等于这一窗服务端真跑的拍数（applySteps == dTick）',
+      (q.carryStepsBad || 0) === 0,
+      `违例 ${q.carryStepsBad || 0} 包 · 现场 ${JSON.stringify((q.carryStepsWhy || []).slice(0, 3))}`);
     // 恒等式：一拍一份输入。同一拍记两遍 ⇒ 回滚多演一步而服务端把第二份当重复包丢掉，
     // 表现出来就是"权威端比我的重建少走一拍"，且 rep 看不出（它没重复）。
     ok('输入总线没把同一拍记两遍（回滚窗口逐拍唯一）', q.dupTicks === 0, `重复记录 ${q.dupTicks} 拍 · 不可归因样本现场 ${JSON.stringify((p.unexplained || [])[0] || null)}`);

@@ -86,10 +86,13 @@ function childEnv(env) {
   for (const k of Object.keys(env)) if (env[k] === undefined) delete e[k];
   return e;
 }
-async function bootRaw(env, { ms = 8000 } = {}) {
+async function bootRaw(env, { ms = 20000 } = {}) {
   const { spawn } = await import('node:child_process');
   // 端口用 with-server.mjs 那个"问内核要一个空闲端口"的办法，不自己随机：随机撞上别人占用的端口时，
   // 进程会因为**别的**原因起不来，而 H5/H6 量的是"它该起来" —— 那种红查起来完全不讲道理。
+  // 20 秒这个数是**量具的耐心上限，不是判据线**：判据是"起来了 + 日志写了什么"，而绿色路径
+  // 在看到启动行的那一拍就早退，所以这个上限只在机器被拖慢时才起作用 —— 单跑一两秒、
+  // 全套件跑热后 spawn 偶发超过 8 秒，把 H6 抹成过一次红（实测 2026-09-26），才把窗口补上。
   const port = await freePort();
   const s = spawn(process.execPath, ['server/net-server.mjs', String(port)], { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(env) });
   let log = '', exitCode = null;

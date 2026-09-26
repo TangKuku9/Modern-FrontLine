@@ -422,6 +422,90 @@ console.log(sec('I 计数'));
     `${acc.stat.scryptN} 次 / ${acc.stat.scryptMs} ms`);
 }
 
+// ══════════ J 审计日志 ══════════
+// "谁在什么时候从哪个 IP 注册/登录/被拒"—— 以前只有控制台一行 [result]，真有纠纷时
+// 没有可回查的证据。审计的失效也是静默的：忘写一行、把密码写进去、IP 记错，
+// 都不报错，只有出事那一天才知道。所以每一条都得有判据，反证臂跟着。
+console.log(sec('J 审计日志'));
+{
+  const { store, acc } = mk();
+  const r1 = await acc.register({ name: 'Auditor', password: PW, code: 'SESAME', ip: '10.12.0.1' });
+  const rows1 = store.getAudit(100);
+  chk(r1.ok && rows1.length === 1, 'J1 注册成功恰好落一行（多行 = 有分支重复记账，零行 = 审计没接）',
+    JSON.stringify(rows1[0] || null));
+  chk(rows1[0] && rows1[0].ev === 'reg:ok' && rows1[0].ip === '10.12.0.1' && rows1[0].name === 'Auditor',
+    'J2 事件名/IP/呼号逐项对（IP 是到达 Accounts 的那个值，TRUST_PROXY 的折算在 HTTP 那一层做完）',
+    JSON.stringify(rows1[0] || null));
+
+  await acc.register({ name: 'Sneak', password: PW, code: 'WRONG-CODE', ip: '10.12.0.2' });
+  const badRow = store.getAudit(10)[0];
+  chk(badRow && badRow.ev === 'reg:bad_invite' && badRow.name === 'Sneak',
+    'J3 被拒的注册也落账，且记的是**原始输入**的呼号（证据就是对方发来的东西）', JSON.stringify(badRow || null));
+
+  await acc.login({ name: 'Auditor', password: PW + 'x', ip: '10.12.0.3' });
+  await acc.login({ name: 'Auditor', password: PW, ip: '10.12.0.3' });
+  const evs = store.getAudit(10).map(r => r.ev);
+  chk(evs[0] === 'login:ok' && evs[1] === 'login:bad_credentials',
+    'J4 登录的成功/失败各落一行，事件名可读（纠纷时不用翻代码）', JSON.stringify(evs));
+
+  // 反证臂：读路径不许落账。whoami/logout 是"每个页面加载都会发生"的普通事件，
+  // 写进去的话审计表会被正常流量淹没，真正的注册/登录记录反而找不到。
+  const before = store.auditLog.length;
+  const rg = await acc.register({ name: 'Reader', password: PW, code: 'SESAME', ip: '10.12.0.4' });
+  const n1 = store.auditLog.length;                       // 注册本身的那一行
+  await acc.whoami(rg.token);
+  await acc.logout(rg.token);
+  chk(store.auditLog.length === n1 && n1 === before + 1,
+    'J5 反证臂：whoami / logout 不写审计（读路径落账 = 审计表被正常流量淹没）',
+    `before=${before} +1=${n1} now=${store.auditLog.length}`);
+
+  await acc.login({ name: 'Victim', password: 'the-attempted-password-123', ip: '10.12.0.6' });
+  chk(!store.auditLog.some(r => JSON.stringify(r).includes('the-attempted-password')),
+    'J6 密码（哪怕是被试出来的那个）不进审计的任何一格');
+
+  const weird = '坏\u0007名\u001b[31m字'.padEnd(60, '长');
+  await acc.register({ name: weird, password: PW, code: 'SESAME', ip: '10.12.0.7' });
+  const wRow = store.getAudit(1)[0];
+  chk(wRow && wRow.name.length <= 32 && !/[\u0000-\u001f\u007f]/.test(wRow.name),
+    'J7 控制字符被拍平、超长被截断（审计表不做攻击面：一次换行就能伪造一行新记录）',
+    JSON.stringify(wRow));
+
+  // ── SQLite 落地：审计必须**直写**，不走 250ms 的批刷 ──
+  // 账号可以接受"进程被杀丢最近 250ms"（store.mjs 文件头立过账），审计不行 ——
+  // 它就是为"进程被杀之后还说得清发生了什么"而存在的。所以判据是：users 还在
+  // 脏集合里没刷盘时，另一个连接已经能读到 audit 行。
+  let DatabaseSync = null;
+  try { ({ DatabaseSync } = await import('node:sqlite')); } catch { /* 与 H 段同一处理 */ }
+  if (!DatabaseSync) {
+    chk(true, 'J8/J9 跳过：这个 Node 没有 node:sqlite（SqliteStore 的其余判据在 H 段同样跳过）');
+  } else {
+    const file = join(tmpdir(), `mf-audit-${process.pid}-${Math.random().toString(36).slice(2)}.db`);
+    const cleanup = () => { try { rmSync(file, { force: true }); } catch { /* */ } };
+    try {
+      const s1 = new SqliteStore({ file, idleMs: 3600_000, DatabaseSync, now });
+      const acc2 = new Accounts({
+        store: s1, inviteCode: 'SESAME', now, scrypt: TEST_SCRYPT,
+        limiter: new RateLimiter({ windowMs: 3600_000, max: 500, baseMs: 5000, maxBackoffMs: 3600_000 }),
+        loginLimiter: new RateLimiter({ windowMs: 300_000, max: 500, baseMs: 1000, maxBackoffMs: 900_000 }),
+      });
+      await acc2.register({ name: 'Durable', password: PW, code: 'SESAME', ip: '10.12.1.1' });
+      const probe = new DatabaseSync(file);   // 另一个连接：直接查盘上的库
+      const onDisk = probe.prepare('select ev, name, ip from audit').all();
+      const pendingUser = s1.pending;         // users 走批刷，此刻应该还在脏集合里
+      probe.close();
+      chk(onDisk.length === 1 && onDisk[0].ev === 'reg:ok',
+        'J8 审计直写：users 还没刷盘时，另一个连接已经读得到 audit 行（它不许跟着 250ms 批一起赌命）',
+        `盘上 ${JSON.stringify(onDisk)} · users 待刷 ${pendingUser}`);
+      s1.close();
+      const s2 = new SqliteStore({ file, idleMs: 3600_000, DatabaseSync, now });
+      const again = s2.getAudit(10);
+      s2.close();
+      chk(again.length === 1 && again[0].name === 'Durable',
+        'J9 反证臂的反向：重开库之后审计还在（它记的就是"进程死了之后"的事）', JSON.stringify(again[0] || null));
+    } finally { cleanup(); }
+  }
+}
+
 console.log('');
 if (fails) { console.log(`RED  ${checks - fails}/${checks} 通过，${fails} 条失败`); process.exit(1); }
 console.log(`GREEN  账号与防护：${checks}/${checks} 通过`);

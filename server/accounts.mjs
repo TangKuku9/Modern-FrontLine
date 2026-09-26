@@ -274,7 +274,25 @@ export class Accounts {
     return timingSafeEqual(a, b);
   }
 
-  async register({ name, password, code, ip = '-' } = {}) {
+  // 审计包在**入口这一层**，而不是散在各 return 点：register/login 的每一种结局
+  // （限流 / 坏邀请码 / 重名 / 忙 / 成功）都必须落一行 —— 事件名就是结局
+  // （`reg:bad_invite`、`login:bad_credentials`…），真有纠纷时这一张表就能还原
+  // "谁在什么时候从哪个 IP 试了什么、结果如何"。写在各 return 点的症状是：以后
+  // 加一个新的拒绝分支忘了审计，那个分支就成了"纠纷时没有记录"的盲区。
+  // name 记的是**原始输入**（证据就是对方实际发来的东西），但要拍平控制字符、
+  // 截到 32 字 —— 日记的读者（人/脚本）不该被一个超长字符串或换行打进来的一行
+  // 伪造记录糊弄。密码永远不进审计：它根本不在写进去的参数里。
+  _audit(ev, name, ip) {
+    this.store.audit(ev, String(name == null ? '' : name).replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 32), ip || '-');
+  }
+
+  async register(args = {}) {
+    const r = await this._registerImpl(args);
+    this._audit(r.ok ? 'reg:ok' : `reg:${r.error || 'unknown'}`, args.name, args.ip);
+    return r;
+  }
+
+  async _registerImpl({ name, password, code, ip = '-' } = {}) {
     const now = this.now();
     const rl = this.regLimit.hit(`reg:${ip}`, now);
     if (!rl.ok) { this.stat.rateLimited++; return { ok: false, error: 'too_many', retryAfterMs: rl.retryAfterMs }; }
@@ -310,7 +328,13 @@ export class Accounts {
     return { ok: true, token, name: n, profile: this.publicProfile(user) };
   }
 
-  async login({ name, password, ip = '-' } = {}) {
+  async login(args = {}) {
+    const r = await this._loginImpl(args);
+    this._audit(r.ok ? 'login:ok' : `login:${r.error || 'unknown'}`, args.name, args.ip);
+    return r;
+  }
+
+  async _loginImpl({ name, password, ip = '-' } = {}) {
     const now = this.now();
     const n = normalizeName(name);
     const key = nameKey(n);

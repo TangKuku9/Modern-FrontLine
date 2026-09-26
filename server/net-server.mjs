@@ -249,6 +249,11 @@ async function serveStatic(req, res) {
         store: auth.store.constructor.name, inviteRequired: !!CFG.inviteCode },
       gate: { connsPerIp: CFG.connsPerIp, ips: connsByIp.size, wsMsgPerSec: CFG.wsMsgPerSec,
         roomsPerUser: CFG.roomsPerUser, requireAccount: CFG.requireAccount,
+        // 来源检查开没开，自报在这里：ALLOW_ORIGIN 留空 = 不检查。这件事**不做成拒绝启动的闸**
+        // （确实有不需要它的部署，理由见 README《还没做完的部分》），但"忘了设"必须能被机器看见 ——
+        // 启动日志那行只有人盯着看，remote-probe 拿这一格和"陌生来源握手的实测结果"互相印证，
+        // 两处不一致说明有一边在撒谎。
+        originCheck: CFG.origins.length > 0,
         refusedConn: gate.connIp, refusedMsg: gate.msgFlood, refusedRoom: gate.roomQuota, refusedAuth: gate.noAuth },
     });
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(body) });

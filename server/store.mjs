@@ -48,7 +48,22 @@ create table if not exists sessions (
 );
 create index if not exists sessions_uk on sessions (uk);
 create table if not exists meta (k text primary key, v text not null);
+create table if not exists audit (
+  id   integer primary key autoincrement,
+  t    integer not null,
+  ev   text not null,
+  name text not null,
+  ip   text not null
+);
 `;
+
+
+// ── 审计（audit）为什么是**直写**而账号是攒批 ──
+// 审计记的是"谁在什么时候从哪个 IP 注册/登录/被拒" —— 真有纠纷时这是唯一的证据，
+// 它的优先级和 xp 相反：**宁可多花一次磁盘写，也不能和"进程被杀"一起消失**。
+// 而它的频率天然被限流器压着（注册 8/时/IP、登录 12/5分/IP），单条 insert 走的是
+// 已经打开的连接，不在 tick 路径上（注册/登录都发生在 HTTP handler 里）——
+// 所以这里不走脏集合、不走 250ms 批刷，一次 insert 落定。
 
 const MAX_BATCH = 200;          // 单批最多这么多行，见上面"雪崩"那段
 
@@ -72,6 +87,7 @@ export class MemoryStore {
   constructor({ now = Date.now } = {}) {
     this.users = new Map();
     this.sessions = new Map();
+    this.auditLog = [];
     this.now = now;
     this.flushes = 0;
   }
@@ -89,6 +105,13 @@ export class MemoryStore {
   deleteUserSessions(key) { for (const [t, s] of this.sessions) if (s.key === key) this.sessions.delete(t); }
   countUsers() { return this.users.size; }
   countSessions() { return this.sessions.size; }
+  // 审计的**契约与 SQLite 版一致**：不许往调用方抛（审计失败不许挡住注册/登录），
+  // 内存上限只影响留多少条 —— 判据里量的是形状，不是容量。
+  audit(ev, name, ip) {
+    this.auditLog.push({ t: this.now(), ev: String(ev), name: String(name || ''), ip: String(ip || '') });
+    if (this.auditLog.length > 5000) this.auditLog.shift();
+  }
+  getAudit(limit = 50) { return this.auditLog.slice(-limit).reverse(); }
   flush() { this.flushes++; return 0; }
   close() {}
 }
@@ -124,6 +147,7 @@ export class SqliteStore {
     this._insSess = this.db.prepare('insert into sessions (token,uk,exp) values (?,?,?) on conflict(token) do update set uk=excluded.uk, exp=excluded.exp');
     this._delSess = this.db.prepare('delete from sessions where token = ?');
     this._delExp = this.db.prepare('delete from sessions where exp <= ?');
+    this._insAudit = this.db.prepare('insert into audit (t,ev,name,ip) values (?,?,?,?)');
 
     this.timer = setInterval(() => { try { this.flush(); } catch { /* 由 stat.errors 记账 */ } }, this.idleMs);
     // unref：这个定时器不该让进程活着。忘了它的话服务停不下来，
@@ -155,6 +179,16 @@ export class SqliteStore {
   deleteUserSessions(key) { for (const [t, s] of this.sessions) if (s.key === key) this.deleteSession(t); }
   countUsers() { return this.users.size; }
   countSessions() { return this.sessions.size; }
+  // 审计**直写**（理由见文件头 audit 表那一段），且不许往调用方抛：
+  // 磁盘出问题时注册/登录该怎么样还怎么样，代价只在 stat.errors 上可见 ——
+  // 静默丢审计当然不理想，但"审计失败挡住玩家进游戏"更不理想，两害取轻要留下字据。
+  audit(ev, name, ip) {
+    try { this._insAudit.run(this.now(), String(ev), String(name || ''), String(ip || '')); }
+    catch { this.stat.errors++; }
+  }
+  getAudit(limit = 50) {
+    return this.db.prepare('select t, ev, name, ip from audit order by id desc limit ?').all(limit | 0);
+  }
   get pending() { return this.dirtyUsers.size + this.dirtySessions.size + this.goneSessions.size; }
 
   // 一批一事务。批内条数有上限，见文件头"雪崩"那段。
