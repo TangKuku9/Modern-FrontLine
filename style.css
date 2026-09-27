@@ -93,6 +93,17 @@ html, body { position: fixed; inset: 0; }
 .seg div.sel { background: var(--acc); color: #111; font-weight: 700; }
 .lobby-foot { display: flex; gap: 12px; justify-content: flex-end; margin-top: 20px; }
 
+/* 联网大厅的房间列表行。按钮是行内"加入"，整行不做成可点 —— 误触整行就进房的代价太大 */
+.room-row { display: flex; align-items: center; gap: 14px; padding: 8px 12px; background: rgba(255,255,255,.04); border-left: 3px solid transparent; }
+.room-row:hover { background: rgba(255,255,255,.1); border-left-color: var(--acc); }
+.room-row .rr-name { flex: 1; font-weight: 700; letter-spacing: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-row .rr-meta { color: #999; font-size: 12px; }
+.room-row .rr-n { color: #ccc; font-size: 13px; min-width: 48px; text-align: right; }
+.room-row .rr-state { color: #888; font-size: 12px; min-width: 52px; text-align: right; }
+/* 主菜单上"注册后开放"那一项：看得见、点得进（落在注册页），但明写它锁着 */
+.mbtn.locked { opacity: .62; }
+.mbtn.locked:hover { border-left-color: #c9a227; }
+
 /* 装备 */
 .loadout { padding: 50px 60px; width: 100%; display: flex; flex-direction: column; }
 .classes { display: flex; flex-direction: column; gap: 6px; width: 240px; }

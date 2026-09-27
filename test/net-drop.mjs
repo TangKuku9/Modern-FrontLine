@@ -84,7 +84,7 @@ async function boot(browser, tag) {
 }
 
 // 只想跑某一段的时候：node test/net-drop.mjs D —— 一次全跑要五分钟，迭代等不起。
-const only = (process.argv[2] || 'ABCDE').toUpperCase();
+const only = (process.argv[2] || 'ABCDEF').toUpperCase();
 const skip = t => !only.includes(t);
 
 const realErrs = (logs) => logs.filter(l => !/favicon|WebGL|AudioContext|pointer lock|ERR_NETWORK|ERR_INTERNET|Failed to load/i.test(l));
@@ -285,9 +285,10 @@ try {
     srv.kill();
   }
   if (!skip('E')) {
-    console.log('\n── E：联机入口在菜单里，不用手打网址 ──');
+    console.log('\n── E：联机入口在菜单里 —— 房间列表，不用手打网址 ──');
     // 联机的代码早就在了，但要玩家自己敲 ?online=1&room=… 才算真的有这个模式吗？不算。
-    // 这一段就从主菜单开始用鼠标点：联网对战 → 填呼号 → 选阵营 → 加入对局，看它到不到得了局内。
+    // 这一段就从主菜单开始用鼠标点：联网对战 → 大厅是**房间列表** → 填房名建一间 → 进局内，
+    // 再回头查 /api/rooms —— 大厅那张列表必须和服务端的清单是同一份东西。
     // 先收掉前面几段的页面：这一段是唯一要点鼠标的，而"6 个画布页同时软件渲染"会让
     // Playwright 的点击派发卡住 —— 读数与排除过程见文件开头 closeOpened() 的注释。
     await closeOpened();
@@ -312,16 +313,32 @@ try {
     await page.click('[data-a=online]');
     await sleep(500);
     const form = await page.evaluate(() => ({
+      rows: !!document.querySelector('#roomRows'), quick: !!document.querySelector('[data-a=quick]'),
+      create: !!document.querySelector('[data-a=create]'), refresh: !!document.querySelector('[data-a=refresh]'),
+      title: !!document.querySelector('#roomTitle'),
       name: !!document.querySelector('#onName'), team: document.querySelectorAll('#onTeam div').length,
-      room: !!document.querySelector('#onRoom'), join: !!document.querySelector('[data-a=join]'),
       screen: (window.game.menu || {}).screen,
     }));
-    ok('联网大厅给出呼号 / 阵营 / 房间号三项，还有"加入对局"', form.name && form.team === 2 && form.room && form.join && form.screen === 'online', JSON.stringify(form));
+    ok('联网大厅是房间列表：列表区 + 刷新 + 创建并进入 + 快速加入，阵营/呼号还在',
+      form.rows && form.quick && form.create && form.refresh && form.title && form.name && form.team === 2 && form.screen === 'online', JSON.stringify(form));
     ok('反证：光是站在大厅里还没连服务器（进了大厅不等于已经进场）',
       await page.evaluate(() => !window.game.net || !window.game.net.connected), '');
+    // 进对局 URL 的拼装是纯函数（menu.onlineJoinParams）：两条都能**不点按钮**就量到 ——
+    // 真点一下是整页导航，"没塞 room="这件事到了结果页上已经看不见了，
+    // 而"按钮没接线"和"接了线但参数拼错"在结果页上是同一副长相。
+    const urls = await page.evaluate(() => ({
+      auto: String(window.game.menu.onlineJoinParams({ room: '', title: '', team: 'A', name: '士兵', guest: true })),
+      created: String(window.game.menu.onlineJoinParams({ room: 'r1a2b3', title: '菜单甲的房', team: 'B', name: '菜单甲', guest: true })),
+    }));
+    ok('没选房间时 URL 不带 room=（让服务端去做 fill-first 分配）', !/room=/.test(urls.auto), urls.auto);
+    ok('建房时 URL 带 room= 与 title=（房名是显示名，不是房号）',
+      /room=r1a2b3/.test(urls.created) && /title=/.test(urls.created), urls.created);
+    // 真点一次"创建并进入"：按钮要真的把人送进局内（"按钮存在" ≠ "接线了"）
+    // 呼号框照旧要填（访客服上它是这一局的显示名）—— 判据"呼号带进去了"量的就是这一步的接线。
     await page.fill('#onName', '菜单甲');
+    await page.fill('#roomTitle', '菜单甲的房');
     await page.click('#onTeam div[data-v="B"]');
-    await page.click('[data-a=join]');
+    await page.click('[data-a=create]');
     let landed = null;
     for (let i = 0; i < 200; i++) {
       landed = await page.evaluate(() => {
@@ -331,11 +348,87 @@ try {
       if (landed.cid && landed.snaps > 3) break;
       await sleep(250);
     }
-    ok('点"加入对局"之后真的换页进了局内（拿到 cid 且在收快照）',
-      /online=1/.test(landed.url) && !!landed.cid && landed.snaps > 3, JSON.stringify(landed).slice(0, 150));
+    ok('点"创建并进入"之后真的换页进了局内（拿到 cid 且在收快照，URL 带 room= 与 title=）',
+      /online=1/.test(landed.url) && /room=/.test(landed.url) && /title=/.test(landed.url) && !!landed.cid && landed.snaps > 3, JSON.stringify(landed).slice(0, 150));
     ok('大厅里选的阵营带进了对局（B 队不是写在表单上就完事）', landed.team === 'B', 'team=' + landed.team + ' url=' + landed.url);
     ok('呼号带进去了（服务端按白名单收 2~16 字，中文不该被截坏）', landed.name === '菜单甲', JSON.stringify(landed.name));
-    ok('没填房间时不往 URL 里塞 room=（让服务端去做 fill-first 分配）', !/room=/.test(landed.url), landed.url);
+    // 大厅那张列表必须和服务端的清单是**同一份东西** —— 进房之后反过来查 /api/rooms：
+    // 刚建的那间（title=菜单甲的房）要在清单里，人数是活的。画一张假列表也能"看起来有房间"。
+    const rooms = await page.evaluate(() => fetch('/api/rooms').then(r => r.json()).catch(e => ({ ok: false, err: String(e) })));
+    const mine = (rooms.rooms || []).find(x => x.title === '菜单甲的房');
+    ok('进房之后 /api/rooms 里看得见这间房（title 透出、人数是活的）',
+      !!mine && mine.players >= 1, JSON.stringify(mine || rooms).slice(0, 150));
+    ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
+    srv.kill();
+  }
+  if (!skip('F')) {
+    console.log('\n── F：未完成注册前，联网对战不开放 ──');
+    // 这一段刻意用**默认配置**（要账号 + 邀请码）—— 那道闸只在那种服上存在。
+    // 与 E 段互为反证臂：同一个大厅，访客服（E）不锁、要账号的服（F）锁。
+    // 只写一边的话，一个"永远锁着"或"永远不锁"的实现也能绿掉一半判据。
+    await closeOpened();
+    const srv = await withServer({ JOIN_CODE: 'SESAME' });
+    const { page, logs } = await newPage(browser, srv, 'menu-f', null, '', { width: 1280, height: 720 });
+    for (let i = 0; i < 200; i++) {
+      const ready = await page.evaluate(() => !!(window.game && window.game.menu && window.game.menu.el && window.game.menu.el.querySelector('[data-a=online]')));
+      if (ready) break;
+      await sleep(250);
+    }
+    // 账号状态是**按需拉**的（js/main.js 的 accountSync）—— 锁标取决于"这个服要不要账号 +
+    // 我登没登录"，两格都要等它回来。等待点是 accountSync() 这个 promise 本身，不是轮询
+    // statusKnown 那个中间态：statusKnown 置位时 me() 还没回来、updateOnlineEntry 还没跑，
+    // 全量跑（机器忙、/api/me 慢）时就量到"还没画锁"的瞬间 —— 第一版在 test:browser 里就是
+    // 这么红过一次（单跑 F 每次都绿）。await 链上的回调按注册顺序执行，showMain 注册得早，
+    // 所以 evaluate 返回时锁标一定已经画完。
+    await page.evaluate(() => window.game.accountSync());
+    const entry = await page.evaluate(() => {
+      const b = document.querySelector('[data-a=online]');
+      return { locked: !!(b && b.classList.contains('locked')), text: (b && b.textContent || '').trim().slice(0, 60) };
+    });
+    ok('主菜单上"联网对战"标着 🔒 注册后开放（不是假装开放、点了才拒）',
+      entry.locked && /注册后开放/.test(entry.text), JSON.stringify(entry));
+    await page.bringToFront();
+    await page.click('[data-a=online]');
+    await sleep(500);
+    const lock = await page.evaluate(() => {
+      const rows = document.querySelector('#roomRows');
+      return {
+        locked: (rows && rows.dataset.locked) || null, text: ((rows && rows.textContent) || '').trim().slice(0, 60),
+        quick: !!(document.querySelector('[data-a=quick]') || {}).disabled,
+        create: !!(document.querySelector('[data-a=create]') || {}).disabled,
+      };
+    });
+    ok('大厅里房间列表锁着，快速加入 / 创建并进入都按不动',
+      lock.locked === '1' && lock.quick && lock.create && /注册后开放/.test(lock.text), JSON.stringify(lock));
+    // 权限不在"按钮置灰"里：服务端对没会话的清单请求直接 401。
+    // 客户端那道锁只是省掉一次白跑 —— 把它删掉也进不了场（这就是 ② 的服务端那一半）。
+    const anon = await page.evaluate(async () => {
+      const r = await fetch('/api/rooms');
+      return { status: r.status, body: (await r.text()).slice(0, 120) };
+    });
+    ok('服务端也不给没注册的人房间清单（401，且响应里没有 rooms）',
+      anon.status === 401 && !/rooms/.test(anon.body), JSON.stringify(anon));
+    // 注册之后就开放 —— 走 UI 注册（"注册后开放"的另一半）
+    await page.fill('#onName', '菜单乙');
+    await page.fill('#acctPw', 'a-long-enough-password');
+    await page.fill('#acctCode', 'SESAME');
+    await page.click('[data-a=reg]');
+    let after = null;
+    for (let i = 0; i < 80; i++) {
+      after = await page.evaluate(async () => {
+        const rows = document.querySelector('#roomRows');
+        const r = await fetch('/api/rooms');
+        return {
+          locked: (rows && rows.dataset.locked) || null,
+          create: !!(document.querySelector('[data-a=create]') || {}).disabled,
+          status: r.status,
+        };
+      });
+      if (!after.locked && !after.create && after.status === 200) break;
+      await sleep(250);
+    }
+    ok('注册之后房间列表就开放（锁标消失、创建可点、服务端给清单）',
+      !!after && !after.locked && !after.create && after.status === 200, JSON.stringify(after));
     ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
     srv.kill();
   }

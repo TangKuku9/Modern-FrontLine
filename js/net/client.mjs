@@ -22,6 +22,9 @@ export class NetClient {
     this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
     this.name = opts.name || '士兵';
     this.team = opts.team === 'B' ? 'B' : 'A';
+    // 房间的显示名（联机大厅"创建房间"带来）。可选：不带就是"没起名"，
+    // 列表里显示房号。它**不是房号** —— 房号在 room 那一格，白名单不同（见服务端 cleanTitle）。
+    this.title = opts.title || '';
     this.loadout = opts.loadout || null;
     this.cid = null;
     this.connected = false;
@@ -70,7 +73,7 @@ export class NetClient {
         this._opened = true;
         const j = this._join;
         if (j) { clearTimeout(j.timer); j.timer = setTimeout(() => this.settleJoin(new Error('连接超时：8 秒没等到进场应答')), 8000); }
-        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout }));
+        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout, title: this.title || undefined }));
       };
       ws.onmessage = (m) => {
         if (typeof m.data === 'string') { this.onControl(JSON.parse(m.data)); return; }

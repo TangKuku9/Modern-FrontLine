@@ -197,7 +197,8 @@ class Game {
     // 留着它有两个用处：访客可玩的服上它**就是**这一局的显示名（那条路上没有会话可依），
     // 以及"连接中"那一屏能显示一个名字而不是"士兵"。
     // 两种情况下真正的呼号都在连上之后由 welcome 覆盖（见 NetClient 的 onControl('welcome')）。
-    const net = this.net = new NetClient(this, { name: q.get('name') || '士兵', team: q.get('team') || 'A', loadout });
+    // title 同理是可选的显示名（大厅"创建房间"带上来），不带就是没起名。
+    const net = this.net = new NetClient(this, { name: q.get('name') || '士兵', team: q.get('team') || 'A', loadout, title: q.get('title') || '' });
     // 不带 ?room= 时交给服务端自动分配（fill-first，见 server/net-server.mjs:pickRoom）。
     // 默认写死一个房号会让每台新实例都从"互相看不见"开始。
     net.room = q.get('room') || 'auto';

@@ -218,7 +218,9 @@ export class Menu {
     // 也在页面加载时多发两次请求，而那两次请求会把客户端第 0 拍相对权威端的相位挪掉 ——
     // 实测代价见 js/main.js 里那段（net-play 的稳态偏差 5 次里红 4 次）。
     // 这里不 await：拉不到就显示本地那份，单机照玩。
-    this.game.accountSync && this.game.accountSync();
+    // 回来之后刷一次"联网对战"那一项的锁标（未完成注册前不开放）—— 它取决于
+    // "这个服要不要账号、我登没登录"，而这两格都要问服务端才知道（accountSync 是幂等的）。
+    this.game.accountSync && this.game.accountSync().then(() => this.updateOnlineEntry());
     this.setCam('main');
     this.setSoldier(this.game.profile.classes[this.game.profile.selClass || 0]);
     const best = this.game.profile.campaignBest;
@@ -321,10 +323,15 @@ export class Menu {
       setTimeout(() => this.game.startGame('mp', { mode: L.mode, map: L.map, diff: L.diff, allies: L.mode === 'ffa' ? 0 : L.allies, enemies: L.enemies, scoreLimit, timeLimit: L.time }), 600);
     });
   }
-  // 联网大厅。为什么要有它：联机代码早就在了，但要玩家手打 ?online=1 才能玩，
-  // 那等于没有入口。这里只递三样服务端真用得上的东西（呼号、阵营、房间号）——
+  // 联网大厅 = **房间列表**。为什么要有它：联机代码早就在了，但要玩家手打 ?online=1 才能玩，
+  // 那等于没有入口；而"填一个房间号"也不算大厅 —— 玩家看不见哪间开着、有谁在打。
+  // 这里只递服务端真用得上的东西（呼号、阵营、房号 + 可选的房间显示名）——
   // 地图与模式由服务器说了算（见 server/net-server.mjs 的 CFG 与 pickRoom），
   // 大厅里放一个本地选择器去"决定"它们，就是在骗人。
+  //
+  // 未完成注册前**这一屏只开放注册本身**：房间列表、快速加入、创建并进入全部锁着
+  // （renderRoomList 的锁定形态）。入口不藏（藏了玩家连"要注册才能联机"都无从得知），
+  // 但锁要写在明面上 —— 而真正的闸在服务端两处：/api/rooms 的 401 与 WS 握手的 401。
   showOnlineLobby() {
     this.setCam('lobby');
     const L = this.lobby, P = this.game.profile;
@@ -332,14 +339,15 @@ export class Menu {
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
     const r = this.render(`
       <div class="lobby">
-        <div class="hdr">联网对战<small>服务器 ${esc(location.host)} · 权威模拟在服务端，本机只做预测</small></div>
+        <div class="hdr">联网对战<small>服务器 ${esc(location.host)} · 房间列表 · 权威模拟在服务端</small></div>
         <div class="lobby-body">
-          <div class="lobby-col" style="flex:1;max-width:560px">
+          <div class="lobby-col" style="flex:1;max-width:600px">
             <div class="panel"><div class="opts">
-              <div>阵营</div>
-              <div class="seg" id="onTeam"><div data-v="A" class="${L.team === 'B' ? '' : 'sel'}">A 队</div><div data-v="B" class="${L.team === 'B' ? 'sel' : ''}">B 队</div></div>
-              <div>房间号（留空 = 由服务器塞进人最少的一间）</div><input id="onRoom" maxlength="32" placeholder="auto" value="${esc(L.room || '')}" style="${inp}">
-              <div class="note-wide">地图与模式由服务器决定。掉线或服务器更新时屏幕上会写明原因，按 Enter 重连。</div>
+              <div>房间列表</div>
+              <div style="display:flex;gap:8px;align-items:center"><button class="btn small ghost" data-a="refresh">刷新</button><span id="roomNote" style="color:#888;font-size:12px"></span></div>
+              <div id="roomRows" style="grid-column:1/-1;display:flex;flex-direction:column;gap:6px;max-height:216px;overflow-y:auto"></div>
+              <div>创建房间</div>
+              <div style="display:flex;gap:8px"><input id="roomTitle" maxlength="24" placeholder="房间名（留空自动命名）" value="${esc(L.title || '')}" style="${inp}"><button class="btn small ghost" data-a="create">创建并进入</button><button class="btn small" data-a="quick">快速加入</button></div>
             </div></div>
             <div class="panel">
               <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备（服务端会按表重建这一份）</div>
@@ -351,12 +359,17 @@ export class Menu {
           </div>
           <!-- 账号单独占右列。**这不是排版偏好，是尺寸**：账号面板有三种形态，其中"要账号"那一支
                （默认部署）有 3 个输入框 + 按钮 + 两行说明，实测 264 px 高；和左边那两栏叠在同一列里
-               总高 629 px，而 1280×720 下大厅只有 534 px —— 底部的"加入对局"会被顶出视口，
+               总高 629 px，而 1280×720 下大厅只有 534 px —— 底部的按钮会被顶出视口，
                而它看起来像"点不动"而不是"看不见"（Playwright 原话：element is outside of the viewport）。
                分两列之后两列各 341 / 264 px，富余 190 px；顺带把原先空着的右半边用上了。 -->
           <div class="lobby-col" style="flex:1;max-width:430px">
+            <div class="panel"><div class="opts">
+              <div>阵营</div>
+              <div class="seg" id="onTeam"><div data-v="A" class="${L.team === 'B' ? '' : 'sel'}">A 队</div><div data-v="B" class="${L.team === 'B' ? 'sel' : ''}">B 队</div></div>
+              <div class="note-wide">地图与模式由服务器决定。掉线或服务器更新时屏幕上会写明原因，按 Enter 重连。</div>
+            </div></div>
             <div class="panel" id="acctPanel"></div>
-            <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button><button class="btn" data-a="join">加入对局</button></div>
+            <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button></div>
           </div>
         </div>
       </div>`, 'solid', 'online');
@@ -365,27 +378,134 @@ export class Menu {
     }));
     this.on(r, '[data-a=back]', () => this.showMain());
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('online'));
+    this.on(r, '[data-a=refresh]', () => this.renderRoomList(r, L));
+    this.on(r, '[data-a=quick]', () => this.joinOnline(L, {}));
+    this.on(r, '[data-a=create]', () => {
+      const title = String((r.querySelector('#roomTitle') || {}).value || '').trim().slice(0, 24);
+      L.title = title;
+      // 房名不是房号：房号白名单是 [A-Za-z0-9_.-]（见服务端 pickRoom），中文房名直接当房号会被
+      // 清洗成空串、退化成 auto —— 症状是"建了个房，人却进了别人的房间"，而且不报错。
+      // 所以房名整个都是安全字符时拿它当房号（还能当深链），否则另生成房号、房名只做显示。
+      const safe = title.replace(/[^A-Za-z0-9_.-]/g, '');
+      const id = (safe && safe === title) ? title.slice(0, 32) : ('r' + Date.now().toString(36));
+      this.joinOnline(L, { room: id, title });
+    });
     this.renderAccountPanel(r, L);
-    this.on(r, '[data-a=join]', () => {
-      const A = this.game.account;
-      // 要账号的服上没登录就不让进 —— 服务端本来也会在握手那一刻把连接拒掉（401），
-      // 但让玩家点一下、等两秒、再看到一句"需要先登录"，是把一个已经知道的事实变成了惩罚。
-      if (A.requireAccount && !A.loggedIn) { this.acctMsg(r, '先登录或者注册一个账号'); return; }
-      const room = String(r.querySelector('#onRoom').value || '').trim().slice(0, 32);
-      L.room = room;
-      // 呼号框：要账号时它是**账号名**（上面已经登录过了，这一格此时只是重画时的记忆），
-      // 访客可玩时它是**这一局的显示名**。两种情况下都把它记下来，免得切回去时丢了。
-      const nameEl = r.querySelector('#onName');
-      if (nameEl) L.name = String(nameEl.value || '').trim() || L.name;
-      const q = new URLSearchParams({ online: '1', team: L.team === 'B' ? 'B' : 'A' });
-      // name 只在**访客可玩**的服上才带进 URL。要账号的服上服务端从会话取呼号，
-      // join 帧里那一格根本不会被看 —— 继续带着它是在暗示"这一格有用"，
-      // 而下一个接手的人会照着这个假契约往下写（这一段注释上一版就是这么写的，现在它多了一个例外，
-      // 因为访客模式下**没有会话可依**，自报呼号是唯一来源；规则仍只在服务端一处）。
-      if (!A.requireAccount) q.set('name', L.name || '士兵');
-      if (room) q.set('room', room);
-      this.showLoadingOverlay('正在进入对局…');
-      location.href = location.pathname + '?' + q.toString();
+    this.renderRoomList(r, L);
+  }
+
+  // 主菜单上"联网对战"那一项的锁标。规则：**未完成注册前联网对战不开放** ——
+  // 但"不开放"不等于"藏起来"：入口照旧在、点得进（落在注册页），只是写明 🔒 注册后开放。
+  // 判定跟服务端策略走（/api/status 的 requireAccount）：显式配了 REQUIRE_ACCOUNT=0 的
+  // 访客可玩服是服主明说的"这台不用注册"，那不是漏检。改这里改不动权限 ——
+  // 真正的闸在服务端（/api/rooms 的 401 与 WS 握手的 401），这里只是把同一件事显示出来。
+  updateOnlineEntry() {
+    const btn = this.el.querySelector('[data-a=online]');
+    if (!btn) return;
+    const A = this.game.account;
+    const locked = !!(A && A.statusKnown && A.requireAccount && !A.loggedIn);
+    btn.classList.toggle('locked', locked);
+    const md = btn.querySelector('.md');
+    if (md) md.textContent = locked ? '🔒 注册后开放 · 与同一台服务器上的真人对局' : '与同一台服务器上的真人对局 · 权威模拟在服务端';
+  }
+
+  // 进对局 URL 的**唯一**拼装点（列表里每行的"加入" / 快速加入 / 创建并进入共用）。
+  // 抽成纯函数是因为"没选房间时不塞 room="这条判据要能不点按钮就量到 ——
+  // 真点一下是整页导航，判据只能看见结果页，看不见拼装那一刻（"按钮没接线"和
+  // "接了线但参数拼错了"两种失效，在结果页上是同一副长相）。
+  //   · room 为空 = 服务端 fill-first 自动分配（pickRoom 的 'auto'），URL 里就不带 room=；
+  //   · title 只在建房时带，它**不是房号**，只进显示名那一格（服务端 cleanTitle 再洗一遍）；
+  //   · name 只在访客可玩的服上带：要账号时呼号由会话决定，带上反而暗示这一格有用
+  //     （访客模式下**没有会话可依**，自报呼号是唯一来源；规则仍只在服务端一处）。
+  onlineJoinParams({ room = '', title = '', team = 'A', name = '', guest = false }) {
+    const q = new URLSearchParams({ online: '1', team: team === 'B' ? 'B' : 'A' });
+    if (guest) q.set('name', name || '士兵');
+    if (room) { q.set('room', room); if (title) q.set('title', title); }
+    return q;
+  }
+
+  // 进对局的唯一出口。未完成注册前它**不放行**（要账号的服上）—— 这只是省掉一次
+  // 白跑的页面跳转（服务端照样会在握手那一刻 401），不是权限所在处。
+  joinOnline(L, { room = '', title = '' } = {}) {
+    const A = this.game.account;
+    if (A.requireAccount && !A.loggedIn) {
+      this.acctMsg(this.el, '先注册或登录 —— 联网对战在注册后开放');
+      return;
+    }
+    // 呼号框：访客可玩时它是**这一局的显示名**；要账号时服务端从会话取呼号，
+    // 那一格此时只是重画时的记忆。两种情况都记下来，免得切回去时丢了。
+    const nameEl = this.el.querySelector('#onName');
+    if (nameEl) L.name = String(nameEl.value || '').trim() || L.name;
+    L.room = room || '';
+    const q = this.onlineJoinParams({ room, title, team: L.team, name: L.name, guest: !A.requireAccount });
+    this.showLoadingOverlay('正在进入对局…');
+    location.href = location.pathname + '?' + q.toString();
+  }
+
+  // 房间列表区。和 renderAccountPanel 一样按"服务端说的策略 + 我登没登录"分形态：
+  //   · 策略还没回来 —— 先不画（猜错的代价是把登录框画在访客服上，或反过来）；
+  //   · 未注册（要账号的服）—— 🔒 锁着，列表不拉、按钮按不动；
+  //   · 已注册 / 访客可玩 —— 拉 /api/rooms 画房间行。
+  // 锁定那一格**不只是 UI 置灰**：服务端对没会话的 /api/rooms 直接 401
+  // （见 server/http-api.mjs），这里连请求都不发 —— 发了也只会拿到 401。
+  renderRoomList(root, L) {
+    const rows = root.querySelector('#roomRows');
+    const note = root.querySelector('#roomNote');
+    if (!rows) return;
+    const A = this.game.account;
+    const setRoomUI = (on) => {
+      for (const sel of ['[data-a=refresh]', '[data-a=create]', '[data-a=quick]']) {
+        const b = root.querySelector(sel);
+        if (b) { b.disabled = !on; b.style.opacity = on ? '' : '.5'; }
+      }
+    };
+    if (!A.statusKnown) {
+      rows.innerHTML = '<div class="note-wide">正在读取服务器策略…</div>';
+      setRoomUI(false);
+      Promise.resolve(this.game.accountSync ? this.game.accountSync() : A.status()).then(() => {
+        if (this.screen === 'online') this.renderRoomList(root, L);
+      });
+      return;
+    }
+    if (A.requireAccount && !A.loggedIn) {
+      rows.dataset.locked = '1';
+      rows.innerHTML = '<div class="note-wide">🔒 联网对战在注册后开放。右边注册或登录之后，这里就是房间列表。</div>';
+      if (note) note.textContent = '';
+      setRoomUI(false);
+      return;
+    }
+    delete rows.dataset.locked;
+    setRoomUI(true);
+    rows.innerHTML = '<div class="note-wide">正在读取房间列表…</div>';
+    A.rooms().then(r => {
+      if (this.screen !== 'online') return;          // 用户已离开这一页，别把行画到别的屏上
+      if (!r.ok) {
+        rows.innerHTML = `<div class="note-wide">读不到房间列表：${esc(r.message || ('服务器返回了 ' + r.status))}</div>`;
+        return;
+      }
+      const list = r.data.rooms || [];
+      if (note) note.textContent = `${list.length} 间开着`;
+      if (!list.length) {
+        rows.innerHTML = '<div class="note-wide">现在没有开着的房间 —— 「快速加入」会为你开一间，或者自己「创建并进入」。</div>';
+        return;
+      }
+      rows.innerHTML = list.map(x => {
+        const map = MP_MAPS.find(m => m.id === x.map) || { name: x.map };
+        const mode = MP_MODES.find(m => m.id === x.mode) || { name: x.mode };
+        return `<div class="room-row" data-room="${esc(x.id)}">
+          <div class="rr-name">${esc(x.title || x.id)}</div>
+          <div class="rr-meta">${esc(map.name)} · ${esc(mode.name)}</div>
+          <div class="rr-n">${x.players | 0} 人</div>
+          <div class="rr-state">${x.players ? '对战中' : '等待中'}</div>
+          <button class="btn small" data-a="joinRow" data-room="${esc(x.id)}" data-title="${esc(x.title || '')}">加入</button>
+        </div>`;
+      }).join('');
+      // 行内"加入"带的 title 是**显示名**；它和房号相等时（没起名的房）不带，
+      // 免得一路把"显示名 = 房号"传到服务端再存回来（那是把兜底值当成了用户输入）。
+      this.on(rows, '[data-a=joinRow]', el => this.joinOnline(L, {
+        room: el.dataset.room,
+        title: el.dataset.title === el.dataset.room ? '' : el.dataset.title,
+      }));
     });
   }
 
@@ -414,19 +534,16 @@ export class Menu {
     if (!box) return;
     const A = this.game.account;
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
-    const btn = root.querySelector('[data-a=join]');
-    const setJoin = (on) => { if (btn) { btn.disabled = !on; btn.style.opacity = on ? '' : '.5'; } };
 
     // 策略还没回来：**先不画**。画了就是在猜，而猜错的那一边（把登录框画在不要账号的服上）
     // 会让玩家面对一个填不出来的框。这一屏通常只存在几毫秒 —— 它在页面加载时就发出去了。
     if (!A.statusKnown) {
       box.innerHTML = `<div class="opts"><div>账号</div><div style="font-size:12px;color:#888">正在读取服务器策略…</div></div>`;
-      setJoin(false);
-      // 回来之后只重画这一块，不动旁边已经填好的房间号 / 阵营。
+      // 回来之后只重画这两块，不动旁边已经填好的房间名 / 阵营。
       // 顺着把 me() 也拉上：这条路径要在"主菜单还没画过"时也能自给自足
       //（showMain 里那次 accountSync 是正常入口，这里是不依赖它的兜底）。
       Promise.resolve(this.game.accountSync ? this.game.accountSync() : A.status()).then(() => {
-        if (this.screen === 'online') this.renderAccountPanel(root, L);
+        if (this.screen === 'online') { this.renderAccountPanel(root, L); this.renderRoomList(root, L); }
       });
       return;
     }
@@ -444,8 +561,8 @@ export class Menu {
       this.on(box, '[data-a=logout]', async () => {
         await A.logout();
         this.renderAccountPanel(root, L);
+        this.renderRoomList(root, L);      // 登出 = 联网对战重新锁上，列表跟着变
       });
-      setJoin(true);
       return;
     }
 
@@ -455,7 +572,6 @@ export class Menu {
         <input id="onName" maxlength="16" placeholder="2~16 个汉字 / 字母 / 数字" value="${esc(L.name || '士兵')}" style="${inp}">
         <div class="note-wide">这个服务器不需要账号（访客可玩），呼号只在这局里显示，战绩不存到任何地方。不合法的呼号会被服务器拒掉，并说明规则。</div>
       </div>`;
-      setJoin(true);
       return;
     }
 
@@ -486,6 +602,7 @@ export class Menu {
       // 真正的数在服务端，下一次 /api/me 会把它盖回去。
       if (A.user) { this.game.profile.xp = A.user.xp | 0; this.game.saveProfile(); }
       this.renderAccountPanel(root, L);
+      this.renderRoomList(root, L);        // 注册/登录成功 = 联网对战从这里开放
       this.acctMsg(root, `已登录：${A.user ? A.user.name : ''}`);
       setTimeout(() => this.acctMsg(root, ''), 2500);
     };
@@ -493,7 +610,6 @@ export class Menu {
     this.on(box, '[data-a=reg]', () => submit('reg'));
     const pw = root.querySelector('#acctPw');
     if (pw) pw.addEventListener('keydown', e => { if (e.key === 'Enter') submit('login'); });
-    setJoin(false);
   }
 
   perk(id) { for (const col of PERKS) for (const p of col) if (p.id === id) return p; return { name: id, desc: '', icon: '' }; }

@@ -193,6 +193,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
     const ROUTES = {
       '/api/status': 'GET',      // 只读：这个服要不要邀请码
       '/api/me': 'GET',          // 只读：我是谁
+      '/api/rooms': 'GET',       // 只读：联机大厅的房间列表（要账号的服上未注册不开放）
       '/api/register': 'POST',
       '/api/login': 'POST',
       '/api/logout': 'POST',
@@ -232,6 +233,31 @@ export async function createAuth({ cfg = {}, store } = {}) {
       // 真正的安全属性（没会话就读不到别人的档案）由 `u` 决定，跟状态码无关。
       if (!u) { send(res, 200, { ok: true, loggedIn: false, name: null, profile: null }); return true; }
       send(res, 200, { ok: true, loggedIn: true, name: u.name, profile: accounts.publicProfile(u) });
+      return true;
+    }
+
+    if (path === '/api/rooms') {
+      // 联机大厅的房间清单。清单本体从 net-server 注入的 `ctx.listRooms` 取 ——
+      // 房间的真相在那边（rooms 表），这里只决定**谁有资格看**。
+      //
+      // ── 未完成注册前，联网对战不开放 ── 这一格是那条需求在服务端的落点：
+      // 客户端把列表藏起来只是显示（改得动），而这里对没会话的请求直接 401，
+      // 和 WS 握手那道 401 是同一条规则的两半。**只藏 UI 不算数** —— 那是权限，
+      // 不是排版。访客可玩的服（REQUIRE_ACCOUNT=0）不要会话：那是部署时明说的策略，
+      // 不是漏检（和 join 时那句 `CFG.requireAccount && !user` 同源）。
+      //
+      // 与 /api/me 的 200+loggedIn:false **不矛盾**：那是"每次页面加载都会问一次"的
+      // 例行问答，401 会给每一次加载配一条必然出现的控制台红字；而这个接口只有
+      // 大厅里"已经获准进场的人"才会拉，未注册的人根本走不到这个调用 —— 拒了就是拒了。
+      if (ctx.requireAccount) {
+        const u = await sessionOf(req, accounts);
+        if (!u) {
+          stat.rejected++;
+          send(res, 401, { ok: false, error: 'login_required', message: '注册或登录后才能查看房间列表' });
+          return true;
+        }
+      }
+      send(res, 200, { ok: true, rooms: ctx.listRooms ? ctx.listRooms() : [] });
       return true;
     }
 

@@ -86,6 +86,13 @@ export class Account {
     return r;
   }
 
+  // 联机大厅的房间清单。要账号的服上没登录会被 401 —— 那是**服务端**在说
+  // "未完成注册前联网对战不开放"，和 WS 握手那道 401 是同一条规则的两半。
+  // 客户端只负责把拒绝显示出来（见 js/menu.js 的 renderRoomList），自己不发明权限。
+  async rooms() {
+    return this._req('/api/rooms');
+  }
+
   async register({ name, password, code }) {
     this.busy = true; this.lastError = '';
     try {

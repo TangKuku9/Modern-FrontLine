@@ -10,7 +10,11 @@
 import { chromium } from 'playwright';
 import { withServer } from './with-server.mjs';
 
-const ARGS = ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'];
+// GL 参数用 net-drop/net-play 那套（angle + swiftshader 软件渲染）：`--use-gl=swiftshader` 那套
+// 在这台机器上会**在页面启动阶段就丢 WebGL 上下文**（2026-09-27 打点：进菜单时 isContextLost
+// =true，丢上下文后一切像素判据都是 no-op）。其余测试没暴露这一点，是因为它们把渲染 stub 掉了。
+const ARGS = ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--mute-audio',
+  '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--disable-background-timer-throttling'];
 async function launch() {
   for (const [label, opts] of [['chrome', { channel: 'chrome', args: ARGS }], ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }]]) {
     try { const b = await chromium.launch(opts); console.log(`  浏览器: ${label}`); return b; }
@@ -27,6 +31,13 @@ await page.addInitScript(() => { HTMLCanvasElement.prototype.requestPointerLock 
 const srv = await withServer();
 await page.goto(srv.base + '/index.html');
 await page.waitForFunction(() => window.game && window.game.state === 'menu', null, { timeout: 180000 });
+// **立刻停掉菜单的渲染循环**：这一页根本不需要看菜单画面，而它每帧都在真渲染（士兵、
+// 粒子、枪展 + 后处理）。阶段 A 要在页面里造 50 多把枪模，够它渲几十秒 —— 实测
+// swiftshader 的 GPU 进程会在这段时间里丢上下文（2026-09-27 打点：阶段 B 起始 isContextLost
+// =true），而丢了之后一切像素判据都是 no-op、症状像"被测对象坏了"。先断电，再干活。
+await page.evaluate(() => { window.game.renderer.setAnimationLoop(null); });
+const cl = async (tag) => page.evaluate((t) => { (window.__cl ||= []).push(t + '=' + window.game.renderer.getContext().isContextLost()); return window.game.renderer.getContext().isContextLost(); }, tag);
+console.log('  ctx 进菜单后 lost=' + await cl('进菜单后'));
 
 // ---------- 阶段 A：几何（不起局，只用材质就绪后的枪模） ----------
 const geo = await page.evaluate(async () => {
@@ -289,19 +300,41 @@ const geo = await page.evaluate(async () => {
   return out;
 });
 
+console.log('  ctx 阶段A后 lost=' + await cl('阶段A后'));
+
 // ---------- 阶段 B：真起局，ADS，看画面中央有没有那个红点 ----------
 const px = await page.evaluate(async () => {
   const out = [];
   const ok = (label, cond, extra = '') => out.push([!!cond, label + (extra ? '  ' + extra : '')]);
   const g = window.game;
   g.renderer.setAnimationLoop(null);
+  // 时钟钉死在 1/60：手写的 frame() 两次调用之间只有微秒，而主循环是**固定步长** ——
+  // 不钉住的话 200 帧连一拍都推不动，adsT 恒 0，O3⁺/O6ᵈ/O5 四条一起红，而红的没有一条是它
+  // 们的命题（viewmodel.mjs / state-leak.mjs 早就这么钉了，这一段漏了它）。
+  // 2026-09-27 负对照确认过：这组红在改大厅那轮**之前**就在（退掉源码照样红），成因是量具。
+  // 渲染**不** stub —— O5 的像素差分要真出图（那一段另有规矩：走 composer.render() 不走 frame()）。
+  const realClock = g.clock;
+  g.clock = { getDelta: () => 1 / 60 };
+  // 驱动阶段**不渲染**：开镜只需要模拟推进（adsT 是模拟量）。每帧都真渲染会让 swiftshader
+  // 的 GPU 进程在同步循环里被 watchdog 掐掉 —— 上下文一丢，之后所有像素判据全是 no-op，
+  // 症状是"分划差分恒 0、连隐藏整个 vmScene 的对照臂都不动"，看起来像分划没画，
+  // 其实是量具死了（2026-09-27 实测：isContextLost()=true 时整帧读回全黑）。真渲染
+  // 只留给最后采样那几帧。（viewmodel/state-leak 一直是这么 stub 的，这一段也该。）
+  const realRender = g.composer.render.bind(g.composer);
+  g.composer.render = () => {};
+  // 上下文丢失的打点：丢了之后一切都变 no-op，"哪一步丢的"决定修哪一段。
+  const mark = (tag) => { (window.__cl ||= []).push(tag + '=' + g.renderer.getContext().isContextLost()); };
+  mark('起始');
   await g.startGame('mp', { mode: 'tdm', map: 'yard', diff: 1, allies: 4, enemies: 4, scoreLimit: 50, timeLimit: 10 });
+  mark('startGame后');
   const ws = g.player.ws, vm = ws.vm;
   ws.replaceSlot(0, { id: 'm4', att: { optic: 'reddot' }, camo: 'none' }, 30, 150);
   for (let i = 0; i < 120 && vm.groups.length === 0; i++) g.frame();
   ws.switchTo(0);
   for (let i = 0; i < 120 && ws.cur !== 0; i++) g.frame();
   for (let i = 0; i < 200 && ws.adsT < 0.995; i++) { g.input.buttons = 4; g.frame(); }
+  mark('开镜后');
+  g.composer.render = realRender;               // 采样开始才真渲染（见上面 stub 那段的成因）
   const cur = vm.groups[ws.cur];
   ok('O3⁺ ADS 拉满', ws.adsT > 0.99, 'adsT=' + ws.adsT.toFixed(3));
   ok('O3⁺ 红点 ADS 时枪模是可见的（不像高倍镜那样被遮罩藏掉）', vm.holder.visible === true && cur.info.optic === 'reddot',
@@ -330,15 +363,29 @@ const px = await page.evaluate(async () => {
   const snap = (show) => {
     ret.visible = show;
     g.composer.render();
-    const cvs = g.renderer.domElement;
-    const cv = document.createElement('canvas');
-    cv.width = cvs.width; cv.height = cvs.height;
-    const ctx = cv.getContext('2d');
-    ctx.drawImage(cvs, 0, 0);
-    const w = Math.round(cvs.width * 0.12), h = Math.round(cvs.height * 0.12);
+    // 像素**从默认帧缓冲 readPixels 读回**，不走 canvas→drawImage：后者要经过合成器拷贝，
+    // 那条路在 swiftshader 下时序不稳 —— 实测同一份代码有时拷到**上一帧**（于是开关分划的
+    // 差分恒 0，连"隐藏整个 vmScene"的对照臂都一动不动），有时又是新帧（26/26 绿）。
+    // 判据不能赌合成器的心情：readPixels 是同步 GPU 读回，读到的一定是刚渲染的那一帧。
+    // （Y 轴在这里翻正，行序与 drawImage 一致，下面的窗口切法不用改。）
+    const gl = g.renderer.getContext();
+    const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+    const raw = new Uint8Array(W * H * 4);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, raw);
+    const full = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) full.set(raw.subarray((H - 1 - y) * W * 4, (H - y) * W * 4), y * W * 4);
+    const w = Math.round(W * 0.12), h = Math.round(H * 0.12);
+    const crop = (x0, y0, cw, ch) => {
+      const out = new Uint8ClampedArray(cw * ch * 4);
+      for (let y = 0; y < ch; y++) out.set(full.subarray(((y0 + y) * W + x0) * 4, ((y0 + y) * W + x0 + cw) * 4), y * cw * 4);
+      return out;
+    };
     return {
-      center: ctx.getImageData(Math.round((cvs.width - w) / 2), Math.round((cvs.height - h) / 2), w, h).data,
-      corner: ctx.getImageData(Math.round(cvs.width * 0.04), Math.round(cvs.height * 0.72), w, h).data,
+      // 全帧也留一份：中心窗差分为 0 有三种成因（没画出来 / 画在窗外面 / 画了但小于阈值），
+      // 只看中心窗分不出是哪种 —— 全帧差分 + NDC 投影把前两种当场分开。
+      full,
+      center: crop(Math.round((W - w) / 2), Math.round((H - h) / 2), w, h),
+      corner: crop(Math.round(W * 0.04), Math.round(H * 0.72), w, h),
     };
   };
   const diffPx = (A, B) => {
@@ -350,18 +397,52 @@ const px = await page.evaluate(async () => {
     return { n, dR, dG, dB };
   };
   const ret = cur.info.reticle;
+  // ── 对照实验：把整个 vmScene 隐藏再出一帧 ── 它把"截帧这条路是通的"和"分划自己没画"
+  // 分开：对照臂差分也是 0 ⇒ 截帧/vmPass 这条路根本没出图（这时改瞄具是白改）；
+  // 对照臂差分很大 ⇒ 出图是好的，坏的就在这块分划片自己。
+  const ctlA = snap(true);
+  g.vmScene.visible = false;
+  const ctlB = snap(true);
+  g.vmScene.visible = true;
+  const ctlD = diffPx(ctlA.full, ctlB.full);
+  // 上下文丢没丢必须先问：丢了之后所有 gl 调用都是 no-op —— 渲染不出图、readPixels 读回全零、
+  // drawImage 拷到旧帧，三种症状长得跟"分划没画"一模一样（swiftshader 重载下偶发）。
+  const ctxLost = g.renderer.getContext().isContextLost();
+  mark('采样时');
   const on = snap(true), offf = snap(false);
   const c = diffPx(on.center, offf.center);
   const k = diffPx(on.corner, offf.corner);
+  const fullD = diffPx(on.full, offf.full);
+  // 阈值以上差几像素说不清"没画"和"画得太淡"的区别，所以把**无阈值**的原始能量也量出来：
+  // ΣΔ=0 ⇒ 真没画；ΣΔ>0 而阈值计数=0 ⇒ 画了但被阈值/抗锯齿吃掉（那是判据线的问题）。
+  let rawMax = 0, rawSum = 0, rawN = 0, nonZero = 0;
+  for (let i = 0; i < on.full.length; i += 4) {
+    if (on.full[i] | on.full[i + 1] | on.full[i + 2]) nonZero++;
+    const d = Math.abs(on.full[i] - offf.full[i]) + Math.abs(on.full[i + 1] - offf.full[i + 1]) + Math.abs(on.full[i + 2] - offf.full[i + 2]);
+    if (d > 0) { rawN++; rawSum += d; if (d > rawMax) rawMax = d; }
+  }
+  // 分划在真相机里的投影位置（NDC，屏幕正中是 0,0）：它说得出"画了但在取景窗外面"这一种成因
+  const ndcOf = await (async () => {
+    const T = await import('three');
+    const v = new T.Vector3();
+    ret.getWorldPosition(v); v.project(g.vmCamera);
+    // 顺带量法线朝向：CircleGeometry 只有正面（FrontSide），如果枪模/瞄具的朝向让分划
+    // 背对着相机，它会**整个被背面剔除** —— 位置对、投影在正中，但一个像素都不画。
+    const n = new T.Vector3(0, 0, 1).applyQuaternion(ret.getWorldQuaternion(new T.Quaternion()));
+    const fwd = new T.Vector3(); g.vmCamera.getWorldDirection(fwd);
+    return `${v.x.toFixed(2)},${v.y.toFixed(2)} 法线·视线=${n.dot(fwd).toFixed(2)} side=${(ret.material && ret.material.side) ?? '-'}`;
+  })();
   ret.visible = true;
   // 阈值只求"确实动了几个像素"：缩到 20% 之后红点在 1280×720 下只剩 5 个差分像素，
   // 再抬高门槛就是在跟抗锯齿掰手腕。"多大才合适"由 O6 的角直径管，不在这里用像素数卡。
-  ok('O5⁺ ADS 中心出现红点（开关分划的差分显著）', c.n >= 2, `diffPx=${c.n}`);
+  ok('O5⁺ ADS 中心出现红点（开关分划的差分显著）', c.n >= 2,
+    `diffPx=${c.n} 全帧diff=${fullD.n} 原始:${rawN}px ΣΔ=${rawSum} 对照臂=${ctlD.n}px 非零=${nonZero} 丢失打点[${(window.__cl || []).join(' ')}] NDC=${ndcOf}`);
   ok('O5ᵇ 差分像素确实是"变红"', c.dR > 0 && c.dR > c.dG * 2 && c.dR > c.dB * 2, `ΔR=${c.dR} ΔG=${c.dG} ΔB=${c.dB}`);
   // O5⁻ 反证臂：同一对渲染之间，画面角落的同尺寸窗口必须几乎无差。
   // 角落也有差分的话，说明"世界静止"这个前提没成立，O5⁺ 量到的是噪声不是红点。
   ok('O5⁻ 反证：远离中心的同尺寸窗口几乎无差分', k.n <= 2, `cornerDiffPx=${k.n}`);
 
+  g.clock = realClock; realClock.getDelta();      // 还原真时钟再恢复主循环（截图要按真实节奏跑）
   g.renderer.setAnimationLoop(() => g.frame());
   // 注意 buttons 别清零：恢复 loop 后玩家要保持 ADS，下面的截图才是"瞄着的时候"的画面
   return out;

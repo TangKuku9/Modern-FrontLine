@@ -190,6 +190,39 @@ async function cachedFile(file) {
 // 这一层只管 HTTP 的形状（状态码、cookie、content-type）。
 const auth = await createAuth({ cfg: CFG });
 
+// 房间的显示名（联机大厅"创建房间"带来的那一格）。它**不是房号** ——
+// 房号另有白名单（pickRoom 的 [A-Za-z0-9_.-]），中文房名直接当房号会被清洗成空串、
+// 退化成 auto（悄悄塞进别人的房间）。所以房名只做显示，且：
+//   · 拍平控制字符（换行能伪造清单行/日志行）、压缩空白、截 24 字；
+//   · 空串不写（"没起名"和"起了个空名字"不是一回事）。
+function cleanTitle(raw) {
+  return String(raw).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 24);
+}
+
+// 联机大厅要的房间清单（/api/rooms 的清单本体；谁有资格看由 http-api 决定）。
+// 只给**玩法**字段 —— /healthz 里那些运维读数（每拍耗时、延迟补偿计数、堆内存）
+// 不进这里：那是给扩容和排障用的，发给玩家等于把内部健康度当情报发出去。
+// 注意 rooms 里存的是"启动完成"的 promise：还没启动完（p.__room 未挂）的房间
+// **不在清单里**。这是诚实的 —— 那种房间连第一个人都还没进去，
+// 列出来也只会让人点一个还没建好的空壳。
+function roomList() {
+  const out = [];
+  for (const p of rooms.values()) {
+    const r = p.__room;
+    if (!r || r.__stop) continue;
+    out.push({
+      id: r.id,
+      title: r.title || r.id,
+      map: r.mapId,
+      mode: (r.rules && r.rules.mode) || 'tdm',
+      players: r.clients.size,
+      state: r.clients.size ? 'playing' : 'waiting',
+    });
+  }
+  return out;
+}
+auth.ctx.listRooms = roomList;
+
 // 每 IP 的连接数，和四个"拒绝"计数。
 // 计数要落在生产面上（/healthz 的 gate{}）：限流生效的样子和"服务挂了"在玩家侧完全一样，
 // 都是"进不去" —— 没有计数就只能靠猜。
@@ -561,6 +594,10 @@ wss.on('connection', (ws, req) => {
         // 所以访客不会"填了名字却变成访客"：他会当场看到规则，回去改。
         const name = joinName(user, msg.name);
         const room = await pickRoom(msg.room, user);
+        // 房间的显示名：**只有建房那一次说了算**（room.title 还空着的时候）。
+        // 后来的人改不掉房间名 —— 否则"挂个钓鱼名等别人点进来"就成了一个功能。
+        // 不带 title 的老客户端/探针完全不受影响：这一格是可选的。
+        if (!room.title && msg.title != null && cleanTitle(msg.title)) room.title = cleanTitle(msg.title);
         const c = room.addClient({
           // 要账号的服上这一格来自会话；访客可玩的服上是自报呼号（已过白名单）。
           // 两条路都**不用再 slice(0,24)**：白名单本身限了 2~16 个字。

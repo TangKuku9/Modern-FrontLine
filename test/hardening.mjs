@@ -570,6 +570,71 @@ try {
     } finally { d.kill(); }
   }
 
+  // ══════════ I 联机大厅的房间列表与注册闸 ══════════
+  // 两条需求：① 联网对战改成"房间列表"；② 未完成注册前联网对战不开放。
+  // ② 的判据必须落在**服务端**：客户端把列表藏起来只是显示（改得动），这里量的是
+  // "没会话连房间清单都拿不到"（与 WS 握手那道 401 是同一条规则的两半）。
+  // ① 的判据是"建的房真的出现在清单里，字段是玩法字段，且显示名不是房号"。
+  // 这一段**自己起一个服**：主服那台被前面几段用过，CONNS_PER_IP / ROOMS_PER_USER
+  // 的配额是 C/D 段的判据材料 —— 在它上面接着跑会撞配额，那种红和本段要量的东西无关。
+  console.log(sec('I 房间列表与注册闸'));
+  {
+    const s5 = await withServer({ JOIN_CODE: INVITE });
+    try {
+      const anon = await raw(s5.base + '/api/rooms');
+      let aj = null; try { aj = JSON.parse(anon.text); } catch { /* 不是 JSON 就是别的错法 */ }
+      chk(anon.status === 401 && aj && !('rooms' in aj),
+        'I1 没注册（没有会话）连房间清单都拿不到：401，且响应里没有 rooms 字段',
+        `${anon.status} ${anon.text.slice(0, 80)}`);
+
+      const rg = await json(s5.base + '/api/register', { name: '房管甲', password: PW, code: INVITE });
+      const ck = cookieOf(rg);
+      const w1 = await raw(s5.base + '/api/rooms', { headers: { cookie: ck } });
+      const wj = JSON.parse(w1.text);
+      chk(w1.status === 200 && wj.ok === true && Array.isArray(wj.rooms),
+        'I2 注册之后拿得到房间清单（"注册后开放"的另一半）', `${w1.status} rooms=${(wj.rooms || []).length}`);
+
+      // 建一间带显示名的房：title 是显示名，房号仍是 join 里的那个 id
+      const a = await openWs(s5.ws, ck);
+      a.ws.send(JSON.stringify({ t: 'join', room: 'hall-1', title: '午夜小队', team: 'A' }));
+      const wa = await waitFor(a.msgs, m => m.t === 'welcome');
+      chk(!!wa, 'I3 先决：带 title 的 join 进得去', JSON.stringify(a.msgs.map(m => m.t)));
+      await sleep(150);
+      const list = JSON.parse((await raw(s5.base + '/api/rooms', { headers: { cookie: ck } })).text);
+      const row = (list.rooms || []).find(x => x.id === 'hall-1');
+      chk(!!row && row.title === '午夜小队' && row.players >= 1 && row.map === 'yard' && row.mode === 'tdm' && row.state === 'playing',
+        'I4 建的房出现在清单里：title 是显示名、人数是活的、地图/模式/状态来自服务端',
+        JSON.stringify(row || null));
+      // 反证臂：title 与 id 是两格。谁把"显示名"当成房号写回去，这条就红 ——
+      // 而那个错法在客户端的症状是"中文房名被 pickRoom 清成 auto，人进了别人的房间"。
+      chk(!!row && row.id === 'hall-1' && row.title !== row.id,
+        'I5 **反证臂**：显示名与房号是两格（改 title 不许改掉 join 用的 id）',
+        JSON.stringify({ id: row && row.id, title: row && row.title }));
+
+      // 显示名的清洗：控制字符拍平、超长截断。不洗的话一行"房名"里带个换行就能伪造清单行。
+      const b = await openWs(s5.ws, ck);
+      b.ws.send(JSON.stringify({ t: 'join', room: 'hall-2', title: '带\n换行的房名带\n换行的房名带\n换行的房名', team: 'B' }));
+      await waitFor(b.msgs, m => m.t === 'welcome');
+      await sleep(150);
+      const list2 = JSON.parse((await raw(s5.base + '/api/rooms', { headers: { cookie: ck } })).text);
+      const row2 = (list2.rooms || []).find(x => x.id === 'hall-2');
+      chk(!!row2 && !/[\u0000-\u001f]/.test(row2.title) && row2.title.length <= 24,
+        'I6 房名里的控制字符被拍平、长度截到 24（换行能伪造清单行）', JSON.stringify(row2 && row2.title));
+
+      // 反证臂：这道闸跟着 REQUIRE_ACCOUNT 走，不是写死的 401。
+      // 访客可玩的服（服主显式配的）上没会话照样拿得到清单 —— 反过来这条红了，
+      // 说明闸被写成无条件拒绝，那会把访客服整个焊死（net-drop 的 A~E 段就跑在访客服上）。
+      const s6 = await withServer({ JOIN_CODE: INVITE, REQUIRE_ACCOUNT: '0' });
+      try {
+        const guest = await raw(s6.base + '/api/rooms');
+        const gj = JSON.parse(guest.text);
+        chk(guest.status === 200 && gj.ok === true && Array.isArray(gj.rooms),
+          'I7 **反证臂**：REQUIRE_ACCOUNT=0 的访客服上，没会话也拿得到房间清单（闸跟策略走）',
+          `${guest.status} ${guest.text.slice(0, 60)}`);
+      } finally { s6.kill(); }
+    } finally { s5.kill(); }
+  }
+
 } catch (e) {
   console.log('CRASH ' + (e && (e.stack || e.message)));
   fails++;
