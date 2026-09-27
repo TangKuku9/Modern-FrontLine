@@ -258,6 +258,34 @@ const geo = await page.evaluate(async () => {
       ok('O6ᶜ 同一配件两枪型角直径一致（±15%）', Math.abs(a - b) / Math.min(a, b) <= 0.15, `长枪=${a.toFixed(3)}° 手枪=${b.toFixed(3)}°`);
     }
   }
+
+  // O6ᵉ：全息的中心点。它的分划离眼 0.151 m（红点 0.1155 m），所以同样只能比角直径 ——
+  // 米数照抄会分叉（红点那两条已经栽过一次）
+  {
+    const info = buildGun('m4', { optic: 'holo' }, 'none', {});
+    const grp = info.reticle;
+    const dot = grp && grp.children.find(o => o.geometry && o.geometry.type === 'CircleGeometry');
+    if (!dot) ok('O6ᵉ 全息中心点角直径在范围内', false, '没找到中心点');
+    else {
+      const d = Math.abs(grp.position.z - info.sight.z);
+      const deg = 2 * Math.atan(dot.geometry.parameters.radius / d) * 180 / Math.PI;
+      const px = (x) => (x * 27).toFixed(1);
+      ok('O6ᵉ 全息中心点角直径在范围内', deg >= LO && deg <= HI, `${deg.toFixed(3)}° 1080p≈${px(deg)} px（旧 0.531° / ${px(0.531)} px）`);
+    }
+  }
+
+  // O8：全息瞄具应当**加快**开镜（ads 是乘数，小于 1 才是快 —— 别写反了）
+  {
+    const { computeStats } = await import('/js/data.js');
+    const ads = (att) => computeStats('m4', att).ads;
+    const iron = ads({}), rd = ads({ optic: 'reddot' }), holo = ads({ optic: 'holo' });
+    const acog = ads({ optic: 'acog' }), therm = ads({ optic: 'thermal' });
+    ok('O8⁺ 全息开镜比裸枪和红点都快', holo < iron && holo < rd, `裸=${iron.toFixed(3)} 红点=${rd.toFixed(3)} 全息=${holo.toFixed(3)}`);
+    ok('O8ᵃ 这个"快"得快得出来（至少 5%）', holo <= rd * 0.95, `全息=${holo.toFixed(3)} 红点=${rd.toFixed(3)}`);
+    // O8⁻ 反证臂：只写"全息要快"那一半的话，把五种瞄具一律调快也照样全绿 ——
+    // 高倍镜那一串必须仍然比裸枪慢
+    ok('O8⁻ 反证：高倍镜仍然比裸枪慢', acog > iron && therm > iron, `acog=${acog.toFixed(3)} thermal=${therm.toFixed(3)} 裸=${iron.toFixed(3)}`);
+  }
   return out;
 });
 

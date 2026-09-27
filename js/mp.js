@@ -319,6 +319,11 @@ export class MPMatch {
         if (r.t <= 0 && (game.input.keys.Space || r.t < -4)) {
           const sp = this.spawnPoint(pl.team);
           if (this.nextLoadout) { pl.equip(this.nextLoadout); this.nextLoadout = null; this.streakBook.setDiscount(pl.hasPerk('hardline') ? 1 : 0); }
+          // 没换职业也要把装备拨回自己那一套：对局中从地上捡来的枪是**临时**的，
+          // 重生握住的应该是 class 里配置好的那把。player.js 那条注释说的
+          // "loadout 对局中不变"指的是"以 class 为准"，不是"死了还攥着刚捡的那把" ——
+          // 老代码没有换职业时根本不 equip，于是捡来的枪一路带到下一次死亡。
+          else if (pl.loadout) pl.equip(pl.loadout);
           pl.respawn(sp.pos, sp.yaw);
           game.dead = false;
           document.getElementById('deathScreen').classList.add('hidden');

@@ -140,6 +140,12 @@ const fail = (why) => { green = false; console.log(`  ❌ ${why}`); };
   const d = diffTraces(nodeTrace, br.trace);
   if (d.identical) console.log(`  ✅ 单飞轨迹 300 拍：Node 与 Chrome 逐 tick 全等  (digest ${d.digestA})`);
   else fail(`单飞轨迹 300 拍：首处分歧第 ${d.firstDivergentTick} 拍（t=${d.atSeconds}s）  ${d.changed.slice(0, 4).join(' | ')}\n     Node ${d.digestA} vs Chrome ${d.digestB}\n     这个局面没有 AI 决策，两端路径应当完全相同 —— 红在这里就是这份代码的 bug，不是引擎差异。`);
+  // 1b. 同一局的累计玩法抽数 —— "一侧多跑了抽随机的代码"这条在这里无处可躲：
+  //     这一局两端**逐位全等**，于是混沌拿不到任何解释权（下面整场局里它拿得到，见 b）。
+  //     实测 Node 15 = Chrome 15；反证臂：在只有浏览器侧走到的分支里每拍偷抽一次 ⇒ 15 vs 315。
+  const ta = nodeTrace.meta.gameplayDraws, tb = br.trace.meta.gameplayDraws;
+  if (ta === tb) console.log(`  ✅ 单飞局累计玩法抽数相等  | ${ta} 次（这一局逐位全等 ⇒ 差了就是有一侧多跑了代码，没有"混沌"可推诿）`);
+  else fail(`单飞局累计玩法抽数不等：Node ${ta} vs Chrome ${tb}（差 ${ta - tb}）—— 逐位全等却抽得不一样多，只可能是一侧多跑了抽随机的代码（特效偷流那类）`);
 }
 
 // ── 2. 整场对局 900 拍 ─────────────────────────────────────────────────────
@@ -158,11 +164,6 @@ const fail = (why) => { green = false; console.log(`  ❌ ${why}`); };
     for (let i = 0; i < Math.min(nw.length, bw.length); i++) if (nw[i] !== bw[i]) { wBad = i; break; }
     if (wBad < 0) console.log(`  ✅ 世界几何签名逐采样点相同  | ${nw[0]}（${nw.length} 个采样点）`);
     else fail(`世界几何签名在第 ${wBad} 个采样点不同：Node ${nw[wBad]} vs Chrome ${bw[wBad]} —— 两端命中判定拿的不是同一份碰撞体，这会让"打中墙还是打人"分环境且不报错`);
-    // b. 累计玩法抽数
-    const na = nodeMatch.meta.gameplayDraws, nb = br.match.meta.gameplayDraws;
-    if (na === nb) console.log(`  ✅ 累计玩法抽数相等  | ${na} 次（含开局建 bot；只在"错拍"时才会同量不同分布）`);
-    else fail(`累计玩法抽数不等：Node ${na} vs Chrome ${nb}（差 ${na - nb}）—— 有只在一侧存在的代码在抽玩法随机数（特效偷流那类），这是真 bug，两边必须一起改`);
-    // c. 分歧的形状：错拍而不增抽数 = 离散事件被挪了一拍
     const da = nodeMatch.drawsPerTick, db = br.match.drawsPerTick;
     let ticks = 0, bulk = 0, maxD = 0;
     for (let i = 0; i < Math.min(da.length, db.length); i++) {
@@ -170,12 +171,43 @@ const fail = (why) => { green = false; console.log(`  ❌ ${why}`); };
       ticks++; bulk += Math.abs(da[i] - db[i]); maxD = Math.max(maxD, Math.abs(da[i] - db[i]));
     }
     const total = da.reduce((s, v) => s + v, 0);
-    console.log(`     逐拍抽数分歧形状：${ticks}/${da.length} 拍不同 · 错拍总量 ${bulk}（占 ${(bulk / total * 100).toFixed(1)}%）· 单拍最大 ${maxD}`);
+    // b. 玩法抽数 —— 判的是**净差与错拍总量的比值**，不是"最后总数差多少"。
+    //    〔判据形状在 2026-09-27 改过两轮，两轮的理由与证据都留在这一段〕
+    //    第一版比整场累计次数（Node 1647 vs Chrome 1617 ⇒ 红）。但两端从第
+    //    ${d.firstDivergentTick} 拍起就已经是两条混沌轨迹了：那之后 bot 每判一次
+    //    "这发中不中"都各自不同 —— 中了的那一侧要额外抽散布与伤害，抽数自然岔开。
+    //    也就是说**只要允许引擎数学有差异（档 2），累计抽数就必然不等**：红是常态、
+    //    绿是侥幸。这和当初被废掉的那条"整场 digest 逐位全等"是同一类错 —— 把依赖
+    //    "两台引擎恰好实现相同"的性质当成了这份代码的判据，红灯天天亮，等于没有判据。
+    //    第二版改成"分歧点之前抽数必须逐位相同" —— 反证臂一跑就废了：偷流会让两端
+    //    **从第 0 拍起**就分歧（它扰动了流本身），于是"分歧点"塌成 0，判据反而成立。
+    //    判据的边界由嫌疑对象自己挪，这是这个仓库第四次栽在这上面。
+    //    第三版（现在这条）只留下两个余量够大的形状：
+    //      · 净差占总抽数的百分比 —— 混沌是**双向错拍**（离散事件被挪了拍号，两侧互有盈亏），
+    //        净差只有总量的 2.2%；偷流是**单向漂移**，实测 65.8%。两个方向差 30 倍，阈值 5%。
+    //        （试过"净差/错拍总量"这个比值，健康 0.21 vs 偷流 0.52 —— 只差 2.5 倍，不算判据，
+    //         因为偷流一旦把流搅乱，混沌噪声也跟着涌进来，分母被自己抬高了。留着只打印。）
+    //      · 首处逐位分歧的拍号 —— 见下面 b2：偷流扰动的是流本身 ⇒ 立刻分歧，混沌要放大几百拍。
+    const na = nodeMatch.meta.gameplayDraws, nb = br.match.meta.gameplayDraws;
+    const net = Math.abs(na - nb);
+    const ratio = bulk ? net / bulk : 0;
+    if (net <= total * 0.05)
+      console.log(`  ✅ 整场局的抽数差是双向错拍而不是单向漂移  | 净差 ${net} 占总抽数 ${(net / total * 100).toFixed(1)}%（阈值 5%，实测健康 2.2% · 偷流 65.8%）· 净差/错拍 = ${ratio.toFixed(2)}`);
+    else
+      fail(`整场局抽数单向漂移：净差 ${net} 占总抽数 ${(net / total * 100).toFixed(1)}%（>5%）· 净差/错拍 = ${ratio.toFixed(2)} —— 混沌是双向错拍，一侧长期多抽只能是有一侧多跑了代码（特效偷流那类）`);
+    // b2. 首处逐位分歧的拍号 —— 这一条抓的是"分歧来得太快"。
+    //     引擎数学的 1 ULP 要放大成"采样点上读得出来的差别"得跑几百拍（实测第 760 拍 / 900）；
+    //     而"只有一侧在抽流"会当场改变流的位置 ⇒ 两端**第一拍**就走不到一起（实测第 0 拍）。
+    //     阈值 50：健康侧有 15 倍余量，反证臂一侧是 0，中间没有可争的地带。
+    //     （它同时也罩住"只有一侧存在的代码改了物理量"这同一类结构差异，不只是偷流。）
+    const cut = d.firstDivergentTick;
+    if (cut >= 50) console.log(`  ✅ 首处逐位分歧来得够晚（混沌要放大几百拍，结构差异当场就分歧）  | 第 ${cut} 拍 / ${da.length}（阈值 50，实测偷流时为 0）`);
+    else fail(`首处逐位分歧在第 ${cut} 拍 —— 引擎 ULP 差不可能在这么早的拍号上放大成可见分歧（健康侧实测 760）。这么早的分歧只能是两端**从第一拍起就跑了不一样的代码**（一侧偷抽了玩法随机、或某段只在浏览器/只在 Node 生效的分支），这是真 bug。`);
+    // c. 分歧的形状：错拍而不增抽数 = 离散事件被挪了一拍
+    console.log(`     逐拍抽数分歧形状：${ticks}/${da.length} 拍不同 · 错拍总量 ${bulk}（占 ${(bulk / total * 100).toFixed(1)}%）· 单拍最大 ${maxD} · 累计 Node ${na} vs Chrome ${nb}`);
     console.log('     ' + (bulk === 0
       ? '错拍量为 0 ⇒ 只有"某几拍抽数对了但落点不同"这种不可能的情形，值得看一眼。'
-      : (na === nb
-        ? '错拍而总量不变 ⇒ 同一批离散事件被挪了拍号（引擎数学差异放大成一次"这发中/不中"的判决差），不是分支分叉。'
-        : '错拍且总量也变了 ⇒ 除了错拍还有分支分叉，先看上面那条累计抽数。')));
+      : `错拍总量 ${bulk}：全部落在逐位分歧点之后 ⇒ 是混沌连带出来的量（一侧多打中几发就多抽几次），不是判据；判据是上面那条"分歧点之前必须逐位相同"。`));
     if (strict) fail('引擎指纹本次全同，逐位全等是应当成立的性质 —— 上面这些分歧都要当成这份代码的 bug 查，不能按"引擎差异"放行');
     else console.log('     （本次引擎指纹有差异，按档 2 判：上面三条结构性断言才是判据）');
   }

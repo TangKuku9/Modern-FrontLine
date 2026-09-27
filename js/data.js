@@ -113,7 +113,10 @@ export const ATTACHMENTS = {
   ],
   optic: [
     { id: 'reddot', name: 'MRS 红点镜', fx: { zoom: 1.35, optic: 'reddot' } },
-    { id: 'holo', name: '全息瞄准镜', fx: { zoom: 1.4, optic: 'holo', ads: 1.02 } },
+    // ads 是**乘数**，小于 1 才是加快（见 computeStats 的 s.ads *= fx.ads）。
+    // 全息原先是 1.02（比红点还慢 2%），2026-09-27 按"全息应当加快开镜"改成 0.92：
+    // 比无枪托（0.85）保守、与斜角握把（0.9）同档，高倍镜那一串（1.08/1.12/1.15）不动。
+    { id: 'holo', name: '全息瞄准镜', fx: { zoom: 1.4, optic: 'holo', ads: 0.92 } },
     { id: 'acog', name: '4倍 ACOG', fx: { zoom: 3, optic: 'acog', ads: 1.08 } },
     { id: 'thermal', name: '热成像瞄具', fx: { zoom: 2.5, optic: 'thermal', ads: 1.12 } },
     { id: 'sniper', name: '高倍狙击镜', fx: { zoom: 7, optic: 'sniper', ads: 1.15 }, only: ['sniper', 'marksman'] },

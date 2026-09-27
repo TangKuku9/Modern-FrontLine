@@ -78,6 +78,13 @@ const res = await page.evaluate(async () => {
   // D1⁻ 反证臂：清理不许过头 —— 重生了还得能开镜
   for (let i = 0; i < 600 && !pl.alive; i++) g.frame();
   ok('D1⁻ 反证：重生之后还能开镜（清理没把活人的功能也清掉）', pl.alive, 'alive=' + pl.alive);
+  // 重生会把装备拨回 class 那一套（见 D5），所以我进场时塞进 slot 0 的那把狙**已经不在手里了** ——
+  // 这条判据的前提得自己重新摆一遍，否则它红的其实是"回装生效了"，而不是"开镜被清坏了"。
+  // （第一版就栽在这里：D5 那条改动一落地，这条立刻变红，但红的原因是好事。）
+  ws.replaceSlot(0, { id: 'l115', att: {}, camo: 'none' }, 5, 30);
+  frames(20);
+  ws.switchTo(0);
+  frames(60);
   frames(200, () => { g.input.buttons = 4; });
   ok('D1⁻ 反证：重生后 ADS 仍然进镜', ws.adsT > 0.9 && g.scopeState === 'sniper', `adsT=${ws.adsT.toFixed(3)} scopeState=${g.scopeState}`);
   g.input.buttons = 0;
@@ -142,6 +149,35 @@ const res = await page.evaluate(async () => {
   ok('D3⁺ 新一局里没有上一局的死亡牌', hidden('deathScreen'), 'hidden=' + hidden('deathScreen'));
   ok('D3ᵇ 新一局的玩家是活的', g.player.alive && g.dead === false, `alive=${g.player.alive} dead=${g.dead}`);
   ok('D3ᶜ 新一局 scopeState 干净', g.scopeState === null, String(g.scopeState));
+
+  // ---------- ⑤ 地上捡来的枪不该活过重生 ----------
+  // 同一个形状（写装备的那一行在重生时没被跑到）：mp.js 的重生只在"死亡界面换过职业"
+  // 时才 equip，于是从地上捡的那把枪会一路带到下一次死亡 —— 而捡枪本该是临时的。
+  {
+    const p2 = g.player, ws2 = p2.ws;
+    frames(30);
+    const own = ws2.slots[0].id;
+    // 真走一遍捡枪路径：脚边放一把别的枪，然后按 F（updatePickups 认的是 inp.interactPressed）
+    const drop = own === 'ak' ? 'm4' : 'ak';
+    g.spawnPickup(drop, {}, { x: p2.pos.x, y: p2.pos.y, z: p2.pos.z }, 30, 90);
+    // F 只按**一次**：捡枪会把手里那把掉回地上，连按就是在同一个回合里跟自己换枪
+    // （偶数次正好换回原来那把 —— 第一版按了 12 次，于是"没捡到"的假象被 D5ᵃ 抓了出来）
+    frames(1, () => { g.input.pressed['KeyF'] = true; });
+    frames(3);
+    const picked = ws2.slots[0].id;
+    // D5ᵃ 是 D5⁺ 的反证臂：没捡到枪的话，"重生后 id 还是原来那个"就是恒真绿灯
+    ok('D5ᵃ 脚边的枪确实被捡起来了（反证臂）', picked === drop, `${own} → ${picked}`);
+    const k2 = g.bots.find(b => b.alive && !b.isPlayer) || g.bots[0];
+    p2.takeDamage(999, { attacker: k2, weapon: 'x', head: false });
+    frames(30);
+    for (let i = 0; i < 700 && !p2.alive; i++) g.frame();
+    frames(10);
+    ok('D5⁺ 重生后握的是自己 class 里那把', ws2.slots[0].id === own,
+      `捡到 ${picked} → 重生后 ${ws2.slots[0].id}（class=${own}）`);
+    ok('D5ᵇ 重生后弹药是整套拨回来的（不是只换了个 id）', ws2.slots[0].mag === ws2.slots[0].stats.mag,
+      `${ws2.slots[0].mag}/${ws2.slots[0].stats.mag}`);
+  }
+
   g.composer.render = realRender;
   g.clock = realClock; realClock.getDelta();
   return out;

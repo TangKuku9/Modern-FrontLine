@@ -177,7 +177,10 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     add(new THREE.PlaneGeometry(0.036, 0.034), mat('lens'), 0, sightY + 0.004, oz - 0.03);
     const ret = new THREE.Group(); ret.position.set(0, sightY, oz - 0.031); root.add(ret);
     add(new THREE.RingGeometry(0.0045, 0.0052, 24), mat('reticle'), 0, 0, 0, 0, 0, 0, ret);
-    add(new THREE.CircleGeometry(0.0007, 8), mat('reticle'), 0, 0, 0, 0, 0, 0, ret);
+    // 中心点：0.0007 → 0.00035（2026-09-27，嫌太大）。与红点一样按**角直径**说话：
+    // 这处分划离眼 0.151 m（红点 0.1155 m），改完 ø0.266°，1080p ADS 下约 7.2 px。
+    // 上下限仍由 test/optic.mjs 的 O6ᵉ 钉着。
+    add(new THREE.CircleGeometry(0.00035, 8), mat('reticle'), 0, 0, 0, 0, 0, 0, ret);
     info.reticle = ret;
     info.sight.set(0, sightY, oz + 0.12);
   } else if (optic === 'acog' || optic === 'thermal') {
