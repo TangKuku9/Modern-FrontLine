@@ -229,8 +229,8 @@ export class Menu {
         <div class="menu-title">现代战线</div>
         <div class="menu-sub">MODERN FRONTLINE</div>
         <div class="mbtn" data-a="campaign"><div class="ico">◈</div><div><div class="mt">战役</div><div class="md">行动代号：午夜清道夫 ${best ? '· 最佳 ' + fmtTime(best) : ''}</div></div></div>
-        <div class="mbtn" data-a="mp"><div class="ico">⚔</div><div><div class="mt">多人对战</div><div class="md">团队死斗 · 占领 · 自由混战（对战AI）</div></div></div>
-        <div class="mbtn" data-a="online"><div class="ico">🌐</div><div><div class="mt">联网对战</div><div class="md">与同一台服务器上的真人对局 · 权威模拟在服务端</div></div></div>
+        <div class="mbtn" data-a="mp"><div class="ico">⚔</div><div><div class="mt">多人对战</div><div class="md">团队死斗 · 占领 · 自由混战</div></div></div>
+        <div class="mbtn" data-a="online"><div class="ico">🌐</div><div><div class="mt">联网对战</div><div class="md">真人在线对局</div></div></div>
         <div class="mbtn" data-a="loadout"><div class="ico">⚙</div><div><div class="mt">武器装备</div><div class="md">自定义配装 · 枪匠 · 技能 · 连杀奖励</div></div></div>
         <div class="mbtn" data-a="settings"><div class="ico">☰</div><div><div class="mt">设置</div><div class="md">画面 · 操作 · 音频</div></div></div>
       </div>
@@ -238,7 +238,7 @@ export class Menu {
       <div style="position:absolute;right:40px;bottom:30px;text-align:right;font-size:12px;color:#777;line-height:1.9">
         <div><span class="kbd">WASD</span>移动 <span class="kbd">Shift</span>冲刺 <span class="kbd">C</span>蹲/滑铲 <span class="kbd">空格</span>跳跃 <span class="kbd">R</span>换弹 <span class="kbd">V</span>近战</div>
         <div><span class="kbd">G</span>致命装备 <span class="kbd">Q</span>战术装备 <span class="kbd">F</span>互动 <span class="kbd">N</span>夜视仪 <span class="kbd">3/4/5</span>连杀奖励 <span class="kbd">Tab</span>记分板</div>
-        <div style="color:#555;margin-top:6px">现代战线 v1.0 · 程序化实时渲染 · 本作为原创致敬作品</div>
+        <div style="color:#555;margin-top:6px">v1.0</div>
       </div>`, 'dim', 'main');
     this.on(r, '[data-a]', el => {
       const a = el.dataset.a;
@@ -362,19 +362,20 @@ export class Menu {
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
     // 错误信息一律**原样显示服务端那一句**：这个模块不翻译、不复述。翻译的那一版会把
     // "邀请码不对"和"服务器忙"揉成同一句"登录失败"，服主永远收不到"我邀请码是多少"这个真问题。
-    const note = `进对局需要账号${A.inviteRequired ? '，注册要邀请码，由服主给你' : ''}。`;
+    const note = `进对局需要账号${A.inviteRequired ? '，注册需邀请码（向服主索取）' : ''}。`;
+    // 这一段只说"我现在要做什么 / 做完会发生什么"。原先那一版还写了为什么要账号
+    // （封禁依据、服务端看着有人作弊无处记录、换台机器还在也改不动）—— 那是设计文档的
+    // 内容，写在闸上只会让人读两段才知道该点哪个按钮。
     const r = this.render(`
       <div class="gate-card">
-        <div class="op">联网对战 · 先办身份</div>
-        <h1>注册后开放</h1>
-        <p>联网对战需要一个账号：呼号全服唯一（记分板上不会撞名），战绩与经验存在服务端
-        （换台机器、换个浏览器都还在，也改不动），同时也是封禁的依据 —— 没有身份，
-        服务端只能看着有人作弊而无处记录。注册或登录之后自动进入房间列表。</p>
+        <div class="op">联网对战 · 账号</div>
+        <h1>登录 / 注册</h1>
+        <p>呼号全服唯一，战绩与经验保存在服务器。<br>登录后自动进入房间列表。</p>
         <div class="opts">
-          <div>呼号</div><input id="onName" maxlength="16" placeholder="2~16 个字" value="${esc(L.name || '')}" style="${inp}">
+          <div>呼号</div><input id="onName" maxlength="16" placeholder="2-16 个字符" value="${esc(L.name || '')}" style="${inp}">
           <div>密码</div><input id="acctPw" type="password" maxlength="128" placeholder="至少 8 位" style="${inp}">
-          ${A.inviteRequired ? `<div>邀请码</div><input id="acctCode" placeholder="问服主要" style="${inp}">` : ''}
-          <div></div><div style="display:flex;gap:8px"><button class="btn" data-a="login">登录</button><button class="btn ghost" data-a="reg">注册新号</button></div>
+          ${A.inviteRequired ? `<div>邀请码</div><input id="acctCode" placeholder="由服主提供" style="${inp}">` : ''}
+          <div></div><div style="display:flex;gap:8px"><button class="btn" data-a="login">登录</button><button class="btn ghost" data-a="reg">注册</button></div>
           <div class="note-wide" id="acctMsg">${esc(A.lastError || '')}</div>
           <div class="note-wide">${note}</div>
         </div>
@@ -422,7 +423,7 @@ export class Menu {
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
     const r = this.render(`
       <div class="lobby">
-        <div class="hdr">联网对战<small>服务器 ${esc(location.host)} · 房间列表 · 权威模拟在服务端</small></div>
+        <div class="hdr">联网对战<small>服务器 ${esc(location.host)}</small></div>
         <div class="lobby-body">
           <div class="lobby-col" style="flex:1;max-width:600px">
             <div class="panel"><div class="opts">
@@ -433,7 +434,7 @@ export class Menu {
               <div style="display:flex;gap:8px"><input id="roomTitle" maxlength="24" placeholder="房间名（留空自动命名）" value="${esc(L.title || '')}" style="${inp};flex:1;min-width:0"><button class="btn small ghost" data-a="create">创建并进入</button><button class="btn small" data-a="quick">快速加入</button></div>
             </div></div>
             <div class="panel">
-              <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备（服务端会按表重建这一份）</div>
+              <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备</div>
               <div style="display:flex;justify-content:space-between;align-items:center">
                 <div><div style="font-size:20px;font-weight:800">${esc(cls.name)}</div><div style="font-size:12px;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name} · ${cls.perks.map(id => this.perk(id).name).join(' / ')}</div></div>
                 <button class="btn small ghost" data-a="loadout">编辑</button>
@@ -448,7 +449,7 @@ export class Menu {
             <div class="panel"><div class="opts">
               <div>阵营</div>
               <div class="seg" id="onTeam"><div data-v="A" class="${L.team === 'B' ? '' : 'sel'}">A 队</div><div data-v="B" class="${L.team === 'B' ? 'sel' : ''}">B 队</div></div>
-              <div class="note-wide">地图与模式由服务器决定。掉线或服务器更新时屏幕上会写明原因，按 Enter 重连。</div>
+              <div class="note-wide">地图与模式由服务器决定。</div>
             </div></div>
             <div class="panel" id="idPanel"></div>
             <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button></div>
@@ -477,7 +478,7 @@ export class Menu {
   }
 
   // 主菜单上"联网对战"那一项的锁标。规则：**未完成注册前联网对战不开放** ——
-  // 但"不开放"不等于"藏起来"：入口照旧在、点得进（落在注册页），只是写明 🔒 注册后开放。
+  // 但"不开放"不等于"藏起来"：入口照旧在、点得进（落在注册页），只是写明 🔒 需注册。
   // 判定跟服务端策略走（/api/status 的 requireAccount）：显式配了 REQUIRE_ACCOUNT=0 的
   // 访客可玩服是服主明说的"这台不用注册"，那不是漏检。改这里改不动权限 ——
   // 真正的闸在服务端（/api/rooms 的 401 与 WS 握手的 401），这里只是把同一件事显示出来。
@@ -488,7 +489,8 @@ export class Menu {
     const locked = !!(A && A.statusKnown && A.requireAccount && !A.loggedIn);
     btn.classList.toggle('locked', locked);
     const md = btn.querySelector('.md');
-    if (md) md.textContent = locked ? '🔒 注册后开放 · 与同一台服务器上的真人对局' : '与同一台服务器上的真人对局 · 权威模拟在服务端';
+    // 锁态与开放态的差别只在"多一道前置"，后半句保持不变 —— 一眼能看出锁的是注册这件事。
+    if (md) md.textContent = locked ? '🔒 需注册 · 真人在线对局' : '真人在线对局';
   }
 
   // 进对局 URL 的**唯一**拼装点（列表里每行的"加入" / 快速加入 / 创建并进入共用）。
@@ -532,17 +534,17 @@ export class Menu {
     if (!rows) return;
     const A = this.game.account;
     if (A.requireAccount && !A.loggedIn) { this.showOnlineGate(); return; }   // 兜底：身份没了回闸
-    rows.innerHTML = '<div class="note-wide">正在读取房间列表…</div>';
+    rows.innerHTML = '<div class="note-wide">正在载入房间列表…</div>';
     A.rooms().then(r => {
       if (this.screen !== 'online') return;          // 用户已离开这一页，别把行画到别的屏上
       if (!r.ok) {
-        rows.innerHTML = `<div class="note-wide">读不到房间列表：${esc(r.message || ('服务器返回了 ' + r.status))}</div>`;
+        rows.innerHTML = `<div class="note-wide">房间列表读取失败：${esc(r.message || ('服务器返回 ' + r.status))}</div>`;
         return;
       }
       const list = r.data.rooms || [];
-      if (note) note.textContent = `${list.length} 间开着`;
+      if (note) note.textContent = `${list.length} 个房间`;
       if (!list.length) {
-        rows.innerHTML = '<div class="note-wide">现在没有开着的房间 —— 「快速加入」会为你开一间，或者自己「创建并进入」。</div>';
+        rows.innerHTML = '<div class="note-wide">暂无房间 · 可快速加入或新建</div>';
         return;
       }
       rows.innerHTML = list.map(x => {
@@ -594,7 +596,7 @@ export class Menu {
             <span style="color:#999;font-size:12px;margin-left:8px">经验 ${p.xp | 0} · 场次 ${p.matches | 0} · 胜 ${p.wins | 0}</span></div>
           <button class="btn small ghost" data-a="logout">登出</button>
         </div>
-        <div class="note-wide">战绩与经验存在服务端 —— 换台机器、换个浏览器都还在，也改不动。</div>
+        <div class="note-wide">数据保存在服务器。</div>
       </div>`;
       this.on(box, '[data-a=logout]', async () => {
         await A.logout();
@@ -606,8 +608,8 @@ export class Menu {
     if (!A.requireAccount) {
       // 访客可玩：一个呼号框（这一局的显示名），没有密码、没有邀请码。
       box.innerHTML = `<div class="opts"><div>呼号</div>
-        <input id="onName" maxlength="16" placeholder="2~16 个汉字 / 字母 / 数字" value="${esc(L.name || '士兵')}" style="${inp}">
-        <div class="note-wide">这个服务器不需要账号（访客可玩），呼号只在这局里显示，战绩不存到任何地方。不合法的呼号会被服务器拒掉，并说明规则。</div>
+        <input id="onName" maxlength="16" placeholder="2-16 个字符" value="${esc(L.name || '士兵')}" style="${inp}">
+        <div class="note-wide">免注册服务器：呼号仅用于本局显示，战绩不保存。</div>
       </div>`;
       return;
     }
@@ -615,7 +617,7 @@ export class Menu {
     // 走到这里 = "要账号却没登录"：按层级他不该在大厅（守卫早该把人送进闸）。
     // 别装作没事 —— 给一个明确的去处，而不是一块空白面板。
     box.innerHTML = `<div class="opts"><div>身份</div>
-      <div style="font-size:12px;color:#e6a8c8">还没有登录 —— 联网对战在注册后开放。</div>
+      <div style="font-size:12px;color:#e6a8c8">需要账号才能查看房间列表。</div>
       <div class="note-wide"><button class="btn small" data-a="toGate">去注册 / 登录</button></div>
     </div>`;
     this.on(box, '[data-a=toGate]', () => this.showOnlineGate());
@@ -726,7 +728,7 @@ export class Menu {
       if (sel.has(id)) sel.delete(id); else if (sel.size < 3) sel.add(id);
       el.classList.toggle('sel', sel.has(id)); upd();
     });
-    this.on(d, '[data-a=ok]', () => { if (sel.size !== 3) { d.querySelector('#skc').innerHTML = '<span style="color:#ff6a5a">必须选择 3 项连杀奖励</span>'; return; } P.streaks = [...sel]; this.game.saveProfile(); this.showLoadouts(); });
+    this.on(d, '[data-a=ok]', () => { if (sel.size !== 3) { d.querySelector('#skc').innerHTML = '<span style="color:#ff6a5a">需选择 3 项</span>'; return; } P.streaks = [...sel]; this.game.saveProfile(); this.showLoadouts(); });
   }
 
   // ---------------- 枪匠 ----------------
@@ -783,7 +785,7 @@ export class Menu {
         const aid = el.dataset.id;
         if (!aid) delete att[this.gsSlot];
         else {
-          if (!att[this.gsSlot] && Object.keys(att).length >= MAX_ATT) { r.querySelector('#gsMsg').textContent = `最多装备 ${MAX_ATT} 个配件，请先移除其他配件`; return; }
+          if (!att[this.gsSlot] && Object.keys(att).length >= MAX_ATT) { r.querySelector('#gsMsg').textContent = `配件已装满，请先移除一个`; return; }
           att[this.gsSlot] = aid;
         }
         this.game.saveProfile();
@@ -815,7 +817,7 @@ export class Menu {
         ${tog('invertY', '反转 Y 轴')}
         ${tog('voice', '语音播报')}
         ${tog('showFps', '显示帧数')}
-        <div style="font-size:11px;color:#777;margin-top:8px">画面质量中的阴影与纹理分辨率将在下次加载地图 / 刷新页面后完全生效。</div>
+        <div style="font-size:11px;color:#777;margin-top:8px">阴影与纹理质量将在下次载入地图后生效。</div>
         <div class="keys">
           <div><b>WASD</b>移动</div><div><b>鼠标左/右键</b>射击 / 瞄准</div>
           <div><b>Shift</b>战术冲刺</div><div><b>C / Ctrl</b>蹲伏 · 冲刺中滑铲</div>

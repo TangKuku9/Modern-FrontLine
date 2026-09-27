@@ -100,7 +100,7 @@ html, body { position: fixed; inset: 0; }
 .room-row .rr-meta { color: #999; font-size: 12px; }
 .room-row .rr-n { color: #ccc; font-size: 13px; min-width: 48px; text-align: right; }
 .room-row .rr-state { color: #888; font-size: 12px; min-width: 52px; text-align: right; }
-/* 主菜单上"注册后开放"那一项：看得见、点得进（落在注册页），但明写它锁着 */
+/* 主菜单上"🔒 需注册"那一项：看得见、点得进（落在注册页），但明写它锁着 */
 .mbtn.locked { opacity: .62; }
 .mbtn.locked:hover { border-left-color: #c9a227; }
 /* 联机第一层：注册/登录（闸）。居中单卡 —— 它是"前置条件"页，不该有第二个焦点 */

@@ -178,7 +178,7 @@ export class MPMatch {
       this.respawns.push({ e: victim, t: 4.5 });
       const el = document.getElementById('deathScreen');
       el.classList.remove('hidden');
-      document.getElementById('killerInfo').innerHTML = killer && killer !== victim ? `被 <b>${killer.name}</b> 使用 ${weapon || ''} ${head ? '爆头' : ''}击杀` : '你自杀了';
+      document.getElementById('killerInfo').innerHTML = killer && killer !== victim ? `被 <b>${killer.name}</b> 使用 ${weapon || ''} ${head ? '爆头' : ''}击杀` : '自我击杀';
       pl.stats.streak = 0;
       this.streakKills = 0;
       this.streakBook.onDeath();
@@ -241,8 +241,8 @@ export class MPMatch {
     const team = bot.team;
     if (bot.streak === 3) {
       this.rules.uavStart(team, 25 * 60);
-      if (team !== game.player.team) { game.hud.announce('敌方UAV已上线', '保持移动或使用幽灵Perk', 3); game.audio.say('敌方无人机已上线'); }
-      else game.hud.announce('友方UAV已上线', '', 2);
+      if (team !== game.player.team) { game.hud.announce('敌方 UAV 已上线', '幽灵技能可规避', 3); game.audio.say('敌方无人机已上线'); }
+      else game.hud.announce('友方 UAV 已上线', '', 2);
     } else if (bot.streak === 5) {
       const targets = this.enemiesOf(team).filter(e => !(e.isPlayer && e.hasPerk('coldblooded')));
       if (targets.length) {

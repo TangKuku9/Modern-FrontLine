@@ -592,7 +592,7 @@ try {
       const w1 = await raw(s5.base + '/api/rooms', { headers: { cookie: ck } });
       const wj = JSON.parse(w1.text);
       chk(w1.status === 200 && wj.ok === true && Array.isArray(wj.rooms),
-        'I2 注册之后拿得到房间清单（"注册后开放"的另一半）', `${w1.status} rooms=${(wj.rooms || []).length}`);
+        'I2 注册之后拿得到房间清单（主菜单那把锁的另一半）', `${w1.status} rooms=${(wj.rooms || []).length}`);
 
       // 建一间带显示名的房：title 是显示名，房号仍是 join 里的那个 id
       const a = await openWs(s5.ws, ck);

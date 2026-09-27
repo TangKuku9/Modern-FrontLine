@@ -394,8 +394,11 @@ try {
       const b = document.querySelector('[data-a=online]');
       return { locked: !!(b && b.classList.contains('locked')), text: (b && b.textContent || '').trim().slice(0, 60) };
     });
-    ok('主菜单上"联网对战"标着 🔒 注册后开放（不是假装开放、点了才拒）',
-      entry.locked && /注册后开放/.test(entry.text), JSON.stringify(entry));
+    // 这条量的是"入口带着锁标、且文案里说了注册这件事"，**不钉死具体措辞** ——
+    // 钉死五个字的话，每改一次 UI 文案就要改一次判据，而这条真正要看的是"锁没锁"。
+    // （🔒 与"注册"两格只要还在，换任何说法都仍然红得起来；把锁标删掉就红。）
+    ok('主菜单上"联网对战"标着 🔒（不是假装开放、点了才拒），且写明需要注册',
+      entry.locked && /🔒/.test(entry.text) && /注册/.test(entry.text), JSON.stringify(entry));
     await page.bringToFront();
     await page.click('[data-a=online]');
     // 等层级路由落定（策略未知时它会先进"正在进入联网对战…"，别把那一瞬间当注册页）
@@ -410,8 +413,8 @@ try {
       if (atGate.screen === 'onlineGate') break;
       await sleep(250);
     }
-    ok('点入口先落在**注册页**（闸），且注册表单在、提示写着"注册后开放"',
-      atGate.screen === 'onlineGate' && atGate.form && /注册后开放/.test(atGate.msg), JSON.stringify(atGate));
+    ok('点入口先落在**注册页**（闸），注册表单在，且这一屏写明要注册',
+      atGate.screen === 'onlineGate' && atGate.form && /注册/.test(atGate.msg), JSON.stringify(atGate));
     ok('层级①：注册页上**没有房间列表**（先过闸再看房，不是两块锁在一屏上）', !atGate.rows, JSON.stringify(atGate));
     // 权限不在"哪一屏"里：服务端对没会话的清单请求直接 401。客户端只是把闸画出来 ——
     // 把它删掉也进不了场（这就是 ② 的服务端那一半）。

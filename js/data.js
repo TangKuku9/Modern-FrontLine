@@ -117,7 +117,7 @@ export const ATTACHMENTS = {
     // 全息原先是 1.02（比红点还慢 2%），2026-09-27 按"全息应当加快开镜"改成 0.92：
     // 比无枪托（0.85）保守、与斜角握把（0.9）同档，高倍镜那一串（1.08/1.12/1.15）不动。
     { id: 'holo', name: '全息瞄准镜', fx: { zoom: 1.4, optic: 'holo', ads: 0.92 } },
-    { id: 'acog', name: '4倍 ACOG', fx: { zoom: 3, optic: 'acog', ads: 1.08 } },
+    { id: 'acog', name: '4 倍 ACOG', fx: { zoom: 3, optic: 'acog', ads: 1.08 } },
     { id: 'thermal', name: '热成像瞄具', fx: { zoom: 2.5, optic: 'thermal', ads: 1.12 } },
     { id: 'sniper', name: '高倍狙击镜', fx: { zoom: 7, optic: 'sniper', ads: 1.15 }, only: ['sniper', 'marksman'] },
   ],
@@ -214,12 +214,12 @@ export const PERKS = [
     { id: 'doubletime', name: '双倍时间', desc: '战术冲刺时间翻倍，蹲伏移动速度提高30%。', icon: '⏩' },
     { id: 'scavenger', name: '拾荒者', desc: '击杀敌人后自动补充弹药与投掷物。', icon: '🎒' },
     { id: 'eod', name: '爆破专家', desc: '受到的爆炸与燃烧伤害降低50%，闪光效果减半。', icon: '🛡' },
-    { id: 'coldblooded', name: '冷血', desc: '敌方AI锁定你的反应时间大幅延长，哨戒机枪与直升机优先级降低。', icon: '❄' },
+    { id: 'coldblooded', name: '冷血', desc: '敌方 AI 锁定你的反应时间大幅延长，哨戒机枪与直升机优先级降低。', icon: '❄' },
   ],
   [
     { id: 'hardline', name: '强硬路线', desc: '所有连杀奖励所需击杀数减少1。', icon: '⬇' },
     { id: 'overkill', name: '火力过载', desc: '可将第二把主武器作为副武器携带。', icon: '✚' },
-    { id: 'ghost', name: '幽灵', desc: '不会被敌方UAV与雷达侦测到。', icon: '👻' },
+    { id: 'ghost', name: '幽灵', desc: '不会被敌方 UAV 与雷达侦测到。', icon: '👻' },
     { id: 'quickfix', name: '速愈', desc: '击杀敌人立即恢复生命，生命恢复延迟缩短。', icon: '❤' },
   ],
   [
@@ -232,7 +232,7 @@ export const PERKS = [
 
 export const LETHALS = [
   { id: 'frag', name: '破片手雷', desc: '可烹饪的延时破片手雷', count: 2 },
-  { id: 'semtex', name: '粘性炸弹', desc: '粘附于任何表面，2秒后爆炸', count: 2 },
+  { id: 'semtex', name: '粘性炸弹', desc: '粘附于任何表面，2 秒后爆炸', count: 2 },
   { id: 'molotov', name: '燃烧瓶', desc: '撞击后爆燃，形成持续燃烧区域', count: 2 },
 ];
 export const TACTICALS = [
@@ -242,10 +242,10 @@ export const TACTICALS = [
 ];
 
 export const KILLSTREAKS = [
-  { id: 'uav', name: '侦察无人机', kills: 3, desc: '在小地图上显示敌人位置 30秒', icon: '📡' },
+  { id: 'uav', name: '侦察无人机', kills: 3, desc: '在小地图上显示敌人位置 30 秒', icon: '📡' },
   { id: 'cluster', name: '集束空袭', kills: 5, desc: '标记目标区域，呼叫战机投下集束炸弹', icon: '✈' },
   { id: 'sentry', name: '哨戒机枪', kills: 6, desc: '部署一挺自动攻击敌人的机枪塔', icon: '🔫' },
-  { id: 'heli', name: '武装直升机', kills: 7, desc: '直升机盘旋战场并攻击敌人 45秒', icon: '🚁' },
+  { id: 'heli', name: '武装直升机', kills: 7, desc: '直升机盘旋战场并攻击敌人 45 秒', icon: '🚁' },
   { id: 'wp', name: '白磷弹', kills: 10, desc: '白磷覆盖整个战场，灼烧所有敌人', icon: '🔥' },
 ];
 

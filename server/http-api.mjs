@@ -177,7 +177,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
       // "这个服要不要邀请码""这个服要不要账号"，否则它会显示一个用户填不出来的空框。
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         stat.badMethod++;
-        send(res, 405, { ok: false, error: 'bad_method', message: '这个接口只接受 GET' }, { allow: 'GET' });
+        send(res, 405, { ok: false, error: 'bad_method', message: '请求方式不支持' }, { allow: 'GET' });
         return true;
       }
       send(res, 200, {
@@ -203,13 +203,13 @@ export async function createAuth({ cfg = {}, store } = {}) {
       stat.notFound++;
       // 不在路由表里的 /api/* 一律 404，**不许落到静态服务那条路上去** ——
       // 落过去的话它会被当成一个文件路径去找，于是 /api/../server 这类形状就有了意义。
-      send(res, 404, { ok: false, error: 'no_route', message: '没有这个接口' });
+      send(res, 404, { ok: false, error: 'no_route', message: '接口不存在' });
       return true;
     }
     const m = req.method === 'HEAD' ? 'GET' : req.method;
     if (m !== want) {
       stat.badMethod++;
-      send(res, 405, { ok: false, error: 'bad_method', message: `这个接口只接受 ${want}` }, { allow: want });
+      send(res, 405, { ok: false, error: 'bad_method', message: `请求方式不支持（仅支持 ${want}）` }, { allow: want });
       return true;
     }
 
@@ -277,17 +277,17 @@ export async function createAuth({ cfg = {}, store } = {}) {
         stat.tooLarge++;
         // connection: close —— 请求体还在对方手里没发完，我们不会再去读它。
         // 声明关连接比"读到一半就走人"干净：客户端知道自己该重新握手，而不是等一个永远不来的响应。
-        send(res, 413, { ok: false, error: 'too_large', message: '请求体太大了' }, { connection: 'close' });
+        send(res, 413, { ok: false, error: 'too_large', message: '请求过大' }, { connection: 'close' });
         return true;
       }
-      send(res, 400, { ok: false, error: 'bad_body', message: '请求体读不出来' });
+      send(res, 400, { ok: false, error: 'bad_body', message: '请求无效' });
       return true;
     }
     let body;
     try { body = JSON.parse(raw || '{}'); }
-    catch { send(res, 400, { ok: false, error: 'bad_json', message: '请求体不是 JSON' }); return true; }
+    catch { send(res, 400, { ok: false, error: 'bad_json', message: '请求格式无效' }); return true; }
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      send(res, 400, { ok: false, error: 'bad_json', message: '请求体不是 JSON 对象' });
+      send(res, 400, { ok: false, error: 'bad_json', message: '请求格式无效' });
       return true;
     }
 
@@ -341,7 +341,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
     // 留一个显式的兜底而不是静默 return true：以后往 ROUTES 里加一条却忘了写分支时，
     // 症状会是"接口存在但什么都不发生"（客户端一直等），而这里会当场说清楚。
     stat.notFound++;
-    send(res, 501, { ok: false, error: 'not_implemented', message: '这个接口还没接' });
+    send(res, 501, { ok: false, error: 'not_implemented', message: '功能未开放' });
     return true;
   }
 

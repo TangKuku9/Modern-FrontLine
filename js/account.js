@@ -58,7 +58,7 @@ export class Account {
       // "网络错误"，那会把"邀请码不对"和"服务器挂了"混成同一句话。
       return { ok: false, message: (j && j.message) || `服务器返回了 ${r.status}`, status: r.status, retryAfterMs: (j && j.retryAfterMs) | 0 };
     } catch (e) {
-      return { ok: false, message: e && e.name === 'AbortError' ? '服务器没有响应（超时）' : '连不上服务器', status: 0 };
+      return { ok: false, message: e && e.name === 'AbortError' ? '服务器无响应（请求超时）' : '无法连接服务器', status: 0 };
     } finally { clearTimeout(t); }
   }
 
