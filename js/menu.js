@@ -244,7 +244,7 @@ export class Menu {
       const a = el.dataset.a;
       if (a === 'campaign') this.showCampaign();
       else if (a === 'mp') this.showLobby();
-      else if (a === 'online') this.showOnlineLobby();
+      else if (a === 'online') this.showOnlineEntry();   // 层级路由：先过闸还是直接进大厅
       else if (a === 'loadout') this.showLoadouts('main');
       else if (a === 'settings') this.showSettings('main');
     });
@@ -323,16 +323,99 @@ export class Menu {
       setTimeout(() => this.game.startGame('mp', { mode: L.mode, map: L.map, diff: L.diff, allies: L.mode === 'ffa' ? 0 : L.allies, enemies: L.enemies, scoreLimit, timeLimit: L.time }), 600);
     });
   }
-  // 联网大厅 = **房间列表**。为什么要有它：联机代码早就在了，但要玩家手打 ?online=1 才能玩，
-  // 那等于没有入口；而"填一个房间号"也不算大厅 —— 玩家看不见哪间开着、有谁在打。
+  // ── 联机的层级：主菜单 →（闸：注册/登录）→ 房间列表大厅 → 对局 ──
+  // 层级是**屏与屏的先后**，不是同一屏上锁几个按钮：注册是前置条件，房间列表是正事，
+  // 摆在同一屏上两个焦点互相稀释（"一堆按钮 + 三个输入框"，不知道该先干什么），
+  // 而"锁着的列表"是一块看得见点不动的东西，比不给看更招人烦。
+  // 于是拆成三屏，每屏只干一件事；这一段是唯一入口（主菜单点"联网对战"）：
+  //   策略未知      —— 先不猜（猜错的两种都不好：给访客服摆注册页 / 把该注册的人放进大厅）；
+  //   要账号·未登录 —— 注册/登录（闸，独占一屏）；
+  //   其余          —— 房间列表大厅（已登录，或服主明说的访客可玩服）。
+  showOnlineEntry() {
+    const A = this.game.account;
+    if (!A.statusKnown && !this._policyWait) {
+      this._policyWait = true;
+      this.showLoadingOverlay('正在进入联网对战…');
+      Promise.resolve(this.game.accountSync ? this.game.accountSync() : A.status()).then(() => {
+        this._policyWait = false;
+        if (this.screen !== 'loading') return;        // 等待期间人已经去了别处，别把他拽回来
+        // 连不上服务器时 statusKnown 仍是 false：往严的那边倒（当"要账号"处理、落在闸上），
+        // 而不是回到这里空转 —— accountSync 已经定住，再进一次立刻 then，会成死循环。
+        if (A.statusKnown) this.showOnlineEntry(); else this.showOnlineGate();
+      });
+      return;
+    }
+    if (A.requireAccount && !A.loggedIn) this.showOnlineGate();
+    else this.showOnlineLobby();
+  }
+
+  // ── 联机第二层：注册 / 登录（闸）───────────────────────────────────────
+  // 这一屏只干一件事：把身份办了。办完**自动前进**到房间列表大厅 —— 下一步不该让玩家自己找。
+  // 访客可玩的服（REQUIRE_ACCOUNT=0）没有这一层，showOnlineEntry 直接路由到大厅。
+  // 真正的权限不在这里：服务端 /api/rooms 的 401 与 WS 握手的 401 一样拒（改客户端绕不过去）。
+  showOnlineGate() {
+    const A = this.game.account;
+    // 已有身份的人不该停在闸上（刷新、从大厅登出前的旧页签等路径都可能走到这里）—— 直接前进。
+    if (A.statusKnown && (!A.requireAccount || A.loggedIn)) { this.showOnlineLobby(); return; }
+    this.setCam('lobby');
+    const L = this.lobby;
+    const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
+    // 错误信息一律**原样显示服务端那一句**：这个模块不翻译、不复述。翻译的那一版会把
+    // "邀请码不对"和"服务器忙"揉成同一句"登录失败"，服主永远收不到"我邀请码是多少"这个真问题。
+    const note = `进对局需要账号${A.inviteRequired ? '，注册要邀请码，由服主给你' : ''}。`;
+    const r = this.render(`
+      <div class="gate-card">
+        <div class="op">联网对战 · 先办身份</div>
+        <h1>注册后开放</h1>
+        <p>联网对战需要一个账号：呼号全服唯一（记分板上不会撞名），战绩与经验存在服务端
+        （换台机器、换个浏览器都还在，也改不动），同时也是封禁的依据 —— 没有身份，
+        服务端只能看着有人作弊而无处记录。注册或登录之后自动进入房间列表。</p>
+        <div class="opts">
+          <div>呼号</div><input id="onName" maxlength="16" placeholder="2~16 个字" value="${esc(L.name || '')}" style="${inp}">
+          <div>密码</div><input id="acctPw" type="password" maxlength="128" placeholder="至少 8 位" style="${inp}">
+          ${A.inviteRequired ? `<div>邀请码</div><input id="acctCode" placeholder="问服主要" style="${inp}">` : ''}
+          <div></div><div style="display:flex;gap:8px"><button class="btn" data-a="login">登录</button><button class="btn ghost" data-a="reg">注册新号</button></div>
+          <div class="note-wide" id="acctMsg">${esc(A.lastError || '')}</div>
+          <div class="note-wide">${note}</div>
+        </div>
+        <div class="lobby-foot"><button class="btn ghost" data-a="back">返回主菜单</button></div>
+      </div>`, 'solid', 'onlineGate');
+    this.on(r, '[data-a=back]', () => this.showMain());
+    const grab = () => ({
+      name: String((r.querySelector('#onName') || {}).value || '').trim(),
+      password: String((r.querySelector('#acctPw') || {}).value || ''),
+      code: String((r.querySelector('#acctCode') || {}).value || ''),
+    });
+    const submit = async (kind) => {
+      const f = grab();
+      L.name = f.name || L.name;
+      this.acctMsg(r, (kind === 'reg' ? '正在注册…' : '正在登录…'));
+      const r2 = kind === 'reg'
+        ? await A.register({ name: f.name, password: f.password, code: f.code })
+        : await A.login({ name: f.name, password: f.password });
+      if (!r2.ok) { this.acctMsg(r, r2.message || '失败了'); return; }
+      // 登录之后把服务端那份经验值同步到本地档案上（显示用）。
+      // 本地那份仍然可以被玩家改，但它现在只是**一个显示用的副本** ——
+      // 真正的数在服务端，下一次 /api/me 会把它盖回去。
+      if (A.user) { this.game.profile.xp = A.user.xp | 0; this.game.saveProfile(); }
+      this.showOnlineLobby();        // 层级前进：闸过了就进大厅
+    };
+    this.on(r, '[data-a=login]', () => submit('login'));
+    this.on(r, '[data-a=reg]', () => submit('reg'));
+    const pw = r.querySelector('#acctPw');
+    if (pw) pw.addEventListener('keydown', e => { if (e.key === 'Enter') submit('login'); });
+  }
+
+  // ── 联机第三层：房间列表大厅 ──
+  // 这一屏只干一件事：选房、进房。身份在上一层已经办完，这里压缩成一张状态卡（renderIdentity）
+  // —— 再摆一整块登录表单的话，层级就又平了，玩家会以为"进了大厅还要在这儿登一次录"。
   // 这里只递服务端真用得上的东西（呼号、阵营、房号 + 可选的房间显示名）——
   // 地图与模式由服务器说了算（见 server/net-server.mjs 的 CFG 与 pickRoom），
   // 大厅里放一个本地选择器去"决定"它们，就是在骗人。
-  //
-  // 未完成注册前**这一屏只开放注册本身**：房间列表、快速加入、创建并进入全部锁着
-  // （renderRoomList 的锁定形态）。入口不藏（藏了玩家连"要注册才能联机"都无从得知），
-  // 但锁要写在明面上 —— 而真正的闸在服务端两处：/api/rooms 的 401 与 WS 握手的 401。
   showOnlineLobby() {
+    // 守卫：未注册的人根本到不了这里（路由先拦，这行是第二道 —— 谁直接调它都回闸）。
+    const A0 = this.game.account;
+    if (A0.requireAccount && !A0.loggedIn) { this.showOnlineGate(); return; }
     this.setCam('lobby');
     const L = this.lobby, P = this.game.profile;
     const cls = P.classes[P.selClass || 0];
@@ -347,7 +430,7 @@ export class Menu {
               <div style="display:flex;gap:8px;align-items:center"><button class="btn small ghost" data-a="refresh">刷新</button><span id="roomNote" style="color:#888;font-size:12px"></span></div>
               <div id="roomRows" style="grid-column:1/-1;display:flex;flex-direction:column;gap:6px;max-height:216px;overflow-y:auto"></div>
               <div>创建房间</div>
-              <div style="display:flex;gap:8px"><input id="roomTitle" maxlength="24" placeholder="房间名（留空自动命名）" value="${esc(L.title || '')}" style="${inp}"><button class="btn small ghost" data-a="create">创建并进入</button><button class="btn small" data-a="quick">快速加入</button></div>
+              <div style="display:flex;gap:8px"><input id="roomTitle" maxlength="24" placeholder="房间名（留空自动命名）" value="${esc(L.title || '')}" style="${inp};flex:1;min-width:0"><button class="btn small ghost" data-a="create">创建并进入</button><button class="btn small" data-a="quick">快速加入</button></div>
             </div></div>
             <div class="panel">
               <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备（服务端会按表重建这一份）</div>
@@ -357,18 +440,17 @@ export class Menu {
               </div>
             </div>
           </div>
-          <!-- 账号单独占右列。**这不是排版偏好，是尺寸**：账号面板有三种形态，其中"要账号"那一支
-               （默认部署）有 3 个输入框 + 按钮 + 两行说明，实测 264 px 高；和左边那两栏叠在同一列里
-               总高 629 px，而 1280×720 下大厅只有 534 px —— 底部的按钮会被顶出视口，
-               而它看起来像"点不动"而不是"看不见"（Playwright 原话：element is outside of the viewport）。
-               分两列之后两列各 341 / 264 px，富余 190 px；顺带把原先空着的右半边用上了。 -->
+          <!-- 右列放"进场参数"：身份状态卡 + 阵营。注册/登录不在这儿（那是上一层"闸"的事）。
+               旧版这里是一整块账号面板（三种形态，"要账号"那支实测 264 px 高），和房间列表
+               同屏时总高把底部按钮顶出 1280×720 视口；拆掉表单之后右列只剩状态卡 + 阵营，
+               那个高度问题连同"两个焦点"一起消失。 -->
           <div class="lobby-col" style="flex:1;max-width:430px">
             <div class="panel"><div class="opts">
               <div>阵营</div>
               <div class="seg" id="onTeam"><div data-v="A" class="${L.team === 'B' ? '' : 'sel'}">A 队</div><div data-v="B" class="${L.team === 'B' ? 'sel' : ''}">B 队</div></div>
               <div class="note-wide">地图与模式由服务器决定。掉线或服务器更新时屏幕上会写明原因，按 Enter 重连。</div>
             </div></div>
-            <div class="panel" id="acctPanel"></div>
+            <div class="panel" id="idPanel"></div>
             <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button></div>
           </div>
         </div>
@@ -390,7 +472,7 @@ export class Menu {
       const id = (safe && safe === title) ? title.slice(0, 32) : ('r' + Date.now().toString(36));
       this.joinOnline(L, { room: id, title });
     });
-    this.renderAccountPanel(r, L);
+    this.renderIdentity(r, L);
     this.renderRoomList(r, L);
   }
 
@@ -428,10 +510,8 @@ export class Menu {
   // 白跑的页面跳转（服务端照样会在握手那一刻 401），不是权限所在处。
   joinOnline(L, { room = '', title = '' } = {}) {
     const A = this.game.account;
-    if (A.requireAccount && !A.loggedIn) {
-      this.acctMsg(this.el, '先注册或登录 —— 联网对战在注册后开放');
-      return;
-    }
+    // 层级：身份没办就回闸（这不只是省掉一次白跑 —— 大厅本来就不该给没身份的人看见）
+    if (A.requireAccount && !A.loggedIn) { this.showOnlineGate(); return; }
     // 呼号框：访客可玩时它是**这一局的显示名**；要账号时服务端从会话取呼号，
     // 那一格此时只是重画时的记忆。两种情况都记下来，免得切回去时丢了。
     const nameEl = this.el.querySelector('#onName');
@@ -442,40 +522,16 @@ export class Menu {
     location.href = location.pathname + '?' + q.toString();
   }
 
-  // 房间列表区。和 renderAccountPanel 一样按"服务端说的策略 + 我登没登录"分形态：
-  //   · 策略还没回来 —— 先不画（猜错的代价是把登录框画在访客服上，或反过来）；
-  //   · 未注册（要账号的服）—— 🔒 锁着，列表不拉、按钮按不动；
-  //   · 已注册 / 访客可玩 —— 拉 /api/rooms 画房间行。
-  // 锁定那一格**不只是 UI 置灰**：服务端对没会话的 /api/rooms 直接 401
-  // （见 server/http-api.mjs），这里连请求都不发 —— 发了也只会拿到 401。
+  // 房间列表区。**没有"未注册"形态** —— 那一层是"闸"的职责（screen='onlineGate'），
+  // 能走到这里的人一定已经有身份（showOnlineLobby 的守卫 + 下面这行兜底）。
+  // 这里只做一件事：拉 /api/rooms、画房间行。服务端对没会话的请求照样 401
+  // （见 server/http-api.mjs）—— 那道闸没动，改客户端也绕不过去。
   renderRoomList(root, L) {
     const rows = root.querySelector('#roomRows');
     const note = root.querySelector('#roomNote');
     if (!rows) return;
     const A = this.game.account;
-    const setRoomUI = (on) => {
-      for (const sel of ['[data-a=refresh]', '[data-a=create]', '[data-a=quick]']) {
-        const b = root.querySelector(sel);
-        if (b) { b.disabled = !on; b.style.opacity = on ? '' : '.5'; }
-      }
-    };
-    if (!A.statusKnown) {
-      rows.innerHTML = '<div class="note-wide">正在读取服务器策略…</div>';
-      setRoomUI(false);
-      Promise.resolve(this.game.accountSync ? this.game.accountSync() : A.status()).then(() => {
-        if (this.screen === 'online') this.renderRoomList(root, L);
-      });
-      return;
-    }
-    if (A.requireAccount && !A.loggedIn) {
-      rows.dataset.locked = '1';
-      rows.innerHTML = '<div class="note-wide">🔒 联网对战在注册后开放。右边注册或登录之后，这里就是房间列表。</div>';
-      if (note) note.textContent = '';
-      setRoomUI(false);
-      return;
-    }
-    delete rows.dataset.locked;
-    setRoomUI(true);
+    if (A.requireAccount && !A.loggedIn) { this.showOnlineGate(); return; }   // 兜底：身份没了回闸
     rows.innerHTML = '<div class="note-wide">正在读取房间列表…</div>';
     A.rooms().then(r => {
       if (this.screen !== 'online') return;          // 用户已离开这一页，别把行画到别的屏上
@@ -514,43 +570,25 @@ export class Menu {
     if (el) el.textContent = text || '';
   }
 
-  // 账号区。三种形态，由**服务端说的策略**决定（/api/status 的 requireAccount）：
-  //   · 已登录      —— 账号卡（呼号 / 经验 / 场次 / 胜 / 登出）；
-  //   · 要账号      —— 呼号 + 密码（+ 有邀请码时的邀请码栏）与登录/注册按钮；
-  //   · 不要账号    —— 只给一个呼号框（REQUIRE_ACCOUNT=0，本地调试与对战测试走这条）。
-  //
-  // 第三种不是"偷懒的降级"，而是必须的：那种服上玩家**根本没有账号可填**。
-  // 摆一个登录框的代价很具体 —— 玩家填不出来、进不去，而错误信息还是"呼号或密码不对"，
-  // 于是他会去怀疑自己密码打错了，而真相是"这个服不需要密码"。
-  //
+  // 大厅里的"我是谁"。**它是状态卡，不是表单** —— 注册/登录在上一层（闸）办完，
+  // 大厅里再摆一整块登录表单，层级就又平了：玩家会以为"进了大厅还要再登一次录"，
+  // 而两个焦点同屏时谁也不是重点（这正是本轮要拆掉的东西）。
+  // 两种形态，都由**服务端说的策略**决定（/api/status 的 requireAccount）：
+  //   · 已登录   —— 账号卡（呼号 / 经验 / 场次 / 胜 / 登出）；登出 = 退回闸那一屏。
+  //   · 访客可玩 —— 一个呼号框（REQUIRE_ACCOUNT=0）。这不是"偷懒的降级"，而是必须的：
+  //     那种服上玩家**根本没有账号可填**，摆个登录框等于把"这里不需要密码"说成
+  //     "你密码打错了"（错误信息还是"呼号或密码不对"，他会去怀疑自己密码打错了）。
   // 登录之后呼号输入框就消失了 —— 那时呼号由服务端说（welcome.name 覆盖本地那份）。
   // 留一个改不动的框在那儿，等于骗玩家说"这里能改名字"。
-  //
-  // 而没登录时的错误信息一律**原样显示服务端那一句**：这个模块不翻译、不复述。
-  // 翻译的那一版会把"邀请码不对"和"服务器忙"揉成同一句"登录失败"，
-  // 于是服主永远收不到"我邀请码是多少"这个真正的问题。
-  renderAccountPanel(root, L) {
-    const box = root.querySelector('#acctPanel');
+  renderIdentity(root, L) {
+    const box = root.querySelector('#idPanel');
     if (!box) return;
     const A = this.game.account;
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
 
-    // 策略还没回来：**先不画**。画了就是在猜，而猜错的那一边（把登录框画在不要账号的服上）
-    // 会让玩家面对一个填不出来的框。这一屏通常只存在几毫秒 —— 它在页面加载时就发出去了。
-    if (!A.statusKnown) {
-      box.innerHTML = `<div class="opts"><div>账号</div><div style="font-size:12px;color:#888">正在读取服务器策略…</div></div>`;
-      // 回来之后只重画这两块，不动旁边已经填好的房间名 / 阵营。
-      // 顺着把 me() 也拉上：这条路径要在"主菜单还没画过"时也能自给自足
-      //（showMain 里那次 accountSync 是正常入口，这里是不依赖它的兜底）。
-      Promise.resolve(this.game.accountSync ? this.game.accountSync() : A.status()).then(() => {
-        if (this.screen === 'online') { this.renderAccountPanel(root, L); this.renderRoomList(root, L); }
-      });
-      return;
-    }
-
     if (A.loggedIn) {
       const p = A.user;
-      box.innerHTML = `<div class="opts"><div>账号</div>
+      box.innerHTML = `<div class="opts"><div>身份</div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
           <div><b style="letter-spacing:2px">${esc(p.name)}</b>
             <span style="color:#999;font-size:12px;margin-left:8px">经验 ${p.xp | 0} · 场次 ${p.matches | 0} · 胜 ${p.wins | 0}</span></div>
@@ -560,14 +598,13 @@ export class Menu {
       </div>`;
       this.on(box, '[data-a=logout]', async () => {
         await A.logout();
-        this.renderAccountPanel(root, L);
-        this.renderRoomList(root, L);      // 登出 = 联网对战重新锁上，列表跟着变
+        this.showOnlineGate();   // 层级：身份没了就回闸 —— 大厅不给没身份的人看
       });
       return;
     }
 
     if (!A.requireAccount) {
-      // 访客可玩：一个呼号框，没有密码、没有邀请码。
+      // 访客可玩：一个呼号框（这一局的显示名），没有密码、没有邀请码。
       box.innerHTML = `<div class="opts"><div>呼号</div>
         <input id="onName" maxlength="16" placeholder="2~16 个汉字 / 字母 / 数字" value="${esc(L.name || '士兵')}" style="${inp}">
         <div class="note-wide">这个服务器不需要账号（访客可玩），呼号只在这局里显示，战绩不存到任何地方。不合法的呼号会被服务器拒掉，并说明规则。</div>
@@ -575,41 +612,13 @@ export class Menu {
       return;
     }
 
-    const note = `进对局需要账号${A.inviteRequired ? '，注册要邀请码，由服主给你' : ''}。`;
-    box.innerHTML = `<div class="opts">
-      <div>呼号</div><input id="onName" maxlength="16" placeholder="2~16 个字" value="${esc(L.name || '')}" style="${inp}">
-      <div>密码</div><input id="acctPw" type="password" maxlength="128" placeholder="至少 8 位" style="${inp}">
-      ${A.inviteRequired ? `<div>邀请码</div><input id="acctCode" placeholder="问服主要" style="${inp}">` : ''}
-      <div></div><div style="display:flex;gap:8px"><button class="btn small" data-a="login">登录</button><button class="btn small ghost" data-a="reg">注册新号</button></div>
-      <div class="note-wide" id="acctMsg">${esc(A.lastError || '')}</div>
-      <div class="note-wide">${note}</div>
+    // 走到这里 = "要账号却没登录"：按层级他不该在大厅（守卫早该把人送进闸）。
+    // 别装作没事 —— 给一个明确的去处，而不是一块空白面板。
+    box.innerHTML = `<div class="opts"><div>身份</div>
+      <div style="font-size:12px;color:#e6a8c8">还没有登录 —— 联网对战在注册后开放。</div>
+      <div class="note-wide"><button class="btn small" data-a="toGate">去注册 / 登录</button></div>
     </div>`;
-    const grab = () => ({
-      name: String((root.querySelector('#onName') || {}).value || '').trim(),
-      password: String((root.querySelector('#acctPw') || {}).value || ''),
-      code: String((root.querySelector('#acctCode') || {}).value || ''),
-    });
-    const submit = async (kind) => {
-      const f = grab();
-      L.name = f.name || L.name;
-      this.acctMsg(root, (kind === 'reg' ? '正在注册…' : '正在登录…'));
-      const r2 = kind === 'reg'
-        ? await A.register({ name: f.name, password: f.password, code: f.code })
-        : await A.login({ name: f.name, password: f.password });
-      if (!r2.ok) { this.acctMsg(root, r2.message || '失败了'); return; }
-      // 登录之后把服务端那份经验值同步到本地档案上（显示用）。
-      // 本地那份仍然可以被玩家改，但它现在只是**一个显示用的副本** ——
-      // 真正的数在服务端，下一次 /api/me 会把它盖回去。
-      if (A.user) { this.game.profile.xp = A.user.xp | 0; this.game.saveProfile(); }
-      this.renderAccountPanel(root, L);
-      this.renderRoomList(root, L);        // 注册/登录成功 = 联网对战从这里开放
-      this.acctMsg(root, `已登录：${A.user ? A.user.name : ''}`);
-      setTimeout(() => this.acctMsg(root, ''), 2500);
-    };
-    this.on(box, '[data-a=login]', () => submit('login'));
-    this.on(box, '[data-a=reg]', () => submit('reg'));
-    const pw = root.querySelector('#acctPw');
-    if (pw) pw.addEventListener('keydown', e => { if (e.key === 'Enter') submit('login'); });
+    this.on(box, '[data-a=toGate]', () => this.showOnlineGate());
   }
 
   perk(id) { for (const col of PERKS) for (const p of col) if (p.id === id) return p; return { name: id, desc: '', icon: '' }; }

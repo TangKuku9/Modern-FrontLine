@@ -287,8 +287,8 @@ try {
   if (!skip('E')) {
     console.log('\n── E：联机入口在菜单里 —— 房间列表，不用手打网址 ──');
     // 联机的代码早就在了，但要玩家自己敲 ?online=1&room=… 才算真的有这个模式吗？不算。
-    // 这一段就从主菜单开始用鼠标点：联网对战 → 大厅是**房间列表** → 填房名建一间 → 进局内，
-    // 再回头查 /api/rooms —— 大厅那张列表必须和服务端的清单是同一份东西。
+    // 这一段就从主菜单开始用鼠标点：联网对战 →（访客服直接进）房间列表大厅 → 填房名建一间 →
+    // 进局内，再回头查 /api/rooms —— 大厅那张列表必须和服务端的清单是同一份东西。
     // 先收掉前面几段的页面：这一段是唯一要点鼠标的，而"6 个画布页同时软件渲染"会让
     // Playwright 的点击派发卡住 —— 读数与排除过程见文件开头 closeOpened() 的注释。
     await closeOpened();
@@ -311,16 +311,24 @@ try {
     const rt = Date.now() - t0;
     ok('先决：E 页还答得上话（卡死的页面上"点不动"归因不到入口）', rt < 500, `evaluate 往返 ${rt} ms`);
     await page.click('[data-a=online]');
-    await sleep(500);
-    const form = await page.evaluate(() => ({
-      rows: !!document.querySelector('#roomRows'), quick: !!document.querySelector('[data-a=quick]'),
-      create: !!document.querySelector('[data-a=create]'), refresh: !!document.querySelector('[data-a=refresh]'),
-      title: !!document.querySelector('#roomTitle'),
-      name: !!document.querySelector('#onName'), team: document.querySelectorAll('#onTeam div').length,
-      screen: (window.game.menu || {}).screen,
-    }));
+    // 层级路由要等策略回来才落定（访客服直接进大厅；策略未知时先过一拍"正在进入联网对战…"）
+    let form = null;
+    for (let i = 0; i < 40; i++) {
+      form = await page.evaluate(() => ({
+        rows: !!document.querySelector('#roomRows'), quick: !!document.querySelector('[data-a=quick]'),
+        create: !!document.querySelector('[data-a=create]'), refresh: !!document.querySelector('[data-a=refresh]'),
+        title: !!document.querySelector('#roomTitle'),
+        name: !!document.querySelector('#onName'), team: document.querySelectorAll('#onTeam div').length,
+        gate: !!document.querySelector('#acctPw'),
+        screen: (window.game.menu || {}).screen,
+      }));
+      if (form.screen === 'online') break;
+      await sleep(250);
+    }
     ok('联网大厅是房间列表：列表区 + 刷新 + 创建并进入 + 快速加入，阵营/呼号还在',
       form.rows && form.quick && form.create && form.refresh && form.title && form.name && form.team === 2 && form.screen === 'online', JSON.stringify(form));
+    ok('层级：访客可玩的服**跳过注册页**，直接进大厅（反证臂 —— 要账号的服才过闸，见 F 段）',
+      form.screen === 'online' && !form.gate, JSON.stringify(form));
     ok('反证：光是站在大厅里还没连服务器（进了大厅不等于已经进场）',
       await page.evaluate(() => !window.game.net || !window.game.net.connected), '');
     // 进对局 URL 的拼装是纯函数（menu.onlineJoinParams）：两条都能**不点按钮**就量到 ——
@@ -362,10 +370,11 @@ try {
     srv.kill();
   }
   if (!skip('F')) {
-    console.log('\n── F：未完成注册前，联网对战不开放 ──');
+    console.log('\n── F：未完成注册前，联网对战不开放（层级：注册页 → 房间列表）──');
     // 这一段刻意用**默认配置**（要账号 + 邀请码）—— 那道闸只在那种服上存在。
-    // 与 E 段互为反证臂：同一个大厅，访客服（E）不锁、要账号的服（F）锁。
-    // 只写一边的话，一个"永远锁着"或"永远不锁"的实现也能绿掉一半判据。
+    // 与 E 段互为反证臂：同一个入口，访客服（E）直接进大厅、要账号的服（F）先落在注册页。
+    // 判据量的是**层级**：注册页上没有房间列表（先过闸再看房），大厅里没有注册表单（注册是前置，
+    // 不是大厅的一部分）—— 只量"锁没锁"的话，把两块东西锁在同一屏上也能全绿，而那正是要拆掉的。
     await closeOpened();
     const srv = await withServer({ JOIN_CODE: 'SESAME' });
     const { page, logs } = await newPage(browser, srv, 'menu-f', null, '', { width: 1280, height: 720 });
@@ -389,46 +398,64 @@ try {
       entry.locked && /注册后开放/.test(entry.text), JSON.stringify(entry));
     await page.bringToFront();
     await page.click('[data-a=online]');
-    await sleep(500);
-    const lock = await page.evaluate(() => {
-      const rows = document.querySelector('#roomRows');
-      return {
-        locked: (rows && rows.dataset.locked) || null, text: ((rows && rows.textContent) || '').trim().slice(0, 60),
-        quick: !!(document.querySelector('[data-a=quick]') || {}).disabled,
-        create: !!(document.querySelector('[data-a=create]') || {}).disabled,
-      };
-    });
-    ok('大厅里房间列表锁着，快速加入 / 创建并进入都按不动',
-      lock.locked === '1' && lock.quick && lock.create && /注册后开放/.test(lock.text), JSON.stringify(lock));
-    // 权限不在"按钮置灰"里：服务端对没会话的清单请求直接 401。
-    // 客户端那道锁只是省掉一次白跑 —— 把它删掉也进不了场（这就是 ② 的服务端那一半）。
+    // 等层级路由落定（策略未知时它会先进"正在进入联网对战…"，别把那一瞬间当注册页）
+    let atGate = null;
+    for (let i = 0; i < 40; i++) {
+      atGate = await page.evaluate(() => ({
+        screen: (window.game.menu || {}).screen,
+        form: !!document.querySelector('#acctPw') && !!document.querySelector('[data-a=reg]'),
+        rows: !!document.querySelector('#roomRows'),
+        msg: ((document.querySelector('.gate-card') || {}).textContent || '').slice(0, 60),
+      }));
+      if (atGate.screen === 'onlineGate') break;
+      await sleep(250);
+    }
+    ok('点入口先落在**注册页**（闸），且注册表单在、提示写着"注册后开放"',
+      atGate.screen === 'onlineGate' && atGate.form && /注册后开放/.test(atGate.msg), JSON.stringify(atGate));
+    ok('层级①：注册页上**没有房间列表**（先过闸再看房，不是两块锁在一屏上）', !atGate.rows, JSON.stringify(atGate));
+    // 权限不在"哪一屏"里：服务端对没会话的清单请求直接 401。客户端只是把闸画出来 ——
+    // 把它删掉也进不了场（这就是 ② 的服务端那一半）。
     const anon = await page.evaluate(async () => {
       const r = await fetch('/api/rooms');
       return { status: r.status, body: (await r.text()).slice(0, 120) };
     });
     ok('服务端也不给没注册的人房间清单（401，且响应里没有 rooms）',
       anon.status === 401 && !/rooms/.test(anon.body), JSON.stringify(anon));
-    // 注册之后就开放 —— 走 UI 注册（"注册后开放"的另一半）
+    // 过闸 = 在注册页上办身份，办完**自动前进**到大厅（下一步不该让玩家自己找）
     await page.fill('#onName', '菜单乙');
     await page.fill('#acctPw', 'a-long-enough-password');
     await page.fill('#acctCode', 'SESAME');
     await page.click('[data-a=reg]');
-    let after = null;
+    let inLobby = null;
     for (let i = 0; i < 80; i++) {
-      after = await page.evaluate(async () => {
-        const rows = document.querySelector('#roomRows');
+      inLobby = await page.evaluate(async () => {
         const r = await fetch('/api/rooms');
         return {
-          locked: (rows && rows.dataset.locked) || null,
+          screen: (window.game.menu || {}).screen,
+          rows: !!document.querySelector('#roomRows'),
+          regForm: !!document.querySelector('#acctPw'),
           create: !!(document.querySelector('[data-a=create]') || {}).disabled,
           status: r.status,
         };
       });
-      if (!after.locked && !after.create && after.status === 200) break;
+      if (inLobby.screen === 'online' && inLobby.rows && !inLobby.regForm) break;
       await sleep(250);
     }
-    ok('注册之后房间列表就开放（锁标消失、创建可点、服务端给清单）',
-      !!after && !after.locked && !after.create && after.status === 200, JSON.stringify(after));
+    ok('注册之后**自动进大厅**（不用自己找下一步），房间列表在、创建可点、服务端给清单',
+      inLobby && inLobby.screen === 'online' && inLobby.rows && !inLobby.create && inLobby.status === 200,
+      JSON.stringify(inLobby));
+    ok('层级②：大厅里**没有注册表单**（注册是前置，不是大厅的一部分）',
+      !!inLobby && !inLobby.regForm, JSON.stringify(inLobby));
+    // 层级③：登出 = 退回闸那一屏（身份没了，大厅不该给没身份的人看）
+    await page.click('[data-a=logout]');
+    let back = null;
+    for (let i = 0; i < 40; i++) {
+      back = await page.evaluate(() => ({ screen: (window.game.menu || {}).screen, form: !!document.querySelector('#acctPw') }));
+      if (back.screen === 'onlineGate') break;
+      await sleep(250);
+    }
+    ok('层级③：登出退回注册页（身份没了就回闸，不留在大厅里）',
+      back && back.screen === 'onlineGate' && back.form, JSON.stringify(back));
     ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
     srv.kill();
   }
