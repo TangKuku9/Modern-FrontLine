@@ -218,6 +218,8 @@ class Game {
     this.entities = [pl];
     this.state = 'play'; this.paused = false; this.dead = false; this.ending = false;
     this.time = 0; this.tick = 0; this.acc = 0; this.frameTicks = 0;
+    this.deathKiller = null; this.scopeState = null;
+    document.getElementById('deathScreen').classList.add('hidden');   // 见 startGame 里的注释
     this.hud.show(true);
     this.renderer.compile(this.scene, this.camera);
     this.menu.hide();
@@ -437,6 +439,11 @@ class Game {
     this.mode.start();
     this.state = 'play'; this.paused = false; this.dead = false; this.ending = false;
     this.time = 0; this.tick = 0; this.acc = 0; this.frameTicks = 0;
+    this.deathKiller = null; this.scopeState = null;
+    // 开局这件事本身就是"一切都从头算"，所以这里有权把上一局剩下的界面收干净：
+    // deathScreen 原先只在"重生"和"退回菜单"两处收过，死着退出上一局（或直接从结算
+    // 界面再开一局）的时候，那张"被 xx 击杀 · N 秒后重新部署"就跟着进了新局。
+    document.getElementById('deathScreen').classList.add('hidden');
     this.hud.show(true);
     // 预热编译
     this.renderer.compile(this.scene, this.camera);
@@ -480,17 +487,32 @@ class Game {
     return p;
   }
 
+  // 热成像：把人物整体换成"发光"，好让 grade 那个热成像滤镜认得出热源。
+  // 记账必须**按材质**而不是按 mesh —— 一个材质被身上好几块 mesh 共用（制服、靴子、背心
+  // 常常共一份 MATS），按 mesh 记的话，遍历到第二块时它存下的快照已经是被上一块刚改成白的
+  // 那个值（实测 em=[16777215,3]），关镜时沿着同一个顺序恢复，最后一块又把它涂回白色：
+  // 352 个 mesh 一个都没回来 —— 这就是"夜视瞄具关镜后人物还是刺眼亮光"的成因。
   setThermal(on) {
     if (this.thermalOn === on) return;
     this.thermalOn = on;
     this.grade.uniforms.thermal.value = on ? 1 : 0;
-    for (const b of this.bots) {
-      b.model.root.traverse(o => {
-        if (o.isMesh && o.material && o.material.emissive) {
-          if (on) { o.userData.em = o.userData.em || [o.material.emissive.getHex(), o.material.emissiveIntensity]; o.material.emissive.setHex(0xffffff); o.material.emissiveIntensity = b.alive ? 3 : 0.8; }
-          else if (o.userData.em) { o.material.emissive.setHex(o.userData.em[0]); o.material.emissiveIntensity = o.userData.em[1]; }
-        }
-      });
+    const mats = this.thermalMats || (this.thermalMats = new Map());
+    if (on) {
+      for (const b of this.bots) {
+        b.model.root.traverse(o => {
+          if (!o.isMesh || !o.material || !o.material.emissive) return;
+          if (!mats.has(o.material)) mats.set(o.material, [o.material.emissive.getHex(), o.material.emissiveIntensity]);
+          // 活人比尸体亮一点：这一半只能按 mesh 写（共享材质时最后一个遍历到的赢 —— 那是
+          // 既有的近似，不是这次要修的东西）；能不能恢复得回来不看它，看上面那份材质表。
+          o.material.emissive.setHex(0xffffff);
+          o.material.emissiveIntensity = b.alive ? 3 : 0.8;
+        });
+      }
+    } else {
+      // 一律照快照还原，不论这些 mesh 还在不在 —— 中途重生的模型用的是同一批共享材质，
+      // 只盘点"现在树上的 mesh"会漏掉它们。
+      for (const [m, em] of mats) { m.emissive.setHex(em[0]); m.emissiveIntensity = em[1]; }
+      mats.clear();
     }
   }
 

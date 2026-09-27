@@ -14,6 +14,16 @@ function cgeo(r1, r2, len, seg = 14) {
   if (!geoCache.has(k)) { const g = new THREE.CylinderGeometry(r1, r2, len, seg); g.rotateX(Math.PI / 2); geoCache.set(k, g); }
   return geoCache.get(k);
 }
+// 开口管（两端不封盖）：凡是"要从当中望出去"的筒一律走这里。
+// 用 cgeo 画瞄具镜筒会在射手眼底留一个封盖圆面 —— 玩家 ADS 看到的是一堵金属墙而不是镜片，
+// MRS 红点就是这么坏的。判据与它的反证臂在 test/optic.mjs（O1/O1⁻）。
+// 配套材质是 gunTube（DoubleSide）：只有一层 FrontSide 的管壁从内侧会被整片剔除，
+// 看过去就不是筒起见而是"没有壁" —— 那比实心更不像筒。
+function tgeo(r1, r2, len, seg = 14) {
+  const k = `t${r1},${r2},${len},${seg}`;
+  if (!geoCache.has(k)) { const g = new THREE.CylinderGeometry(r1, r2, len, seg, 1, true); g.rotateX(Math.PI / 2); geoCache.set(k, g); }
+  return geoCache.get(k);
+}
 
 export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   const def = WEAPONS[weaponId];
@@ -84,7 +94,9 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
       add(bgeo(0.004, 0.035, 0.012), metal, 0.016, 0.09, -0.035);
       add(bgeo(0.036, 0.004, 0.012), metal, 0, 0.108, -0.035);
       add(new THREE.PlaneGeometry(0.028, 0.03), mat('lens'), 0, 0.09, -0.035);
-      info.reticle = add(new THREE.CircleGeometry(0.0012, 10), mat('reticle'), 0, 0.09, -0.036);
+      // 分划点按**角直径**跟长枪对齐，不是照抄那个米数：这里分划离眼 0.076 m，长枪 0.1155 m。
+      // 同一配件在两个枪型上要一样大（判据 test/optic.mjs 的 O6ᶜ）
+      info.reticle = add(new THREE.CircleGeometry(0.00012, 10), mat('reticle'), 0, 0.09, -0.036);
       info.sight.set(0, 0.09, 0.04);
       info.optic = 'reddot';
     }
@@ -147,9 +159,15 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   const oz = zRear - recv * 0.45;
   if (optic === 'reddot') {
     add(bgeo(0.03, 0.012, 0.04), metal, 0, railY + 0.018, oz);
-    add(cgeo(0.02, 0.02, 0.04, 16), metal, 0, sightY, oz);
-    add(new THREE.CircleGeometry(0.017, 16), mat('lens'), 0, sightY, oz - 0.021);
-    info.reticle = add(new THREE.CircleGeometry(0.0009, 10), mat('reticle'), 0, sightY, oz - 0.022);
+    // 镜筒：开口管 + 双面壁，两端各留一个通透的口（见本文件开头的注释）
+    add(tgeo(0.02, 0.02, 0.042, 20), mat('gunTube'), 0, sightY, oz);
+    // 镜片与分划都收进筒里（原先飘在筒口外面 1mm，从侧面看像粘上去的一块盖片）
+    add(new THREE.CircleGeometry(0.0175, 20), mat('lens'), 0, sightY, oz - 0.017);
+    // 分划点：0.0009 → 0.00018（2026-09-27，嫌 ADS 下太大）。这件事要用**角直径**说话，不能用米数：
+    // 同一个 MRS 配件装在手枪上时，分划离眼只有 0.076 m、这里是 0.1155 m，照抄这个常数会让它大一倍半
+    // —— 所以手枪那处取 0.00012 而不是 0.00018。改完实测 ø 0.179°，1080p ADS 下约 4.8 px；
+    // 上下限 0.08°/0.30° 由 test/optic.mjs 的 O6 钉住（太小看不见、太大糊成饼，两个方向都要红）。
+    info.reticle = add(new THREE.CircleGeometry(0.00018, 10), mat('reticle'), 0, sightY, oz - 0.0155);
     info.sight.set(0, sightY, oz + 0.1);
   } else if (optic === 'holo') {
     add(bgeo(0.04, 0.016, 0.07), metal, 0, railY + 0.02, oz);
@@ -164,21 +182,26 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     info.sight.set(0, sightY, oz + 0.12);
   } else if (optic === 'acog' || optic === 'thermal') {
     add(bgeo(0.03, 0.02, 0.05), metal, 0, railY + 0.02, oz);
-    add(cgeo(0.019, 0.019, 0.12, 16), metal, 0, sightY + 0.005, oz);
-    add(cgeo(0.024, 0.019, 0.03, 16), metal, 0, sightY + 0.005, oz - 0.07);
-    add(cgeo(0.022, 0.019, 0.025, 16), metal, 0, sightY + 0.005, oz + 0.065);
+    // 主镜筒/物镜锥/目镜锥一律开口管：这三段原本都是实心 cgeo，从枪口方向看过去
+    // 从枪口方向看过去就是三根摞在一起的金属柱（镜身 + 物镜镯 + 目镜镯），
+    add(tgeo(0.019, 0.019, 0.12, 16), mat('gunTube'), 0, sightY + 0.005, oz);
+    add(tgeo(0.024, 0.019, 0.03, 16), mat('gunTube'), 0, sightY + 0.005, oz - 0.07);
+    add(tgeo(0.022, 0.019, 0.025, 16), mat('gunTube'), 0, sightY + 0.005, oz + 0.065);
     if (optic === 'thermal') add(bgeo(0.03, 0.03, 0.05), mat('gunPoly'), 0.025, sightY + 0.005, oz + 0.02);
-    add(new THREE.CircleGeometry(0.02, 16), mat('lensDark'), 0, sightY + 0.005, oz - 0.086);
+    // 物镜片塞进物镜锥里（原来飘在锥口外 1mm）
+    add(new THREE.CircleGeometry(0.021, 16), mat('lensDark'), 0, sightY + 0.005, oz - 0.082);
     info.sight.set(0, sightY + 0.005, oz + 0.14);
   } else if (optic === 'sniper') {
     const sy = sightY + 0.018;
     add(bgeo(0.02, 0.03, 0.02), metal, 0, railY + 0.02, oz - 0.06);
     add(bgeo(0.02, 0.03, 0.02), metal, 0, railY + 0.02, oz + 0.06);
-    add(cgeo(0.016, 0.016, 0.26, 16), metal, 0, sy, oz);
-    add(cgeo(0.028, 0.017, 0.08, 16), metal, 0, sy, oz - 0.15);
-    add(cgeo(0.022, 0.016, 0.05, 16), metal, 0, sy, oz + 0.14);
-    add(cgeo(0.02, 0.02, 0.03, 12), metal, 0, sy + 0.025, oz, Math.PI / 2);
-    add(new THREE.CircleGeometry(0.027, 16), mat('lensDark'), 0, sy, oz - 0.191);
+    add(tgeo(0.016, 0.016, 0.26, 16), mat('gunTube'), 0, sy, oz);
+    add(tgeo(0.028, 0.017, 0.08, 16), mat('gunTube'), 0, sy, oz - 0.15);
+    add(tgeo(0.022, 0.016, 0.05, 16), mat('gunTube'), 0, sy, oz + 0.14);
+    // 上方的调节旋钮：骑在筒顶，不许伸进通光孔 —— 老位置 sy+0.025 让它的底面戳进内壁 6mm，
+    // 于是从眼里斜穿镜筒的那条光路会被它挡住一格（test/optic.mjs 的 O1 就是靠这条发现的）
+    add(cgeo(0.02, 0.02, 0.03, 12), metal, 0, sy + 0.042, oz, Math.PI / 2);
+    add(new THREE.CircleGeometry(0.023, 16), mat('lensDark'), 0, sy, oz - 0.185);
     info.sight.set(0, sy, oz + 0.2);
   }
   // 激光

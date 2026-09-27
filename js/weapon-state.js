@@ -35,6 +35,21 @@ export class WeaponState {
     this.replay = false;              // 客户端回滚重放中：见 update() 的注释
     this.aimAccum = new THREE.Vector2();  // 攒给视图模型做摆动用的视线位移
   }
+  // 死亡清场。为什么非要有这么一个函数：**死了之后 ws.update 就不再被跑到**
+  // （main.js 只给活人跑 update），于是 adsT / scopeState / 换弹动画会整组冻在死前那一帧 ——
+  // 死亡视角里还挂着一层瞄具遮罩，相机的 FOV 也停在 ADS 那个窄视野上（2026-09-27：
+  // 开镜时被击杀就是这个症状，它不是"没来得及跑完这一帧"，是永远没人再跑它）。
+  // 由 player.js:takeDamage 的致死分支调用；服务端跑同一份，两边同一次清理。
+  onDeath() {
+    this.adsT = 0; this.sprintT = 0;
+    this.state = 'idle'; this.stateT = 0; this.stateDur = 0; this.reloadStage = 0;
+    this.triggerHeld = false; this.meleeHit = false;
+    // 手上有正在烹饪的手雷就让它消失：死了的人不该在自己看不见的审判空里继续炖雷
+    this.cooking = false; this.cookT = 0; this.grenade = null;
+    // 高倍镜遮罩是 ws.update 每拍算出来挂在 game 上的（本文件末尾），这里一并摘掉，
+    // 否则 HUD 的 #scope 会盖在死亡视角上（hud.js 就是照这个字段开关它的）
+    if (this.game) this.game.scopeState = null;
+  }
   dispose() { this.sink = null; }
 
   // 纯数据弹匣槽：几何/材质/精灵都在 Viewmodel 里按同样的 cfg 另建一份

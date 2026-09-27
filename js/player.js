@@ -136,6 +136,13 @@ export class Player {
     this.punch(0.02);
     if (this.hp <= 0) {
       this.hp = 0; this.alive = false; this.stats.deaths++;
+      this.ws.onDeath();
+      // 相机那一半：写 cam.fov 的只有 updateCamera（挂在 update 末尾），而死了就不会再 update
+      // —— 这一行不写，死亡视角就一直停在 ADS 那个窄视野里。只有本机玩家有那块相机。
+      if (this.game.player === this && this.game.camera) {
+        this.game.camera.fov = this.game.settings.fov;
+        this.game.camera.updateProjectionMatrix();
+      }
       this.game.onKill(info.attacker, this, info.weapon, info.head);
       return true;
     }

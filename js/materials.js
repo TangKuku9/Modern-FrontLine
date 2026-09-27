@@ -107,7 +107,11 @@ function buildMaterials() {
   MATS.gunGreen = new THREE.MeshStandardMaterial({ color: 0x4a5236, roughness: 0.7, metalness: 0.1 });
   MATS.gunWood = new THREE.MeshStandardMaterial({ map: TEX.wood.map, normalMap: TEX.wood.normalMap, color: 0xb06a3a, roughness: 0.55 });
   MATS.gunSteel = new THREE.MeshStandardMaterial({ color: 0x9aa0a6, roughness: 0.25, metalness: 0.95 });
-  MATS.lens = new THREE.MeshStandardMaterial({ color: 0x4a7a8a, roughness: 0.05, metalness: 0.9, transparent: true, opacity: 0.25, depthWrite: false });
+  // 瞄具镜筒：开放性管，所以要双面 —— FrontSide 的话从膛内看过去整圈壁都被剔除，
+  // 玩家看到的是"没有壁"，比实心还假。判据 test/optic.mjs（O2）
+  MATS.gunTube = new THREE.MeshStandardMaterial({ color: 0x2a2d31, roughness: 0.4, metalness: 0.8, side: THREE.DoubleSide });
+  // 镜片两面都要看得见：开放式瞄具从枪口方向看过去也该是一块玻璃，不是通心管
+  MATS.lens = new THREE.MeshStandardMaterial({ color: 0x4a7a8a, roughness: 0.05, metalness: 0.9, transparent: true, opacity: 0.25, depthWrite: false, side: THREE.DoubleSide });
   MATS.lensDark = new THREE.MeshStandardMaterial({ color: 0x0a1418, roughness: 0.05, metalness: 1 });
   MATS.reticle = new THREE.MeshBasicMaterial({ color: 0xff2a2a, transparent: true, depthTest: true });
   MATS.reticle.color.multiplyScalar(4);

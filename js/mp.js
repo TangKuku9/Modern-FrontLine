@@ -459,6 +459,10 @@ export class MPMatch {
     this.rules.forceEnd(typeof winner === 'string' ? winner : ((winner && winner.team) || 'draw'));
     const game = this.game, pl = game.player;
     game.ending = true;
+    // 死着迎来终局的情形：deathScreen 之前只在"重生"与"退回菜单"两条路上收过，
+    // 于是排行榜/结算界面会被一张"被 xx 击杀 · N 秒后重新部署"盖在下面，
+    // 而且那张牌会一直活到下一局（见 main.js:startGame 的兜底，两边都留着）。
+    document.getElementById('deathScreen').classList.add('hidden');
     let win;
     if (this.ffa) win = winner === pl ? 'win' : 'lose';
     else win = winner === 'draw' ? 'draw' : winner === pl.team ? 'win' : 'lose';
