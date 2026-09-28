@@ -66,7 +66,6 @@ export const CFG = {
   // 强制把一局压到 N 秒（0 = 不覆盖，用房里选的分钟数）。这是**调试与判据用的闸门**：
   // 没有它，"打完一局 → 自动回房间"那一段要验就得真等十分钟。
   matchSeconds: (() => { const n = Number(process.env.MATCH_SECONDS); return Number.isFinite(n) && n > 0 ? n : 0; })(),
-  staticMaxAge: int(process.env.STATIC_MAX_AGE, 86400),
   shutdownGraceMs: int(process.env.SHUTDOWN_GRACE_MS, 4000),
   // 逗号分隔的允许来源。留空 = 不检查（开发方便，生产务必设）：WS 不吃 CORS，
   // 不检查 origin 的话任何网站都能拿你的对局服务当免费炮台、或替它的访客占你名额。
@@ -196,9 +195,13 @@ async function cachedFile(file) {
   return e;
 }
 
-// 缓存策略只有一种"必须每次回源"：入口文档。其余走 ETag 再验证 ——
-// 命中就是 304 且不带 body，所以"发文件"不再和对局抢 CPU。
-// 上一版全部 no-store：16 人 20Hz 才 66 kbps，而每个访客要重新拉 1.2 MB 的 three。
+// 缓存策略只有一种：所有静态资源（含入口文档）一律 no-cache —— 每次都回源再验证，
+// 没变就是 304 且不带 body（"发文件"不和对局抢 CPU），变了才拉新包体。
+// 走过两个极端：全部 no-store，每个访客都重拉 1.2 MB 的 three；非 html 走 max-age=86400，
+// 浏览器在新鲜期内根本不来问 —— 服务端一更新就是"新 HTML + 旧 JS"混跑，旧客户端对着
+// 新协议静默卡死在加载界面。no-cache 让"发版本 → 客户端下次加载自动同步"成立。
+// 304 也必须带 cache-control（见 serveStatic）：存着旧 max-age 的浏览器只有从 304
+// 头里才能学到新策略，不然新鲜期永远续下去。
 // 账号层。放在这里而不是内联进来，是为了让"规则"和"接线"分开：
 // 注册/登录/限流的规则在 server/accounts.mjs，存储语义在 server/store.mjs，
 // 这一层只管 HTTP 的形状（状态码、cookie、content-type）。
@@ -338,9 +341,9 @@ async function serveStatic(req, res) {
   catch { res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found'); return; }
   const type = MIME[extname(file).toLowerCase()] || 'application/octet-stream';
   const base = { 'content-type': type, etag: e.etag, 'last-modified': new Date(e.mtimeMs).toUTCString(), 'x-content-type-options': 'nosniff' };
+  // 放在 304 判定之前：再验证命中的响应也要带上策略，老客户端只认响应头里的新值。
+  base['cache-control'] = 'no-cache';
   if (req.headers['if-none-match'] === e.etag) { res.writeHead(304, base).end(); return; }   // 不发包体
-  const html = extname(file).toLowerCase() === '.html';
-  base['cache-control'] = html ? 'no-cache' : `public, max-age=${CFG.staticMaxAge}, must-revalidate`;
   // 压缩只对文本生效，且只压一次（结果挂在 fileCache 上）。小文件压了反而多几字节。
   if (GZIPPABLE.test(type) && e.size > 1024 && /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) {
     if (!e.gz) e.gz = gzipSync(e.buf, { level: 6 });

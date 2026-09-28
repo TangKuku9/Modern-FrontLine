@@ -23,7 +23,7 @@ const ok = (label, cond, extra = '') => { n++; if (!cond) bad++; console.log(`  
 const srv = await withServer({
   NODE_ENV: 'production',
   MAX_ROOMS: '4', MAX_CLIENTS: '8', ROOM_IDLE_MS: '1500', MAX_PAYLOAD: '16384',
-  ALLOW_ORIGIN: 'http://127.0.0.1', STATIC_MAX_AGE: '60',
+  ALLOW_ORIGIN: 'http://127.0.0.1',
   // 邀请码要给：生产模式下**不设** JOIN_CODE 会被配置闸拒绝启动（那是有意的 ——
   // 源码里那个默认码是公开的，而日志以前会说"已设"）。这条探针量的不是那一格。
   JOIN_CODE: 'probe-invite-code',
@@ -65,14 +65,15 @@ try {
   ok('/healthz 报出的房间数与连接数在真实值上（新服务：0 间 0 人）', hj.rooms === 0 && hj.clients === 0, `rooms=${hj.rooms} clients=${hj.clients}`);
   ok('/healthz 不许被缓存（探针拿到过期数据比没有更糟）', /no-store/.test(h0.headers['cache-control'] || ''), h0.headers['cache-control']);
 
-  console.log('\n── 静态资源：指纹缓存 + 压缩 + 入口回源 ──');
+  console.log('\n── 静态资源：一律回源再验证 + 压缩 ──');
   const raw = readFileSync(ROOT + 'js/main.js');
   const a = await get('/js/main.js');
   ok('js 文件按字节原样送达（压缩/缓存不能改内容）', a.status === 200 && a.buf.equals(raw), `${a.buf.length} B vs 磁盘 ${raw.length} B`);
-  ok('非 html 资源带 max-age（不再 no-store 让访客每次重拉 1.2 MB 的 three）', /public, max-age=60/.test(a.headers['cache-control'] || ''), a.headers['cache-control']);
+  ok('非 html 资源也是 no-cache（发版本后客户端下次加载自动同步，不用等 24 小时新鲜期过完）', /no-cache/.test(a.headers['cache-control'] || ''), a.headers['cache-control']);
   const etag = a.headers.etag;
   const b304 = await get('/js/main.js', { 'if-none-match': etag });
   ok('带 ETag 再验证命中 304 且不带包体', b304.status === 304 && b304.buf.length === 0, `status=${b304.status} body=${b304.buf.length} B`);
+  ok('304 也带 no-cache（存着旧 max-age 的浏览器只有从 304 头里才能学到新策略）', /no-cache/.test(b304.headers['cache-control'] || ''), b304.headers['cache-control']);
   const g = await get('/js/main.js', { 'accept-encoding': 'gzip' });
   const gzb = g.headers['content-encoding'] === 'gzip';
   ok('文本资源会压（且 gzip 后确实更小）', gzb && g.buf.length < a.buf.length, `原 ${a.buf.length} B → gzip ${g.buf.length} B = ${(g.buf.length / a.buf.length * 100).toFixed(0)}%`);

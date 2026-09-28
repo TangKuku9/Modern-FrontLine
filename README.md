@@ -154,7 +154,6 @@ Dockerfile / .env.example      镜像与部署配置模板（`.env.example` 不�
 | `MATCH_SECONDS` | `0` | 把一局强制压到 N 秒（`0` = 用房里选的分钟数）。调试与判据用的闸门 |
 | `ALLOW_ORIGIN` | 空=不检查 | 逗号分隔的允许来源，**生产务必设** |
 | `ROOM_IDLE_MS` | `60000` | 空房间多久回收 |
-| `STATIC_MAX_AGE` | `86400` | 非 html 静态资源的 max-age |
 | `SHUTDOWN_GRACE_MS` | `4000` | 收到 SIGTERM 后留给收尾的时间 |
 | `JOIN_CODE` | 源码里的 `mf2026` | 注册邀请码；设成空串 = 开放注册。**生产模式必须显式设**（含显式设空） |
 | `ACCOUNTS_DB` | 空 | 账号库路径。留空 = 只存内存、重启就丢；设成路径走 SQLite。**生产 + `REQUIRE_ACCOUNT=1` 时必须显式设** |

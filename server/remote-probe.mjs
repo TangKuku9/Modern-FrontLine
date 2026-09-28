@@ -140,8 +140,9 @@ try {
   if (etag) {
     const b304 = await get('/js/main.js', { 'if-none-match': etag });
     ok('带 ETag 再验证命中 304 且不带包体', b304.status === 304 && b304.buf.length === 0, `status=${b304.status} body=${b304.buf.length} B`);
+    ok('304 也带 no-cache（存着旧 max-age 的浏览器只有从 304 头里才能学到新策略）', /no-cache/.test(b304.headers['cache-control'] || ''), b304.headers['cache-control']);
   } else skip('ETag 再验证 304', '这台机器的 /js/main.js 没给 ETag（反代可能把它剥了）');
-  ok('非 html 资源带 max-age（访客不必每次重拉 three）', /max-age=\d+/.test(plain.headers['cache-control'] || ''), plain.headers['cache-control']);
+  ok('非 html 资源也是 no-cache（发版本后客户端下次加载自动同步）', /no-cache/.test(plain.headers['cache-control'] || ''), plain.headers['cache-control']);
   const lib = await get('/lib/three.module.js');
   ok('three 本体能取到且大小合理（最大的那份静态资源）', lib.status === 200 && lib.buf.length > 500000, `${lib.buf.length} B`);
 
