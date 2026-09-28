@@ -784,6 +784,11 @@ export class NetClient {
         // 于是"闪多久"只有一份算法 —— 两份的话，联机与单机被闪的时长会各自漂移。
         if (this.game.flashPlayer) this.game.flashPlayer(this.game.player, ev.dur);
         else { this.game.hud.flash(ev.dur); this.game.audio.ring(Math.min(4, ev.dur), 0.15); }
+      } else if (ev.e === 'popup' && ev.cid === this.cid) {
+        // 只给我自己的那一条提示（"摧毁武装直升机"）。**为什么必须走事件**：伤害在服务端
+        // 裁决（哑副本不扣血），而那条 popup 写在 takeDamage 那一行 —— 服务端的 hud 是桩，
+        // 所以除了这一条事件，没有任何东西能把它递到我这台机器上。
+        this.game.hud.popup(ev.text, ev.color || '#fff', true);
       } else if (ev.e === 'proj') {
         this.spawnProjectile(ev);
       } else if (ev.e === 'leave') {
@@ -876,6 +881,12 @@ export class NetClient {
   removeTurret(netId) {
     const t = this.turrets.get(netId);
     if (!t) return;
+    // 寿命还有剩就被告别了 ⇒ 是被打下来的（哑副本的血在服务端扣，本地看不到）。
+    // 它在天上那样消失是很突兀的：少了这一帧爆炸，屏幕上就是"一架直升机凭空少了一架"。
+    if (t.isHeli && t.t > 0.5 && this.game.world) {
+      this.game.effects.explosion(t.pos.clone(), 2);
+      this.game.audio.explosion(t.pos, 1);
+    }
     if (t.dispose) t.dispose();
     if (t.mesh && t.mesh.parent) t.mesh.parent.remove(t.mesh);
     const i = this.game.entities.indexOf(t);

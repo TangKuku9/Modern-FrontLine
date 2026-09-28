@@ -30,6 +30,7 @@ npm install && npm start             # 联机：静态资源与 WebSocket 同端
 - **AI**：三档难度，会寻路、找掩体、投雷、夺点，也使用连杀奖励
 - **Perk**：3 栏位共 12 项（双倍时间、拾荒者、爆破专家、冷血、强硬路线、火力过载、幽灵、速愈、快手、振奋、静步、高度警觉）
 - **连杀奖励**：侦察无人机、集束空袭（手动标记目标）、哨戒机枪、武装直升机、白磷弹，每次选 3 项
+- **空中打击可以被打下来**：武装直升机有 8 段命中体（座舱 / 旋翼主轴 / 机身 / 尾梁 / 垂尾）与 600 点机体血量。子弹只造成 35% 伤害（打要害再 ×1.8，约两个弹匣放倒），RPG-7 直击要害一发即毁、直击非要害打掉八成血；血量低于七成开始冒烟。装甲表与 `takeDamage` 只有一份（`js/mp.js:HELI_ARMOR`），单机与联机权威端用的是同一个类
 - **计分**：击杀奖章（爆头 / 远距离 / 双杀 / 三杀 / 首杀）、助攻、经验值与等级
 - **联网对战**跑在真对局服务上（见《实时联机》）。模式规则与连杀奖励两端共用同一份实现（`js/match-rules.js` + `js/combat.js` 的 `clusterStrike`/`phosphorusSweep`），服务端是唯一裁决者；按模式唯一不同处是集束空袭落点怎么定（单机点地图、联机改用呼叫者视线前方 22 m）—— 输入不同，规则不同没发生。
 
@@ -228,7 +229,7 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 ### 验收
 
 ```bash
-npm test              # 不含浏览器：gate + rollback + reconcile-chain + net-journal + codec + lagcomp + mp-rules + accounts + hardening + room-flow + net-probe + deploy-probe + xenv + fps + viewmodel + net-feel + optic + state-leak
+npm test              # 不含浏览器：gate + rollback + reconcile-chain + net-journal + codec + lagcomp + mp-rules + accounts + hardening + room-flow + net-probe + deploy-probe + xenv + fps + viewmodel + net-feel + heli-armor + optic + state-leak
 npm run test:browser  # 只跑两个真浏览器测试（需先下载 playwright 浏览器）
 npm run test:all      # 上面两档全跑
 ```
@@ -246,6 +247,7 @@ npm run test:all      # 上面两档全跑
 - `test/hardening.mjs`：外围闸门，全走真 HTTP 与真 WebSocket 握手，不打桩。与上一份的分工是"规则 vs 接线"：只做 `accounts.mjs` 会出现"规则全对、但接口根本没调它"这种绿
 - `server/deploy-probe.mjs`：静态白名单、ETag/304、gzip、路径穿越、来源检查两个方向、超帧被断且别人那一局不陪葬、房间配额、空房回收、优雅下线、进场装备闸门、心跳清理两个方向
 - `test/net-feel.mjs`：联机"手感层"—— 远端玩家的表现（开火/脚步/换弹/朝向/相位/受击/淡出/名牌）与本地玩家的反馈闭环（killfeed / 死亡画面 / 挨打三件套 / 重生倒计时 / 网络状态 / 暂停屏结构 / 输入法保护）。这一层的共同点是**全都不影响权威状态**：少了它不崩不报错，只是"看不见、听不见、没反应"，所以它最容易被改坏也最容易在下次重构里被顺手删掉。面板那一半（killfeed / 死亡画面）在 `test/net-play.mjs` 里量，因为 `js/main.js` 不导出 `Game`
+- `test/heli-armor.mjs`：武装直升机的命中体与装甲表 —— 打不打得着 / 打在哪儿 / 子弹只磨一层皮 / RPG 直击要害一发即毁、非要害大残。反证臂覆盖"命中体不跟着模型转""删掉系数""不问要害""丢掉直击那一格""尾梁那几颗球""哑副本进了实体表"
 - `test/optic.mjs`：开放式瞄具通透性与分划角直径（判据写在**角直径**而不是米数上 —— 同一配件在手枪与长枪的离眼距离不同）
 - `test/state-leak.mjs`：死亡 / 换局 / 热成像三处的状态残留，共同形状是"写那个字段的那行代码，出问题之后再也不跑了"
 - `server/xenv.mjs`：跨环境一致性（引擎指纹自校准两档，见上）

@@ -6,7 +6,7 @@ import { MAPS } from './maps.js';
 import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats } from './data.js';
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
-import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, rng, shuffle } from './util.js';
+import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
 import { StreakBook, MatchRules, WP_SECONDS, killScore, KILL_POINTS } from './match-rules.js';
 
 const BOT_WEAPONS = ['m4', 'm4', 'ak', 'ak', 'scar', 'mp5', 'mp5', 'vector', 'pkm', 'm870', 'sks', 'l115'];
@@ -108,13 +108,18 @@ export class MPMatch {
     this.nextLoadout = this.buildLoadout(this.game.profile.classes[idx]);
     this.game.profile.selClass = idx; this.game.saveProfile();
   }
-  enemiesOf(team) { return this.game.entities.filter(e => e.alive && e.team !== team && e.pos && e.targetable !== false); }
+  // 这张表是**地面上的敌对目标**：喂它的是"往哪儿投"与"往哪儿报"那几件事（集束空袭落点、
+  // 白磷弹的目标集合、敌方 UAV 给 bot 的报点），它们全部假设目标站在地上。直升机照样在
+  // game.entities 里（所以子弹打得到它），只是不参与这几处。
+  enemiesOf(team) { return this.game.entities.filter(e => e.alive && e.team !== team && e.pos && e.targetable !== false && !e.isHeli); }
   spawnPoint(team) {
     const w = this.game.world;
     let cands;
     if (this.ffa) cands = [...w.spawns.A, ...w.spawns.B];
     else cands = team === 'A' ? w.spawns.A : w.spawns.B;
-    const enemies = this.game.entities.filter(e => e.alive && e.team !== team && e.pos);
+    // 出生点只躲地面的敌人：直升机每 45 秒绕场一圈，把它算进"离敌人多远"会让出生点
+    // 躲一条它在天上留下的轨迹。
+    const enemies = this.game.entities.filter(e => e.alive && e.team !== team && e.pos && !e.isHeli);
     // 加入随机点提升多样性（占领/自由模式）
     if (this.ffa || rng.next() < 0.25) for (let i = 0; i < 6; i++) cands = cands.concat([w.randomWalkable()]);
     let best = cands[0], bs = -1;
@@ -397,6 +402,13 @@ export class MPMatch {
     this.hudScore();
     const markers = [];
     if (this.flags) for (const f of this.flags) markers.push({ id: 'f' + f.name, pos: f.pos.clone().setY(f.mesh.position.y + 3.6), label: f.name, cls: 'flag ' + (f.owner === pl.team ? 'ally' : f.owner ? 'enemy' : 'neutral') });
+    // 敌方直升机：血量写在它头顶。"还剩多少"必须看得见 —— 它在 24 m 高空，一梭子下去
+    // 掉的血你看不见，没有这个读数的话玩家没法判断自己在不在输出。这一份血量是**本机
+    // 权威**的（单机这一侧的 Heli.takeDamage 就在本机），所以这条标记只长在单机这条路上。
+    for (const a of this.active) {
+      if (a.isHeli && a.alive && a.team !== pl.team)
+        markers.push({ id: 'heli' + a.uid, pos: a.pos.clone().setY(a.pos.y + 2.4), label: a.name, cls: 'enemy', text: `${Math.max(1, Math.ceil(a.hp / a.maxHp * 100))}%`, hideDist: true });
+    }
     game.hud.setMarkers(markers);
     // 结束判定。团队模式走规则内核（分数到线 / 时间到，都是"谁赢了"这件事的定义），
     // 自由混战的"谁赢了"取决于名次而名次里有人 —— 那不是规则能判的，留在上层。
@@ -533,11 +545,14 @@ export class Sentry {
   takeDamage(d, info) {
     if (!this.alive) return false;
     this.hp -= info.explosive ? d * 2 : d * 0.5;
-    if (this.hp <= 0) { this.destroy(); if (info.attacker && info.attacker.isPlayer) this.game.hud.popup('摧毁哨戒机枪 +100', '', true); return true; }
+    if (this.hp <= 0) { this.destroy(info); if (info.attacker && info.attacker.isPlayer) this.game.hud.popup('摧毁哨戒机枪 +100', '', true); return true; }
     return false;
   }
-  destroy() {
+  destroy(info = {}) {
     this.alive = false;
+    // 与 Heli 同一组字段：联机的"被摧毁"播报与"摧毁者"提示读的就是这两个（server/room.mjs
+    // 的 gone 循环）。它们以前没有，于是联机里把机枪打掉是**悄无声息**的。
+    this.downed = true; this.killer = info.attacker || null;
     this.game.effects.explosion(this.pos.clone().setY(this.pos.y + 0.8), 0.6); this.game.audio.explosion(this.pos, 0.5);
     this.dispose();
   }
@@ -585,11 +600,61 @@ export class Sentry {
 
 // ---------- 武装直升机 ----------
 // dumb 的含义与 Sentry 相同：权威端那一个真的开火，客户端那一个只飞、只放曳光。
+//
+// 它是**可以打下来的**。这一件事有三个零件，全在这一个类里；单机跑的就是这个类，
+// 联机权威端 server/room.mjs 建的也是同一个类，而客户端的哑副本压根不在
+// game.entities 里（打不到、也扣不了血 ⇒ 伤害只有一台机器在裁），所以下面这张表一改，
+// 两端同时生效 —— 这正是"两端各改一处、改完还对不上"那种分歧的唯一解药。
+//
+//  ① 装甲表 HELI_ARMOR：子弹轻微、溅射翻倍、RPG 直击按要害分档。
+//  ② 命中体 HELI_HITBOXES：射线落到实处还要回答"打在哪儿"（body 还是 vital）。
+//  ③ 血量 hp 与它的唯一入口 takeDamage。
+
+// 装甲表（一处定义）。改这里的数之前先读一遍 test/heli-armor.mjs 那几条判据的措辞 ——
+// 每一条写的都是"这条红了说明哪个设计意图坏了"。
+export const HELI_ARMOR = {
+  hp: 600,        // 机体总血量
+  bullet: 0.35,   // 轻武器：只有 35% 的伤害落到机体上 —— 打它是"磨"，不是"秒"
+  vital: 1.8,     // 要害：座舱与旋翼主轴，在 bullet 的基础上再翻一倍多 —— 瞄准的意义就在这里
+  splash: 1.6,    // 没直接命中的爆炸（冲击波）：远处的当量对机体比对人管用
+  rpgBody: 0.8,   // RPG 直击非要害：一次性打掉八成血（大残，再补一匣就下来）
+};
+
+// 命中体：一串局部坐标的球（机头朝 -Z，y 向上），判定时随 yaw 绕 Y 轴旋到世界。
+// 为什么是球串而不是一个包围盒：包围盒会把"从机头斜前方擦过去的那一枪"判成命中，
+// 而那一枪在画面上是**穿过去了** —— 打空气掉血比打不中难受得多。
+// 旋翼桨叶**不**在表里：那一片是高速旋转的糊影，给它一片 7.5 m 的"命中板"会让
+// 瞄准变成看运气。相邻两颗在 Z 上是叠住的，逐颗排下来是一条连续的机体 —— 中间断开一段
+// 的症状是"那一截打上去没反应"，而模型看上去还好端端在那儿。
+export const HELI_HITBOXES = [
+  { x: 0, y: 0.15, z: -2.2, r: 1.00, part: 'vital' },  // 座舱：正前方那个玻璃罩
+  { x: 0, y: 1.45, z: 0.0, r: 0.85, part: 'vital' },   // 旋翼主轴 / 主减速器
+  { x: 0, y: 0.00, z: -0.8, r: 1.30, part: 'body' },   // 机身前段
+  { x: 0, y: 0.10, z: 1.60, r: 1.25, part: 'body' },   // 机身后段
+  { x: 0, y: 0.45, z: 3.20, r: 0.50, part: 'body' },   // 尾梁（三颗把它接成一条）
+  { x: 0, y: 0.45, z: 4.60, r: 0.50, part: 'body' },
+  { x: 0, y: 0.45, z: 6.00, r: 0.55, part: 'body' },
+  { x: 0.2, y: 1.10, z: 7.00, r: 0.80, part: 'body' }, // 垂尾 + 尾桨
+];
+
+let HELI_UID = 0;
+
 export class Heli {
   constructor(game, team, owner, opts = {}) {
     this.game = game; this.team = team; this.owner = owner; this.alive = true;
     this.dumb = !!opts.dumb;
+    this.uid = ++HELI_UID;              // 给 HUD 标记当稳定的 key（Heli 没有 netId）
+    this.name = '武装直升机';
+    this.isHeli = true;                 // 空中目标：不进"地面目标集合"（见 enemiesOf 那条注释）
+    this.metal = true;                  // 打中是冒火星不是冒血（js/combat.js:fireHitscan）
     this.t = opts.duration || 45;
+    this.maxHp = opts.hp || HELI_ARMOR.hp;
+    this.hp = this.maxHp;
+    this.smokeT = 0;
+    // 是被打下来的还是到点离场 —— 联机的"被击落"播报读这一位（server/room.mjs 的 gone 循环）。
+    // 少了它的话，45 秒自然离场也会被念成"敌方武装直升机被击落"。
+    this.downed = false;
+    this.killer = null;
     // ang 是航线的相位。它是**每个实例各自的随机起点**，所以联机下必须由创造它的那一端
     // 决定并广播出去（事件里带 ang）—— 客户端各抽一次的话，两边的直升机不在同一条航线上。
     this.ang = opts.ang !== undefined ? opts.ang : rng.next() * 6;
@@ -601,9 +666,69 @@ export class Heli {
     this.rotor = this.mesh.userData.rotor; this.tail = this.mesh.userData.tail;
     game.scene.add(this.mesh);
     this.pos = new THREE.Vector3();
+    this.yaw = 0;
     this.enter = 1;
     game.audio.loop('heli' + this.ang, 'rotor', 0.0);
     this.loopName = 'heli' + this.ang;
+    // 只有**权威的那一个**进实体表：game.entities 是"谁会被子弹与爆炸遍历到"的名单
+    // （js/combat.js:traceBullet / explode），放进去即意味着"这一台机器上可以裁决它的血量"。
+    // 客户端的哑副本不进 ⇒ 本地子弹从它身上穿过去，血量只由权威端说了算。
+    if (!this.dumb) game.entities.push(this);
+  }
+  // 受击点 / 炸点距离取机身中心：爆炸的溅射算式（js/combat.js:explode）与哨戒机枪的瞄准
+  // 读的都是它 —— 直升机没有"胸"这个概念，这里给的就是机体那一点。
+  chestPos(o) { return o.copy(this.pos); }
+  hitTest(o, d, maxT) {
+    if (!this.alive) return null;
+    // 只按 yaw 旋。mesh 还有 -0.1 的俯仰和一点点横滚，而命中体不跟着走：那两个量在
+    // 7 m 长的机体上偏不到 40 cm，换来的是"命中体不必再依赖 Euler 的叠加顺序"。
+    const c = Math.cos(this.yaw), s = Math.sin(this.yaw);
+    let bt = maxT, bp = null;
+    for (const v of HELI_HITBOXES) {
+      const wx = this.pos.x + v.x * c + v.z * s;
+      const wy = this.pos.y + v.y;
+      const wz = this.pos.z - v.x * s + v.z * c;
+      const t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, wx, wy, wz, v.r);
+      if (t >= 0 && t < bt) { bt = t; bp = v.part; }
+    }
+    return bp ? { t: bt, part: bp } : null;
+  }
+  // 唯一的裁决入口。info.part 来自 hitTest（'vital' / 'body'），info.direct 来自 Projectile
+  // —— 火箭的**弹体自己撞上了**它，而不是在附近炸开（js/combat.js:explode 转发那一位）。
+  takeDamage(d, info = {}) {
+    if (!this.alive) return false;
+    let dmg;
+    if (info.direct) {
+      // RPG-7 直击。从这里才谈得上"PVP 有解"：一个 7 连杀的空中炮台不该被一发乱扔的手雷
+      // 掀掉，但它该怕一发打准的火箭 —— 要害一发即毁，非要害一次打掉八成。
+      if (info.part === 'vital') { this.hp = 0; return this.destroy(info); }
+      dmg = this.maxHp * HELI_ARMOR.rpgBody;
+    } else if (info.explosive) dmg = d * HELI_ARMOR.splash;
+    else dmg = d * HELI_ARMOR.bullet * (info.part === 'vital' ? HELI_ARMOR.vital : 1);
+    this.hp -= dmg;
+    if (this.hp <= 0) { this.hp = 0; return this.destroy(info); }
+    return false;
+  }
+  destroy(info = {}) {
+    if (!this.alive) return true;
+    this.alive = false;
+    this.downed = true;
+    this.killer = info.attacker || null;
+    const p = this.pos.clone();
+    this.game.effects.explosion(p, 2);
+    this.game.audio.explosion(p, 1);
+    if (info.attacker && info.attacker.isPlayer) this.game.hud.popup('摧毁武装直升机', '', true);
+    this.dispose();
+    return true;
+  }
+  dispose() {
+    this.game.scene.remove(this.mesh);
+    this.game.audio.stopLoop(this.loopName);
+    // 从实体表里摘掉：game.entities 是被每发子弹与每次爆炸遍历的表，留着一个已经死了的
+    // 直升机不报错（takeDamage 第一行就 return false），只是让这张表每局多攒几架。
+    const es = this.game.entities;
+    const i = es.indexOf(this);
+    if (i >= 0) es.splice(i, 1);
   }
   update(dt) {
     const game = this.game;
@@ -621,7 +746,7 @@ export class Heli {
     if (this.scanT <= 0) {
       this.scanT = 0.5; this.target = null; let bd = 90;
       for (const e of game.entities) {
-        if (!e.alive || e.team === this.team || !e.chestPos) continue;
+        if (!e.alive || e.team === this.team || !e.chestPos || e.isHeli) continue;
         if (e.isPlayer && e.hasPerk('coldblooded')) continue;
         const c = e.chestPos(new THREE.Vector3());
         const dd = c.distanceTo(this.pos);
@@ -649,8 +774,26 @@ export class Heli {
     this.mesh.rotation.y = look;
     this.mesh.rotation.z = Math.sin(this.ang * 3) * 0.05;
     this.mesh.rotation.x = -0.1;
+    // 命中体跟着机头转（HELI_HITBOXES 是局部坐标），所以 yaw 必须在这儿落地 ——
+    // 漏了这一行的话，命中体永远停在 yaw=0，直升机看上去朝着东、实际能被从北边打穿。
+    this.yaw = look;
+    // 冒烟 / 起火：血量越低越凶。它是场上**唯一**的"它快掉了"信号 —— 直升机在 24 m 高空、
+    // 每发子弹只掉几点血，没有这一缕烟的话没人知道自己在不在有效输出。（单机侧血量就是
+    // 本机算的；联机的哑副本不掉血 ⇒ 这条警告目前只在单机看得到，见 docs/net-vs-local-gaps.md。）
+    if (this.hp < this.maxHp * 0.7) {
+      this.smokeT -= dt;
+      if (this.smokeT <= 0) {
+        const frac = this.hp / this.maxHp;
+        this.smokeT = 0.03 + 0.05 * frac;
+        game.effects.smoke.emit({
+          x: this.pos.x, y: this.pos.y, z: this.pos.z,
+          vx: -Math.cos(this.yaw) * 2, vy: -1.5, vz: -Math.sin(this.yaw) * 2,
+          drag: 1, life: 1.4, s0: 0.6, s1: 2.4, c0: [0.22, 0.22, 0.22], a0: 0.5,
+        });
+        if (frac < 0.3) game.effects.add.emit({ x: this.pos.x, y: this.pos.y - 0.6, z: this.pos.z, vx: 0, vy: 0.5, vz: 0, life: 0.4, s0: 0.6, s1: 2.2, c0: [6, 2.4, 0.4], a0: 1 });
+      }
+    }
   }
-  dispose() { this.game.scene.remove(this.mesh); this.game.audio.stopLoop(this.loopName); }
 }
 
 export function buildHeli(color = 0x3a4a3a) {

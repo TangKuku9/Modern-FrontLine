@@ -338,6 +338,16 @@ export class NetRoom {
       if (a.alive || a.__gone) continue;
       a.__gone = true;
       this.events.push({ e: 'gone', netId: a.netId, kind: a.isTurret ? 'sentry' : 'heli' });
+      // 被**打**下来的那一种要另发两句话：自然到点离场不该被念成"xxx 被击落"。
+      // （Heli.downed 只由 takeDamage 那条路置上，见 js/mp.js:Heli.destroy。）
+      if (a.downed) {
+        const kind = a.isTurret ? '哨戒机枪' : '武装直升机';
+        // 这句不带 to：客户端按"是不是自己这一队"决定要不要在前面加"敌方"
+        // （对面听到"敌方武装直升机被击落"，自己这边听到"武装直升机被击落"）。
+        this.events.push({ e: 'announce', team: a.team, text: kind + '被摧毁' });
+        const kc = a.killer ? this.byPlayer.get(a.killer) : null;
+        if (kc) this.events.push({ e: 'popup', cid: kc.cid, text: '摧毁' + kind });
+      }
     }
     this.active = this.active.filter(a => a.alive);
     this.tick++;
@@ -433,8 +443,10 @@ export class NetRoom {
   // 为什么事件也是必需的：哨戒机枪与武装直升机是**权威实体**（伤害在这一台机器上算），
   // 如果不告诉客户端，别人就是被一个自己看不见的东西打死 —— 那比不做这一项更糟。
 
+  // 与单机同一份语义（js/mp.js:MPMatch.enemiesOf）：**地面上的**敌对目标。
+  // 直升机照样会被射线打得到，但不进"白磷弹烧谁 / 集束空袭炸哪儿"那类照地投放的集合。
   enemiesOf(team) {
-    return this.game.entities.filter(e => e.alive && e.team !== team && e.pos && e.targetable !== false);
+    return this.game.entities.filter(e => e.alive && e.team !== team && e.pos && e.targetable !== false && !e.isHeli);
   }
 
   // 往房间里放一个 AI。当前联机对局里**不自动放**（真人对真人），但这条通道必须能跑：

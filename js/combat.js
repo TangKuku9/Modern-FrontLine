@@ -10,6 +10,9 @@ import { mat } from './materials.js';
 import { crandRange as crand, rand, clamp, raySphere, rayAABB } from './util.js';
 
 const _p = new THREE.Vector3(), _q = new THREE.Vector3();
+// 金属命中要用的法线。不与 _p/_q 共用：那两个在爆炸/弹道那一段里跨调用带着值，
+// 这里要是蹭用了别人的临时向量，症状会是"偶发的火星喷向奇怪的方向"而没人查得到。
+const _n = new THREE.Vector3();
 
 // 玩家命中盒的解析定义（头球 + 躯干 AABB）。**一处定义，四处用**：
 // 本机玩家的当下裁决（js/player.js:hitTest）、远端玩家的即时反馈（js/net/remote.mjs:hitTest）、
@@ -60,8 +63,13 @@ export function fireHitscan(game, shooter, o, d, stats, weaponName, opts = {}) {
   const r = traceBullet(game, shooter, o, d, opts.maxDist || 400, opts.rewind || null);
   if (r.ent) {
     const dmg = damageAt(stats, r.t, r.part) * (opts.dmgMul || 1);
-    const killed = r.ent.takeDamage(dmg, { attacker: shooter, head: r.part === 'head', dir: d, weapon: weaponName, point: r.point });
-    game.effects.blood(r.point, d, r.part === 'head');
+    // part 要带过去：装甲表按"打在哪儿"分档（js/mp.js:Heli.takeDamage 的 vital/body）。
+    // 人身上它就是 'head'/'body'/'legs'，那份 takeDamage 不看这一格，所以加它是免费的。
+    const killed = r.ent.takeDamage(dmg, { attacker: shooter, head: r.part === 'head', dir: d, weapon: weaponName, point: r.point, part: r.part });
+    // 金属该冒火星，不打 fake 血 —— 打在直升机上喷一蓬血的错不会被报出来，只会让人以为
+    // "我把驾驶员打下来了"（真被打下来的也是那台机体，它不是一个人）。
+    if (r.ent.metal) game.effects.impact(r.point, _n.copy(d).negate(), 'metal');
+    else game.effects.blood(r.point, d, r.part === 'head');
     r.killed = killed; r.dmg = dmg;
   } else if (r.world) {
     game.effects.impact(r.point, r.world.normal, r.world.box.mat || 'concrete');
@@ -85,6 +93,11 @@ export function explode(game, pos, radius, maxDmg, attacker, weapon, opts = {}) 
     if (d < radius * 1.2) game.audio.ring(1.5, 0.05);
   }
   if (opts.noDamage) return;
+  // opts.direct：**这一颗火箭是自己撞上去的**（它在 Projectile.update 里对着实体表做过一次
+  // 射线，撞到谁记的就是谁）。溅射按距离连续衰减，而"弹体撞在它身上"不是一个随距离
+  // 变化的量 —— 装甲那一套（js/mp.js:Heli.takeDamage）就靠这一位分辨"一发入魂"与
+  // "在旁边炸开"。少了它的症状：打中座舱与在它脚底下炸开是同一个数，于是"要害"没有凭据。
+  const direct = opts.direct || null;
   const src = _p.copy(pos); src.y += 0.4;
   for (const e of game.entities) {
     if (!e.alive || !e.chestPos) continue;
@@ -92,12 +105,15 @@ export function explode(game, pos, radius, maxDmg, attacker, weapon, opts = {}) 
     const dist = c.distanceTo(src);
     if (dist > radius) continue;
     if (attacker && e !== attacker && e.team === attacker.team && !opts.ff) continue;
-    if (game.world.lineBlocked(src, c)) continue;
+    if (!direct || direct.ent !== e) { if (game.world.lineBlocked(src, c)) continue; }
     let dmg = maxDmg * Math.pow(1 - dist / radius, 0.8);
     if (e.isPlayer && e.hasPerk && e.hasPerk('eod')) dmg *= 0.5;
     if (e === attacker && e.isPlayer) dmg *= 0.6;
     const dir = new THREE.Vector3().subVectors(c, src).normalize();
-    e.takeDamage(dmg, { attacker, dir, weapon, explosive: true, point: c.clone() });
+    e.takeDamage(dmg, {
+      attacker, dir, weapon, explosive: true, point: c.clone(),
+      direct: !!direct && direct.ent === e, part: direct && direct.ent === e ? direct.part : undefined,
+    });
   }
   game.makeNoise(pos, 80, attacker ? attacker.team : null);
 }
@@ -172,9 +188,20 @@ export class Projectile {
         const dir = _q.copy(this.vel).normalize();
         const len = this.vel.length() * sd;
         const hit = g.world.raycast(this.pos, dir, len + 0.1);
-        let entHit = null;
-        for (const e of g.entities) { if (e === this.owner || !e.alive || (this.owner && e.team === this.owner.team)) continue; const h = e.hitTest(this.pos, dir, len + 0.3); if (h) entHit = e; }
+        // 实体那一侧取**最近**的一个，并把"打在哪儿"一并记下来。原来这里写的是
+        // `if (h) entHit = e`（最后一个说了算），于是火箭对着站在别人前面的那个人飞过去时，
+        // 账会记到后面那个人的头上，而弹道看上去是先擦到了前面那个。
+        let entHit = null, entPart = null, entT = Infinity;
+        for (const e of g.entities) {
+          if (e === this.owner || !e.alive || !e.hitTest || (this.owner && e.team === this.owner.team)) continue;
+          const h = e.hitTest(this.pos, dir, len + 0.3);
+          if (h && h.t < entT) { entT = h.t; entHit = e; entPart = h.part; }
+        }
         if (hit || entHit || this.pos.y < 0.05 || this.age > 6) {
+          // 弹体撞上去的那一个要跟着这一炸走下去：有装甲的东西（直升机）就靠它分辨
+          // "直击"与"在旁边炸开"。以前这里只传"炸了"，于是火箭从机身中间穿过去，
+          // 落在击者身上的也只是"附近有一次爆炸"。
+          this.direct = entHit ? { ent: entHit, part: entPart } : null;
           if (hit) this.pos.copy(hit.point).addScaledVector(hit.normal, 0.2);
           return this.detonate();
         }
@@ -244,7 +271,7 @@ export class Projectile {
     const nd = this.dumb ? { noDamage: true } : {};
     const wn = { frag: '破片手雷', semtex: '粘性炸弹', molotov: '燃烧瓶', rocket: 'RPG-7', bomb: '集束空袭' }[this.type];
     if (this.type === 'frag' || this.type === 'semtex') explode(g, this.pos, 7, 160, this.owner, wn, nd);
-    else if (this.type === 'rocket') explode(g, this.pos, 6, 170, this.owner, wn, { scale: 1.2, ...nd });
+    else if (this.type === 'rocket') explode(g, this.pos, 6, 170, this.owner, wn, { scale: 1.2, ...nd, direct: this.direct });
     else if (this.type === 'bomb') explode(g, this.pos, 8, 180, this.owner, wn, { scale: 1.3, ...nd });
     else if (this.type === 'flash') flashAt(g, this.pos, this.owner, nd);
     else if (this.type === 'molotov') {

@@ -119,7 +119,9 @@ export class Bot {
   stun(t) { this.stunT = Math.max(this.stunT, t); }
   hint(pos) { if (!this.target || !this.targetVisible) { this.lastSeenPos = pos.clone(); this.lastSeenT = this.game.time - 2; this.alerted = true; } }
 
-  isEnemy(e) { return e.team !== this.team && e.alive && e.targetable !== false; }
+  // bot 不打天上的东西：它的队列里不该出现武装直升机（哨戒机枪会打，那是另一份名单）。
+  // 能不能打中它在这里不算数 —— 那件事由射线答（js/combat.js:traceBullet）。
+  isEnemy(e) { return e.team !== this.team && e.alive && e.targetable !== false && !e.isHeli; }
 
   perceive() {
     const game = this.game;
