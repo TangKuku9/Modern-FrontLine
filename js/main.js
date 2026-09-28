@@ -19,6 +19,7 @@ import { MPMatch } from './mp.js';
 import { Campaign } from './campaign.js';
 import { Player } from './player.js';
 import { NetClient } from './net/client.mjs';
+import { LobbyClient } from './net/lobby.mjs';
 import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS } from './data.js';
 import { repairClass } from './loadout.mjs';
@@ -168,18 +169,19 @@ class Game {
     else this.menu.showMain();
   }
 
-  // 按需拉一次账号状态（幂等）。**刻意不在构造函数里调** —— 成因与实测见上面那段。
-  // 两个调用点：menu.showMain()（主菜单的档案卡要服务端那份经验值）、
-  // menu.showOnlineEntry()（联机的层级路由要按策略决定先过闸还是进大厅）。返回 promise 只为让调用方能等；
-  // 调用方都**不该**阻塞在它上面：连不上服务器不是错误，单机照玩。
+  // 按需拉一次账号状态。**只缓存"问成功"的那一次** —— 这一条是量出来的：
+  // 无论成败都缓存的那一版，在一次超时之后就把结果钉死了。实测形状是两个软件渲染的
+  // 页签同时加载（页面忙到 /api/status 的 8 秒闸门跳开），于是那个人之后每一次点
+  // "联网对战"都落在注册页上 —— 而在访客服上那一屏根本没有他能填的东西。
+  // 判据是 statusKnown（"服务端亲口说过策略"），不是"我发过一次请求"。
   accountSync() {
     if (!this.account) return Promise.resolve();
-    if (this._acctSync) return this._acctSync;
+    if (this._acctSync && this.account.statusKnown) return this._acctSync;
     this._acctSync = this.account.status().then(() => this.account.me()).then(() => {
       // 登录之后把服务端那份经验值同步到本地档案上（显示用）。本地那份仍然可以被玩家改，
       // 但它现在只是**一个显示用的副本** —— 真正的数在服务端，下一次 me() 会把它盖回去。
       if (this.account.user) { this.profile.xp = this.account.user.xp | 0; this.saveProfile(); }
-    }).catch(() => { /* 连不上服务器不是启动错误：单机照玩 */ });
+    }).catch(() => { /* 连不上服务器不是启动错误：单机照玩，下一次进联网还会再问 */ });
     return this._acctSync;
   }
 
@@ -205,6 +207,15 @@ class Game {
     let welcome;
     try { welcome = await net.connect(); }
     catch (e) { this.menu.showLoadingOverlay('连接失败：' + e.message); return null; }
+    return this.beginNetMatch(welcome, net);
+  }
+
+  // 从"拿到进场应答"到"这一局在本机跑起来"。**两个调用点**：上面那条 ?online=1 的
+  // 直连老路，和大厅里房主按下开始（js/net/lobby.mjs 对 welcome 那一帧的分流）。
+  // 两条路共用这一段是刻意的：换世界 → 建本机玩家 → 装配 → 起 HUD 的顺序只要有一处不同，
+  // 另一条路就会带上没人复现过的边界症状（第 0 拍对不齐那一族就是这种形状）。
+  async beginNetMatch(welcome, net) {
+    this.net = net;
     this.audio.init();
     this.clearWorld();
     this.renderPass.scene = this.scene; this.renderPass.camera = this.camera;
@@ -227,6 +238,87 @@ class Game {
     document.getElementById('clickToPlay').classList.remove('hidden');
     this.lock();
     return welcome;
+  }
+
+  // ---------- 联机大厅：一条 WebSocket 从列表一路走到对局 ----------
+  // 连接归 game 而不是归 menu：menu 会因为换屏反复重画，而这条连接身上的身份
+  // （我在哪间房的哪个座位）必须跨过"大厅 → 房间 → 对局 → 回房间"整段活着。
+  onlineLobby() {
+    if (this.lobby && this.lobby.connected) return Promise.resolve(this.lobby);
+    const lb = this.lobby = new LobbyClient(this, {
+      name: this.menu.lobby.name,
+      onRooms: () => { if (this.menu.screen === 'online') this.menu.renderRooms(); },
+      onRoom: (j) => this.onRoomFrame(j),
+      onChat: (j) => this.onChatFrame(j),
+      onError: (m) => this.menu.onlineError(m),
+      onNote: (m) => this.onLobbyNote(m),
+      onBegin: (j) => this.startMatchFromLobby(j),
+    });
+    return lb.connect().catch(e => { this.lobby = null; throw e; });
+  }
+
+  // room 那一帧有三个去处，按"我现在在哪一屏"分：
+  //   对局中、而服务端说这局结束了 → 退回房间屏（returnRoom 的唯一触发点）；
+  //   正要进房而应答到了 → 换到房间屏；
+  //   已经在房间屏 → 只重画数据，不重建界面（重建会把聊天输入框里打到一半的字抹掉）。
+  onRoomFrame(j) {
+    if (this.state === 'play') {
+      if (j.room && j.room.state !== 'playing') this.returnToRoom();
+      return;
+    }
+    if (this._wantRoom && j.me) { this._wantRoom = false; this.menu.showOnlineRoom(); return; }
+    if (this.menu.screen !== 'onlineRoom') return;
+    if (!j.me) { this.menu.showOnlineLobby(); return; }        // 座位没了（房间散了 / 最后一人走了）
+    this.menu.renderRoom();
+  }
+  onChatFrame(j) {
+    // 两种 chat 帧长得不一样：一条新消息，和"刚进大厅时补给你的最近几句"。
+    // 后者只重画整块列表 —— 拿它走追加路径会画出一条没有 text 的空行，
+    // 而"新进来的人看不到之前说过什么"这种缺陷没人会当 bug 报，只会以为频道本来就是空的。
+    if (Array.isArray(j.hist)) { if (j.ch === 'lobby' && this.menu.screen === 'online') this.menu.renderChat(this.menu.el, 'lobby'); return; }
+    if (j.ch === 'lobby') { if (this.menu.screen === 'online') this.menu.pushChat(this.menu.el, 'lobby', j); return; }
+    if (this.menu.screen === 'onlineRoom') this.menu.pushChat(this.menu.el, 'room', j);
+  }
+  onLobbyNote(msg) {
+    // 服务端下线时那一句：在对局里就报在 HUD 上，在菜单里就写在当前那一屏上。
+    // 只塞进 net.events 的话没人读它 —— 那正是"服务器重启后所有人站在一个静止的世界里"。
+    if (this.state === 'play' && this.hud) this.hud.announce(msg, '', 6);
+    else this.menu.onlineError(msg);
+  }
+  // 建房 / 加入之后先占住这一屏：座位应答到达之前不画房间（画了会是一屏空座位）。
+  // 应答失败时 onlineError 会清掉这个标记并退回大厅，人不会被卡在"正在进房…"上。
+  showRoomSoon() {
+    this._wantRoom = true;
+    this.menu.showLoadingOverlay('正在进房…');
+  }
+  // 房主按下开始：服务端在**同一条连接**上发来进场应答，这里把世界换过来。
+  // 交还 socket 的时机在 beginNetMatch 之后 —— 加载地图那几百毫秒里到的快照直接丢掉，
+  // 否则那几个远端玩家会被塞进菜单那个场景（症状是主菜单背景上飘过几个士兵）。
+  async startMatchFromLobby(welcome) {
+    if (this.state === 'play' || !this.lobby) return;          // 已经在这局里了（重复的应答）
+    const lb = this.lobby;
+    const net = new NetClient(this, { name: welcome.name, team: welcome.team });
+    this.menu.showLoadingOverlay('正在进入对局…');
+    await this.beginNetMatch(welcome, net);
+    net.attach(lb.ws, welcome);
+    lb.match = net;
+  }
+  // 一局结束、回到房间：拆掉对局层的东西，但**那条连接不能关**（它是房间的座位）。
+  // this.mode 要先摘干净：clearWorld 会顺手 dispose 当前 mode，而 NetClient.dispose
+  // 的默认动作就是关 socket —— 顺序反过来的话"回房间"就变成"被踢出房间"。
+  returnToRoom() {
+    const net = this.net;
+    if (this.lobby) this.lobby.match = null;
+    this.mode = null;
+    if (net) net.dispose(true);
+    this.net = null;
+    this.clearWorld();
+    this.state = 'menu'; this.paused = false; this.dead = false;
+    this.hud.show(false); this.hud.showScoreboard(false);
+    document.getElementById('deathScreen').classList.add('hidden');
+    if (document.pointerLockElement) document.exitPointerLock();
+    if (this.lobby && this.lobby.state && this.lobby.state.me) this.menu.showOnlineRoom();
+    else this.menu.showOnlineLobby();
   }
   buildNetLoadout(cls) {
     return {

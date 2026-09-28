@@ -177,7 +177,10 @@ export class MatchRules {
     if (this.timeUp) {
       // 自由混战的赢家是**名次第一的那个人**，而"人"这种东西规则不认（它只认队伍）。
       // 这条一开始写成了返回 'draw'，于是单机 FFA 一到时间就变成平局。
-      if (this.ffa) return null;
+      // 现在改成把"已经结束、没有赢家"这件事**记进 over**：只 return null 的话，
+      // 权威端每秒那次 checkEnd 读不到任何状态，FFA 一到时间就永远不结束
+      // （房间也永远回不来 —— 见 server/room.mjs 的每秒判终点）。
+      if (this.ffa) return this._end(null);
       const { A, B } = this.scores;
       return this._end(A > B ? 'A' : B > A ? 'B' : 'draw');
     }

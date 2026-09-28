@@ -1,7 +1,7 @@
 // 菜单系统：主菜单、战役简报、多人大厅、配装、枪匠、设置、暂停、结算
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, attachmentAllowed, findAttachment } from './data.js';
+import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, attachmentAllowed, findAttachment } from './data.js';
 import { buildGun } from './gunmodel.js';
 import { createSoldierModel, animateSoldier } from './soldier.js';
 import { mat, camoSwatch } from './materials.js';
@@ -9,6 +9,14 @@ import { damp, fmtTime } from './util.js';
 
 const DIFF_NAMES = ['新兵', '正规军', '老兵'];
 const MAX_ATT = 5;
+// 经验 → 等级。这一条公式在存档卡、房间座位栏里各画一份的话，
+// 换算法就要改两处，而漏掉那处只会显示出一个偏低的等级，没人会报错。
+export const levelOf = (xp) => Math.min(55, Math.floor(Math.sqrt(Math.max(0, xp | 0) / 300)) + 1);
+
+// 联机能选的模式 = js/data.js 那张表上 net 为真的那几个（服务端判得出它们的胜负）。
+// 与 server/lobby.mjs:MODE_IDS 同源，两侧各筛各的话症状就是"界面上给了一格，点下去被拒"
+// —— 而房间列表上那一格模式正是别人挑房的依据。
+const ONLINE_MODES = MP_MODES.filter(m => m.net);
 
 // 地图缩略插画（内联SVG）
 const MAP_ART = {
@@ -48,7 +56,7 @@ export class Menu {
     this.camTarget = { pos: new THREE.Vector3(-0.3, 1.45, 4.2), look: new THREE.Vector3(0.6, 1.15, 0) };
     this.camLook = this.camTarget.look.clone();
     this.gunRotY = -Math.PI / 2; this.gunRotX = 0; this.gunSpin = true;
-    this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, name: '士兵', team: 'A', room: '' };
+    this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, minutes: 10, name: '士兵', team: 'A', room: '', title: '' };
     this.campDiff = 1;
     this.selClass = game.profile.selClass || 0;
     this.buildScene();
@@ -199,7 +207,7 @@ export class Menu {
   hide() { this.el.innerHTML = ''; this.screen = ''; this.overlayOpen = false; }
   level() {
     const xp = this.game.profile.xp || 0;
-    const lv = Math.min(55, Math.floor(Math.sqrt(xp / 300)) + 1);
+    const lv = levelOf(xp);
     const a = Math.pow(lv - 1, 2) * 300, b = Math.pow(lv, 2) * 300;
     return { lv, frac: lv >= 55 ? 1 : (xp - a) / (b - a), xp };
   }
@@ -407,12 +415,11 @@ export class Menu {
     if (pw) pw.addEventListener('keydown', e => { if (e.key === 'Enter') submit('login'); });
   }
 
-  // ── 联机第三层：房间列表大厅 ──
-  // 这一屏只干一件事：选房、进房。身份在上一层已经办完，这里压缩成一张状态卡（renderIdentity）
-  // —— 再摆一整块登录表单的话，层级就又平了，玩家会以为"进了大厅还要在这儿登一次录"。
-  // 这里只递服务端真用得上的东西（呼号、阵营、房号 + 可选的房间显示名）——
-  // 地图与模式由服务器说了算（见 server/net-server.mjs 的 CFG 与 pickRoom），
-  // 大厅里放一个本地选择器去"决定"它们，就是在骗人。
+  // ── 联机第三层：大厅（一张实时的房间列表 + 全服频道）──
+  // 这一屏只干两件事：挑一间房进去，以及和还没进房的人说句话。
+  // 列表不再靠"点一下刷新去拉 /api/rooms"：连接一建立服务端就把清单推过来，之后
+  // 每有变动再推一次（有人建房 / 进人 / 开局）。轮询那一版的症状是"列表比现实慢半拍"，
+  // 而玩家据此点下去的那一行可能已经开打了。
   showOnlineLobby() {
     // 守卫：未注册的人根本到不了这里（路由先拦，这行是第二道 —— 谁直接调它都回闸）。
     const A0 = this.game.account;
@@ -421,60 +428,322 @@ export class Menu {
     const L = this.lobby, P = this.game.profile;
     const cls = P.classes[P.selClass || 0];
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
+    const seg = (id, vals, labels, cur) => `<div class="seg" id="${id}">${vals.map((v, i) => `<div data-v="${v}" class="${cur == v ? 'sel' : ''}">${labels ? labels[i] : v}</div>`).join('')}</div>`;
     const r = this.render(`
       <div class="lobby">
-        <div class="hdr">联网对战<small>服务器 ${esc(location.host)}</small></div>
+        <div class="hdr">联网对战<small>服务器 ${esc(location.host)} · 在线 <span id="lbOnline">…</span></small></div>
         <div class="lobby-body">
-          <div class="lobby-col" style="flex:1;max-width:600px">
+          <div class="lobby-col lb-left">
+            <div class="panel lb-rooms">
+              <div class="lb-hd"><span>房间</span><span id="lbNote">正在进入大厅…</span></div>
+              <div id="lbRows" class="lb-rows"></div>
+            </div>
             <div class="panel"><div class="opts">
-              <div>房间列表</div>
-              <div style="display:flex;gap:8px;align-items:center"><button class="btn small ghost" data-a="refresh">刷新</button><span id="roomNote" style="color:#888;font-size:12px"></span></div>
-              <div id="roomRows" style="grid-column:1/-1;display:flex;flex-direction:column;gap:6px;max-height:216px;overflow-y:auto"></div>
-              <div>创建房间</div>
-              <div style="display:flex;gap:8px"><input id="roomTitle" maxlength="24" placeholder="房间名（留空自动命名）" value="${esc(L.title || '')}" style="${inp};flex:1;min-width:0"><button class="btn small ghost" data-a="create">创建并进入</button><button class="btn small" data-a="quick">快速加入</button></div>
+              <div>建房 / 加入</div>
+              <div style="display:flex;gap:8px"><input id="roomTitle" maxlength="24" placeholder="房间名（可留空）" value="${esc(L.title || '')}" style="${inp};flex:1;min-width:0"><button class="btn small" data-a="create">创建房间</button><button class="btn small ghost" data-a="quick">快速加入</button></div>
+              <div>地图</div>${seg('segMap', MP_MAPS.map(m => m.id), MP_MAPS.map(m => m.name), L.map)}
+              <div>模式</div>${seg('segMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), this.onlineMode())}
+              <div>时长</div>${seg('segMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), L.minutes)}
+              <div class="note-wide" id="lbErr"></div>
             </div></div>
+          </div>
+          <div class="lobby-col lb-right">
+            <div class="panel" id="idPanel"></div>
             <div class="panel">
               <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备</div>
               <div style="display:flex;justify-content:space-between;align-items:center">
-                <div><div style="font-size:20px;font-weight:800">${esc(cls.name)}</div><div style="font-size:12px;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name} · ${cls.perks.map(id => this.perk(id).name).join(' / ')}</div></div>
+                <div><div style="font-size:18px;font-weight:800">${esc(cls.name)}</div><div style="font-size:12px;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name}</div></div>
                 <button class="btn small ghost" data-a="loadout">编辑</button>
               </div>
             </div>
-          </div>
-          <!-- 右列放"进场参数"：身份状态卡 + 阵营。注册/登录不在这儿（那是上一层"闸"的事）。
-               旧版这里是一整块账号面板（三种形态，"要账号"那支实测 264 px 高），和房间列表
-               同屏时总高把底部按钮顶出 1280×720 视口；拆掉表单之后右列只剩状态卡 + 阵营，
-               那个高度问题连同"两个焦点"一起消失。 -->
-          <div class="lobby-col" style="flex:1;max-width:430px">
-            <div class="panel"><div class="opts">
-              <div>阵营</div>
-              <div class="seg" id="onTeam"><div data-v="A" class="${L.team === 'B' ? '' : 'sel'}">A 队</div><div data-v="B" class="${L.team === 'B' ? 'sel' : ''}">B 队</div></div>
-              <div class="note-wide">地图与模式由服务器决定。</div>
-            </div></div>
-            <div class="panel" id="idPanel"></div>
-            <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button></div>
+            ${this.chatPanel('lobby', '全服频道')}
+            <div class="lobby-foot"><button class="btn ghost" data-a="back">返回主菜单</button></div>
           </div>
         </div>
       </div>`, 'solid', 'online');
-    r.querySelectorAll('#onTeam div').forEach(d => d.addEventListener('click', () => {
-      L.team = d.dataset.v; r.querySelectorAll('#onTeam div').forEach(x => x.classList.toggle('sel', x === d));
-    }));
-    this.on(r, '[data-a=back]', () => this.showMain());
+    r.querySelectorAll('.seg').forEach(sg => sg.querySelectorAll('div').forEach(d => d.addEventListener('click', () => {
+      const key = sg.id === 'segMap' ? 'map' : sg.id === 'segMode' ? 'mode' : 'minutes';
+      L[key] = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
+      sg.querySelectorAll('div').forEach(x => x.classList.toggle('sel', x === d));
+    })));
+    this.on(r, '[data-a=back]', () => this.leaveOnline());
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('online'));
-    this.on(r, '[data-a=refresh]', () => this.renderRoomList(r, L));
-    this.on(r, '[data-a=quick]', () => this.joinOnline(L, {}));
-    this.on(r, '[data-a=create]', () => {
-      const title = String((r.querySelector('#roomTitle') || {}).value || '').trim().slice(0, 24);
-      L.title = title;
-      // 房名不是房号：房号白名单是 [A-Za-z0-9_.-]（见服务端 pickRoom），中文房名直接当房号会被
-      // 清洗成空串、退化成 auto —— 症状是"建了个房，人却进了别人的房间"，而且不报错。
-      // 所以房名整个都是安全字符时拿它当房号（还能当深链），否则另生成房号、房名只做显示。
-      const safe = title.replace(/[^A-Za-z0-9_.-]/g, '');
-      const id = (safe && safe === title) ? title.slice(0, 32) : ('r' + Date.now().toString(36));
-      this.joinOnline(L, { room: id, title });
-    });
+    this.on(r, '[data-a=quick]', () => this.onlineQuick());
+    this.on(r, '[data-a=create]', () => this.onlineCreate());
+    this.bindChat(r, 'lobby');
     this.renderIdentity(r, L);
-    this.renderRoomList(r, L);
+    this.renderRooms();
+    this.renderChat(r, 'lobby');
+    // 连接是这条路的入口：进不来就把原因写在这一屏上（而不是把人踢回主菜单 ——
+    // 他什么都不知道，只会以为"这按钮点了没用"）。
+    this.game.onlineLobby().then(() => { this.syncLobbyName(); }).catch(e => this.lobbyNote(r, '连不上大厅：' + (e && e.message || e)));
+  }
+
+  // 建房 / 快速加入：两条都是"进一间等待中的房"，区别只在于房号与设置归谁定。
+  // 房名与房号是两格（中文房名当房号会被服务端洗成空串 → 悄悄进别人的房），
+  // 所以房名安全字符时才拿它当房号，否则另生成一个。
+  // 建房帧里的模式：夹到服务端兑现得了的那几个。this.lobby 那一格是单人对战与联机共用的
+  // （map 也是），在单人里选了「占领」再过来建房，不夹这一句就会把「占领」发出去、
+  // 换回一条玩家在联机界面上无从解释的拒绝。这里刻意不改 L.mode —— 那是别人的偏好，
+  // 玩家回到单人对战时理应当看见他上次选的那个。
+  onlineMode() { const m = this.lobby.mode; return ONLINE_MODES.some(x => x.id === m) ? m : ONLINE_MODES[0].id; }
+  onlineCreate() {
+    const L = this.lobby, lb = this.game.lobby;
+    if (!lb) return;
+    const title = String((this.el.querySelector('#roomTitle') || {}).value || '').trim().slice(0, 24);
+    L.title = title;
+    this.syncLobbyName();
+    const safe = title.replace(/[^A-Za-z0-9_.-]/g, '');
+    const room = (safe && safe === title) ? title.slice(0, 32) : ('r' + Date.now().toString(36).slice(-6));
+    lb.createRoom({ room, title, map: L.map, mode: this.onlineMode(), minutes: L.minutes });
+    this.game.showRoomSoon();
+  }
+  onlineQuick() {
+    const lb = this.game.lobby; if (!lb) return;
+    this.syncLobbyName();
+    lb.quickRoom({ title: '', map: this.lobby.map, mode: this.onlineMode(), minutes: this.lobby.minutes });
+    this.game.showRoomSoon();
+  }
+  onlineJoin(room, title) {
+    const lb = this.game.lobby; if (!lb) return;
+    this.syncLobbyName();
+    lb.joinRoom(room);
+    this.game.showRoomSoon();
+  }
+  // 呼号：要账号的服上它是服务端给的（renderIdentity 那一格只显示、不填），
+  // 访客可玩的服上它是这一局的显示名。两种情况都盖到 LobbyClient 身上，
+  // 因为"我叫什么"只有服务端说了算的那一份 —— 客户端这里只是个副本。
+  syncLobbyName() {
+    const lb = this.game.lobby; if (!lb) return;
+    const el = this.el.querySelector('#onName');
+    if (el) this.lobby.name = String(el.value || '').trim().slice(0, 16) || this.lobby.name;
+    lb.name = this.game.account.loggedIn ? (this.game.account.user || {}).name || lb.name : this.lobby.name;
+  }
+  lobbyNote(root, msg) {
+    const n = root && root.querySelector('#lbNote');
+    if (n) n.textContent = msg;
+  }
+  // 列表画的是**服务端推来的那一份**（game.lobby.rooms）。空表有两种完全不同的意思
+  // —— "还没连上"和"连上了但没人建房"，所以文案分开写，别都写成"暂无房间"。
+  renderRooms() {
+    const rows = this.el.querySelector('#lbRows');
+    if (!rows || this.screen !== 'online') return;
+    const lb = this.game.lobby;
+    const note = this.el.querySelector('#lbNote'), on = this.el.querySelector('#lbOnline');
+    if (on) on.textContent = lb ? String(lb.online) : '—';
+    if (!lb || !lb.connected) { rows.innerHTML = '<div class="note-wide">正在进入大厅…</div>'; return; }
+    const list = lb.rooms || [];
+    if (note) note.textContent = list.length + ' 间';
+    if (!list.length) { rows.innerHTML = '<div class="note-wide">还没有房间 · 起一间，或点快速加入</div>'; return; }
+    rows.innerHTML = list.map(x => {
+      const map = MP_MAPS.find(m => m.id === x.map) || { name: x.map };
+      const mode = MP_MODES.find(m => m.id === x.mode) || { name: x.mode };
+      const playing = x.state === 'playing';
+      const full = x.players >= x.max;
+      const can = !playing && !full;
+      return `<div class="room-row ${can ? '' : 'off'}">
+        <div class="rr-name">${esc(x.title)}</div>
+        <div class="rr-meta">${esc(map.name)} · ${esc(mode.name)} · ${x.time || 10} 分</div>
+        <div class="rr-n">${x.players | 0}/${x.max | 0}</div>
+        <div class="rr-state">${playing ? '对局中' : (full ? '已满' : (x.ready | 0) + ' 已准备')}</div>
+        <button class="btn small ${can ? '' : 'ghost'}" data-a="joinRow" data-room="${esc(x.id)}" ${can ? '' : 'disabled'}>${playing ? '观战不了' : '加入'}</button>
+      </div>`;
+    }).join('');
+    this.on(rows, '[data-a=joinRow]', el => { if (!el.disabled) this.onlineJoin(el.dataset.room); });
+  }
+  // 离开联机这一层：连接是这一层唯一的真相来源，回主菜单就把它拆掉。
+  // 不拆的症状是"人已经在主菜单了，聊天还在往里灌、房间里还占着一个座位"。
+  leaveOnline() {
+    const lb = this.game.lobby;
+    if (lb) { lb.close(); this.game.lobby = null; }
+    this.showMain();
+  }
+
+  // ── 聊天框（大厅与房间共用一份外壳，只是频道不同）──
+  chatPanel(ch, label) {
+    const id = ch === 'lobby' ? 'lbChat' : 'rmChat';
+    const inp = ch === 'lobby' ? 'lbSay' : 'rmSay';
+    return `<div class="panel chat-box">
+      <div class="lb-hd"><span>${esc(label)}</span></div>
+      <div id="${id}" class="chat-lines"></div>
+      <div class="chat-in"><input id="${inp}" maxlength="120" placeholder="说点什么…" autocomplete="off"><button class="btn small ghost" data-a="say">发送</button></div>
+    </div>`;
+  }
+  bindChat(root, ch) {
+    const box = root.querySelector(ch === 'lobby' ? '#lbChat' : '#rmChat');
+    if (!box) return;
+    const inp = root.querySelector(ch === 'lobby' ? '#lbSay' : '#rmSay');
+    const btn = box.parentElement.querySelector('[data-a=say]');
+    const fire = () => {
+      const lb = this.game.lobby; if (!lb) return;
+      const v = String(inp.value || '');
+      if (!v.trim()) return;
+      lb.say(ch, v);
+      inp.value = '';
+    };
+    if (btn) btn.addEventListener('click', fire);
+    // 回车发送、Esc 只关这个输入框 —— 菜单屏上的输入框拿到焦点时，那些按键
+    // 不该再被游戏那套快捷键接走（Tab 的 preventDefault 在 main.js 里，见它那段）。
+    if (inp) inp.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); fire(); }
+    });
+  }
+  // 聊天行**只往容器里追加**，不整块重画：重画会把人正打到一半的输入框和滚动位置一起抹掉。
+  renderChat(root, ch) {
+    const box = root.querySelector(ch === 'lobby' ? '#lbChat' : '#rmChat');
+    if (!box) return;
+    const lb = this.game.lobby;
+    const rows = ch === 'lobby' ? (lb ? lb.chat : []) : ((lb && lb.state && lb.state.chat) || []);
+    box.innerHTML = rows.slice(-40).map(x => this.chatLine(x)).join('');
+    box.scrollTop = box.scrollHeight;
+  }
+  chatLine(x) {
+    if (x.sys) return `<div class="chat-line sys">${esc(x.text)}</div>`;
+    const mine = this.game.lobby && x.from && x.from === (this.game.lobby.state && this.game.lobby.state.me && this.game.lobby.state.me.name);
+    return `<div class="chat-line"><b class="${mine ? 'me' : ''}">${esc(x.from || x.name || '')}</b><span>${esc(x.text || '')}</span></div>`;
+  }
+  pushChat(root, ch, row) {
+    const box = root.querySelector(ch === 'lobby' ? '#lbChat' : '#rmChat');
+    if (!box) return;
+    box.insertAdjacentHTML('beforeend', this.chatLine(row));
+    while (box.children.length > 40) box.removeChild(box.firstChild);
+    box.scrollTop = box.scrollHeight;
+  }
+  // 服务端那句拒绝画在**当前那一屏**上。它不翻译、不复述（和注册闸同一个规矩）：
+  // "邀请码不对"和"服务器忙"如果被揉成同一句"失败了"，服主永远收不到真问题。
+  onlineError(msg) {
+    // 正在进房的那一层是"加载"屏，它没有地方画这句话 —— 不先退回大厅，人就会被
+    // 永久卡在"正在进房…"上（拒绝恰恰是最需要让人看见的一种结果）。
+    if (this.game._wantRoom) { this.game._wantRoom = false; this.showOnlineLobby(); }
+    const el = this.el.querySelector(this.screen === 'onlineRoom' ? '#rmErr' : '#lbErr');
+    if (el) { el.textContent = msg || ''; clearTimeout(this._errT); this._errT = setTimeout(() => { el.textContent = ''; }, 6000); }
+  }
+  // ── 联机第四层：房间 ──
+  // 这一屏只干一件事：凑人、准备、由房主按下开始。
+  // 界面**不自己判**"能不能开始" —— canStart/why 是服务端算好随状态一起推过来的那一格。
+  // 两边各判一次的版本必然会对不上（按钮能点而服务端说不能开，或反过来永远点不动），
+  // 而对不上的症状又是一句不报错的"点了没反应"。
+  showOnlineRoom() {
+    const lb = this.game.lobby, st = lb && lb.state;
+    if (!st || !st.me) { this.showOnlineLobby(); return; }      // 不在任何房里就别画房间
+    this.setCam('lobby');
+    const r = this.render(`
+      <div class="lobby rm">
+        <div class="hdr"><span id="rmTitle">房间</span><small id="rmMeta"></small></div>
+        <div class="lobby-body">
+          <div class="lobby-col team-col">
+            <div class="team-hd">A 队<span id="nA" class="th-n"></span></div>
+            <div id="seatA" class="seats"></div>
+            <button class="btn small ghost" data-a="toA">换到 A 队</button>
+          </div>
+          <div class="lobby-col rm-mid">
+            <div class="panel" id="rmCfg"></div>
+            ${this.chatPanel('room', '房间频道')}
+            <div class="note-wide" id="rmErr"></div>
+          </div>
+          <div class="lobby-col team-col">
+            <div class="team-hd b">B 队<span id="nB" class="th-n"></span></div>
+            <div id="seatB" class="seats"></div>
+            <button class="btn small ghost" data-a="toB">换到 B 队</button>
+          </div>
+        </div>
+        <div class="rm-foot">
+          <button class="btn ghost" data-a="leave">离开房间</button>
+          <button class="btn ghost" data-a="loadout">编辑配装</button>
+          <button class="btn" data-a="ready">准备</button>
+          <button class="btn go" data-a="start">开始游戏</button>
+          <span id="rmWhy"></span>
+        </div>
+      </div>`, 'solid', 'onlineRoom');
+    this.on(r, '[data-a=leave]', () => this.roomLeave());
+    this.on(r, '[data-a=loadout]', () => this.showLoadouts('onlineRoom'));
+    this.on(r, '[data-a=ready]', () => this.roomReady());
+    this.on(r, '[data-a=start]', () => { const l = this.game.lobby; if (l) l.start(); });
+    this.on(r, '[data-a=toA]', () => this.roomTeam('A'));
+    this.on(r, '[data-a=toB]', () => this.roomTeam('B'));
+    this.bindChat(r, 'room');
+    this.renderRoom();
+    this.renderChat(r, 'room');
+    // 回到这一屏时把当前配装再交一次：很可能是刚从"编辑装备"回来的，而服务端只在
+    // 开局那一刻读座位上的那一份（少这一句的症状就是"改了枪没带上"）。
+    if (lb && lb.state && lb.state.me) lb.ready(!!lb.state.me.ready);
+  }
+  // 服务端一推新状态就重画这一屏。**只改文字与按钮**，不重建整棵子树 ——
+  // 重建会把聊天输入框里打到一半的字和滚动位置一起抹掉（那正是"打字时被顶回去"）。
+  renderRoom() {
+    const lb = this.game.lobby, st = lb && lb.state;
+    if (!st || this.screen !== 'onlineRoom') return;
+    const room = st.room || {}, me = st.me || {}, seats = st.seats || [];
+    const map = MP_MAPS.find(m => m.id === room.map) || { name: room.map };
+    const mode = MP_MODES.find(m => m.id === room.mode) || { name: room.mode };
+    const playing = room.state === 'playing';
+    const t = this.el.querySelector('#rmTitle'); if (t) t.textContent = room.title || room.id;
+    const mt = this.el.querySelector('#rmMeta');
+    if (mt) mt.textContent = `${map.name} · ${mode.name} · ${room.time || 10} 分 · ${seats.length}/${room.max || 16} 人 · 房主 ${room.host || '—'}`;
+    const per = Math.max(2, Math.floor((room.max || 16) / 2));
+    const row = (s) => `<div class="seat ${s.ready ? 'rd' : ''} ${s.isHost ? 'host' : ''}">
+      <span class="s-tag">${s.isHost ? '房主' : (s.ready ? '✔' : '·')}</span>
+      <span class="s-name">${esc(s.name)}</span>
+      <span class="s-lv">${s.xp ? 'Lv ' + (levelOf(s.xp)) : ''}</span>
+      <span class="s-st">${s.isHost ? '随时可开' : (s.ready ? '已准备' : '等待中')}</span>
+    </div>`;
+    const blank = () => '<div class="seat empty"><span class="s-tag">·</span><span class="s-name">空位</span><span class="s-st"></span></div>';
+    for (const team of ['A', 'B']) {
+      const box = this.el.querySelector(team === 'A' ? '#seatA' : '#seatB');
+      const list = seats.filter(s => s.team === team);
+      const n = this.el.querySelector(team === 'A' ? '#nA' : '#nB');
+      if (n) n.textContent = `${list.length}/${per}`;
+      if (box) box.innerHTML = list.map(row).join('') + blank().repeat(Math.max(0, Math.min(per, Math.max(3, list.length + 1)) - list.length));
+    }
+    const rb = this.el.querySelector('[data-a=ready]');
+    if (rb) {
+      const hide = me.isHost || playing;
+      rb.style.display = hide ? 'none' : '';
+      rb.textContent = me.ready ? '取消准备' : '准备';
+    }
+    const sb = this.el.querySelector('[data-a=start]');
+    if (sb) {
+      sb.style.display = me.isHost ? '' : 'none';
+      sb.disabled = !st.canStart || playing;
+      sb.style.opacity = sb.disabled ? .45 : 1;
+      sb.textContent = playing ? '对局进行中…' : '开始游戏';
+    }
+    const why = this.el.querySelector('#rmWhy');
+    if (why) why.textContent = playing ? '所有人已进入对局。' : (me.isHost ? (st.canStart ? '人都准备好了，可以开始。' : st.why || '') : (me.ready ? '已准备，等房主开始。' : st.why || '还没准备。'));
+    // 房主改设置那一格：非房主只读（改了也不会生效，摆成能编辑的样子就是骗人）。
+    const cfg = this.el.querySelector('#rmCfg');
+    if (cfg) {
+      const seg = (id, vals, labels, cur, dis) => `<div class="seg ${dis ? 'dis' : ''}" id="${id}">${vals.map((v, i) => `<div data-v="${v}" class="${cur == v ? 'sel' : ''}" data-dis="${dis ? 1 : 0}">${labels ? labels[i] : v}</div>`).join('')}</div>`;
+      // 三行"标签 + 选择器"，不用 .opts 那个 110px 标签列的两列网格：那一列是给
+      // 大厅那种宽栏设计的，塞进房间中间这一栏（约 300 px）之后四张地图名被挤成竖排单字。
+      const row = (label, id, vals, labels, cur) => `<div class="cfg-row"><span>${label}</span>${seg(id, vals, labels, cur, !me.isHost || playing)}</div>`;
+      cfg.innerHTML = `<div class="lb-hd"><span>${me.isHost ? '房间设置' : '本局设置'}</span><span>${me.isHost ? '改动立刻随列表广播' : '由房主决定'}</span></div>`
+        + row('地图', 'rmMap', MP_MAPS.map(m => m.id), MP_MAPS.map(m => m.name), room.map)
+        // 只有一种玩法可选时不画选择器：一个撑满整行的亮块看着像"还能点出别的"，
+        // 而它其实是一句陈述。id 两边同名，判据不必跟着形状改。
+        + (ONLINE_MODES.length > 1
+          ? row('模式', 'rmMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), room.mode)
+          : `<div class="cfg-row"><span>模式</span><div class="cfg-one" id="rmMode">${esc(mode.name)}</div></div>`)
+        + row('时长', 'rmMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), room.time || 10);
+      cfg.querySelectorAll('.seg div[data-dis="0"]').forEach(d => d.addEventListener('click', () => {
+        const sg = d.parentElement, v = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
+        const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : 'minutes';
+        if (this.game.lobby) this.game.lobby.setCfg({ [key]: v });
+      }));
+    }
+  }
+  roomReady() {
+    const lb = this.game.lobby, st = lb && lb.state; if (!st || !st.me) return;
+    if (lb) lb.ready(!st.me.ready);
+  }
+  roomTeam(team) {
+    const lb = this.game.lobby; if (lb) lb.setTeam(team);
+  }
+  roomLeave() {
+    const lb = this.game.lobby; if (lb) lb.leaveRoom();
+    this.game._wantRoom = false;
+    this.showOnlineLobby();
   }
 
   // 主菜单上"联网对战"那一项的锁标。规则：**未完成注册前联网对战不开放** ——
@@ -491,80 +760,6 @@ export class Menu {
     const md = btn.querySelector('.md');
     // 锁态与开放态的差别只在"多一道前置"，后半句保持不变 —— 一眼能看出锁的是注册这件事。
     if (md) md.textContent = locked ? '🔒 需注册 · 真人在线对局' : '真人在线对局';
-  }
-
-  // 进对局 URL 的**唯一**拼装点（列表里每行的"加入" / 快速加入 / 创建并进入共用）。
-  // 抽成纯函数是因为"没选房间时不塞 room="这条判据要能不点按钮就量到 ——
-  // 真点一下是整页导航，判据只能看见结果页，看不见拼装那一刻（"按钮没接线"和
-  // "接了线但参数拼错了"两种失效，在结果页上是同一副长相）。
-  //   · room 为空 = 服务端 fill-first 自动分配（pickRoom 的 'auto'），URL 里就不带 room=；
-  //   · title 只在建房时带，它**不是房号**，只进显示名那一格（服务端 cleanTitle 再洗一遍）；
-  //   · name 只在访客可玩的服上带：要账号时呼号由会话决定，带上反而暗示这一格有用
-  //     （访客模式下**没有会话可依**，自报呼号是唯一来源；规则仍只在服务端一处）。
-  onlineJoinParams({ room = '', title = '', team = 'A', name = '', guest = false }) {
-    const q = new URLSearchParams({ online: '1', team: team === 'B' ? 'B' : 'A' });
-    if (guest) q.set('name', name || '士兵');
-    if (room) { q.set('room', room); if (title) q.set('title', title); }
-    return q;
-  }
-
-  // 进对局的唯一出口。未完成注册前它**不放行**（要账号的服上）—— 这只是省掉一次
-  // 白跑的页面跳转（服务端照样会在握手那一刻 401），不是权限所在处。
-  joinOnline(L, { room = '', title = '' } = {}) {
-    const A = this.game.account;
-    // 层级：身份没办就回闸（这不只是省掉一次白跑 —— 大厅本来就不该给没身份的人看见）
-    if (A.requireAccount && !A.loggedIn) { this.showOnlineGate(); return; }
-    // 呼号框：访客可玩时它是**这一局的显示名**；要账号时服务端从会话取呼号，
-    // 那一格此时只是重画时的记忆。两种情况都记下来，免得切回去时丢了。
-    const nameEl = this.el.querySelector('#onName');
-    if (nameEl) L.name = String(nameEl.value || '').trim() || L.name;
-    L.room = room || '';
-    const q = this.onlineJoinParams({ room, title, team: L.team, name: L.name, guest: !A.requireAccount });
-    this.showLoadingOverlay('正在进入对局…');
-    location.href = location.pathname + '?' + q.toString();
-  }
-
-  // 房间列表区。**没有"未注册"形态** —— 那一层是"闸"的职责（screen='onlineGate'），
-  // 能走到这里的人一定已经有身份（showOnlineLobby 的守卫 + 下面这行兜底）。
-  // 这里只做一件事：拉 /api/rooms、画房间行。服务端对没会话的请求照样 401
-  // （见 server/http-api.mjs）—— 那道闸没动，改客户端也绕不过去。
-  renderRoomList(root, L) {
-    const rows = root.querySelector('#roomRows');
-    const note = root.querySelector('#roomNote');
-    if (!rows) return;
-    const A = this.game.account;
-    if (A.requireAccount && !A.loggedIn) { this.showOnlineGate(); return; }   // 兜底：身份没了回闸
-    rows.innerHTML = '<div class="note-wide">正在载入房间列表…</div>';
-    A.rooms().then(r => {
-      if (this.screen !== 'online') return;          // 用户已离开这一页，别把行画到别的屏上
-      if (!r.ok) {
-        rows.innerHTML = `<div class="note-wide">房间列表读取失败：${esc(r.message || ('服务器返回 ' + r.status))}</div>`;
-        return;
-      }
-      const list = r.data.rooms || [];
-      if (note) note.textContent = `${list.length} 个房间`;
-      if (!list.length) {
-        rows.innerHTML = '<div class="note-wide">暂无房间 · 可快速加入或新建</div>';
-        return;
-      }
-      rows.innerHTML = list.map(x => {
-        const map = MP_MAPS.find(m => m.id === x.map) || { name: x.map };
-        const mode = MP_MODES.find(m => m.id === x.mode) || { name: x.mode };
-        return `<div class="room-row" data-room="${esc(x.id)}">
-          <div class="rr-name">${esc(x.title || x.id)}</div>
-          <div class="rr-meta">${esc(map.name)} · ${esc(mode.name)}</div>
-          <div class="rr-n">${x.players | 0} 人</div>
-          <div class="rr-state">${x.players ? '对战中' : '等待中'}</div>
-          <button class="btn small" data-a="joinRow" data-room="${esc(x.id)}" data-title="${esc(x.title || '')}">加入</button>
-        </div>`;
-      }).join('');
-      // 行内"加入"带的 title 是**显示名**；它和房号相等时（没起名的房）不带，
-      // 免得一路把"显示名 = 房号"传到服务端再存回来（那是把兜底值当成了用户输入）。
-      this.on(rows, '[data-a=joinRow]', el => this.joinOnline(L, {
-        room: el.dataset.room,
-        title: el.dataset.title === el.dataset.room ? '' : el.dataset.title,
-      }));
-    });
   }
 
   acctMsg(root, text) {
@@ -599,6 +794,11 @@ export class Menu {
         <div class="note-wide">数据保存在服务器。</div>
       </div>`;
       this.on(box, '[data-a=logout]', async () => {
+        // 连接要跟着身份一起断：它是**握手那一刻验过会话**才建立的，登出之后还留着，
+        // 这人就一边"已经登出"一边继续收全服聊天、继续在房间里占一个座位。
+        // 关掉的代价只是回大厅时重连一次（onlineLobby 自己会重建）。
+        if (this.game.lobby) { this.game.lobby.close(); this.game.lobby = null; }
+        this.game._wantRoom = false;
         await A.logout();
         this.showOnlineGate();   // 层级：身份没了就回闸 —— 大厅不给没身份的人看
       });
@@ -667,7 +867,7 @@ export class Menu {
     this.on(r, '[data-p=tactical]', () => this.pickSimple(ci, 'tactical'));
     this.on(r, '[data-p=perks]', () => this.pickPerks(ci));
     this.on(r, '[data-p=streaks]', () => this.pickStreaks());
-    this.on(r, '[data-a=back]', () => { if (this.loadoutFrom === 'lobby') this.showLobby(); else if (this.loadoutFrom === 'online') this.showOnlineLobby(); else if (this.loadoutFrom === 'pause') this.showPause(); else this.showMain(); });
+    this.on(r, '[data-a=back]', () => { if (this.loadoutFrom === 'lobby') this.showLobby(); else if (this.loadoutFrom === 'online' || this.loadoutFrom === 'onlineRoom') this.showOnlineLobby(); else if (this.loadoutFrom === 'pause') this.showPause(); else this.showMain(); });
   }
   picker(title, sub, inner, onBack) {
     const scr = this.el.firstChild;

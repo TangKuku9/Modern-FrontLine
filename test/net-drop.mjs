@@ -285,90 +285,136 @@ try {
     srv.kill();
   }
   if (!skip('E')) {
-    console.log('\n── E：联机入口在菜单里 —— 房间列表，不用手打网址 ──');
-    // 联机的代码早就在了，但要玩家自己敲 ?online=1&room=… 才算真的有这个模式吗？不算。
-    // 这一段就从主菜单开始用鼠标点：联网对战 →（访客服直接进）房间列表大厅 → 填房名建一间 →
-    // 进局内，再回头查 /api/rooms —— 大厅那张列表必须和服务端的清单是同一份东西。
-    // 先收掉前面几段的页面：这一段是唯一要点鼠标的，而"6 个画布页同时软件渲染"会让
-    // Playwright 的点击派发卡住 —— 读数与排除过程见文件开头 closeOpened() 的注释。
+    console.log('\n── E：联机的层级 —— 大厅 → 房间（准备 / 房主开始）→ 对局 → 回房间 ──');
+    // 这一整段走的是 CF 那条路，而且**全程不换页**：一条 WebSocket 从大厅一路带到对局。
+    // 一局压到 25 秒（MATCH_SECONDS）、打完当场回房（MATCH_RETURN_MS=0）—— 不压这两格，
+    // "局末回房间"要真等十分钟才验得到，而它恰好是新增的那条"到点也判结束"
+    // （server/room.mjs 每秒那次 checkEnd）唯一的症状级证据。
     await closeOpened();
-    const srv = await withServer(GUEST);
-    // 视口给成玩家真会用的大小：480×270 是其余几段为了软件渲染快用的，那种尺寸下
-    // 菜单本来就滚不到按钮，拿它来点"加入对局"只会量到视口，量不到入口。
-    const { page, logs } = await newPage(browser, srv, 'menu-e', null, '', { width: 1280, height: 720 });
-    for (let i = 0; i < 200; i++) {
-      const ready = await page.evaluate(() => !!(window.game && window.game.menu && window.game.menu.el && window.game.menu.el.querySelector('[data-a=online]')));
-      if (ready) break;
-      await sleep(250);
-    }
-    const hasEntry = await page.evaluate(() => !!document.querySelector('[data-a=online]'));
-    ok('主菜单上有"联网对战"这一项（不是只能靠 ?online=1 的隐藏入口）', hasEntry);
-    // 先决：这一页还答得上话。没有它的话，"按钮点不动"与"页面自己卡住了"分不开 ——
-    // 而这两件事一个是入口坏了、一个是我们自己的量具在重载下失效（上次的红就属于后者）。
-    await page.bringToFront();
-    const t0 = Date.now();
-    await page.evaluate(() => 1);
-    const rt = Date.now() - t0;
-    ok('先决：E 页还答得上话（卡死的页面上"点不动"归因不到入口）', rt < 500, `evaluate 往返 ${rt} ms`);
-    await page.click('[data-a=online]');
-    // 层级路由要等策略回来才落定（访客服直接进大厅；策略未知时先过一拍"正在进入联网对战…"）
-    let form = null;
-    for (let i = 0; i < 40; i++) {
-      form = await page.evaluate(() => ({
-        rows: !!document.querySelector('#roomRows'), quick: !!document.querySelector('[data-a=quick]'),
-        create: !!document.querySelector('[data-a=create]'), refresh: !!document.querySelector('[data-a=refresh]'),
-        title: !!document.querySelector('#roomTitle'),
-        name: !!document.querySelector('#onName'), team: document.querySelectorAll('#onTeam div').length,
-        gate: !!document.querySelector('#acctPw'),
-        screen: (window.game.menu || {}).screen,
-      }));
-      if (form.screen === 'online') break;
-      await sleep(250);
-    }
-    ok('联网大厅是房间列表：列表区 + 刷新 + 创建并进入 + 快速加入，阵营/呼号还在',
-      form.rows && form.quick && form.create && form.refresh && form.title && form.name && form.team === 2 && form.screen === 'online', JSON.stringify(form));
-    ok('层级：访客可玩的服**跳过注册页**，直接进大厅（反证臂 —— 要账号的服才过闸，见 F 段）',
-      form.screen === 'online' && !form.gate, JSON.stringify(form));
-    ok('反证：光是站在大厅里还没连服务器（进了大厅不等于已经进场）',
-      await page.evaluate(() => !window.game.net || !window.game.net.connected), '');
-    // 进对局 URL 的拼装是纯函数（menu.onlineJoinParams）：两条都能**不点按钮**就量到 ——
-    // 真点一下是整页导航，"没塞 room="这件事到了结果页上已经看不见了，
-    // 而"按钮没接线"和"接了线但参数拼错"在结果页上是同一副长相。
-    const urls = await page.evaluate(() => ({
-      auto: String(window.game.menu.onlineJoinParams({ room: '', title: '', team: 'A', name: '士兵', guest: true })),
-      created: String(window.game.menu.onlineJoinParams({ room: 'r1a2b3', title: '菜单甲的房', team: 'B', name: '菜单甲', guest: true })),
-    }));
-    ok('没选房间时 URL 不带 room=（让服务端去做 fill-first 分配）', !/room=/.test(urls.auto), urls.auto);
-    ok('建房时 URL 带 room= 与 title=（房名是显示名，不是房号）',
-      /room=r1a2b3/.test(urls.created) && /title=/.test(urls.created), urls.created);
-    // 真点一次"创建并进入"：按钮要真的把人送进局内（"按钮存在" ≠ "接线了"）
-    // 呼号框照旧要填（访客服上它是这一局的显示名）—— 判据"呼号带进去了"量的就是这一步的接线。
-    await page.fill('#onName', '菜单甲');
-    await page.fill('#roomTitle', '菜单甲的房');
-    await page.click('#onTeam div[data-v="B"]');
-    await page.click('[data-a=create]');
-    let landed = null;
-    for (let i = 0; i < 200; i++) {
-      landed = await page.evaluate(() => {
-        const g = window.game, n = g && g.net;
-        return { url: location.search, cid: n && n.cid, team: n && n.team, name: n && n.name, state: g && g.state, snaps: n && n.snaps };
-      });
-      if (landed.cid && landed.snaps > 3) break;
-      await sleep(250);
-    }
-    ok('点"创建并进入"之后真的换页进了局内（拿到 cid 且在收快照，URL 带 room= 与 title=）',
-      /online=1/.test(landed.url) && /room=/.test(landed.url) && /title=/.test(landed.url) && !!landed.cid && landed.snaps > 3, JSON.stringify(landed).slice(0, 150));
-    ok('大厅里选的阵营带进了对局（B 队不是写在表单上就完事）', landed.team === 'B', 'team=' + landed.team + ' url=' + landed.url);
-    ok('呼号带进去了（服务端按白名单收 2~16 字，中文不该被截坏）', landed.name === '菜单甲', JSON.stringify(landed.name));
-    // 大厅那张列表必须和服务端的清单是**同一份东西** —— 进房之后反过来查 /api/rooms：
-    // 刚建的那间（title=菜单甲的房）要在清单里，人数是活的。画一张假列表也能"看起来有房间"。
-    const rooms = await page.evaluate(() => fetch('/api/rooms').then(r => r.json()).catch(e => ({ ok: false, err: String(e) })));
-    const mine = (rooms.rooms || []).find(x => x.title === '菜单甲的房');
-    ok('进房之后 /api/rooms 里看得见这间房（title 透出、人数是活的）',
-      !!mine && mine.players >= 1, JSON.stringify(mine || rooms).slice(0, 150));
-    ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
+    const srv = await withServer({ ...GUEST, MATCH_SECONDS: '25', MATCH_RETURN_MS: '0' });
+    const V = { width: 1280, height: 720 };
+    const A = await newPage(browser, srv, 'lobby-a', null, '', V);
+    const B = await newPage(browser, srv, 'lobby-b', null, '', V);
+    const a = A.page, b = B.page;
+    // arg 必须显式传进页面：page.evaluate 只带走这个函数本身，带不走它的闭包。
+    // 引用了外层变量的那一版会在页面里抛 ReferenceError，而下面的 .catch(() => null) 把它
+    // 咽成"条件还没满足" —— 症状就是"轮询到超时、一条错误都没有"，最难查的那种红。
+    const wait = async (page, fn, ms = 30000, arg = undefined) => {
+      const t0 = Date.now();
+      for (;;) {
+        const v = await page.evaluate(fn, arg).catch(() => null);
+        if (v) return v;
+        if (Date.now() - t0 > ms) return null;
+        await sleep(250);
+      }
+    };
+    let hall = null;
+    for (let i = 0; i < 200; i++) { if (await a.evaluate(() => !!document.querySelector('[data-a=online]'))) break; await sleep(250); }
+    ok('主菜单上有"联网对战"这一项（不是只能靠 ?online=1 的隐藏入口）', await a.evaluate(() => !!document.querySelector('[data-a=online]')));
+    await a.bringToFront();
+    await a.click('[data-a=online]');
+    ok("点进去落在**大厅**：房间列表 + 全服频道 + 建房/快速加入，且这一屏没有注册表单",
+      !!(hall = await wait(a, () => {
+        const f = { s: (window.game.menu || {}).screen, rows: !!document.querySelector("#lbRows"), chat: !!document.querySelector("#lbChat"),
+          create: !!document.querySelector("[data-a=create]"), quick: !!document.querySelector("[data-a=quick]"),
+          name: !!document.querySelector("#onName"), gate: !!document.querySelector("#acctPw") };
+        return f.s === "online" && f.rows && f.chat && f.create && f.quick && f.name && !f.gate ? f : null;
+      })), JSON.stringify(hall));
+    ok('反证：光是站在大厅里还没连上服务器（进了大厅不等于已经进场）',
+      await a.evaluate(() => !window.game.net || !window.game.net.connected));
+    // 模式那一格是**承诺**：列表里别人按它挑房。服务端没有据点、也没有占领得分的时候，
+    // 界面上给出「占领」就等于摆了一格点了会 0:0 打到时间耗尽的玩法（判据见 test/room-flow H 段）。
+    ok('建房屏的模式选择器里只有服务端判得了胜负的玩法（没有占领 / 自由混战）',
+      await a.evaluate(() => { const s = document.querySelector('#segMode');
+        return !!s && /团队死斗/.test(s.textContent) && !/占领|混战/.test(s.textContent); }),
+      await a.evaluate(() => (document.querySelector('#segMode') || {}).textContent));
+    await a.screenshot({ path: 'test/lobby-hall.png' });
+    await a.fill('#onName', '菜单甲');
+    await a.fill('#lbSay', '有人一起玩吗');
+    await a.press('#lbSay', 'Enter');
+    await a.fill('#roomTitle', 'midnight');
+    await a.click('#segMap div[data-v=frost]');
+    await a.click('[data-a=create]');
+    ok('建房之后落在**房间屏**：两队座位栏 + 房间频道 + 底部三个动作',
+      !!(await wait(a, () => (window.game.menu || {}).screen === 'onlineRoom'
+        && document.querySelectorAll('#seatA .seat, #seatB .seat').length >= 2
+        && !!document.querySelector('#rmChat') && !!document.querySelector('[data-a=start]') && !!document.querySelector('[data-a=leave]'))));
+    ok('房间设置那一格里也只有判得了胜负的玩法（房主点不到的那几格不该摆出来）',
+      await a.evaluate(() => { const s = document.querySelector('#rmMode');
+        return !!s && /团队死斗/.test(s.textContent) && !/占领|混战/.test(s.textContent); }),
+      await a.evaluate(() => (document.querySelector('#rmMode') || {}).textContent));
+    ok('一个人的时候不给开局，且把原因写在按钮旁边（不是把按钮藏起来）',
+      await a.evaluate(() => { const s = document.querySelector('[data-a=start]'); return !!s && s.disabled === true && /至少/.test((document.querySelector('#rmWhy') || {}).textContent || ''); }),
+      JSON.stringify(await a.evaluate(() => ({ d: (document.querySelector('[data-a=start]') || {}).disabled, why: (document.querySelector('#rmWhy') || {}).textContent }))));
+    await a.screenshot({ path: 'test/lobby-room-solo.png' });
+
+    await b.bringToFront();
+    await b.click('[data-a=online]');
+    ok('第二个人在大厅里**看得见那间房**（房名、地图、人数是服务端推的，不是本地编的）',
+      !!(await wait(b, () => {
+        const row = (document.querySelector('#lbRows [data-room=midnight]') || {}).closest && document.querySelector('#lbRows [data-room=midnight]').closest('.room-row');
+        return row && { meta: row.querySelector('.rr-meta').textContent, n: row.querySelector('.rr-n').textContent, state: row.querySelector('.rr-state').textContent };
+      })), JSON.stringify(await b.evaluate(() => { const r = (document.querySelector('#lbRows [data-room=midnight]') || { closest: () => null }).closest('.room-row'); return r && { meta: r.querySelector('.rr-meta').textContent, n: r.querySelector('.rr-n').textContent, state: r.querySelector('.rr-state').textContent }; })));
+    ok('大厅里那个人也看得见全服频道刚说的那句', await wait(b, () => [...document.querySelectorAll('#lbChat .chat-line')].some(x => /有人一起玩吗/.test(x.textContent))));
+    await b.fill('#onName', '菜单乙');
+    await b.click('#lbRows [data-room=midnight]');
+    ok('加入之后两个人在**同一间房**里，各自数得出两个座位',
+      !!(await wait(a, () => document.querySelectorAll('#seatA .seat:not(.empty), #seatB .seat:not(.empty)').length === 2))
+      && !!(await wait(b, () => document.querySelectorAll('#seatA .seat:not(.empty), #seatB .seat:not(.empty)').length === 2)));
+    ok('服务端把人分到空着的那一队（不是两队都从 A 开始挤）',
+      await b.evaluate(() => (window.game.lobby.state.me || {}).team === 'B'), 'team=' + await b.evaluate(() => (window.game.lobby.state.me || {}).team));
+    await b.bringToFront();
+    await b.fill('#rmSay', '我来了，等一下');
+    await b.press('#rmSay', 'Enter');
+    ok('房间频道只有房里的人收得到（这句话房主那边要出现）',
+      await wait(a, () => [...document.querySelectorAll('#rmChat .chat-line')].some(x => /我来了/.test(x.textContent))));
+    await b.click('[data-a=ready]');
+    ok('第二个人点准备之后，房主那边的开始按钮当场变可点',
+      await wait(a, () => { const s = document.querySelector('[data-a=start]'); return s && s.disabled === false && /都准备好/.test((document.querySelector('#rmWhy') || {}).textContent || ''); }));
+    await a.bringToFront();
+    await a.screenshot({ path: 'test/lobby-room-both.png' });
+    // 按下开始之前先在这条连接上装一个''看客''监听器：这一句之后如果没进对局，判据要能
+    // 自己说清是**服务端没回 welcome**、**回了 err**、还是**客户端在换世界时抛了**。
+    // 少了这份现场，''没进对局''这一条红就只能靠猜（第一版就是这么连红三轮）。
+    await a.evaluate(() => {
+      window.__f = [];
+      const lb = window.game.lobby;
+      lb.ws.addEventListener('message', ev => { if (typeof ev.data === 'string') window.__f.push(ev.data.slice(0, 150)); });
+      window.addEventListener('unhandledrejection', e => window.__f.push('REJECT ' + String((e.reason && e.reason.message) || e.reason)));
+      // 再往里一层：onBegin 到底进没进、进去之后是同步抛还是异步抛。
+    });
+    await b.evaluate(() => {
+      window.__f = [];
+      const lb = window.game.lobby;
+      lb.ws.addEventListener('message', ev => { if (typeof ev.data === 'string') window.__f.push(ev.data.slice(0, 120)); });
+    });
+    await a.click('[data-a=start]');
+    const played = async (page, team) => wait(page, (t) => {
+      const g = window.game, n = g.net;
+      return g.state === 'play' && n && n.cid && n.snaps > 5 && n.team === t && !document.querySelector('.lobby');
+    }, 40000, team);
+    ok('房主按下开始之后**两个人都进了对局**（拿到 cid 且在收快照）', !!(await played(a, 'A')) && !!(await played(b, 'B')),
+      'A 侧 ' + JSON.stringify(await a.evaluate(() => ({ s: game.state, snaps: game.net && game.net.snaps, tail: (window.__f || []).slice(-1) }))).slice(0, 200) + ' | B 侧 ' + JSON.stringify(await b.evaluate(() => ({ s: game.state, snaps: game.net && game.net.snaps, tail: (window.__f || []).slice(-1) }))).slice(0, 200))
+    ok('进对局**没有换页也没有重连**：对局用的就是大厅那一条 WebSocket',
+      await a.evaluate(() => !!(window.game.net && window.game.net.ws === window.game.lobby.ws && window.game.lobby.connected)),
+      'same-socket=' + await a.evaluate(() => !!(window.game.net && window.game.net.ws === window.game.lobby.ws)));
+    ok('房里选的地图带进了对局（不是服务端那一张默认图）',
+      await a.evaluate(() => !!window.game.net && window.game.net.mapId === 'frost'), 'map=' + await a.evaluate(() => window.game.net && window.game.net.mapId));
+    await a.screenshot({ path: 'test/lobby-match.png' });
+    ok('局末自动回房间：回到房间屏、对局已经拆掉、座位还在',
+      !!(await wait(a, () => (window.game.menu || {}).screen === 'onlineRoom' && window.game.state === 'menu' && !window.game.net && document.querySelectorAll('#seatA .seat:not(.empty), #seatB .seat:not(.empty)').length === 2, 60000))
+      && !!(await wait(b, () => (window.game.menu || {}).screen === 'onlineRoom' && window.game.state === 'menu', 60000)));
+    ok('回房间之后准备状态清零（下一局要重新点准备）',
+      await b.evaluate(() => (window.game.lobby.state.me || {}).ready === false)
+      && await a.evaluate(() => (window.game.lobby.state.me || {}).ready === true));
+    await b.click('[data-a=ready]');
+    await a.bringToFront();
+    await a.click('[data-a=start]');
+    ok('房主能接着开第二局（同一批座位、同一条连接）', !!(await played(a, 'A')) && !!(await played(b, 'B')));
+    ok('页面没有真错误', realErrs(A.logs).length === 0 && realErrs(B.logs).length === 0, [...A.logs, ...B.logs].slice(0, 2).join(' ⏐ '));
     srv.kill();
   }
+
   if (!skip('F')) {
     console.log('\n── F：未完成注册前，联网对战不开放（层级：注册页 → 房间列表）──');
     // 这一段刻意用**默认配置**（要账号 + 邀请码）—— 那道闸只在那种服上存在。
@@ -407,7 +453,7 @@ try {
       atGate = await page.evaluate(() => ({
         screen: (window.game.menu || {}).screen,
         form: !!document.querySelector('#acctPw') && !!document.querySelector('[data-a=reg]'),
-        rows: !!document.querySelector('#roomRows'),
+        rows: !!document.querySelector('#lbRows'),
         msg: ((document.querySelector('.gate-card') || {}).textContent || '').slice(0, 60),
       }));
       if (atGate.screen === 'onlineGate') break;
@@ -435,7 +481,7 @@ try {
         const r = await fetch('/api/rooms');
         return {
           screen: (window.game.menu || {}).screen,
-          rows: !!document.querySelector('#roomRows'),
+          rows: !!document.querySelector('#lbRows'),
           regForm: !!document.querySelector('#acctPw'),
           create: !!(document.querySelector('[data-a=create]') || {}).disabled,
           status: r.status,

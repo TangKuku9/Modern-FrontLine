@@ -99,6 +99,16 @@ export class NetClient {
     });
   }
 
+  // 大厅那条连接已经在手上了（见 js/net/lobby.mjs 对 welcome 那一帧的分流）：
+  // 不再拨号，把这条 socket 交给我用，并把服务端给的进场应答喂进**同一条**处理路径。
+  // 两条路共用 onControl('welcome') 是有意的 —— 应答里那几格（槽位表、装备回声、种子、
+  // cid）少读一处，症状都是"某条路上按 3 没反应"这种不报错的东西。
+  attach(ws, j) {
+    this.ws = ws; this.ownsSocket = false; this.connected = true; this._opened = true;
+    this.onControl(j);
+    return this.welcome;
+  }
+
   // 进场握手的一次性结算：拨号超时 / 应答超时 / WebSocket 错误 / 服务端拒绝 / welcome，
   // 谁先到算谁，第二次调用是无操作（"还挂着吗"这件事本身就是 onControl 的分支判据）。
   settleJoin(err, payload) {
@@ -121,6 +131,9 @@ export class NetClient {
       // 呼号以**服务端说的**为准。以前这里是客户端自己那份（URL 里读来的），
       // 于是"我屏幕上叫甲、记分板上叫乙"是常态 —— 而玩家只会以为自己串号了。
       if (j.name) { this.name = j.name; if (this.game) this.game.playerName = j.name; }
+      // 阵营由服务端说（房间那条路上它是"房里站的那一队"，不是网址里的 team=）。
+      // 老服务端没这一格时退回自己那份 —— 那是 ?online=1 直连的语义，没有房间就没有队。
+      if (j.team) this.team = j.team === 'B' ? 'B' : 'A';
       // 连杀奖励的槽位表由服务端给：**按 3/4/5 各是什么、每个要几杀**，这两件事的真相
       // 在权威端（js/match-rules.js 的账本里）。客户端自己按 data.js 那份渲染的话，
       // 服务端换一项、客户端还显示旧的 —— 症状是"按了没反应"，正是这一轮要消灭的东西。
@@ -834,10 +847,13 @@ export class NetClient {
       + head(`敌方 · ${Math.floor(this.scores.B)}`, 'B') + B.map(row).join('') + '</table>';
   }
 
-  dispose() {
+  dispose(keepSocket = false) {
     for (const t of [...this.turrets.values()]) this.removeTurret(t.netId);
     for (const r of this.remotes.values()) r.dispose();
     this.remotes.clear();
-    if (this.ws) this.ws.close();
+    if (this.game) this.game.remotePlayers = [];
+    // keepSocket 是给"打完回房间"那条路用的：那条连接是大厅的，关掉它等于把人踢出房间。
+    // （clearWorld → mode.dispose 走的是默认分支，legacy 的 ?online=1 那条路行为不变。）
+    if (this.ws && !keepSocket) this.ws.close();
   }
 }

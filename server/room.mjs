@@ -276,6 +276,14 @@ export class NetRoom {
     // 变长的表；而记分板本来也不需要 20Hz 的精度 —— 每 2 秒一份足够。
     // 120 拍是 SNAP_EVERY 的倍数，所以这一条总会落在一次广播里，不会白等一轮。
     if (this.tick % 120 === 0) this.pushBoard();
+    // 每秒问一次"这一局结束了没有"。以前 checkEnd 只挂在 onKill 上，于是
+    // **分数没到上限的一局永远不结束**：时间条走到 00:00 就停在那儿，人还能继续打死对方，
+    // 而房间也永远回不到等待态（房主开不了下一局）。规则的判据在 rules 里，这里只是
+    // 给它一个被问到的机会 —— 和 onKill 那次是同一个函数，不是第二份真相。
+    if (!this.matchOverSent && this.tick % 60 === 0) {
+      this.rules.checkEnd();
+      if (this.rules.over) this.endMatch(this.rules.over.winner);
+    }
     this.drainKillFeed();
     // 一拍一份姿态，拍号 = 这一拍刚产出的那个状态（this.tick 已经 ++，与快照头里的 tick 同义）。
     // 必须写在 game.step 之后：在那之前这一拍的位移还没算出来，存下去的就是上一拍的姿态，

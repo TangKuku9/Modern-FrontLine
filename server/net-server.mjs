@@ -8,8 +8,14 @@
 // 协议：
 //   上行 二进制 = 若干个 13 字节输入包（按 tick 打时间戳，攒一帧一起发）
 //        文本   = {t:'join'|'ping'} 控制帧
+//               | 大厅与房间：{t:'lobby'|'say'|'createRoom'|'joinRoom'|'quickRoom'|
+//                 'leaveRoom'|'ready'|'team'|'roomCfg'|'start'}（判据在 server/lobby.mjs）
 //   下行 二进制 = 快照（server/codec.mjs 的定长格式）
 //        文本   = {t:'welcome'|'ev'|'err'|'pong'|'note'}
+//               | 大厅与房间：{t:'lobby'|'room'|'chat'}
+// 一条连接可以从大厅一路走到对局（'start' 之后服务端在同一条连接上发 welcome），
+// 也可以一上来就 'join' 直连对局 —— 后者是所有探针与 ?online=1 深链走的路，
+// 它的形状在这轮改造里刻意一个字没动。
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, normalize, resolve, sep } from 'node:path';
@@ -17,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { WebSocketServer } from 'ws';
 import { NetRoom, DT, SNAP_EVERY } from './room.mjs';
+import { Lobby, MAX_SEATS } from './lobby.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
 import { normalizeName, validName, NAME_RULE_TEXT } from './accounts.mjs';
@@ -52,6 +59,12 @@ export const CFG = {
   maxClients: int(process.env.MAX_CLIENTS, 128),       // 每进程真人连接上限
   maxPayload: int(process.env.MAX_PAYLOAD, 64 * 1024), // 单帧字节上限：正常一帧 ≤ 13×60 = 780 B
   roomIdleMs: int(process.env.ROOM_IDLE_MS, 60000),    // 空房间多久收掉
+  // 一局打完到"自动回到房间"之间留几秒（设 0 = 当场回）。记分板要给人看一眼，
+  // 但也不能让人站在一个还在空跑的 sim 里出不去 —— 见 returnRoom。
+  matchReturnMs: (() => { const n = Number(process.env.MATCH_RETURN_MS); return Number.isFinite(n) && n >= 0 ? n : 8000; })(),
+  // 强制把一局压到 N 秒（0 = 不覆盖，用房里选的分钟数）。这是**调试与判据用的闸门**：
+  // 没有它，"打完一局 → 自动回房间"那一段要验就得真等十分钟。
+  matchSeconds: (() => { const n = Number(process.env.MATCH_SECONDS); return Number.isFinite(n) && n > 0 ? n : 0; })(),
   staticMaxAge: int(process.env.STATIC_MAX_AGE, 86400),
   shutdownGraceMs: int(process.env.SHUTDOWN_GRACE_MS, 4000),
   // 逗号分隔的允许来源。留空 = 不检查（开发方便，生产务必设）：WS 不吃 CORS，
@@ -190,6 +203,12 @@ async function cachedFile(file) {
 // 这一层只管 HTTP 的形状（状态码、cookie、content-type）。
 const auth = await createAuth({ cfg: CFG });
 
+// 大厅与房间的控制帧。列成一张表而不是写成一串 else-if 的条件：
+// 下面那个分支要按这张表判断"这帧归大厅管"，而漏一条的症状不是报错，是**这帧被静默丢掉**
+// —— 房主按开始没反应、聊天发不出去，都属于这一类。
+const LOBBY_FRAMES = new Set(['lobby', 'say', 'createRoom', 'joinRoom', 'quickRoom', 'leaveRoom',
+  'ready', 'team', 'roomCfg', 'start']);
+
 // 房间的显示名（联机大厅"创建房间"带来的那一格）。它**不是房号** ——
 // 房号另有白名单（pickRoom 的 [A-Za-z0-9_.-]），中文房名直接当房号会被清洗成空串、
 // 退化成 auto（悄悄塞进别人的房间）。所以房名只做显示，且：
@@ -207,18 +226,30 @@ function cleanTitle(raw) {
 // 列出来也只会让人点一个还没建好的空壳。
 function roomList() {
   const out = [];
+  const seen = new Set();
   for (const p of rooms.values()) {
     const r = p.__room;
     if (!r || r.__stop) continue;
+    // 一个人都没有的 live 房不上清单：它正在等回收（roomIdleMs），而谁都进不去它 ——
+    // 列出来的那一格 state 恰好还是 'waiting'（人数是判据），症状就是"清单上有一间
+    // 永远点不进去的空房"。在跑的那局的真实人数由下面 lobby 那份补上（等待态那张名单）。
+    if (!r.clients.size) continue;
+    seen.add(r.id);
     out.push({
       id: r.id,
       title: r.title || r.id,
       map: r.mapId,
       mode: (r.rules && r.rules.mode) || 'tdm',
       players: r.clients.size,
-      state: r.clients.size ? 'playing' : 'waiting',
+      max: MAX_SEATS,
+      ready: 0,
+      state: 'playing',        // 上面已经把"没人在里面的 live 房"筛掉了，走到这里必然是有局的
     });
   }
+  // 等待态的那些也在这张清单里 —— "大厅列表"和"/api/rooms"必须是同一份东西，
+  // 分两处各列一遍的症状就是 net-drop E 段一直盯着的那件事（画一张假列表也能"看起来有房间"）。
+  // 已经开始的以 live 那一份为准（人数是活的），所以放在后面且按 id 去重。
+  for (const w of lobby.list()) if (!seen.has(w.id)) out.push(w);
   return out;
 }
 auth.ctx.listRooms = roomList;
@@ -288,6 +319,10 @@ async function serveStatic(req, res) {
         // 两处不一致说明有一边在撒谎。
         originCheck: CFG.origins.length > 0,
         refusedConn: gate.connIp, refusedMsg: gate.msgFlood, refusedRoom: gate.roomQuota, refusedAuth: gate.noAuth },
+      // 大厅与房间那一层的计数。同一类理由：那五种"开始游戏点了没反应"和"聊天发不出去"
+      // 在玩家侧都只是"这游戏坏了"，而原因（不是房主 / 有人没准备 / 刷屏被限流 / 房号撞了）
+      // 各不相同，不数出来就只能靠猜。
+      lobby: lobby.stats(),
     });
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(body) });
     res.end(body);
@@ -366,6 +401,17 @@ const rooms = new Map();
 const roomOwner = new Map();
 let draining = false;
 
+// ── 大厅 / 等待态房间（CF 式开房间的那一层，规则本体在 server/lobby.mjs）──
+// 注入两件事而不是让它自己去摸这张表：send 是"往这条连接写一帧，且不许因为连接
+// 正在断而抛"；liveBusy 是"这个房号已经被一间在跑的 sim 占了吗"。不问一句的话，
+// 建房与开局会各自往同一个 id 上挂一份 sim —— 那正是 room.mjs 头注释里数过的串门形状。
+const lobby = new Lobby({
+  send: (ws, m) => { try { if (ws && ws.readyState === 1) ws.send(m); } catch { /* 已经在断了 */ } },
+  liveBusy: (id) => rooms.has(id),
+  maxWaiting: CFG.maxRooms * 2,        // 等待态一份 sim 都不建，给两倍额度；上限仍是一道闸
+  maxPerUser: CFG.roomsPerUser,        // 和 live 那一份共用 ROOMS_PER_USER：一个人能开的房就这么多
+});
+
 function ownedRooms(userKey) {
   let n = 0;
   for (const id of rooms.keys()) if (roomOwner.get(id) === userKey) n++;
@@ -375,15 +421,19 @@ function ownedRooms(userKey) {
 // map 里存的是"启动完成"这个 promise，而不是房间对象本身。
 // 之前先 set 再 await start()，第二个加入者会在材质预加载那 ~0.8s 窗口里
 // 看到一个 game 还没建好的房间，直接 TypeError（实测：cid 1 被烧掉、B 拿不到身份）。
-async function createRoom(id) {
-  const room = new NetRoom({ id, mapId: CFG.map, seed: CFG.seed });
+async function createRoom(id, opts = {}) {
+  const room = new NetRoom({ id, mapId: opts.mapId || CFG.map, seed: CFG.seed, mode: opts.mode, cfg: opts.cfg });
+  // 这间是"从房间大厅开出来的"（房主按下开始），还是"有人直接 join 一个房号"开出来的。
+  // 这个标记决定两件事：打完要不要把这条连接送回房间（见 resultDrain 那一轮），
+  // 以及半路上能不能被人用网址挤进来（下面那个 __closed）。
+  room.__fromLobby = !!opts.fromLobby;
   await room.start();
   room.__lastBusy = Date.now();
   startRoomLoop(room, id);
   console.log(`[room ${id}] 权威模拟启动，${(1 / DT).toFixed(0)}Hz，每 ${SNAP_EVERY} tick 下一次快照`);
   return room;
 }
-async function getRoom(id, user = null) {
+async function getRoom(id, user = null, opts = {}) {
   let p = rooms.get(id);
   if (!p) {
     // 这三种是"业务上就该拒绝"，不是故障：标一下，让下面的 catch 按拒绝记账而不是甩栈。
@@ -397,7 +447,7 @@ async function getRoom(id, user = null) {
       const e = new Error(`你已经有 ${CFG.roomsPerUser} 个房间了，先进其中一个玩，或者等它空出来被回收`);
       e.refusal = true; throw e;
     }
-    p = createRoom(id);
+    p = createRoom(id, opts);
     // 健康页要逐房间读数，而表里存的是 promise —— 把解析出来的对象顺手挂在 promise 上，
     // 观测这条路径就不必每拍 await（await 会把读数耦合到建房的那次异步启动上）。
     p.then(r => { p.__room = r; }).catch(() => {});
@@ -419,12 +469,71 @@ async function pickRoom(requested, user = null) {
     let best = null, bestN = -1;
     for (const p of rooms.values()) {
       const room = await p.catch(() => null);
-      if (!room || room.__stop) continue;
+      // __closed = 从房间大厅开出来的私人局：快速加入不许把人往里塞
+      // （列表上那间房的门已经关了，硬塞进去等于把"房主开局"那道闸绕过去）。
+      if (!room || room.__stop || room.__closed) continue;
       if (room.clients.size > bestN && room.clients.size < 16) { best = room; bestN = room.clients.size; }
     }
     if (best) return best;
   }
   return getRoom(id, user);
+}
+
+// ── 把一条连接接进一间 live 房间 ──
+// 两个调用点：直连对局的 join 帧，和房主按下开始（beginLive）。之所以只留一份：
+// welcome 那一格里装着槽位表、装备回声、种子与 cid —— 每一格的失效都是静默的
+// （少一格槽位表就是"那条路上按 3 没反应"），而两份副本必然会在某次改动后少一格。
+function enterMatch(room, ws, { name, team, loadout, account }) {
+  const c = room.addClient({ name, team, loadout, account });
+  ws.__cid = c.cid; ws.__room = room; c.ws = ws;
+  return c;
+}
+function welcomeFrame(room, c) {
+  return {
+    t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId, seed: room.seed,
+    // 你的呼号由**服务端**告诉你，而不是你告诉服务端。客户端拿到之后把它盖到本地那份上 ——
+    // 不盖的话 HUD 上会一直显示 URL 里那个名字，而记分板上是另一个，玩家会以为串号了。
+    name: c.name,
+    // 阵营同样由服务端说。房间那条路上它是"房里站的那一队"，不是网址里的 team= ——
+    // 少了这一格，客户端会拿自己那份旧值去摆 HUD 与名牌，症状是"我在 B 队，屏幕上我是 A 队"。
+    team: c.team,
+    pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw, loadout: c.loadout,
+    // 连杀奖励的槽位表。**必须由服务端给**：按 3/4/5 各是什么、每个要几杀，
+    // 这两件事的真相在权威端（规则内核里）；客户端自己按 data.js 那份渲染的话，
+    // 服务端换一项客户端还显示旧的，症状是"按了没反应"。
+    streaks: room.streakDefs.map(d => ({ id: d.id, name: d.name, icon: d.icon, kills: d.kills })),
+    others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team })),
+  };
+}
+
+// 房主按下开始。这里只负责"把名单变成一局"，判据全在 server/lobby.mjs:startGate。
+// 顺序有讲究：先把所有人安放进 sim，再逐个发 welcome —— others 是"我进这一间时房里有谁"，
+// 边放边发的话第一个进的人看不见后面那几个，症状是房主的世界一开始是空的。
+async function beginLive(wroom) {
+  if (rooms.has(wroom.id)) return { ok: false, message: '已经有一间同名的房在打了，改个房号再开' };
+  if (draining) return { ok: false, message: '服务器正在下线，开不了新局' };
+  if (rooms.size >= CFG.maxRooms) return { ok: false, message: `这台服务器已经有 ${rooms.size} 个房间，不再新建（MAX_ROOMS）` };
+  const host = wroom.seats.get(wroom.hostSid);
+  let live;
+  try {
+    live = await getRoom(wroom.id, host && host.account ? { key: host.account } : null, {
+    mapId: wroom.mapId, mode: wroom.mode, fromLobby: true,
+    // 时长是房里选的那一格（分钟）。CFG.matchSeconds 是本地/判据用的强制覆盖，见它那条注释。
+    cfg: { mode: wroom.mode, timeLimit: CFG.matchSeconds ? CFG.matchSeconds / 60 : wroom.minutes },
+  });
+  } catch (e) { return { ok: false, message: String(e && e.message || e) }; }
+  live.title = wroom.title;
+  // 这间是私人房：只接纳房里那些人。不立这一条的话，任何人都能照着列表里那个房号
+  // 手打一个网址挤进别人的对局（"房主要求人人准备"这道闸就白做了 —— 他从没准备过）。
+  live.__closed = true;
+  const put = [];
+  for (const s of wroom.seats.values()) {
+    if (!s.ws || s.ws.readyState !== 1) continue;         // 掉线的人不进对局：他在名单上已经不在了
+    put.push({ s, c: enterMatch(live, s.ws, { name: s.name, team: s.team, loadout: s.loadout, account: s.account }) });
+  }
+  for (const { s, c } of put) lobby.send(s.ws, JSON.stringify(welcomeFrame(live, c)));
+  console.log(`[room ${wroom.id}] 房主 ${host ? host.name : '?'} 开局：${put.length} 人进 ${wroom.mapId}/${wroom.mode}`);
+  return { ok: true, live, n: put.length };
 }
 
 function startRoomLoop(room, id) {
@@ -504,6 +613,7 @@ function broadcast(room) {
 // "跑得越久越慢"的那种事故。客户端自选 id 的场景下必然产生一次性房间。
 const sweeper = setInterval(() => {
   const now = Date.now();
+  lobby.sweep(now);          // 等待态那些也要收（一张名单而已，但它一样会攒出几百间空房）
   for (const [id, p] of rooms) {
     p.then(room => {
       if (room.__stop || rooms.get(id) !== p) return;
@@ -524,16 +634,45 @@ sweeper.unref?.();
 // 为什么不在 endMatch 里直接写：见 server/room.mjs:endMatch 上面那一段 ——
 // 简单说就是"60 拍/秒的循环里只做 O(1) 内存记账"。
 // 丢一局的代价有上限（那一局的经验值），而卡住一整间房没有上限。
+function drainResults(room) {
+  for (const batch of room.takeResults()) {
+    for (const row of batch.rows) {
+      const p2 = auth.accounts.addResult(row.account, row);
+      if (p2) console.log(`[result] ${row.account} +${row.xp} xp（${row.kills}/${row.deaths}${row.win ? ' 胜' : ''}）→ 累计 ${p2.xp}`);
+    }
+  }
+}
+
+// 打完这一间：先把结果落库，再把 sim 收掉，最后把每条连接从"对局态"退回"房间态"。
+// 顺序不能换：takeResults 之后这间就不在 rooms 表里了，晚一步那批经验值就没人取了。
+// 为什么必须回：不回的话症状是"胜利之后还能继续杀人"（endMatch 只是发一条事件，
+// sim 照跑），而房里的人既看不到房间也开不了下一局。
+function returnRoom(id, room) {
+  drainResults(room);
+  for (const c of room.clients.values()) {
+    const ws = c.ws;
+    if (!ws) continue;
+    // 清这两个字段 = 这条连接不再是某个对局里的玩家。之后它发上来的二进制会被
+    // message 处理里那道现成的 `ws.__cid == null` 闸门丢掉，不用另加判断。
+    ws.__cid = null; ws.__room = null;
+  }
+  room.__stop = true;
+  rooms.delete(id);
+  roomOwner.delete(id);
+  lobby.liveEnded(lobby.rooms.get(id));
+  console.log(`[room ${id}] 打完收工，回房间（等房主再开）`);
+}
+
 const resultDrain = setInterval(() => {
-  for (const p of rooms.values()) {
+  for (const [id, p] of rooms) {
     const room = p.__room;
     if (!room || !room.takeResults) continue;
-    for (const batch of room.takeResults()) {
-      for (const row of batch.rows) {
-        const p2 = auth.accounts.addResult(row.account, row);
-        if (p2) console.log(`[result] ${row.account} +${row.xp} xp（${row.kills}/${row.deaths}${row.win ? ' 胜' : ''}）→ 累计 ${p2.xp}`);
-      }
-    }
+    drainResults(room);
+    // 只管从房间大厅开出来的局。直连对局那条路（?online=1 与所有探针）打完还是打完 ——
+    // 它们没有"房间"可回，而把回收加在那条路上会改掉一批已经在用的判据的量法。
+    if (!room.__fromLobby || !room.matchOverSent) continue;
+    if (!room.__overAt) room.__overAt = Date.now();
+    else if (Date.now() - room.__overAt >= CFG.matchReturnMs) returnRoom(id, room);
   }
 }, 1000);
 resultDrain.unref?.();
@@ -542,6 +681,9 @@ wss.on('connection', (ws, req) => {
   // 身份来自**握手时验过的会话**，不是 join 帧里的自报字段。二者差一个数量级：
   // 前者是一条会被封的实名记录，后者只是一个字符串。
   ws.__user = (req && req.__user) || null;
+  // 大厅里还没进任何一间房的人也要能说话（全服频道）。这一格此刻就定下来，
+  // 不等到 createRoom —— 因为 say 只认座位上/这一格的名字，谁后填的都不算。
+  if (ws.__user) ws.__name = ws.__user.name;
   ws.__ip = clientIp(req || { socket: {} }, CFG.trustProxy);
   connsByIp.set(ws.__ip, (connsByIp.get(ws.__ip) | 0) + 1);
   ws.__msgWin = { t: Date.now(), n: 0 };
@@ -593,36 +735,58 @@ wss.on('connection', (ws, req) => {
         // 由下面那个 catch 变成一条 {t:'err'} —— 客户端在加载页上原样显示这一句。
         // 所以访客不会"填了名字却变成访客"：他会当场看到规则，回去改。
         const name = joinName(user, msg.name);
+        // 一间还在等人准备的房子里没有 sim。绕过大厅直接进的症状是"进了个空世界，
+        // 谁也不在，也没有开始" —— 而这个人本来只需要在房间界面里等房主按一下。
+        if (lobby.waitingRoom(msg.room)) { ws.send(JSON.stringify({ t: 'err', msg: '那间房还在等房主开始，请在房间界面里等' })); return; }
         const room = await pickRoom(msg.room, user);
+        if (room.__closed) { ws.send(JSON.stringify({ t: 'err', msg: '那间房是房间大厅开出来的私人局，只接纳房里那些人' })); return; }
         // 房间的显示名：**只有建房那一次说了算**（room.title 还空着的时候）。
         // 后来的人改不掉房间名 —— 否则"挂个钓鱼名等别人点进来"就成了一个功能。
         // 不带 title 的老客户端/探针完全不受影响：这一格是可选的。
         if (!room.title && msg.title != null && cleanTitle(msg.title)) room.title = cleanTitle(msg.title);
-        const c = room.addClient({
+        // 进座与那一格应答都在 enterMatch / welcomeFrame 里 —— 它们现在有两个调用点
+        // （这里，和房主按下开始的 beginLive），一份形状才不会被改漏。
+        const c = enterMatch(room, ws, {
           // 要账号的服上这一格来自会话；访客可玩的服上是自报呼号（已过白名单）。
           // 两条路都**不用再 slice(0,24)**：白名单本身限了 2~16 个字。
-          name,
-          team: msg.team === 'B' ? 'B' : 'A',
-          loadout: msg.loadout || null,
-          account: user ? user.key : null,
+          name, team: msg.team === 'B' ? 'B' : 'A', loadout: msg.loadout || null, account: user ? user.key : null,
         });
-        ws.__cid = c.cid; ws.__room = room;      // 存对象本身：rooms 里存的是 promise
-        c.ws = ws;                                // 反向也要有：广播按 room.clients 走
-        ws.send(JSON.stringify({
-          t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId, seed: room.seed,
-          // 你的呼号由**服务端**告诉你，而不是你告诉服务端。客户端拿到之后把它盖到本地那份上 ——
-          // 不盖的话 HUD 上会一直显示 URL 里那个名字，而记分板上是另一个，玩家会以为串号了。
-          name: c.name,
-          pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw, loadout: c.loadout,
-          // 连杀奖励的槽位表。**必须由服务端给**：按 3/4/5 各是什么、每个要几杀，
-          // 这两件事的真相在权威端（规则内核里）；客户端自己按 data.js 那份渲染的话，
-          // 服务端换一项、客户端还显示旧的，症状是"按了没反应"——正是这一轮要消灭的东西。
-          streaks: room.streakDefs.map(d => ({ id: d.id, name: d.name, icon: d.icon, kills: d.kills })),
-          others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team })),
-        }));
+        ws.send(JSON.stringify(welcomeFrame(room, c)));
         console.log(`[join] ${c.name} → cid ${c.cid} @ ${room.id}（在线 ${room.clients.size}，本机 ${wss.clients.size} 连接 / ${rooms.size} 间）`);
       } else if (msg.t === 'ping') {
         ws.send(JSON.stringify({ t: 'pong', c: msg.c, s: Date.now(), tick: ws.__room?.tick ?? 0 }));
+      } else if (LOBBY_FRAMES.has(msg.t)) {
+        // ── 大厅与房间：这一层只接线，判据全在 server/lobby.mjs ──
+        // 身份和 join 同源（joinName）：要账号的服上呼号来自会话，访客可玩的服上才看自报那格。
+        // 在这里另起一套"聊天用的名字"是最容易出事的地方 —— 那等于给冒充留了一条路。
+        if (CFG.requireAccount && !ws.__user) { ws.send(JSON.stringify({ t: 'err', msg: '需要先登录' })); return; }
+        const id = () => {
+          const n = joinName(ws.__user, msg.name);
+          ws.__name = n;
+          return { name: n, account: ws.__user ? ws.__user.key : null, xp: ws.__user ? (ws.__user.xp | 0) : 0, loadout: msg.loadout || null };
+        };
+        if (msg.t === 'lobby') lobby.attach(ws);
+        else if (msg.t === 'say') lobby.say(ws, msg);
+        else if (msg.t === 'leaveRoom') lobby.leaveRoom(ws);
+        else if (msg.t === 'ready') lobby.setReady(ws, msg);
+        else if (msg.t === 'team') lobby.setTeam(ws, msg.team);
+        else if (msg.t === 'roomCfg') lobby.setCfg(ws, msg);
+        else if (msg.t === 'joinRoom') { const r = lobby.joinRoom(ws, { ...msg, ...id() }); if (!r.ok) ws.send(JSON.stringify({ t: 'err', msg: r.message })); }
+        else if (msg.t === 'createRoom') { const r = lobby.createRoom(ws, { ...msg, ...id() }); if (!r.ok) ws.send(JSON.stringify({ t: 'err', msg: r.message })); }
+        else if (msg.t === 'quickRoom') { const r = lobby.quickRoom(ws, { ...msg, ...id() }); if (!r.ok) ws.send(JSON.stringify({ t: 'err', msg: r.message })); }
+        else if (msg.t === 'start') {
+          const g = lobby.start(ws);
+          if (!g.ok) { ws.send(JSON.stringify({ t: 'err', msg: g.message })); return; }
+          const begun = await beginLive(g.room);
+          if (!begun.ok) {
+            // 开不了局要把房间还回去，并且当场说清楚为什么 —— 否则这间会永远停在
+            // "对局中"却没有对局，而房里的人看到的是四个人的静止界面。
+            lobby.startFailed(g.room, begun.message);
+            ws.send(JSON.stringify({ t: 'err', msg: begun.message }));
+            return;
+          }
+          lobby.pushRoom(g.room);
+        }
       }
     } catch (e) {
       // 只把 message 发给客户端、把 stack 留在服务端日志：客户端不该看到栈，
@@ -639,6 +803,8 @@ wss.on('connection', (ws, req) => {
     if (n > 0) connsByIp.set(ws.__ip, n); else connsByIp.delete(ws.__ip);
     const room = ws.__room;
     if (room && ws.__cid != null) { room.removeClient(ws.__cid); console.log(`[leave] cid ${ws.__cid} 断开（在线 ${room.clients.size}）`); }
+    // 座位也要跟着退：一个人都没了的房间要被回收，而房主跑掉的那间要移交（见 lobby.mjs）。
+    lobby.detach(ws);
   });
 });
 
