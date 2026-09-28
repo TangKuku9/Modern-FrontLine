@@ -25,12 +25,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // （每个人的 room 状态 + welcome），按次序死等某一种会把别的挤掉。
 function client(wsUrl, tag) {
   const got = [];
-  const bin = { n: 0 };
+  const bin = { n: 0, last: 0 };
   const ws = new WebSocket(wsUrl);
   const c = {
     tag, ws, frames: got,
     opened: new Promise(res => ws.on('open', res)),
     binary: () => bin.n,
+    // 最近一份快照的**字节数**。Bot 有没有编进快照只能从包长看出来：
+    // 包是定长的（11 + n×25），所以"多一个 Bot"必须让这一格正好多 25。
+    // 只数包数的话，Bot 进了 sim 却没进协议也能全绿 —— 而那正是最要命的失效形状
+    //（房主加了一屋子 Bot，所有人进去一个也看不见，然后被看不见的东西打死）。
+    lastBytes: () => bin.last,
     async until(p, ms = 8000) {
       const t0 = Date.now();
       for (;;) {
@@ -44,7 +49,7 @@ function client(wsUrl, tag) {
     close() { try { ws.close(); } catch { /* 已经在断了 */ } },
   };
   ws.on('message', (d, isBin) => {
-    if (isBin) { bin.n++; return; }
+    if (isBin) { bin.n++; bin.last = d.length || (d.buffer && d.buffer.byteLength) || 0; return; }
     try { got.push(JSON.parse(String(d))); } catch { /* 非 JSON 的下行不在本协议里 */ }
   });
   return c;
@@ -257,6 +262,108 @@ try {
   ok('两种拒绝都在 /healthz 上数得出来（静默失效要显形）', bm1 - bm0 === 2, `${bm0} → ${bm1}`);
   h.close();
   srv3.kill();
+
+  console.log('\n── I：房主往房间里加 Bot ──');
+  // 房间里只有两个人的时候也要能打一场像样的仗，所以这一项存在的理由就是"人不够时拿 Bot 填"。
+  // 判据分两半：这一半证明**房主点得动、名单会变、开局真带进对局**（走真 WebSocket）；
+  // 权威端那一半（Bot 进不进快照、死了对不对、记分板有没有它）在 test/room-bots.mjs。
+  const srv4 = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
+  const p = client(srv4.ws, '癸'), q = client(srv4.ws, '子');
+  await p.opened; await q.opened;
+  p.send({ t: 'lobby' }); q.send({ t: 'lobby' });
+  await p.until(j => j.t === 'lobby'); await q.until(j => j.t === 'lobby');
+  p.send({ t: 'createRoom', room: 'botroom', name: '癸1', title: 'Bot 房' });
+  const i0 = await p.until(j => j.t === 'room' && j.room && j.room.id === 'botroom', 6000);
+  ok('一个人的房：没有 Bot 时不能开局（这一格是下面每一条的起点）',
+    !!i0 && i0.canStart === false && (i0.bots || []).length === 0, JSON.stringify(i0 && i0.why));
+
+  // ── 反证臂：先确定"一个人的时候确实开不了"，否则"加了 Bot 能开"是句空话 ──
+  p.send({ t: 'botAdd', team: 'B' });
+  const i1 = await p.until(j => j.t === 'room' && (j.bots || []).length === 1, 6000);
+  ok('房主加一个 Bot，房间状态里当场多一格（含名字与队伍）',
+    !!i1 && i1.bots[0].name && i1.bots[0].team === 'B', JSON.stringify(i1 && i1.bots));
+  // 这条专门盯"没带难度"那一格：undefined 被夹成 0（新兵）的话，房间明明写着正规军
+  // 却加出一屋子最简单的 Bot —— 界面与手感对不上，而没有任何一处会报错。
+  ok('没指定难度时取房间那一格（不是把"没选"当成"选了新兵"）',
+    !!i1 && i1.bots[0].skill === 1, `skill=${i1 && i1.bots[0].skill}（房间默认 ${i1 && i1.botSkill}）`);
+  p.send({ t: 'roomCfg', botSkill: 2 });
+  const i1b = await p.until(j => j.t === 'room' && j.botSkill === 2, 6000);
+  ok('房主改难度：房间里已有的 Bot 一起改（不然"后来加的更凶"，界面表达不出来）',
+    !!i1b && i1b.bots[0].skill === 2, JSON.stringify(i1b && i1b.bots));
+  p.send({ t: 'roomCfg', botSkill: 1 });
+  await p.until(j => j.t === 'room' && j.botSkill === 1, 6000);
+  ok('加了 Bot 之后一个人就能开局（这正是"加 Bot"这一项存在的理由）',
+    !!i1 && i1.canStart === true, JSON.stringify(i1 && { canStart: i1.canStart, why: i1.why }));
+  ok('Bot 占位置：列表上那一格人数把它算进去了（不然"2/16"点进去只看见一个人）',
+    (await apiRooms(srv4.base)).find(x => x.id === 'botroom')?.players === 2,
+    JSON.stringify((await apiRooms(srv4.base)).find(x => x.id === 'botroom')));
+
+  const nh0 = (await health(srv4.base)).lobby.notHost | 0;
+  q.send({ t: 'joinRoom', room: 'botroom', name: '子2' });
+  await q.until(j => j.t === 'room' && j.me, 6000);
+  q.send({ t: 'botAdd', team: 'A' });
+  const rejB = await q.until(j => j.t === 'err', 4000);
+  ok('非房主加 Bot 被拒，且话说清楚了（改得动的东西不算权限）',
+    !!rejB && /房主/.test(rejB.msg || ''), JSON.stringify(rejB && rejB.msg));
+  ok('这一类拒绝在服务端数得出来（与"不是房主按开始"同一格计数）',
+    (await health(srv4.base)).lobby.notHost === nh0 + 1);
+  ok('被拒之后 Bot 数没变（拒绝不是"先加了再说"）',
+    (await apiRooms(srv4.base)).find(x => x.id === 'botroom')?.bots === 1);
+
+  // ── 满员 ──
+  p.frames.length = 0;
+  for (let k = 0; k < 20; k++) p.send({ t: 'botAdd' });
+  await sleep(500);
+  const rowI = (await apiRooms(srv4.base)).find(x => x.id === 'botroom') || {};
+  ok('加满为止：Bot 与真人共用一个 16 的上限（不是给 Bot 另开一个池子）',
+    rowI.players === 16 && rowI.bots === 14, JSON.stringify({ players: rowI.players, bots: rowI.bots }));
+  ok('加不进去的那几次在 /healthz 上数得出来（静默失效要显形）',
+    (await health(srv4.base)).lobby.botFull >= 5, `botFull=${(await health(srv4.base)).lobby.botFull}`);
+
+  // ── 减 Bot（只在等待态能改：开局那一刻名单就被读进 sim 了）──
+  p.send({ t: 'botDel' });
+  const i3 = await p.until(j => j.t === 'room' && (j.bots || []).length === 13, 6000);
+  ok('房主减一个：名单当场少一格（减的是最后加的那个）',
+    !!i3 && (i3.bots || []).length === 13 && (await health(srv4.base)).lobby.botDel === 1,
+    JSON.stringify(i3 && (i3.bots || []).length));
+  q.send({ t: 'botDel' });
+  const rejD = await q.until(j => j.t === 'err', 4000);
+  ok('非房主减 Bot 同样被拒', !!rejD && /房主/.test(rejD.msg || ''), JSON.stringify(rejD && rejD.msg));
+
+  // ── 开局：Bot 要真的进对局，而且看得见 ──
+  q.send({ t: 'ready', on: true });
+  await p.until(j => j.t === 'room' && j.canStart === true, 6000);
+  p.send({ t: 'start' });
+  const wp2 = await p.until(j => j.t === 'welcome', 15000);
+  ok('房主开局，这一局进去了', !!wp2, JSON.stringify(wp2 && { cid: wp2.cid, room: wp2.room }));
+  // 命门：others 是客户端建 NetPlayer 的唯一依据。Bot 不在这一格里 ⇒ 全房的人一个 Bot 也看不见，
+  // 而权威端的 Bot 照样在开枪、照样裁决伤害 —— 那比不加 Bot 更糟。
+  const botOthers = (wp2 && wp2.others || []).filter(o => o.bot);
+  ok('Bot 随 welcome 一起下发（客户端按这一份建插值缓存与名牌）',
+    botOthers.length === 13, `others 里 ${botOthers.length} 个 Bot（共 ${(wp2 && wp2.others || []).length}）`);
+  await sleep(900);
+  // 包长反推实体数：11 + n×25。这条同时证明 Bot 编进了快照、且每实体仍是 25 字节。
+  const entN = p.lastBytes() ? (p.lastBytes() - 11) / 25 : -1;
+  ok('快照里确实是 15 个实体（2 人 + 13 Bot，包长反推，不是读服务端的对象）',
+    entN === 15, `${p.lastBytes()} 字节 → ${entN} 个实体`);
+  // 反证臂：这条红了 = 快照里根本没有 Bot（或者每实体的字节数被改了）
+  ok('【反证】包长是整数个实体（11 + 15×25 = 386，不是被别的字段挤歪）',
+    p.lastBytes() === 11 + 15 * 25, `${p.lastBytes()} 字节`);
+  // 反证臂②：对局中不能再改名单 —— 那份名单在开局那一刻就被读进 sim 了，
+  // 半路插人的症状是"场上凭空多一个人"，而客户端的名册是在 welcome 里一次性给的。
+  p.send({ t: 'botAdd', team: 'A' });
+  await sleep(300);
+  ok('【反证】对局中加 Bot 不改名单（半个世界长出来一个人最难查，所以直接不让）',
+    (await health(srv4.base)).lobby.playing >= 1, `playing=${(await health(srv4.base)).lobby.playing}`);
+
+  // ── 房主跑了：Bot 不能接管这间房 ──
+  p.close();
+  const i2 = await q.until(j => j.t === 'room' && j.me && j.me.isHost === true, 8000);
+  ok('房主离开后移交给另一个真人（Bot 不会变成房主 —— 它没有那条连接）',
+    !!i2 && i2.me.isHost === true && (i2.bots || []).length === 13, JSON.stringify(i2 && { host: i2.me.name, bots: (i2.bots || []).length }));
+  q.close();
+  srv4.kill();
+
   console.log(`\n${bad ? '❌' : '✅'} ${n - bad}/${n} 通过`);
   for (const line of String(srv2.log()).split('\n').filter(x => /^\[room|开局|结果|拒绝/.test(x)).slice(-6)) console.log('  服务端: ' + line);
   process.exit(bad ? 1 : 0);

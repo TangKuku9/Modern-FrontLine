@@ -1,7 +1,7 @@
 // 菜单系统：主菜单、战役简报、多人大厅、配装、枪匠、设置、暂停、结算
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, attachmentAllowed, findAttachment } from './data.js';
+import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
 import { buildGun } from './gunmodel.js';
 import { createSoldierModel, animateSoldier } from './soldier.js';
 import { mat, camoSwatch } from './materials.js';
@@ -671,7 +671,10 @@ export class Menu {
           <div class="lobby-col team-col">
             <div class="team-hd">A 队<span id="nA" class="th-n"></span></div>
             <div id="seatA" class="seats"></div>
-            <button class="btn small ghost" data-a="toA">换到 A 队</button>
+            <div class="team-btns">
+              <button class="btn small ghost" data-a="toA">换到 A 队</button>
+              <button class="btn small ghost" data-a="addA">+ Bot</button>
+            </div>
           </div>
           <div class="lobby-col rm-mid">
             <div class="panel" id="rmCfg"></div>
@@ -681,7 +684,10 @@ export class Menu {
           <div class="lobby-col team-col">
             <div class="team-hd b">B 队<span id="nB" class="th-n"></span></div>
             <div id="seatB" class="seats"></div>
-            <button class="btn small ghost" data-a="toB">换到 B 队</button>
+            <div class="team-btns">
+              <button class="btn small ghost" data-a="toB">换到 B 队</button>
+              <button class="btn small ghost" data-a="addB">+ Bot</button>
+            </div>
           </div>
         </div>
         <div class="rm-foot">
@@ -698,6 +704,11 @@ export class Menu {
     this.on(r, '[data-a=start]', () => { const l = this.game.lobby; if (l) l.start(); });
     this.on(r, '[data-a=toA]', () => this.roomTeam('A'));
     this.on(r, '[data-a=toB]', () => this.roomTeam('B'));
+    this.on(r, '[data-a=addA]', () => this.roomAddBot('A'));
+    this.on(r, '[data-a=addB]', () => this.roomAddBot('B'));
+    // Bot 那一行点一下就移除。只给房主：不是房主点了会收到服务端一句拒绝，
+    // 而"点了没反应但服务端其实拒了"正是这一层要避免的那种界面 —— 干脆不让它能点。
+    this.on(r, '.seat[data-bid]', (el) => this.roomDelBot(+el.dataset.bid));
     this.bindChat(r, 'room');
     this.renderRoom();
     this.renderChat(r, 'room');
@@ -710,13 +721,16 @@ export class Menu {
   renderRoom() {
     const lb = this.game.lobby, st = lb && lb.state;
     if (!st || this.screen !== 'onlineRoom') return;
-    const room = st.room || {}, me = st.me || {}, seats = st.seats || [];
+    const room = st.room || {}, me = st.me || {}, seats = st.seats || [], bots = st.bots || [];
     const map = MP_MAPS.find(m => m.id === room.map) || { name: room.map };
     const mode = MP_MODES.find(m => m.id === room.mode) || { name: room.mode };
     const playing = room.state === 'playing';
     const t = this.el.querySelector('#rmTitle'); if (t) t.textContent = room.title || room.id;
     const mt = this.el.querySelector('#rmMeta');
-    if (mt) mt.textContent = `${map.name} · ${mode.name} · ${room.time || 10} 分 · ${seats.length}/${room.max || 16} 人 · 房主 ${room.host || '—'}`;
+    // Bot 占位置，所以人数那一格要把它们算进去；另写一个"N Bot"，否则一间 1 人 + 7 Bot
+    // 的房在标题上写着 8 人，点进去只看见一个人 —— 那看起来像列表算错了。
+    if (mt) mt.textContent = `${map.name} · ${mode.name} · ${room.time || 10} 分 · ${room.players || seats.length}/${room.max || 16} 人`
+      + (bots.length ? `（${bots.length} Bot）` : '') + ` · 房主 ${room.host || '—'}`;
     const per = Math.max(2, Math.floor((room.max || 16) / 2));
     const row = (s) => `<div class="seat ${s.ready ? 'rd' : ''} ${s.isHost ? 'host' : ''}">
       <span class="s-tag">${s.isHost ? '房主' : (s.ready ? '✔' : '·')}</span>
@@ -724,13 +738,27 @@ export class Menu {
       <span class="s-lv">${s.xp ? 'Lv ' + (levelOf(s.xp)) : ''}</span>
       <span class="s-st">${s.isHost ? '随时可开' : (s.ready ? '已准备' : '等待中')}</span>
     </div>`;
+    // Bot 那一行：房主点一下移除，所以它是可点的（data-bid），并且写明"点击移除" ——
+    // 一行看着和真人一模一样的名单，玩家没有任何办法知道哪个能点。
+    const botRow = (b) => `<div class="seat bot" data-bid="${b.bid}">
+      <span class="s-tag">Bot</span>
+      <span class="s-name">${esc(b.name)}</span>
+      <span class="s-lv">${BOT_SKILL_NAMES[b.skill | 0] || ''}</span>
+      <span class="s-st">${me.isHost && !playing ? '点击移除' : ''}</span>
+    </div>`;
     const blank = () => '<div class="seat empty"><span class="s-tag">·</span><span class="s-name">空位</span><span class="s-st"></span></div>';
     for (const team of ['A', 'B']) {
       const box = this.el.querySelector(team === 'A' ? '#seatA' : '#seatB');
-      const list = seats.filter(s => s.team === team);
+      const list = seats.filter(s => s.team === team).map(row);
+      const bl = bots.filter(b => b.team === team).map(botRow);
+      const all = list.concat(bl);
       const n = this.el.querySelector(team === 'A' ? '#nA' : '#nB');
-      if (n) n.textContent = `${list.length}/${per}`;
-      if (box) box.innerHTML = list.map(row).join('') + blank().repeat(Math.max(0, Math.min(per, Math.max(3, list.length + 1)) - list.length));
+      if (n) n.textContent = `${all.length}/${per}`;
+      if (box) box.innerHTML = all.join('') + blank().repeat(Math.max(0, Math.min(per, Math.max(3, all.length + 1)) - all.length));
+      // 加 Bot 那个按钮只画给房主，且对局开始之后不能再加（服务端也会拒，
+      // 但把按钮留在那儿就是"能点但没反应"）。
+      const ab = this.el.querySelector(team === 'A' ? '[data-a=addA]' : '[data-a=addB]');
+      if (ab) ab.style.display = (me.isHost && !playing) ? '' : 'none';
     }
     const rb = this.el.querySelector('[data-a=ready]');
     if (rb) {
@@ -761,10 +789,14 @@ export class Menu {
         + (ONLINE_MODES.length > 1
           ? row('模式', 'rmMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), room.mode)
           : `<div class="cfg-row"><span>模式</span><div class="cfg-one" id="rmMode">${esc(mode.name)}</div></div>`)
-        + row('时长', 'rmMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), room.time || 10);
+        + row('时长', 'rmMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), room.time || 10)
+        // Bot 难度。改一格**全体 Bot 一起变**（服务端那条注释写了为什么不做成逐个改），
+        // 所以这一行只在房里真有 Bot 时才画 —— 空房子里摆一个 Bot 难度选择器，
+        // 玩家会以为"选了就会自动加 Bot"。
+        + (bots.length ? row('Bot', 'rmBot', BOT_SKILLS, BOT_SKILL_NAMES, st.botSkill | 0) : '');
       cfg.querySelectorAll('.seg div[data-dis="0"]').forEach(d => d.addEventListener('click', () => {
         const sg = d.parentElement, v = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
-        const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : 'minutes';
+        const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : sg.id === 'rmBot' ? 'botSkill' : 'minutes';
         if (this.game.lobby) this.game.lobby.setCfg({ [key]: v });
       }));
     }
@@ -775,6 +807,14 @@ export class Menu {
   }
   roomTeam(team) {
     const lb = this.game.lobby; if (lb) lb.setTeam(team);
+  }
+  roomAddBot(team) {
+    const lb = this.game.lobby; if (lb) lb.addBot(team);
+  }
+  roomDelBot(bid) {
+    const lb = this.game.lobby, st = lb && lb.state;
+    if (!lb || !st || !st.me || !st.me.isHost) return;
+    lb.removeBot(bid);
   }
   roomLeave() {
     const lb = this.game.lobby; if (lb) lb.leaveRoom();

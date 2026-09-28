@@ -80,6 +80,10 @@ export class LobbyClient {
   ready(on) { this.send({ t: 'ready', on: !!on, ...this._id() }); }
   setTeam(team) { this.send({ t: 'team', team }); }
   setCfg(o = {}) { this.send({ t: 'roomCfg', ...o }); }
+  // 加 / 减 Bot。判据全在服务端（只有房主能改、位置满了就拒）—— 这里连"我是不是房主"
+  // 都不判：客户端自己再判一遍的话，界面上的按钮灰不灰和服务端放不放行就成了两个真相。
+  addBot(team) { this.send({ t: 'botAdd', team }); }
+  removeBot(bid) { this.send({ t: 'botDel', bid }); }
   start() { this.send({ t: 'start' }); }
   say(ch, text) { const t = String(text || '').trim().slice(0, 120); if (t) this.send({ t: 'say', ch, text: t }); }
 

@@ -15,8 +15,8 @@ import { sanitizeLoadout } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
 import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
-import { Sentry, Heli } from '../js/mp.js';
-import { KILLSTREAKS, DEFAULT_STREAKS } from '../js/data.js';
+import { Sentry, Heli, BOT_WEAPONS, randomAtt } from '../js/mp.js';
+import { KILLSTREAKS, DEFAULT_STREAKS, BOT_NAMES } from '../js/data.js';
 
 export const TICK_HZ = 60;
 export const DT = 1 / TICK_HZ;
@@ -160,11 +160,15 @@ export class NetRoom {
     const w = this.game.world;
     const cands = [...(w.spawns[team] || []), ...(team === 'P' ? [...w.spawns.A, ...w.spawns.B] : [])];
     for (let i = 0; i < 6; i++) cands.push(w.randomWalkable());
-    const foes = [...this.clients.values()].filter(c => c.pl.alive && c.pl.team !== team && c.pl.pos);
+    // Bot 也要算进"别贴着敌人出生"：房间里有 Bot 之后，只看 clients 的那份会把一堆 Bot
+    // 摞在同一个出生点上（它们互相看不见对方，因为对方不在自己的敌情表里）。
+    const foes = [...this.clients.values()].map(c => c.pl)
+      .concat(this.game ? this.game.bots : [])
+      .filter(p => p && p.alive && p.team !== team && p.pos);
     let best = cands[0], bs = -1;
     for (const c of cands) {
       let md = 1e9;
-      for (const f of foes) md = Math.min(md, f.pl.pos.distanceTo(c));   // clients 不是 players
+      for (const f of foes) md = Math.min(md, f.pos.distanceTo(c));
       const s = Math.min(md, 60) + rng.next() * 8;
       if (s > bs) { bs = s; best = c; }
     }
@@ -320,6 +324,22 @@ export class NetRoom {
       }
     }
     this.game.step(DT, inputs[0] ? inputs[0].inp : decodeInputBits(0, 0), inputs.map(({ c, inp }) => ({ pl: c.pl, inp })));
+    // Bot 的重生。单机那一半长在 MPMatch.update 的 respawns 队列里（js/mp.js:317，
+    // 死了的人按 4 + rng.next()*2 秒排队），而联机权威端没有那份名单 ——
+    // 少了它的症状是"Bot 死一个少一个"：一局打到后半段场上只剩真人，
+    // 而那看起来像"对面不来了"，谁都不会把它当成 bug 去查。
+    // 延迟刻意与单机同一条式子：抄成"更合理"的版本会让两端的手感分叉，且没人会去查。
+    if (this.game) for (const b of this.game.bots) {
+      if (b.alive) continue;
+      if (b.__respawnT == null) b.__respawnT = 4 + rng.next() * 2;      // 刚死的这一拍排上队
+      b.__respawnT -= DT;
+      if (b.__respawnT <= 0) {
+        const sp = this.spawnPoint(b.team);
+        b.respawn(sp.pos, sp.yaw);
+        b.__respawnT = null;
+        this.game.dmgBy.delete(b);            // 上一条命的伤害账不许算进下一条命的助攻
+      }
+    }
     // 白磷弹的**持续灼烧**。这段以前只长在单机 js/mp.js:MPMatch.update 里：联机侧
     // rules.wpTicks 只被写、从来没被读，于是白磷弹在联机里只剩"一次 55 点 + 一层橙屏"。
     // 概率/伤害/目标集合刻意与单机那一行逐字一致（连 `rng.next() < dt*2` 都一样）——
@@ -449,10 +469,55 @@ export class NetRoom {
     return this.game.entities.filter(e => e.alive && e.team !== team && e.pos && e.targetable !== false && !e.isHeli);
   }
 
+  // ── 往对局里放一个 Bot（房主在房间屏上点的那个「+」）──
+  // 它和 addClient 是并列的两条路：真人走「连接 → addClient」，Bot 走「房主名单 → spawnBot」。
+  // 刻意**不给它造一个假的 client**：cid 是"这条连接"的编号，而 Bot 没有连接。造一个假 cid
+  // 会让插值缓存、延迟补偿的 pose 环、战绩队列都开始给一个不存在的连接记账 —— 那类错误
+  // 全是静默的（"某个人永远进不了记分板"）。所以它只有一个 netId（快照里的那个 id）。
+  spawnBot({ name = 'Bot', team = 'A', skill = 1 } = {}) {
+    if (!this.started) return null;
+    const sp = this.spawnPoint(team);
+    const wid = BOT_WEAPONS[Math.floor(rng.next() * BOT_WEAPONS.length) % BOT_WEAPONS.length];
+    const def = MAPS[this.mapId] || {};
+    const styles = def.styles || ['ally', 'enemy'];
+    const bot = new Bot(this.game, {
+      team, name, weaponId: wid, att: randomAtt(wid), difficulty: skill,
+      pos: sp.pos, yaw: sp.yaw, role: 'mp',
+      style: team === 'A' ? styles[0] : styles[1], camo: 'none',
+    });
+    bot.isBot = true;
+    // 同步 id 与真人的 cid **共用同一个分配器**。两边各起一套编号的话，某天一个 Bot 的 id
+    // 撞上一个人的 cid，客户端会把两者认成同一个实体 —— 症状是"两个人共用一个位置"，
+    // 而协议上没有任何一处会报错（快照里的 id 只是一个 u16）。
+    bot.netId = NEXT_CID++;
+    this.addBot(bot);
+    return bot;
+  }
+
   // 往房间里放一个 AI。当前联机对局里**不自动放**（真人对真人），但这条通道必须能跑：
   // 判据靠它验"群体警戒在房间里真的会扩散"，而"没人时拿 AI 填房"将来也走这里。
   addBot(bot) { this.game.addBot(bot); this.bots.set(bot, bot.group || null); return bot; }
   removeBot(bot) { this.game.removeBot(bot); this.bots.delete(bot); }
+
+  // Bot 的快照行。它和真人那一份**必须长成一个形状**（同样的 25 字节、同样的字段顺序）：
+  // 客户端只有一份 NetPlayer，按 id 取插值缓存，不区分对面是人还是 Bot。
+  // 少了它的症状不是报错，是"房主加了一屋子 Bot，对面一个人也看不见" ——
+  // 权威端的 Bot 照样在开枪、照样打死人（伤害是这一台机器算的），于是玩家被看不见的东西打死。
+  botEntity(bot) {
+    let flags = 0;
+    if (bot.alive) flags |= FLAG.Alive;
+    if (bot.crouchT > 0.5) flags |= FLAG.Crouch;
+    // 开火位取 bot.flashT（js/ai.js:418 开火时置 0.05）：客户端那朵枪口火光就靠这一位。
+    // 不给它的话，Bot 在你屏幕上是一边平移一边无声地让人掉血。
+    if (bot.flashT > 0) flags |= FLAG.Firing;
+    if (bot.mag < (bot.stats && bot.stats.mag || 30)) flags |= FLAG.Reloading;
+    return {
+      id: bot.netId, x: bot.pos.x, y: bot.pos.y, z: bot.pos.z, yaw: bot.yaw, pitch: bot.pitch || 0,
+      hp: bot.hp, flags, weapon: weaponIndex(bot.weaponId || 'm4'), mag: bot.mag || 0,
+      phase: (bot.anim && bot.anim.phase) || 0, vx: bot.vel.x, vz: bot.vel.z,
+      team: teamIndex(bot.team), ack: 0, rep: 0,
+    };
+  }
 
   // 群体警戒。js/ai.js 有四处调 game.alertGroup，而以前 NetRoom 上没有这个方法 ——
   // `this.game.alertGroup && ...` 那条守卫把它整个挡掉：不报错、不崩，只是"整组敌人
@@ -495,6 +560,12 @@ export class NetRoom {
           R.charged++;
           this.events.push({ e: 'streakReady', cid: kc.cid, slot: i, id: kc.book.slots[i].id, name: kc.book.slots[i].name });
         }
+      } else if (killer && killer.isBot) {
+        // Bot 的账记在它自己身上（js/ai.js:51 那三个字段，单机记分板读的就是它们）。
+        // 不记的话，Bot 杀了人却在自己那一行显示 0 —— 而队伍分是加了 1 的，
+        // 于是"比分涨了但谁都没加分"，那正是这一局里有 Bot 时才看得见的错位。
+        // 连杀槽不给：Bot 没有 StreakBook（那本账属于"真人按 3/4/5"那条链路）。
+        killer.kills++; killer.score += sc.points;
       }
       if (!R.firstBlood) {
         R.firstBlood = true;
@@ -569,6 +640,12 @@ export class NetRoom {
     const rows = [];
     for (const c of this.clients.values()) {
       rows.push({ cid: c.cid, name: c.name, team: c.team, k: c.kills, d: c.deaths, a: c.assists | 0, alive: !!c.pl.alive, s: Math.round(c.score), sk: Math.floor(c.book.progress) });
+    }
+    // Bot 也进记分板：它在这一局里真的在杀人、也真的在给队伍加分（onKill 那条路与真人同一句）。
+    // 不列出来的话，房主加满一屋子 Bot 之后会看到一张只有真人的表，而比分却在涨 ——
+    // 那种"分数对不上名单"谁都会先怀疑记分板算错了。
+    if (this.game) for (const b of this.game.bots) {
+      rows.push({ cid: b.netId, name: b.name, team: b.team, k: b.kills | 0, d: b.deaths | 0, a: 0, alive: !!b.alive, s: Math.round(b.score || 0), sk: 0, bot: true });
     }
     rows.sort((a, b) => b.k - a.k || b.s - a.s);
     // 名次是**排序结果**，不是自己算的位次：客户端数第几行就是第几名（排序在服务端做，
@@ -735,6 +812,9 @@ export class NetRoom {
         phase: ws.bobPhase, vx: pl.vel.x, vz: pl.vel.z, team: teamIndex(pl.team), ack: c.ack, rep: c.rep,
       });
     }
+    // Bot 排在真人**之后**：客户端按 id 建表，先到先得，把 Bot 放前面会让"开局那一帧"
+    // 里真人的插入顺序跟着变（顺序本身不影响正确性，但每条日志与判据的读数会跟着跳）。
+    if (this.game) for (const b of this.game.bots) if (b.netId) out.push(this.botEntity(b));
     return out;
   }
 }

@@ -9,9 +9,12 @@ import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
 import { StreakBook, MatchRules, WP_SECONDS, killScore, KILL_POINTS } from './match-rules.js';
 
-const BOT_WEAPONS = ['m4', 'm4', 'ak', 'ak', 'scar', 'mp5', 'mp5', 'vector', 'pkm', 'm870', 'sks', 'l115'];
+// Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
+// 这是"联机的 Bot 和单机的 Bot 手感一样"唯一的一处定义。抄一份的话，两边的 Bot
+// 会从某次改动起拿不同的枪，而那种差异没人会去查（不报错、不崩，只是"对面变强了"）。
+export const BOT_WEAPONS = ['m4', 'm4', 'ak', 'ak', 'scar', 'mp5', 'mp5', 'vector', 'pkm', 'm870', 'sks', 'l115'];
 
-function randomAtt(wid) {
+export function randomAtt(wid) {
   const att = {};
   const slots = shuffle(WEAPONS[wid].slots.slice()).slice(0, 3);
   for (const s of slots) {

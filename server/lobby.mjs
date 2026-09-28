@@ -17,12 +17,18 @@
 // ── 权限在这里，不在界面上 ──
 // 谁能开局、开局要满足什么条件、聊天能发多快，全部在服务端判一遍。客户端把"开始"
 // 按钮置灰只是体验；改得动的东西不算权限（和 /api/rooms 的 401、WS 握手的 401 同源）。
-import { MP_MAPS, MP_MODES, MP_MINUTES } from '../js/data.js';
+import { MP_MAPS, MP_MODES, MP_MINUTES, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
 
 // 一间的上限。和 net-server:pickRoom 里那个"人最多且没满"的 16 是同一个数 ——
 // 两处各写一份的话，改一处的症状是"列表说还能进、进去说满了"。
 export const MAX_SEATS = 16;
 export const MAX_PER_TEAM = MAX_SEATS / 2;
+// Bot 与真人**共用一个上限**：一间房里 16 个位置，坐几个人、放几个 Bot 都从这一格里出。
+// 给 Bot 另设一个上限的话，"列表说还能进、进去说满了"那种错位又回来了（这就是 seats
+// 那一条注释里已经数过的同一个形状）。
+// 难度三档的**名字表**在 js/data.js（房间屏也要画它）；这里只认下标。
+// 难度本身的定义在 js/ai.js 的 DIFF —— 这里抄一份的话，
+// 改难度表的症状是"联机的 Bot 和单机不一样"。
 // 一条聊天多少字。上限的理由不是"防刷长文"，是它会被广播给一屋子人：
 // 没有上限的话一条 64 KB 的"消息"就是 16 份 64 KB 下行（maxPayload 只管单帧，不管扇出）。
 export const CHAT_LEN = 120;
@@ -103,6 +109,7 @@ export class Lobby {
       badMode: 0,
       starts: 0, notHost: 0, tooFew: 0, notReady: 0,
       seats: 0, leaves: 0, swept: 0,
+      botAdd: 0, botDel: 0, botFull: 0,
     };
   }
 
@@ -111,12 +118,15 @@ export class Lobby {
   touch(room) { room.lastActive = Date.now(); }
 
   // 一间的对外摘要。列表和"对局中不能进"这两件事都读它，所以只有一份。
+  // Bot 也占位置，所以 players 是"真人 + Bot"，另把 Bot 数单独带出去 ——
+  // 列表上写着"6/16"而进去只看见一个人的那种错觉，靠这一格拆开。
   brief(room) {
     let ready = 0;
     for (const s of room.seats.values()) if (s.ready) ready++;
+    const bots = room.bots ? room.bots.size : 0;
     return {
       id: room.id, title: room.title || room.id, map: room.mapId, mode: room.mode,
-      players: room.seats.size, max: MAX_SEATS, ready, time: room.minutes,
+      players: room.seats.size + bots, max: MAX_SEATS, bots, ready: ready + bots, time: room.minutes,
       state: room.stage === 'playing' ? 'playing' : 'waiting',
       host: (room.seats.get(room.hostSid) || {}).name || '',
     };
@@ -139,7 +149,12 @@ export class Lobby {
     }));
     const me = forSeat ? { sid: forSeat.sid, name: forSeat.name, team: forSeat.team, ready: !!forSeat.ready, isHost: forSeat.sid === room.hostSid } : null;
     const g = this.startGate(room, forSeat);
-    return { t: 'room', room: this.brief(room), me, seats, canStart: g.ok, why: g.why, chat: room.chat.slice() };
+    // Bot 单独一列而不是混进 seats：seats 那一格的语义是"一条连接"（下游到处假设
+    // seat.ws 存在、seat 能当房主），把 Bot 塞进去会让 _handover 有朝一日把房主交给一个 Bot，
+    // 而那种房间的开始按钮永远点不动，且不报错。
+    const bots = room.bots ? [...room.bots.values()].map(b => ({ bid: b.bid, name: b.name, team: b.team, skill: b.skill })) : [];
+    return { t: 'room', room: this.brief(room), me, seats, bots, botSkill: room.botSkill | 0,
+      canStart: g.ok, why: g.why, chat: room.chat.slice() };
   }
   pushRoom(room) {
     for (const s of room.seats.values()) {
@@ -175,18 +190,31 @@ export class Lobby {
   _owned(key) { let n = 0; for (const r of this.rooms.values()) if (r.hostKey === key) n++; return n; }
   _mkRoom(id, title, mapId, mode, minutes) {
     const room = { id, title, hostSid: null, mapId, mode, minutes, stage: 'waiting',
-      seats: new Map(), chat: [], lastActive: Date.now() };
+      seats: new Map(), chat: [], lastActive: Date.now(),
+      // 房主加的 Bot。**只在等待态可改**：开局那一刻这份名单被读进 sim，之后再动它
+      // 就要往一个正在跑的世界里插人（快照里的实体表会长出来一格，而客户端的名册
+      // 是在 welcome 里一次性给的）—— 那种"半路冒出一个人"的错最难查，所以直接不让它发生。
+      bots: new Map(), botSeq: 0, botSkill: 1 };
     this.rooms.set(id, room);
     return room;
   }
   _seat(ws, name, loadout, xp, account) {
     return { sid: sidOf(ws), name, team: 'A', ready: false, xp: xp | 0, account: account || null, ws, loadout: loadout || null };
   }
+  _total(room) { return room.seats.size + (room.bots ? room.bots.size : 0); }
+  _teamCount(room, t) {
+    let n = 0;
+    for (const s of room.seats.values()) if (s.team === t) n++;
+    if (room.bots) for (const b of room.bots.values()) if (b.team === t) n++;
+    return n;
+  }
   // 新来的人塞进人少的那一队。按"谁点得快谁选队"分的话，一屋子人全挤在 A 队，
   // 而房主按开始时的判据里如果要求两队都有人，那就是"人够了却开不了局"。
+  // Bot 也要算进两队的人数：不算的话，一间摆了 8 个 A 队 Bot 的房还能再塞 8 个人进 A 队，
+  // 开局就是 16 打 0 —— 而列表上这间房只显示"8/16"，谁也看不出它已经歪了。
   _freeTeam(room) {
-    let a = 0, b = 0;
-    for (const s of room.seats.values()) (s.team === 'B' ? b++ : a++);
+    if (this._total(room) >= MAX_SEATS) return null;
+    const a = this._teamCount(room, 'A'), b = this._teamCount(room, 'B');
     if (a >= MAX_PER_TEAM && b >= MAX_PER_TEAM) return null;
     return a <= b ? 'A' : 'B';
   }
@@ -251,7 +279,7 @@ export class Lobby {
     if (!room) { this.stat.badId++; return { ok: false, message: '那间房已经不在了' }; }
     if (room.stage !== 'waiting') { this.stat.playing++; return { ok: false, message: '那间房正在对局中，等它打完或在列表里另找一间' }; }
     const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account);
-    if (!this._place(room, seat)) { this.stat.full++; return { ok: false, message: '那间房已经满了（上限 ' + MAX_SEATS + ' 人）' }; }
+    if (!this._place(room, seat)) { this.stat.full++; return { ok: false, message: '那间房已经满了（上限 ' + MAX_SEATS + ' 个位置，Bot 也占位置）' }; }
     this.stat.join++;
     this._sys(room, seat.name + ' 进来了');
     this.pushRoom(room); this.pushLobby();
@@ -263,7 +291,7 @@ export class Lobby {
   quickRoom(ws, msg = {}) {
     let best = null;
     for (const r of this.rooms.values()) {
-      if (r.stage !== 'waiting' || r.seats.size >= MAX_SEATS) continue;
+      if (r.stage !== 'waiting' || this._total(r) >= MAX_SEATS) continue;
       if (this._freeTeam(r) === null) continue;
       if (!best || r.seats.size > best.seats.size) best = r;
     }
@@ -327,6 +355,83 @@ export class Lobby {
     if (MAP_IDS.has(msg.map)) room.mapId = msg.map;
     if (MODE_IDS.has(msg.mode)) room.mode = msg.mode;
     if (MIN_SET.has(Number(msg.minutes))) room.minutes = Number(msg.minutes);
+    // Bot 难度改一个就**全体一起改**：房间屏上那一格只有一个选择器，而"后来加的 Bot 更凶"
+    // 这种半新半旧的状态没有任何界面能表达出来，玩家只会觉得"这几个 Bot 手感不一样"。
+    if (BOT_SKILLS.includes(Number(msg.botSkill))) {
+      room.botSkill = Number(msg.botSkill);
+      for (const b of room.bots.values()) b.skill = room.botSkill;
+    }
+    this.touch(room);
+    this.pushRoom(room); this.pushLobby();
+  }
+
+  // ── 房主往房间里加 / 减 Bot ──
+  // 判据和别的房主操作同源：**只有房主能改**，改完立刻广播（房间屏与大厅列表一起推 ——
+  // 列表上那一格"几个人"要把 Bot 算进去，否则别人看见的是一张与进去之后不符的表）。
+  // 名字从 js/data.js 的 BOT_NAMES 里挑一个这一间还没用过的：两个 Bot 同名的话，
+  // 击杀播报里"猎鹰 击杀 猎鹰"在玩家看来就是自己人打自己人。
+  _botName(room) {
+    const used = new Set();
+    for (const s of room.seats.values()) used.add(s.name);
+    for (const b of room.bots.values()) used.add(b.name);
+    for (const n of BOT_NAMES) if (!used.has(n)) return n;
+    return 'Bot ' + (room.botSeq + 1);
+  }
+  _botTeam(room, want) {
+    if (this._total(room) >= MAX_SEATS) return null;
+    if (want === 'A' || want === 'B') return this._teamCount(room, want) < MAX_PER_TEAM ? want : null;
+    const a = this._teamCount(room, 'A'), b = this._teamCount(room, 'B');
+    if (a >= MAX_PER_TEAM && b >= MAX_PER_TEAM) return null;
+    return a <= b ? 'A' : 'B';
+  }
+  addBot(ws, msg = {}) {
+    const at = this.seat(ws); if (!at) return;
+    const { room, seat } = at;
+    if (room.stage !== 'waiting') { this.stat.playing++; return; }
+    if (seat.sid !== room.hostSid) {
+      this.stat.notHost++;
+      this.send(ws, JSON.stringify({ t: 'err', msg: '只有房主能添加 Bot' }));
+      return;
+    }
+    // 指定了队但那一队站满：**当场拒绝**，不静默换到另一队。静默换队的症状是
+    // 房主连点两下"A 队 +"，结果人全跑到 B 队去了，而他以为自己一直在加 A 队。
+    const team = this._botTeam(room, msg.team);
+    if (!team) {
+      this.stat.botFull++;
+      this.send(ws, JSON.stringify({ t: 'err', msg: team === null && (msg.team === 'A' || msg.team === 'B')
+        ? `${msg.team} 队已经站满了（每队 ${MAX_PER_TEAM} 个）`
+        : `这间房已经满了（上限 ${MAX_SEATS} 个位置）` }));
+      return;
+    }
+    // 难度：**没带就用房间那一格**。写成 `(msg.skill | 0)` 那种夹取值是错的 ——
+    // undefined | 0 正好等于 0（新兵），于是"什么都没选"被当成"选了最简单的那一档"，
+    // 而房间里那一格明明写着正规军。这条是被判据抓出来的（I 段第一条 Bot 的 skill 是 0）。
+    const skill = BOT_SKILLS.includes(msg.skill) ? msg.skill : (room.botSkill | 0);
+    const bid = ++room.botSeq;
+    const bot = { bid, name: this._botName(room), team, skill };
+    room.bots.set(bid, bot);
+    this.stat.botAdd++;
+    this._sys(room, `${seat.name} 加了一个 Bot（${bot.name}）`);
+    this.touch(room);
+    this.pushRoom(room); this.pushLobby();
+  }
+  removeBot(ws, msg = {}) {
+    const at = this.seat(ws); if (!at) return;
+    const { room, seat } = at;
+    if (room.stage !== 'waiting') { this.stat.playing++; return; }
+    if (seat.sid !== room.hostSid) {
+      this.stat.notHost++;
+      this.send(ws, JSON.stringify({ t: 'err', msg: '只有房主能移除 Bot' }));
+      return;
+    }
+    // 没带 bid 就移除最后加的那个：房主点"减一个"时他脑子里是"刚加的那个走"。
+    // 反过来（移除最早那个）会让名单每次都跳到顶上，看不出自己减掉了谁。
+    const list = [...room.bots.values()];
+    const bot = msg.bid != null ? room.bots.get(msg.bid | 0) : list[list.length - 1];
+    if (!bot) return;
+    room.bots.delete(bot.bid);
+    this.stat.botDel++;
+    this._sys(room, `${seat.name} 移除了 Bot（${bot.name}）`);
     this.touch(room);
     this.pushRoom(room); this.pushLobby();
   }
@@ -336,7 +441,10 @@ export class Lobby {
     if (!seat) return { ok: false, why: '你不在任何房间里。' };
     if (room.stage !== 'waiting') return { ok: false, why: '这间已经在对局中了。' };
     if (seat.sid !== room.hostSid) return { ok: false, why: '只有房主能开始游戏。' };
-    if (room.seats.size < 2) return { ok: false, why: '至少还要再来一个人。' };
+    // Bot 算人头：一个人加一个 Bot 就能开 —— 这正是"加 Bot"这一项存在的理由
+    // （屋里只有两个人时也能打一场像样的仗）。不算的话，房主加了八个 Bot 还是
+    // 被"至少还要再来一个人"挡着，而界面上那八个 Bot 明明就列在下面。
+    if (this._total(room) < 2) return { ok: false, why: '至少还要再来一个人或一个 Bot。' };
     const wait = [...room.seats.values()].filter(s => s.sid !== room.hostSid && !s.ready).map(s => s.name);
     if (wait.length) return { ok: false, why: '还在等：' + wait.slice(0, 4).join('、') + (wait.length > 4 ? '…' : '') };
     return { ok: true, why: '' };

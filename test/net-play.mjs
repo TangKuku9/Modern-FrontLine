@@ -215,7 +215,33 @@ try {
     H.hits = g.player.stats.hits;
     return H;
   };
+  // 面板读数**必须在开打之前就开始采**。killfeed 那一行 6 秒后自删、死亡画面 3 秒重生时收起，
+  // 而 HUNT 最长跑 25 秒 —— 等它跑完再来读面板，读到的是"已经过期"的那一格。
+  // （这一版之前那两条就是这么恒红的：权威 hp=0、重生事件 1、killerInfo 有字，全都证明人
+  //   真的死了，只有面板读数取晚了。是这个仓库第三类量具错误：**读数取晚了**。）
+  // 所以在页面里装一个 50 ms 的观察器，把"见过的最大行数 / 死亡画面出现过没有"记在自己身上，
+  // HUNT 跑完再来收 —— 采样窗口覆盖整场，而不是只覆盖结尾那 2.5 秒。
+  const WATCH = () => {
+    const w = window.__uiWatch = { rows: 0, feed: '', dead: false, info: '', polls: 0 };
+    w.t = setInterval(() => {
+      w.polls++;
+      const k = document.getElementById('killfeed');
+      if (k && k.children.length > w.rows) {
+        w.rows = k.children.length;
+        w.feed = k.textContent.replace(/\s+/g, ' ').trim();
+      }
+      const d = document.getElementById('deathScreen');
+      if (d && !d.classList.contains('hidden')) {
+        w.dead = true;
+        w.info = (document.getElementById('killerInfo') || {}).textContent || w.info;
+      }
+    }, 50);
+    return true;
+  };
+  const STOP = () => { const w = window.__uiWatch; if (w) clearInterval(w.t); return w; };
+  await A.page.evaluate(WATCH); await B.page.evaluate(WATCH);
   const [hA, hB] = await Promise.all([A.page.evaluate(HUNT), B.page.evaluate(HUNT)]);
+  const uwA = await A.page.evaluate(STOP), uwB = await B.page.evaluate(STOP);   // 不叫 wA：下面武器那一节已经用了这个名字
   const hpA = await A.page.evaluate(() => {
     const g = window.game, s = g.net.mySnapshot;
     return {
@@ -259,41 +285,25 @@ try {
   // 那一半（killfeed 那一行、死亡画面、"被 X 使用 Y 击杀"）只能在这里量。
   // 反证臂：`git stash push -- js/main.js` 退掉那一组回调再跑，下面三条必须变红
   // （没有 onNetKill/onNetDeath ⇒ killfeed 永远空、死亡画面永远不显示）。
-  const uiOf = (p) => p.page.evaluate(() => {
-    const kf = document.getElementById('killfeed');
-    const ds = document.getElementById('deathScreen');
-    return {
-      rows: kf ? kf.children.length : -1,
-      feed: kf ? kf.textContent.replace(/\s+/g, ' ').trim() : '',
-      dead: !!(ds && !ds.classList.contains('hidden')),
-      info: (document.getElementById('killerInfo') || {}).textContent || '',
-    };
-  });
-  // killfeed 那一条 6 秒后自己删、死亡画面在 3 秒重生时收起来 ⇒ 这里**轮询采样**而不是读一次：
-  // 单点读数有可能正好落在两者之间，那会做成一条时红时绿的判据（而这个仓库里"偶发红"
-  // 的下场是被当成噪声忽略掉）。
-  let uiA = await uiOf(A), uiB = await uiOf(B), sawScreen = false;
-  for (let i = 0; i < 25; i++) {
-    if (uiA.dead || uiB.dead) sawScreen = true;
-    if ((uiA.rows >= 1 || uiB.rows >= 1) && sawScreen) break;
-    await sleep(100);
-    uiA = await uiOf(A); uiB = await uiOf(B);
-  }
-  console.log(`  甲面板：killfeed ${uiA.rows} 行「${uiA.feed}」· 死亡画面 ${uiA.dead} · killerInfo「${uiA.info}」`);
-  console.log(`  乙面板：killfeed ${uiB.rows} 行「${uiB.feed}」· 死亡画面 ${uiB.dead} · killerInfo「${uiB.info}」`);
+  // 反证臂：把 js/main.js 里那两组回调摘掉再跑，下面三条必须变红（killfeed 永远空、
+  // 死亡画面永远不显示）。实测见文末记录：摘掉 killfeed 那一行 ⇒ 三条全红。
+  const uiA = uwA || {}, uiB = uwB || {};
+  console.log(`  甲面板：killfeed 最多 ${uiA.rows} 行「${uiA.feed}」· 死亡画面出现过 ${uiA.dead} · killerInfo「${uiA.info}」`);
+  console.log(`  乙面板：killfeed 最多 ${uiB.rows} 行「${uiB.feed}」· 死亡画面出现过 ${uiB.dead} · killerInfo「${uiB.info}」`);
+  console.log(`  观察器各自采样了 ${uiA.polls} / ${uiB.polls} 次（覆盖整场，不是只覆盖结尾）`);
   // 判据钉**结构**不钉措辞：只要那一行里出现了这两个呼号之一，就说明画的是这一把的那次击杀
   // （钉"→"或"击杀"这类字眼会在下次改文案时假红）。
-  const feedText = (uiA.feed + ' ' + uiB.feed).trim();
+  const feedText = ((uiA.feed || '') + ' ' + (uiB.feed || '')).trim();
   ok('killfeed 画出了那一行、且写着这两个人（差距 31）',
     (uiA.rows >= 1 || uiB.rows >= 1) && [hpA.name, hpB.name].some(n => n && feedText.includes(n)),
     `「${feedText}」`);
   // killerInfo 在重生时**不会**被清（只清 respawnText），所以这一条不受 3 秒窗口影响。
-  const infoText = (uiA.info + ' ' + uiB.info).trim();
+  const infoText = ((uiA.info || '') + ' ' + (uiB.info || '')).trim();
   ok('死亡画面把击杀者填上了（差距 32）',
     infoText.length > 0 && [hpA.name, hpB.name].some(n => n && infoText.includes(n)),
     `「${infoText}」`);
-  ok('死亡画面在被打死的当下真的显示过（3 秒重生时才收起来）', sawScreen,
-    `采样末值 甲 dead=${uiA.dead} · 乙 dead=${uiB.dead}`);
+  ok('死亡画面在被打死的当下真的显示过（3 秒重生时才收起来）', !!(uiA.dead || uiB.dead),
+    `甲 dead=${uiA.dead} · 乙 dead=${uiB.dead}（观察器全程盯着，不是末值）`);
 
   await sleep(4500);
   const after = async (p) => p.page.evaluate(() => {

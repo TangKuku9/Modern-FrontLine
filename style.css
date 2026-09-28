@@ -147,6 +147,13 @@ html, body { position: fixed; inset: 0; }
 .seat .s-lv { color: #888; font-size: 11px; }
 .seat .s-st { color: #999; font-size: 11px; min-width: 56px; text-align: right; }
 .seat.rd .s-st { color: #8fe06a; }
+/* Bot 席位：左边一道冷色的标识条，房主那一行可点（点了移除）。 */
+.seat.bot { border-left-color: #7fb2ff; background: rgba(127,178,255,.07); }
+.seat.bot .s-tag { color: #7fb2ff; }
+.seat.bot[data-bid] { cursor: pointer; }
+.seat.bot[data-bid]:hover { background: rgba(127,178,255,.14); }
+.team-btns { display: flex; gap: 6px; margin-top: 8px; }
+.team-btns .btn { flex: 1; }
 .rm-foot { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
 .rm-foot #rmWhy { margin-left: auto; font-size: 12px; color: #999; }
 .btn.go { letter-spacing: 4px; }

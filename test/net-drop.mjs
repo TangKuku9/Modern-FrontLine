@@ -508,6 +508,99 @@ try {
     ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
     srv.kill();
   }
+  if (!skip('G')) {
+    console.log('\n── G：房主在房间屏上加 Bot，一个人也能开一局 ──');
+    // 这一段的判据是**看得见**：房主一个人加了 3 个 Bot 之后开局，他屏幕上要真的出现
+    // 3 个远端实体。少了这一条，"Bot 进了权威端却没编进快照"那种失效会全绿 ——
+    // 而它的症状是最糟的一种：房主加了一屋子 Bot，进去一个也看不见，然后被看不见的东西打死。
+    // 服务端那一半（包长、重生、记分板）在 test/room-bots.mjs，真连接的名单规则在 room-flow 的 I 段。
+    await closeOpened();
+    const srv = await withServer(GUEST);
+    const V2 = { width: 1280, height: 720 };
+    const A = await newPage(browser, srv, 'bots-a', null, '', V2);
+    const a = A.page;
+    const wait = async (page, fn, ms = 30000, arg = undefined) => {
+      const t0 = Date.now();
+      for (;;) {
+        const v = await page.evaluate(fn, arg).catch(() => null);
+        if (v) return v;
+        if (Date.now() - t0 > ms) return null;
+        await sleep(250);
+      }
+    };
+    for (let i = 0; i < 200; i++) { if (await a.evaluate(() => !!document.querySelector('[data-a=online]'))) break; await sleep(250); }
+    await a.bringToFront();
+    await a.click('[data-a=online]');
+    await wait(a, () => (window.game.menu || {}).screen === 'online' && !!document.querySelector('[data-a=create]'));
+    await a.fill('#onName', '房主甲');
+    await a.click('[data-a=create]');
+    await wait(a, () => (window.game.menu || {}).screen === 'onlineRoom' && !!document.querySelector('[data-a=start]'));
+
+    ok('只有房主看得见"+ Bot"那两个按钮（不是摆给所有人点、点了才拒）',
+      await a.evaluate(() => document.querySelector('[data-a=addA]').style.display !== 'none'
+        && document.querySelector('[data-a=addB]').style.display !== 'none'),
+      JSON.stringify(await a.evaluate(() => ({ a: document.querySelector('[data-a=addA]').style.display, b: document.querySelector('[data-a=addB]').style.display }))));
+    ok('一个人的时候不给开局（这一格是下面每一条的起点）',
+      await a.evaluate(() => document.querySelector('[data-a=start]').disabled === true));
+
+    await a.click('[data-a=addA]');
+    await a.click('[data-a=addA]');
+    await a.click('[data-a=addB]');
+    const seats = await wait(a, () => {
+      const all = [...document.querySelectorAll('#seatA .seat[data-bid], #seatB .seat[data-bid]')];
+      return all.length === 3 ? all.map(el => ({
+        name: el.querySelector('.s-name').textContent,
+        team: el.closest('#seatA') ? 'A' : 'B',
+        tag: el.querySelector('.s-tag').textContent,
+        st: el.querySelector('.s-st').textContent,
+      })) : null;
+    });
+    ok('点了三下，两队各多出几行 Bot（名字与队伍都画出来了）',
+      !!seats && seats.filter(s => s.team === 'A').length === 2 && seats.filter(s => s.team === 'B').length === 1,
+      JSON.stringify(seats));
+    ok('Bot 那一行标着"Bot"，房主那一行写明"点击移除"（一行和人长得一样的话没人知道能点）',
+      !!seats && seats.every(s => s.tag === 'Bot' && s.st === '点击移除'), JSON.stringify(seats && seats.map(s => s.tag + '/' + s.st)));
+    ok('加了 Bot 之后一个人就能开局（这正是这一项存在的理由）',
+      await a.evaluate(() => document.querySelector('[data-a=start]').disabled === false
+        && /都准备好|可以开始/.test((document.querySelector('#rmWhy') || {}).textContent || '')),
+      JSON.stringify(await a.evaluate(() => ({ d: document.querySelector('[data-a=start]').disabled, why: (document.querySelector('#rmWhy') || {}).textContent }))));
+    ok('标题上把 Bot 数单写出来（只写"4 人"的话，点进去只看见一个人，像列表算错了）',
+      /3 Bot/.test(await a.evaluate(() => (document.querySelector('#rmMeta') || {}).textContent || '')),
+      await a.evaluate(() => (document.querySelector('#rmMeta') || {}).textContent));
+    // 难度那一格：有 Bot 之后才画出来（空房子里摆一个 Bot 选择器 = "选了就会自动加 Bot"）
+    ok('房间设置里多出 Bot 难度那一行，且能改',
+      await a.evaluate(() => !!document.querySelector('#rmBot') && /正规军/.test(document.querySelector('#rmBot').textContent)),
+      await a.evaluate(() => (document.querySelector('#rmBot') || {}).textContent));
+    const botNames = await a.evaluate(() => (window.game.lobby.state.bots || []).map(b => b.name));
+    await a.screenshot({ path: 'test/lobby-room-bots.png' });
+
+    await a.click('[data-a=start]');
+    ok('房主一个人也进了对局（拿到 cid、在收快照）',
+      !!(await wait(a, () => window.game.state === 'play' && window.game.net && window.game.net.cid && window.game.net.snaps > 5, 40000)),
+      JSON.stringify(await a.evaluate(() => ({ s: game.state, snaps: game.net && game.net.snaps }))));
+    // ── 这一段的命门 ──
+    const seen = await wait(a, () => window.game.net.remotes.size >= 3 ? [...window.game.net.remotes.values()].map(r => ({ name: r.name, team: r.team })) : null, 20000);
+    ok('屏幕上真的出现 3 个远端实体（Bot 没编进快照的话这里是 0，而它照样在开枪）',
+      !!seen && seen.length === 3, JSON.stringify(seen));
+    ok('它们的名字就是房主在房间屏上加的那几个（不是服务端另起的一套）',
+      !!seen && seen.every(s => botNames.includes(s.name)), JSON.stringify({ added: botNames, seen: seen && seen.map(s => s.name) }));
+    ok('分在房主指定的那两队（A 队 2 个、B 队 1 个）',
+      !!seen && seen.filter(s => s.team === 'A').length === 2 && seen.filter(s => s.team === 'B').length === 1,
+      JSON.stringify(seen));
+    // 反证臂：这些实体是**会动的**（插值在跑），不是建出来就杵在原地的空壳
+    const moved = await (async () => {
+      const p0 = await a.evaluate(() => [...window.game.net.remotes.values()].map(r => [+r.pos.x.toFixed(3), +r.pos.z.toFixed(3)]));
+      await sleep(2500);
+      const p1 = await a.evaluate(() => [...window.game.net.remotes.values()].map(r => [+r.pos.x.toFixed(3), +r.pos.z.toFixed(3)]));
+      return p0.length === 3 && p0.some((p, i) => Math.hypot(p[0] - p1[i][0], p[1] - p1[i][1]) > 0.2);
+    })();
+    ok('【反证】这 3 个实体在自己走（Bot 在权威端跑，位置经插值送到屏幕上）', moved);
+    await a.bringToFront();
+    await a.screenshot({ path: 'test/lobby-match-bots.png' });
+    ok('页面没有真错误', realErrs(A.logs).length === 0, A.logs.slice(0, 2).join(' ⏐ '));
+    srv.kill();
+  }
+
 } catch (e) {
   console.log('CRASH ' + (e && (e.stack || e.message)));
   bad++; n++;

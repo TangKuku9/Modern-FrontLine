@@ -208,7 +208,7 @@ const auth = await createAuth({ cfg: CFG });
 // 下面那个分支要按这张表判断"这帧归大厅管"，而漏一条的症状不是报错，是**这帧被静默丢掉**
 // —— 房主按开始没反应、聊天发不出去，都属于这一类。
 const LOBBY_FRAMES = new Set(['lobby', 'say', 'createRoom', 'joinRoom', 'quickRoom', 'leaveRoom',
-  'ready', 'team', 'roomCfg', 'start']);
+  'ready', 'team', 'roomCfg', 'start', 'botAdd', 'botDel']);
 
 // 房间的显示名（联机大厅"创建房间"带来的那一格）。它**不是房号** ——
 // 房号另有白名单（pickRoom 的 [A-Za-z0-9_.-]），中文房名直接当房号会被清洗成空串、
@@ -507,7 +507,12 @@ function welcomeFrame(room, c) {
     // 这两件事的真相在权威端（规则内核里）；客户端自己按 data.js 那份渲染的话，
     // 服务端换一项客户端还显示旧的，症状是"按了没反应"。
     streaks: room.streakDefs.map(d => ({ id: d.id, name: d.name, icon: d.icon, kills: d.kills })),
-    others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team })),
+    // 房里的 Bot 也进 others：客户端按这一份建 NetPlayer（一个插值缓存 + 一个名牌），
+    // 而 Bot 在权威端是**真的**实体（会开枪、会裁决伤害）。不把它列进来的症状是
+    // 房主加了一屋子 Bot，所有人进去却一个也看不见 —— 然后被看不见的东西打死。
+    // bot:true 那一格只给界面看（座位栏上要能区分），判定不读它。
+    others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team }))
+      .concat((room.game ? room.game.bots : []).filter(b => b.netId).map(b => ({ id: b.netId, name: b.name, team: b.team, bot: true }))),
   };
 }
 
@@ -536,9 +541,14 @@ async function beginLive(wroom) {
     if (!s.ws || s.ws.readyState !== 1) continue;         // 掉线的人不进对局：他在名单上已经不在了
     put.push({ s, c: enterMatch(live, s.ws, { name: s.name, team: s.team, loadout: s.loadout, account: s.account }) });
   }
+  // Bot 在**所有人安放完之后**再放：welcomeFrame 的 others 要能列出它们，
+  // 而 spawnPoint 挑出生点时也要避开已经站在场上的人（先放 Bot 的话，第一个 Bot
+  // 会把"离敌人最远"算成"离空气最远"，于是整队 Bot 全摞在同一个角上）。
+  const nbots = [];
+  if (wroom.bots) for (const b of wroom.bots.values()) { if (live.spawnBot(b)) nbots.push(b.name); }
   for (const { s, c } of put) lobby.send(s.ws, JSON.stringify(welcomeFrame(live, c)));
-  console.log(`[room ${wroom.id}] 房主 ${host ? host.name : '?'} 开局：${put.length} 人进 ${wroom.mapId}/${wroom.mode}`);
-  return { ok: true, live, n: put.length };
+  console.log(`[room ${wroom.id}] 房主 ${host ? host.name : '?'} 开局：${put.length} 人 + ${nbots.length} Bot 进 ${wroom.mapId}/${wroom.mode}`);
+  return { ok: true, live, n: put.length, bots: nbots.length };
 }
 
 function startRoomLoop(room, id) {
@@ -783,6 +793,8 @@ wss.on('connection', (ws, req) => {
         else if (msg.t === 'ready') lobby.setReady(ws, msg);
         else if (msg.t === 'team') lobby.setTeam(ws, msg.team);
         else if (msg.t === 'roomCfg') lobby.setCfg(ws, msg);
+        else if (msg.t === 'botAdd') lobby.addBot(ws, msg);
+        else if (msg.t === 'botDel') lobby.removeBot(ws, msg);
         else if (msg.t === 'joinRoom') { const r = lobby.joinRoom(ws, { ...msg, ...id() }); if (!r.ok) ws.send(JSON.stringify({ t: 'err', msg: r.message })); }
         else if (msg.t === 'createRoom') { const r = lobby.createRoom(ws, { ...msg, ...id() }); if (!r.ok) ws.send(JSON.stringify({ t: 'err', msg: r.message })); }
         else if (msg.t === 'quickRoom') { const r = lobby.quickRoom(ws, { ...msg, ...id() }); if (!r.ok) ws.send(JSON.stringify({ t: 'err', msg: r.message })); }
