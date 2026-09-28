@@ -8,6 +8,7 @@
 // 协议：
 //   上行 二进制 = 若干个 13 字节输入包（按 tick 打时间戳，攒一帧一起发）
 //        文本   = {t:'join'|'ping'} 控制帧
+//               | 对局内：{t:'loadout'|'respawn'}（死亡画面里换配装 / 按空格提前部署）
 //               | 大厅与房间：{t:'lobby'|'say'|'createRoom'|'joinRoom'|'quickRoom'|
 //                 'leaveRoom'|'ready'|'team'|'roomCfg'|'start'}（判据在 server/lobby.mjs）
 //   下行 二进制 = 快照（server/codec.mjs 的定长格式）
@@ -22,7 +23,7 @@ import { extname, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { WebSocketServer } from 'ws';
-import { NetRoom, DT, SNAP_EVERY } from './room.mjs';
+import { NetRoom, DT, SNAP_EVERY, RESPAWN_DELAY } from './room.mjs';
 import { Lobby, MAX_SEATS } from './lobby.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
@@ -498,6 +499,10 @@ function welcomeFrame(room, c) {
     // 少了这一格，客户端会拿自己那份旧值去摆 HUD 与名牌，症状是"我在 B 队，屏幕上我是 A 队"。
     team: c.team,
     pos: [c.pl.pos.x, c.pl.pos.y, c.pl.pos.z], yaw: c.pl.yaw, loadout: c.loadout,
+    // 重生等待时长由服务端说：客户端要据此画"3 秒后重新部署"的倒计时，而那个数字的真相
+    // 在权威端（server/room.mjs:RESPAWN_DELAY）。客户端自己写一个常数的话，两边一旦不同步，
+    // 倒计时数到 0 还会再等一会儿 —— 玩家只会以为"卡住了"。
+    respawnDelay: RESPAWN_DELAY,
     // 连杀奖励的槽位表。**必须由服务端给**：按 3/4/5 各是什么、每个要几杀，
     // 这两件事的真相在权威端（规则内核里）；客户端自己按 data.js 那份渲染的话，
     // 服务端换一项客户端还显示旧的，症状是"按了没反应"。
@@ -755,6 +760,13 @@ wss.on('connection', (ws, req) => {
         console.log(`[join] ${c.name} → cid ${c.cid} @ ${room.id}（在线 ${room.clients.size}，本机 ${wss.clients.size} 连接 / ${rooms.size} 间）`);
       } else if (msg.t === 'ping') {
         ws.send(JSON.stringify({ t: 'pong', c: msg.c, s: Date.now(), tick: ws.__room?.tick ?? 0 }));
+      } else if (msg.t === 'loadout' || msg.t === 'respawn') {
+        // 对局内的两条**窄**控制帧。它们都只认"这条连接当前在哪个房间的哪个座位"，
+        // 而那个座位是握手时定下的 ⇒ 客户端报不了别人的 cid，也没有越权的余地。
+        const room = ws.__room;
+        if (!room || ws.__cid == null) return;
+        if (msg.t === 'loadout') room.applyLoadout(ws.__cid, msg.loadout || null);
+        else room.requestRespawn(ws.__cid);
       } else if (LOBBY_FRAMES.has(msg.t)) {
         // ── 大厅与房间：这一层只接线，判据全在 server/lobby.mjs ──
         // 身份和 join 同源（joinName）：要账号的服上呼号来自会话，访客可玩的服上才看自报那格。

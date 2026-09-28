@@ -48,6 +48,33 @@ function fxList(fx) {
 }
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+// 输入法保护：中文/日文选词时的回车是"**上屏**"，不是"提交 / 发送"。
+// `isComposing` 是标准信号，`keyCode === 229` 是部分旧 IME / 浏览器唯一给得出来的回退信号
+// （两者都要，只认一个会在某类输入法上漏掉）。抽成纯函数不是为了好看 —— 那两处都在 DOM
+// 事件回调里，node 侧够不到，而"少写这一句"的症状（把半成品拼音当成密码提交 / 当成消息发出去）
+// 只会表现为"玩家手快"，所以它必须能被判据直接走一遍。
+export const isImeKey = (e) => !!(e && (e.isComposing || e.keyCode === 229));
+
+// 暂停屏上"这一屏该说什么、该给哪些动作"。抽成纯函数有两个理由：
+//   ① 联机这条路上"暂停"这个词是**假**的（本地 sim 停了、服务端照跑，你的人还在场上挨打）——
+//      §附三 说得很清楚，服务端不暂停不是缺陷，缺的是**客户端的提示与降级**；
+//   ② "联机时不许再出现'重新开始对局'"这条必须能被判据钉住。钉文案是错的（这个仓库为此
+//      红过一整轮），所以这里量的是**结构**：哪个动作在不在。
+// 返回的字段名就是判据要读的东西，文案只是它们的呈现。
+export function pauseActions({ camp, online }) {
+  return {
+    title: online ? '菜单' : '已暂停',
+    sub: camp ? '战役 · 午夜清道夫' : online ? '多人对战 · 对局仍在进行' : '多人对战',
+    changeClass: !camp,
+    // 联机时"重新开始对局"会 ws.close() 静默断开、然后在本地开一局带 AI 的对战 ——
+    // 玩家以为还在打原来那局。替代它的是"退出本局"（有大厅座位就回房间，那条 socket
+    // 是房间的座位，关掉等于被踢出房间）。
+    restart: !online,
+    leaveMatch: online,
+    note: online ? '按 Esc 继续 · 对局不会因此停下' : '按 Esc 继续',
+  };
+}
+
 export class Menu {
   constructor(game) {
     this.game = game;
@@ -412,7 +439,12 @@ export class Menu {
     this.on(r, '[data-a=login]', () => submit('login'));
     this.on(r, '[data-a=reg]', () => submit('reg'));
     const pw = r.querySelector('#acctPw');
-    if (pw) pw.addEventListener('keydown', e => { if (e.key === 'Enter') submit('login'); });
+    if (pw) pw.addEventListener('keydown', e => {
+      // 输入法保护（中文/日文）：选词时的回车是"上屏"，不是"提交"。少这一句的后果是
+      // 密码框里那一串还没上屏的候选被当成密码提交，报一句"密码错误"而玩家完全不知道为什么。
+      if (isImeKey(e)) return;
+      if (e.key === 'Enter') submit('login');
+    });
   }
 
   // ── 联机第三层：大厅（一张实时的房间列表 + 全服频道）──
@@ -586,6 +618,10 @@ export class Menu {
     // 不该再被游戏那套快捷键接走（Tab 的 preventDefault 在 main.js 里，见它那段）。
     if (inp) inp.addEventListener('keydown', e => {
       e.stopPropagation();
+      // 输入法保护：中文/日文选词时的回车是"上屏"，不是"发送"。isComposing 是标准信号，
+      // keyCode 229 是部分旧 IME/浏览器唯一的回退信号。少这一句就会把半成品发出去 ——
+      // 而"打一句中文发出去变成一串拼音"这种问题，玩家只会怪自己手快。
+      if (isImeKey(e)) return;
       if (e.key === 'Enter') { e.preventDefault(); fire(); }
     });
   }
@@ -1055,20 +1091,28 @@ export class Menu {
     this.pauseAt = performance.now();
     const g = this.game;
     const camp = g.mode && g.mode.constructor.name === 'Campaign';
+    // 三种语义的差别（联机的"暂停"是假的、以及为什么)全在 pauseActions 里，见它的注释。
+    const online = !!(g.net && g.state === 'play');
+    const P = pauseActions({ camp, online });
     const r = this.render(`
       <div class="pause">
-        <div class="hdr" style="margin-bottom:30px">已暂停<small>${camp ? '战役 · 午夜清道夫' : '多人对战'}</small></div>
+        <div class="hdr" style="margin-bottom:30px">${P.title}<small>${P.sub}</small></div>
         <div class="mbtn" data-a="resume"><div class="ico">▶</div><div class="mt">继续游戏</div></div>
-        ${camp ? '<div class="mbtn" data-a="cp"><div class="ico">↺</div><div class="mt">读取检查点</div></div>' : '<div class="mbtn" data-a="class"><div class="ico">⚙</div><div class="mt">更换配装</div></div>'}
-        <div class="mbtn" data-a="restart"><div class="ico">⟲</div><div class="mt">${camp ? '重新开始任务' : '重新开始对局'}</div></div>
+        ${camp ? '<div class="mbtn" data-a="cp"><div class="ico">↺</div><div class="mt">读取检查点</div></div>' : ''}
+        ${P.changeClass ? '<div class="mbtn" data-a="class"><div class="ico">⚙</div><div class="mt">更换配装</div></div>' : ''}
+        ${P.restart ? `<div class="mbtn" data-a="restart"><div class="ico">⟲</div><div class="mt">${camp ? '重新开始任务' : '重新开始对局'}</div></div>` : ''}
+        ${P.leaveMatch ? '<div class="mbtn" data-a="leaveMatch"><div class="ico">✕</div><div class="mt">退出本局</div></div>' : ''}
         <div class="mbtn" data-a="settings"><div class="ico">☰</div><div class="mt">设置</div></div>
         <div class="mbtn" data-a="quit"><div class="ico">✕</div><div class="mt">退出到主菜单</div></div>
-        <div style="margin-top:20px;font-size:12px;color:#777">按 Esc 继续</div>
+        <div style="margin-top:20px;font-size:12px;color:#777">${P.note}</div>
       </div>`, 'solid', 'pause');
     this.on(r, '[data-a=resume]', () => this.resume());
     this.on(r, '[data-a=cp]', () => { g.paused = false; this.hide(); if (g.player.alive) { g.player.alive = false; g.dead = true; } g.mode.respawn(); });
     this.on(r, '[data-a=class]', () => this.showClassSelect(true));
     this.on(r, '[data-a=restart]', () => { const cfg = g.mode.cfg; const kind = camp ? 'campaign' : 'mp'; g.paused = false; g.startGame(kind, cfg); });
+    // 联机的"退出本局"：有大厅座位就**回房间**（那条 socket 是房间的座位，关掉等于被踢出房间，
+    // 见 js/main.js:returnToRoom 的注释）；?online=1 那种没有房间的直连才真的回主菜单。
+    this.on(r, '[data-a=leaveMatch]', () => { g.paused = false; if (g.lobby && g.lobby.connected) g.returnToRoom(); else g.exitToMenu(); });
     this.on(r, '[data-a=settings]', () => this.showSettings('pause'));
     this.on(r, '[data-a=quit]', () => g.exitToMenu());
   }

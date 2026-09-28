@@ -43,7 +43,20 @@ export class HeadlessGame {
     // （js/weapons.js:11）。于是"权威服务端偷偷跑了画面代码"会变成当场抛错，
     // 而不是安静地多算一份枪模。闸门里断言 game.player.ws.vm === null。
     this.camera = new THREE.PerspectiveCamera(78, 16 / 9, 0.05, 2500);
-    const s = makeStubs();
+    // —— 两处"必须是真行为、不能是桩"的权威侧状态 ——
+    // ① 火源列表。effects.addFireSource 的伤害是写在**第四个参数**（每拍回调）里的，
+    //    桩不会去调它 ⇒ 燃烧瓶在联机里零伤害，而且不报错。浏览器侧那份实现挂在
+    //    Effects.update 里（渲染帧驱动），服务端没有 Effects，只能在 step 里自己推。
+    //    列表**挂在实例上**（不是模块级）：一个进程跑多间房时，模块级会让火跨房间烧人。
+    // ② 伤害流水账：助攻要用"谁对谁打了多少"，而这件事只有权威端有（客户端那份是预测）。
+    const fires = this.fires = [];
+    const s = makeStubs({
+      'effects.addFireSource': (pos, r = 0.5, dur = Infinity, dmg = null) => {
+        const f = { pos: pos && pos.clone ? pos.clone() : new THREE.Vector3(pos.x, pos.y, pos.z), r, t: 0, dur, dmg, acc: 0 };
+        fires.push(f);
+        return f;
+      },
+    });
     Object.assign(this, s, { stubLog: s.log });
     this.renderer = makeAbsorbingRenderer(s.log);
     this.effects.texFlash = {};
@@ -75,12 +88,27 @@ export class HeadlessGame {
     this.player = null;
     this.mode = null;
     this.events = [];
+    this.dmgBy = new Map();          // 受害者 → Map(攻击者 → 累计伤害)。助攻的唯一原料。
     const { mat } = requireMaterials();
     this.mat = mat;
   }
 
   // ---------- main.js:307-311 的同形实现 ----------
   makeNoise(pos, r, team, footstep = false) { this.noises.push({ pos: pos.clone(), r, team, t: this.time, footstep }); }
+  // 权威端的伤害账本（受害者 → 攻击者 → 累计伤害）。**只在服务端这一份 game 上存在**：
+  // Player.takeDamage 里那句 `if (this.game.onDamage)` 在浏览器侧取到 undefined，
+  // 于是单机与客户端预测都不受影响；回滚重放也走不到它（weapon-state 的 fire 在 replay
+  // 时直接 continue —— 那一发的伤害服务端早就裁过）。这一条是助攻的**唯一**原料：
+  // 没有它，助攻只能靠猜（记分板那一列会永远空着，而没人会当 bug 报）。
+  // 与单机的关系：单机是把这个 Map 挂在 Bot 身上（js/ai.js:dmgTaken），真人不适用。
+  onDamage(victim, dmg, info) {
+    const a = (info && info.attacker) || null;
+    if (!a || a === victim || !(dmg > 0)) return;
+    let m = this.dmgBy.get(victim);
+    if (!m) this.dmgBy.set(victim, m = new Map());
+    m.set(a, (m.get(a) || 0) + dmg);
+    if (this.dmgBy.size > 64) this.dmgBy.delete(this.dmgBy.keys().next().value);
+  }
   onKill(killer, victim, weapon, head, info) {
     this.events.push({ e: 'kill', tick: this.tick, killer: killer && killer.name, victim: victim && victim.name, weapon, head: !!head });
     if (this.mode && this.mode.onKill) this.mode.onKill(killer, victim, weapon, head, info || {});
@@ -145,6 +173,14 @@ export class HeadlessGame {
     for (const b of this.bots) b.update(dt);
     for (const p of this.projectiles) p.update(dt);
     if (this.projectiles.some(p => !p.alive)) this.projectiles = this.projectiles.filter(p => p.alive);
+    // 火源：与浏览器侧 Effects.update 的那一段同构（判据是"掉落伤害总额一样"而不是"逐拍一样"：
+    // 伤害式是 `35 * dt` 的累加，两端各自的 dt 之和相同 ⇒ 总额相同）。
+    for (let i = this.fires.length - 1; i >= 0; i--) {
+      const f = this.fires[i];
+      f.t += dt; f.acc += dt;
+      if (f.t > f.dur) { this.fires.splice(i, 1); continue; }
+      if (f.dmg) f.dmg(dt, f);
+    }
     if (this.mode && this.mode.update) this.mode.update(dt, inp);
     return this;
   }

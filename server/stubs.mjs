@@ -44,11 +44,15 @@ const EFFECT_OVERRIDES = {
   'effects.lights': [],
 };
 
-export function makeStubs() {
+// extra：**每局一份**的覆盖项。默认那份 addFireSource 是个返回假对象的桩，而它一旦是桩，
+// 燃烧瓶在权威端就一点伤害都没有（伤害回调写在那个函数的第四个参数里，桩不会去调它）。
+// 想让火真的烧起来，就得把"这一局的火源列表"注入进来 —— 所以覆盖必须能按 game 实例给，
+// 不能用模块级的表：一个进程跑多间房时，模块级的火源表会让 A 房的火烧到 B 房的人身上。
+export function makeStubs(extra = {}) {
   const log = [];
   return {
     log,
-    effects: deepRecorder('effects', log, EFFECT_OVERRIDES),
+    effects: deepRecorder('effects', log, { ...EFFECT_OVERRIDES, ...extra }),
     audio: deepRecorder('audio', log),
     hud: deepRecorder('hud', log),
     menu: deepRecorder('menu', log),

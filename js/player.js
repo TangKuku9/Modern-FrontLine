@@ -130,6 +130,9 @@ export class Player {
     this.hp -= dmg * this.dmgMul;
     this.dmgT = 0;
     this.lastAttacker = info.attacker;
+    // 权威端的伤害流水账（助攻的原料）。浏览器侧没有这个钩子 ⇒ 单机与客户端预测都不受影响；
+    // 回滚重放也走不到这儿（weapon-state 的 fire 在 replay 时直接 continue）。
+    if (this.game.onDamage) this.game.onDamage(this, dmg * this.dmgMul, info);
     if (info.attacker && info.attacker.pos) this.game.hud.damageFrom(info.attacker.pos);
     else if (info.point) this.game.hud.damageFrom(info.point);
     if (!info.burn || Math.random() < 0.1) this.game.audio.hurt();

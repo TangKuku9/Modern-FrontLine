@@ -69,15 +69,22 @@ export function fireHitscan(game, shooter, o, d, stats, weaponName, opts = {}) {
   return r;
 }
 
+// opts.noDamage：**表现副本专用**（联机里"别人扔的那颗雷"在客户端只负责被看见）。
+// 少了它就只有两种选择：要么别人的雷在客户端隐形，要么客户端自己也算一次伤害 ——
+// 后者不会报错，只会让"这一局死得特别快"，而且两边各扣一次血在报表上完全看不出来。
 export function explode(game, pos, radius, maxDmg, attacker, weapon, opts = {}) {
   game.effects.explosion(pos, opts.scale || 1);
   game.audio.explosion(pos, opts.scale || 1);
+  // 冲击反馈（震屏 / 耳鸣）**先于**伤害跑，而且不看 noDamage：这一段的语义是
+  // "我附近炸了"，不是"我被裁决了伤害"。联机里"别人打来的爆炸不震屏"这条差距就卡在这儿 ——
+  // 客户端手上只有表现副本，它不裁伤害，但它知道爆炸在哪儿、离我多远。
   const pl = game.player;
   if (pl && pl.alive) {
     const d = pl.pos.distanceTo(pos);
     if (d < radius * 4) pl.shake(clamp(1.2 - d / (radius * 4), 0, 1) * 1.2);
     if (d < radius * 1.2) game.audio.ring(1.5, 0.05);
   }
+  if (opts.noDamage) return;
   const src = _p.copy(pos); src.y += 0.4;
   for (const e of game.entities) {
     if (!e.alive || !e.chestPos) continue;
@@ -95,9 +102,10 @@ export function explode(game, pos, radius, maxDmg, attacker, weapon, opts = {}) 
   game.makeNoise(pos, 80, attacker ? attacker.team : null);
 }
 
-export function flashAt(game, pos, owner) {
+export function flashAt(game, pos, owner, opts = {}) {
   game.effects.flashbang(pos);
   game.audio.explosion(pos, 0.4);
+  if (opts.noDamage) return;                   // 表现副本：只有那团白光，不裁"谁被闪了"
   const eye = new THREE.Vector3();
   for (const e of game.entities) {
     if (!e.alive || !e.eyePos) continue;
@@ -111,16 +119,27 @@ export function flashAt(game, pos, owner) {
     let t = (1 - d / 18) * (0.5 + facing * 0.7) * 5;
     if (e.isPlayer) {
       if (e.hasPerk('eod')) t *= 0.5;
-      game.hud.flash(Math.min(4.5, t));
-      game.audio.ring(Math.min(4, t), 0.15);
+      // 真人在权威端是**另一台机器上的浏览器**：hud.flash/audio.ring 在那台机器上够不着
+      // （服务端的 game.hud 是桩）。所以这里不是"调一下表现"，而是把"你被闪了多久"
+      // 编成一条事件发出去 —— game.flashPlayer 由 NetRoom 提供，浏览器侧没有它就照旧本地放。
+      const dur = Math.min(4.5, t);
+      if (game.flashPlayer) game.flashPlayer(e, dur);
+      else { game.hud.flash(dur); game.audio.ring(Math.min(4, dur), 0.15); }
     } else if (e.stun) e.stun(Math.min(4.5, t + 0.5));
   }
 }
 
 export class Projectile {
-  constructor(game, type, pos, vel, owner, fuse) {
+  // opts.dumb：**表现副本**。联机里"别人扔出来的那一颗"在客户端由这条通路重建 ——
+  // 它照样飞、照样磕墙、照样到点炸（视觉与声音都在本机跑），但**一次伤害都不裁决**。
+  // 为什么不让权威端直接广播"炸了"然后客户端放个特效：那样落地位置是权威的、
+  // 可按点播的事件只有 20Hz，弹道在客户端就会"先到后爆"或者干脆不出现；
+  // 让副本自己按同一套物理飞，起手位置/速度来自权威事件，就同时有"看得见"和"落得准"。
+  // 代价是副本的爆炸时刻由本地物理决定（与服务端差一两个量化格），但那不是伤害。
+  constructor(game, type, pos, vel, owner, fuse, opts = {}) {
     this.game = game; this.type = type; this.pos = pos.clone(); this.vel = vel.clone(); this.owner = owner;
     this.fuse = fuse; this.alive = true; this.stuck = false; this.age = 0; this.bounces = 0;
+    this.dumb = !!opts.dumb;
     let geo, m;
     if (type === 'frag') { geo = new THREE.SphereGeometry(0.05, 10, 8); m = mat('gunGreen'); }
     else if (type === 'semtex') { geo = new THREE.BoxGeometry(0.08, 0.05, 0.05); m = mat('yellowPaint'); }
@@ -134,6 +153,11 @@ export class Projectile {
     this.mesh.position.copy(this.pos);
     game.scene.add(this.mesh);
     if (type === 'semtex') { this.light = new THREE.Mesh(new THREE.SphereGeometry(0.025, 6, 4), new THREE.MeshBasicMaterial({ color: new THREE.Color(6, 0.3, 0.3) })); this.light.position.y = 0.05; this.mesh.add(this.light); }
+    // 权威端挂钩：**这一颗现在存在于世界里了**，把它编成一条事件发出去（NetRoom 收到后
+    // 分配 netId 并广播）。做在构造函数里而不是每一个 new 的调用点，是因为调用点有五处
+    // （手雷/粘性/燃烧瓶/闪光/烟雾/RPG/集束炸弹），漏一处就是"某种投掷物在联机里隐形"。
+    // 浏览器一侧没有这个钩子（game.onProjectile 未定义），所以单机的行为一个字都不变。
+    if (game.onProjectile) game.onProjectile(this);
   }
   update(dt) {
     if (!this.alive) return;
@@ -215,17 +239,20 @@ export class Projectile {
     const g = this.game;
     this.alive = false;
     g.scene.remove(this.mesh);
+    // 表现副本：伤害一律不走（noDamage），但视觉/声音/冲击照旧 ——
+    // "我附近炸了"这件事必须由这一台机器自己算，因为那一台只会告诉别人它炸了。
+    const nd = this.dumb ? { noDamage: true } : {};
     const wn = { frag: '破片手雷', semtex: '粘性炸弹', molotov: '燃烧瓶', rocket: 'RPG-7', bomb: '集束空袭' }[this.type];
-    if (this.type === 'frag' || this.type === 'semtex') explode(g, this.pos, 7, 160, this.owner, wn);
-    else if (this.type === 'rocket') explode(g, this.pos, 6, 170, this.owner, wn, { scale: 1.2 });
-    else if (this.type === 'bomb') explode(g, this.pos, 8, 180, this.owner, wn, { scale: 1.3 });
-    else if (this.type === 'flash') flashAt(g, this.pos, this.owner);
+    if (this.type === 'frag' || this.type === 'semtex') explode(g, this.pos, 7, 160, this.owner, wn, nd);
+    else if (this.type === 'rocket') explode(g, this.pos, 6, 170, this.owner, wn, { scale: 1.2, ...nd });
+    else if (this.type === 'bomb') explode(g, this.pos, 8, 180, this.owner, wn, { scale: 1.3, ...nd });
+    else if (this.type === 'flash') flashAt(g, this.pos, this.owner, nd);
     else if (this.type === 'molotov') {
       const owner = this.owner;
       const center = this.pos.clone(); center.y = g.world.groundHeight(center.x, center.z, center.y + 0.2, 0.1) + 0.05;
       g.audio.explosion(center, 0.35);
       g.audio.click(2500, 0.3, 0.4, center);
-      g.effects.addFireSource(center, 3, 7, (dt, f) => {
+      g.effects.addFireSource(center, 3, 7, this.dumb ? null : (dt, f) => {
         for (const e of g.entities) {
           if (!e.alive) continue;
           if (owner && e.team === owner.team && e !== owner) continue;

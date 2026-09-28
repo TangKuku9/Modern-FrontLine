@@ -12,6 +12,7 @@ import { uavFromFlags } from '../match-rules.js';
 import { rollback } from './predict.mjs';
 import { clamp } from '../util.js';
 import { Sentry, Heli } from '../mp.js';
+import { Projectile } from '../combat.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
 // 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
@@ -56,6 +57,12 @@ export class NetClient {
     this.worldFlags = 0;
     this.board = null;                                // 最近一份记分板（每 2 秒一条事件）
     this.turrets = new Map();                         // netId -> 本地表现副本（哨戒机枪 / 直升机）
+    // 别人扔出来的那些东西，在这边各有一个**表现副本**（js/combat.js:Projectile 的 dumb 模式）。
+    // 起手状态（位置/速度/引信）来自权威事件，之后客户端自己按同一套物理飞 —— 只看得见，
+    // 一次伤害都不裁决。见 spawnProjectile。
+    this.projs = new Map();                           // netId -> Projectile
+    this.leaving = [];                                // 正在淡出的远端玩家（已经不在权威世界里）
+    this.pingSent = 0; this.pingGot = 0;
   }
 
   connect() {
@@ -156,6 +163,7 @@ export class NetClient {
       else this.events.push({ e: 'serverError', msg: j.msg });
     } else if (j.t === 'pong') {
       this.rtt = performance.now() - j.c;
+      this.pingGot = (this.pingGot || 0) + 1;
     } else if (j.t === 'note') {
       // 服务端优雅下线时给的那句话 —— 比"连接断了"有用得多，玩家知道是维护不是自己网卡
       this.serverNote = String(j.msg || '');
@@ -170,7 +178,9 @@ export class NetClient {
     this.events.push({ e: 'disconnected', kind, reason });
   }
 
-  sendPing() { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'ping', c: performance.now() })); }
+  sendPing() {
+    if (this.ws && this.ws.readyState === 1) { this.pingSent = (this.pingSent || 0) + 1; this.ws.send(JSON.stringify({ t: 'ping', c: performance.now() })); }
+  }
 
   // 我这一帧渲染的是服务端的哪一拍 —— 这正是延迟补偿要的量。
   //
@@ -266,14 +276,27 @@ export class NetClient {
       if (r.weaponId === undefined) r.weaponId = 'm4';
       r.push(e, now);
     }
-    for (const [id, r] of this.remotes) {
-      if (!seen.has(id)) {
-        r.dispose(); this.remotes.delete(id);
-        const i = this.game.entities.indexOf(r);
-        if (i >= 0) this.game.entities.splice(i, 1);
-        this.game.remotePlayers = [...this.remotes.values()];
-      }
-    }
+    for (const [id, r] of this.remotes) if (!seen.has(id)) this.beginLeave(r);
+  }
+
+  // 一个远端实体从权威世界里消失了（注销 / 掉线 / 断在半路）。
+  // **不瞬时拆掉**：先进入淡出队列，让"他走了"这件事看得见 —— 瞬时消失与"我自己卡住了"
+  // 在画面上没有办法分辨，而那是联机里最容易误判的一类现象。淡出跑完才真正拆模型。
+  // 它留在 game.entities 里（模型得在场上才能淡出），但 targetable 已经置 false ——
+  // 子弹与爆炸的遍历都会跳过它，所以"对着一个已经走掉的人开枪"不会再有反馈。
+  beginLeave(r) {
+    if (!r || r.leaving) return;
+    this.remotes.delete(r.id);
+    r.beginLeave();
+    this.leaving.push(r);
+    this.game.remotePlayers = [...this.remotes.values()];
+  }
+  // 按名字找一个远端玩家。死亡镜头要转向击杀者，而服务端给的是**名字**（快照是定长的，
+  // 名字进不去）。找不到（被哨戒机枪 / 直升机打死的）就交回 null，那条路只有沉镜头。
+  remoteByName(name) {
+    if (!name) return null;
+    for (const r of this.remotes.values()) if (r.name === name) return r;
+    return null;
   }
 
   // 回滚重放本体在 js/net/predict.mjs（那边同时被 test/rollback.mjs 逐位断言）。
@@ -694,6 +717,15 @@ export class NetClient {
 
   onEvents(j) {
     for (const ev of j.ev) {
+      // 定向事件（`to`）在服务端是**一起下发**的（broadcast 把同一份 Buffer / 字符串发给
+      // 全房，见 server/net-server.mjs:broadcast），所以"这句话该给谁看"只能在客户端筛。
+      // 漏掉这三行的症状很具体：哨戒机枪部署失败被念成"敌方 无法在此部署"给全场听。
+      //  · self = 只给呼叫者（失败原因、自己的部署确认）
+      //  · own  = 只给呼叫者的**队**（"我方空袭已呼叫"这类战报）
+      //  · foes = 只给对面（来袭预警）
+      if (ev.to === 'self') { if (ev.cid !== this.cid) continue; }
+      else if (ev.to === 'own') { if (ev.team !== this.team) continue; }
+      else if (ev.to === 'foes') { if (ev.team === this.team) continue; }
       this.events.push(ev);
       if (ev.e === 'kill') {
         const g = this.game;
@@ -737,6 +769,28 @@ export class NetClient {
         this.game.audio.say((mine ? '' : '敌方') + ev.text);
       } else if (ev.e === 'firstBlood') {
         if (ev.cid === this.cid) this.game.hud.popup('首杀', '', true);
+      } else if (ev.e === 'assist' && ev.cid === this.cid) {
+        // 助攻的**表现侧**。分数与服务端的账在权威端结算（server/room.mjs:onKill），
+        // 这里只报一下"你参与了这个击杀" —— 一条提示，不改任何本地数字。
+        this.game.hud.popup(`助攻 ${ev.victim || ''}`, '#9cf');
+      } else if (ev.e === 'hurt' && ev.cid === this.cid) {
+        // 我的血量在联机里是**快照直接覆盖**的（predict 写 pl.hp），全程不走 takeDamage ⇒
+        // 单机那份 takeDamage 里的三件套（方向指示 / 痛感音 / 镜头冲击）一处都不会响。
+        // 服务端把"这一拍掉了血"编成事件发过来，这里补上那三件 —— 只做表现，绝不写 hp。
+        this.game.onNetHurt && this.game.onNetHurt(ev);
+      } else if (ev.e === 'flash' && ev.cid === this.cid) {
+        // 被闪光。单机走的是 js/combat.js:flashAt 的真人分支，而服务端那边 hud 是桩，
+        // 所以必须走事件。两边**共用**同一个 game.flashPlayer（main.js 提供的），
+        // 于是"闪多久"只有一份算法 —— 两份的话，联机与单机被闪的时长会各自漂移。
+        if (this.game.flashPlayer) this.game.flashPlayer(this.game.player, ev.dur);
+        else { this.game.hud.flash(ev.dur); this.game.audio.ring(Math.min(4, ev.dur), 0.15); }
+      } else if (ev.e === 'proj') {
+        this.spawnProjectile(ev);
+      } else if (ev.e === 'leave') {
+        const who = this.roster.get(ev.cid);
+        const r = this.remotes.get(ev.cid) || this.leaving.find(x => x.id === ev.cid);
+        if (r) this.beginLeave(r);                  // 事件先到：淡出不必等下一包快照缺人
+        if (who && ev.cid !== this.cid) this.game.hud.announce((who.name || '一名玩家') + ' 离开了对局', '', 2);
       } else if (ev.e === 'board') {
         this.board = ev;
         this.scores.A = ev.scores.A; this.scores.B = ev.scores.B;
@@ -761,6 +815,10 @@ export class NetClient {
   update(dt, inp) {
     const hud = this.game.hud;
     hud.streaks(this.streakDefs.length ? this.streakState : null, Math.floor(this.streakProgress));
+    // 每秒问一次往返时延。`sendPing` 定义了却**从无调用点** ⇒ rtt 恒 0，于是"网络状态"
+    // 这件事在客户端根本不存在（记分板上那个数也就永远是 0）。1 Hz 足够，也不会把
+    // JSON 帧塞满上行（上行的大头是定长输入包）。
+    if (!this.lost && (this.localTick % 60) === 0) this.sendPing();
     // 比分条按 6Hz 刷（每 10 拍）而不是每拍：它是 innerHTML 赋值，60Hz 刷会白掉帧。
     // 时间条走到秒都看得见，6Hz 足够。
     if ((this.localTick % 10) === 0) {
@@ -778,6 +836,22 @@ export class NetClient {
   setStreakSlot(id, patch) {
     const s = this.streakState.find(x => x.id === id);
     if (s) Object.assign(s, patch);
+  }
+
+  // 别人扔出来的那一颗：在本地按**同一套物理**重建（js/combat.js:Projectile 的 dumb 模式）。
+  // 起手状态（位置 / 速度 / 引信）来自权威事件，之后客户端自己飞、自己磕墙、自己到点炸，
+  // 只是**一次伤害都不裁决**（表现副本）。三种方案里只有这一条同时拿到"看得见"和"落得准"：
+  // 逐拍同步位置 ⇒ 20Hz 的弹道一跳一跳；只播"炸了" ⇒ 弹道根本不存在。
+  // 代价是爆炸时刻由本地物理决定（与服务端差一两个量化格），而那不是伤害。
+  spawnProjectile(ev) {
+    const g = this.game;
+    if (!g.world) return;                       // 地图还没加载完时收到的一条迟到事件
+    const owner = { team: ev.team, isPlayer: ev.team === this.team, alive: true };
+    const p = new Projectile(g, ev.kind, new THREE.Vector3(ev.x, ev.y, ev.z),
+      new THREE.Vector3(ev.vx, ev.vy, ev.vz), owner, ev.fuse, { dumb: true });
+    p.netId = ev.netId;
+    g.projectiles.push(p);
+    this.projs.set(ev.netId, p);
   }
 
   // 权威端放的哨戒机枪 / 武装直升机，在客户端建一个**不开火**的同形副本（dumb）。
@@ -824,12 +898,50 @@ export class NetClient {
       if (this.snapGap > 2.5) this.markLost('stale', '已经 2.5 秒没收到服务器状态');
     }
     for (const r of this.remotes.values()) r.update(dt, now);
+    // 淡出队列：走完的拆模型、从实体表里摘掉。它是"瞬时消失"的反面 ——
+    // 一个已经不在权威世界里的人，还在屏幕上留 0.8 秒。
+    for (let i = this.leaving.length - 1; i >= 0; i--) {
+      const r = this.leaving[i];
+      r.update(dt, now);
+      if (r.fadedOut) {
+        r.dispose();
+        const k = this.game.entities.indexOf(r);
+        if (k >= 0) this.game.entities.splice(k, 1);
+        this.leaving.splice(i, 1);
+      }
+    }
+    // 表现副本的账本要跟着 projectiles 一起收：手雷/炸弹到点炸掉之后 p.alive=false，
+    // main.js 的 update 会把它从 projectiles 里筛掉 —— 这边若不清，就是一张只涨不减的表。
+    if (this.projs.size) for (const [id, p] of this.projs) if (!p.alive) this.projs.delete(id);
     // 连杀奖励的表现副本按渲染帧走（它们只做动画与朝向，没有要裁决的东西）。
     // 寿命到点由权威端的 gone 事件说了算，这里的 this.t 只是兜底。
     for (const t of this.turrets.values()) t.update(dt);
   }
 
   spawnPoint() { return { pos: this.game.player ? this.game.player.pos.clone() : null, yaw: 0 }; }
+
+  // ── 局内换配装 / 提前部署（死亡画面与暂停菜单的那两条上行帧）──
+  // 语序与单机**一致**（js/mp.js:107 的 MPMatch.applyClass）：记住，重生时生效。
+  // 所以这里只把新配装发上去，**绝不本地 equip** —— 正在打的那条命的装备突然换掉，
+  // 会和权威端的预测分叉一整条命（表现是"每收一份快照被拽一下"）。
+  // 真正的生效点在服务端（重生块先 equip 再 respawn），然后把回声放进 respawn 事件里
+  // （js/main.js:onNetRespawn 按那份回声配枪）。三处各写一份装备表就是这个仓库最老的坑。
+  applyClass(idx) {
+    const g = this.game;
+    const cls = g.profile && g.profile.classes && g.profile.classes[idx];
+    if (!cls || !g.buildNetLoadout) return false;
+    g.profile.selClass = idx; g.saveProfile();
+    this.nextLoadout = g.buildNetLoadout(cls);
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'loadout', loadout: this.nextLoadout }));
+    return true;
+  }
+  get canChangeClass() { return true; }         // 与单机 MPMatch 同值（js/mp.js:37）
+  // 倒计时走完之后的确认。服务端只认"倒计时的最后 0.1 s"（server/room.mjs:requestRespawn），
+  // 所以这里不需要自己判断时机 —— 早了会被丢掉，而那正是我们想要的：早重生是实打实的收益，
+  // 闸门必须留在服务端。
+  requestRespawn() {
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'respawn' }));
+  }
 
   // 小地图的 UAV 效果。hud.drawMinimap 拿它决定"要不要把敌人画出来"，
   // 而敌人位置本来就在客户端手上（remotes 的插值结果）—— 所以这里只需要回答
@@ -838,19 +950,42 @@ export class NetClient {
 
   minimapMarkers() { return []; }
 
+  // 记分板。四件与单机对齐（js/mp.js:448-456）：名次、助攻、死亡灰行、实时刷新；
+  // 再加一行网络状态。以前只有名字/得分/击杀/死亡四列：助攻恒 '-'、没有名次、
+  // 活着与躺着长得一模一样，而且 A/B 的比分标签写死了 `我方 · A` —— 我要是站 B 队，
+  // 那一屏上"我方"挂的是对面的分。
   scoreboardHTML() {
-    const row = (r) => `<tr class="${r.cid === this.cid ? 'me' : ''}"><td>${r.name}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>-</td></tr>`;
-    const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
+    const row = (r) => `<tr class="${r.cid === this.cid ? 'me ' : ''}${r.alive === false ? 'dead' : ''}">`
+      + `<td>${r.rank || ''}</td><td>${r.name}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>${r.a || 0}</td></tr>`;
+    const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>#</th><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
     const rows = (this.board && this.board.rows) || [];
     const A = rows.filter(r => r.team === this.team), B = rows.filter(r => r.team !== this.team);
-    return head(`我方 · ${Math.floor(this.scores.A)}`, 'A') + A.map(row).join('') + '</table>'
-      + head(`敌方 · ${Math.floor(this.scores.B)}`, 'B') + B.map(row).join('') + '</table>';
+    const mine = this.team === 'A' ? this.scores.A : this.scores.B;
+    const theirs = this.team === 'A' ? this.scores.B : this.scores.A;
+    // 网络状态：同一屏里回答"是我卡了还是服务器卡了"。rtt 是 pong 实测的往返（每秒一次），
+    // snaps 是收到的快照份数 —— 后者停住就说明下行断了（和 2.5 秒那条看门狗是同一个事实）。
+    const net = `ping ${Math.round(this.rtt)} ms · 快照 ${this.snaps} 份`;
+    return `<div class="sbnet">${net}</div>`
+      + head(`我方 · ${Math.floor(mine)}`, 'A') + A.map(row).join('') + '</table>'
+      + head(`敌方 · ${Math.floor(theirs)}`, 'B') + B.map(row).join('') + '</table>';
   }
 
   dispose(keepSocket = false) {
     for (const t of [...this.turrets.values()]) this.removeTurret(t.netId);
     for (const r of this.remotes.values()) r.dispose();
     this.remotes.clear();
+    // 淡出队列里的那些还没走完：它们已经不在 remotes 里了，漏掉这一行就会把模型留在场上
+    // （回房间之后主菜单背景上飘着几个半透明的人）。
+    for (const r of this.leaving) r.dispose();
+    this.leaving.length = 0;
+    // 表现副本的 mesh 是挂在场景里的：不清的话它们会跟着进主菜单。
+    for (const p of this.projs.keys()) {
+      for (let i = this.game.projectiles.length - 1; i >= 0; i--) {
+        const q = this.game.projectiles[i];
+        if (q.netId === p && q.mesh) this.game.scene.remove(q.mesh);
+      }
+    }
+    this.projs.clear();
     if (this.game) this.game.remotePlayers = [];
     // keepSocket 是给"打完回房间"那条路用的：那条连接是大厅的，关掉它等于把人踢出房间。
     // （clearWorld → mode.dispose 走的是默认分支，legacy 的 ?online=1 那条路行为不变。）

@@ -136,6 +136,13 @@ export function animateSoldier(p, s, dt) {
     return;
   }
   const c = s.crouch;
+  // 存活分支必须**自己**把倒地姿态复位。死亡分支写的是 root.rotation.x/z，而这里以前
+  // 从不碰它们 —— 于是"死过又活过来"的人一直保持倒地角度，只是站着滑。症状是
+  // "远端重生后一直趴着"，而它不报错、也不影响位置，只是看起来像在游泳。
+  // 放在 animateSoldier 里而不是各调用点：调用点有三处（本机预测不画、Bot、NetPlayer），
+  // 漏掉任何一处都会在那一路上复现。ai.js 的 respawn 里那句 rotation.set(0,yaw,0) 保留 ——
+  // 它管的是同一帧就位，这里管的是"之后每一帧都不会被旧姿态污染"。
+  p.root.rotation.x = 0; p.root.rotation.z = 0;
   const moving = s.speed > 0.3;
   const sw = moving ? Math.sin(s.phase) : 0;
   const amp = Math.min(1, s.speed / 5) * (1 - c * 0.5);

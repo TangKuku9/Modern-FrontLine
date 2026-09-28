@@ -26,6 +26,10 @@ import { repairClass } from './loadout.mjs';
 import { damp } from './util.js';
 import { Account } from './account.js';
 
+// 拼进 innerHTML 的**服务端字符串**（呼号、离开提示）一律先剥掉角括号。
+// 被攻破的服务器不该能往这台页面上塞脚本，而 HUD 那几处（announce/killfeed）走的就是 innerHTML。
+const escHtml = (s) => String(s == null ? '' : s).replace(/[<>]/g, '');
+
 const GradeShader = {
   uniforms: { tDiffuse: { value: null }, time: { value: 0 }, nvg: { value: 0 }, thermal: { value: 0 }, hurt: { value: 0 }, vig: { value: 0.35 }, wp: { value: 0 }, res: { value: new THREE.Vector2(1, 1) } },
   vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
@@ -327,13 +331,97 @@ class Game {
       lethal: cls.lethal, tactical: cls.tactical, perks: cls.perks || [],
     };
   }
+  // ---------- 联机：本地玩家的反馈闭环 ----------
+  // 这一组四个回调（kill / death / hurt / respawn）在 `js/net/client.mjs` 里各有一个
+  // 明确的调用点。以前一个都不存在 —— 于是联机里"打死了没有任何提示、死了没有画面、
+  // 挨打没有方向"这三条同时成立，而服务端**早就把这些事件发出来了**（`g.onNetKill &&`
+  // 那一句恒为空过，不报错）。
+  onNetKill(ev) {
+    const me = this.player;
+    const myName = me && me.name;
+    // hud.killfeed 收的是**实体**（它只读 .name / .isPlayer / .team 三格），而事件里
+    // 只有名字，所以这里造两个同形的轻量对象 —— 改 HUD 的签名会让单机那条路一起动。
+    const mk = (name) => {
+      const r = this.net && this.net.remoteByName ? this.net.remoteByName(name) : null;
+      return { name, isPlayer: name === myName, team: r ? r.team : (name === myName && me ? me.team : null) };
+    };
+    const killer = mk(ev.killer), victim = mk(ev.victim);
+    this.hud.killfeed(killer, victim, escHtml(ev.weapon), ev.head);
+    if (killer.isPlayer) {
+      this.hud.popup(`${ev.pts ? '+' + ev.pts + '  ' : ''}击杀 ${escHtml(ev.victim)}`, '#d4f24a');
+      this.audio.hit(true, !!ev.head);
+    }
+  }
+  onNetDeath(ev) {
+    const pl = this.player; if (!pl) return;
+    this.dead = true;
+    this.deathAt = performance.now() / 1000;
+    this._respawnAsked = false;
+    // 死亡镜头要转向击杀者。本机手上没有"是谁在打我"这件事（快照只给位置），事件给的
+    // 是名字 ⇒ 按名字去远端表里找那一个人。找不到的（哨戒机枪 / 直升机 / 已经走了的人）
+    // 留 null，那条路只有沉镜头 —— 指一个假方向比不指更糟。
+    this.deathKiller = this.net && this.net.remoteByName ? this.net.remoteByName(ev.killer) : null;
+    const el = document.getElementById('deathScreen');
+    el.classList.remove('hidden');
+    document.getElementById('killerInfo').innerHTML = ev.killer && ev.killer !== ev.victim
+      ? `被 <b>${escHtml(ev.killer)}</b> 使用 ${escHtml(ev.weapon || '')} ${ev.head ? '爆头' : ''}击杀`
+      : '自我击杀';
+    if (document.pointerLockElement) document.exitPointerLock();
+  }
+  // 挨打的三件套。本地玩家在联机里的血量是**快照直接覆盖**的（js/net/predict.mjs 写 pl.hp），
+  // 全程不走 takeDamage ⇒ 单机那份 takeDamage 里的三件（方向指示 / 痛感音 / 镜头冲击）
+  // 一处都不会响。服务端把"这一拍掉了血"编成事件发过来（含限流），这里补上，只做表现。
+  onNetHurt(ev) {
+    const pl = this.player;
+    if (!pl || !pl.alive || this.dead) return;
+    this.audio.hurt();
+    pl.punch(0.02);
+    if (ev.from) this.hud.damageFrom(new THREE.Vector3(ev.from[0], ev.from[1], ev.from[2]));
+  }
   onNetRespawn(ev) {
     const pl = this.player;
     if (!pl) return;
+    // 装备回声：服务端在重生那一拍把**它手里那份**配装发回来。按它配枪是必需的 ——
+    // 局内换了职业时，这一格才是"换装生效"的证据；没换时它保证"对局中捡来的枪不跟到
+    // 重生"这条规矩在联机侧同样成立（单机是 js/mp.js:326 那句 else）。
+    // **必须在 respawn 之前**：respawn 会 fullAmmo()，反过来的话新枪拿在手上、弹匣是照旧枪补的。
+    if (ev.loadout) pl.equip(ev.loadout);
     pl.respawn(new THREE.Vector3(ev.pos[0], ev.pos[1], ev.pos[2]), ev.yaw);
-    this.dead = false;
+    this.dead = false; this.deathKiller = null; this._respawnAsked = false;
+    document.getElementById('deathScreen').classList.add('hidden');
+    document.getElementById('respawnText').textContent = '';
+    this.menu.hideClassSelect();
     document.getElementById('clickToPlay').classList.remove('hidden');
     this.lock();
+  }
+  // 死亡画面的倒计时与"提前部署"。
+  // 重生这件事的主人是服务端（server/room.mjs 的 RESPAWN_DELAY）—— 这里只做两件客户端
+  // 能做的事：把那个数字画出来，以及把"时间到了"转成一条上行请求。
+  // 倒计时走完之前**不发**：服务端那条闸门会把它丢掉（server/room.mjs:requestRespawn），
+  // 而"发了却没生效"在客户端是完全看不见的 —— 那正是这个仓库最讨厌的一类失效。
+  netRespawnTick() {
+    const el = document.getElementById('respawnText');
+    if (!el) return;
+    let text = '';
+    if (this.dead) {
+      const delay = (this.net && this.net.welcome && this.net.welcome.respawnDelay) || 3;
+      const left = delay - (performance.now() / 1000 - (this.deathAt || 0));
+      if (left > 0) { text = `${Math.ceil(left)} 秒后重新部署…`; this._respawnAsked = false; }
+      else {
+        text = '按 [空格] 重新部署';
+        if (!this._respawnAsked) { this._respawnAsked = true; if (this.net && this.net.requestRespawn) this.net.requestRespawn(); }
+      }
+    }
+    // 只在**文字变了**的时候写 DOM：这条按渲染帧走，144Hz 上每帧赋一次 textContent
+    // 是白掉帧的（记分板那条 6Hz 限流是同一个理由）。
+    if (el.textContent !== text) el.textContent = text;
+  }
+  // 被闪光弹闪到。**一处定义**：单机的 js/combat.js:flashAt 在真人分支里先问 game.flashPlayer，
+  // 联机的 flash 事件（js/net/client.mjs）也调它。两边各写一遍的话，联机与单机被闪的时长
+  // 会各自漂移，而"感觉这次闪得短"是没人会去查的差异。
+  flashPlayer(e, dur) {
+    this.hud.flash(dur);
+    this.audio.ring(Math.min(4, dur), 0.15);
   }
 
   setupComposer() {
@@ -452,10 +540,9 @@ class Game {
       // "进不去这局"不在这里：那种失败发生在 welcome 之前，startOnline 的 catch 会在加载页
       // 上说明原因，而此刻还没有对局 HUD 可言。
       const why = n.lost === 'stale' ? '与服务器失联' : '连接已断开';
-      // hud.announce 走 innerHTML（HUD 别处要放标签），而这里拼进来的是**服务端给的字符串**：
-      // 被攻破的服务器不该能往这台页面上塞脚本。角括号一律先剥掉。
-      const esc = (s) => String(s || '').replace(/[<>]/g, '');
-      const detail = (n.serverNote ? esc(n.serverNote) + ' · ' : '') + esc(n.lostReason) + '（服务器可能在更新）';
+      // hud.announce 走 innerHTML（HUD 别处要放标签），而这里拼进来的两串都来自**服务端**，
+      // 所以一律过 escHtml（定义在文件头，别的 innerHTML 拼接点也用它）。
+      const detail = (n.serverNote ? escHtml(n.serverNote) + ' · ' : '') + escHtml(n.lostReason) + '（服务器可能在更新）';
       this.hud.announce(why, detail + ' 按 Enter 重新连接', Infinity);      // Infinity = 不自动消失
       return;
     }
@@ -591,14 +678,19 @@ class Game {
     this.grade.uniforms.thermal.value = on ? 1 : 0;
     const mats = this.thermalMats || (this.thermalMats = new Map());
     if (on) {
-      for (const b of this.bots) {
-        b.model.root.traverse(o => {
+      // 遍历**所有**实体，而不是只遍历 this.bots —— 联机里真人都在 game.entities 里，
+      // 而 bots 在联机里永远是空的 ⇒ 热成像对场上每一个人都不起作用（开镜一片漆黑，
+      // 而"夜视/热成像坏了"没人报得清楚）。bots 本来就是 entities 的子集，不会漏也不会重。
+      // 哨戒机枪 / 直升机只有 .mesh 没有 .model，被下面那句守卫跳过（它们是金属，不是热源）。
+      for (const e of this.entities) {
+        if (!e || !e.model || !e.model.root) continue;
+        e.model.root.traverse(o => {
           if (!o.isMesh || !o.material || !o.material.emissive) return;
           if (!mats.has(o.material)) mats.set(o.material, [o.material.emissive.getHex(), o.material.emissiveIntensity]);
           // 活人比尸体亮一点：这一半只能按 mesh 写（共享材质时最后一个遍历到的赢 —— 那是
           // 既有的近似，不是这次要修的东西）；能不能恢复得回来不看它，看上面那份材质表。
           o.material.emissive.setHex(0xffffff);
-          o.material.emissiveIntensity = b.alive ? 3 : 0.8;
+          o.material.emissiveIntensity = e.alive ? 3 : 0.8;
         });
       }
     } else {
@@ -652,6 +744,9 @@ class Game {
       this.grade.uniforms.nvg.value = 0; this.grade.uniforms.hurt.value = 0; this.grade.uniforms.thermal.value = 0; this.grade.uniforms.wp.value = 0;
     }
     if (this.net) { this.net.flush(); this.net.frameUpdate(rdt); }
+    // 死亡画面的倒计时**按渲染帧**走而不是按 sim 拍：它量的是墙钟（服务端那个
+    // RESPAWN_DELAY 也是墙钟），而暂停时 sim 是停的、服务端的秒表却不停。
+    if (this.net && this.state === 'play') this.netRespawnTick();
     this.netLostUi();
     if (this.netDebug) this.updateNetDebug(raw);
     this.grade.uniforms.time.value = performance.now() * 0.001;

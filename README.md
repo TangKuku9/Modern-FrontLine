@@ -228,7 +228,7 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 ### 验收
 
 ```bash
-npm test              # 不含浏览器：gate + rollback + reconcile-chain + net-journal + codec + lagcomp + mp-rules + accounts + hardening + room-flow + net-probe + deploy-probe + xenv + fps + viewmodel + optic + state-leak
+npm test              # 不含浏览器：gate + rollback + reconcile-chain + net-journal + codec + lagcomp + mp-rules + accounts + hardening + room-flow + net-probe + deploy-probe + xenv + fps + viewmodel + net-feel + optic + state-leak
 npm run test:browser  # 只跑两个真浏览器测试（需先下载 playwright 浏览器）
 npm run test:all      # 上面两档全跑
 ```
@@ -245,6 +245,7 @@ npm run test:all      # 上面两档全跑
 - `test/accounts.mjs`：账号内核与防护规则（纯逻辑 + 注入假时钟与内存存储，能跑到边界而不靠等）；三条量不了耗时、只能审计源码的判据见上节
 - `test/hardening.mjs`：外围闸门，全走真 HTTP 与真 WebSocket 握手，不打桩。与上一份的分工是"规则 vs 接线"：只做 `accounts.mjs` 会出现"规则全对、但接口根本没调它"这种绿
 - `server/deploy-probe.mjs`：静态白名单、ETag/304、gzip、路径穿越、来源检查两个方向、超帧被断且别人那一局不陪葬、房间配额、空房回收、优雅下线、进场装备闸门、心跳清理两个方向
+- `test/net-feel.mjs`：联机"手感层"—— 远端玩家的表现（开火/脚步/换弹/朝向/相位/受击/淡出/名牌）与本地玩家的反馈闭环（killfeed / 死亡画面 / 挨打三件套 / 重生倒计时 / 网络状态 / 暂停屏结构 / 输入法保护）。这一层的共同点是**全都不影响权威状态**：少了它不崩不报错，只是"看不见、听不见、没反应"，所以它最容易被改坏也最容易在下次重构里被顺手删掉。面板那一半（killfeed / 死亡画面）在 `test/net-play.mjs` 里量，因为 `js/main.js` 不导出 `Game`
 - `test/optic.mjs`：开放式瞄具通透性与分划角直径（判据写在**角直径**而不是米数上 —— 同一配件在手枪与长枪的离眼距离不同）
 - `test/state-leak.mjs`：死亡 / 换局 / 热成像三处的状态残留，共同形状是"写那个字段的那行代码，出问题之后再也不跑了"
 - `server/xenv.mjs`：跨环境一致性（引擎指纹自校准两档，见上）
@@ -252,8 +253,11 @@ npm run test:all      # 上面两档全跑
 
 ## 已知缺口
 
+联机与本地的手感差距另有一份只读走查清单：`docs/net-vs-local-gaps.md`（45 条 + 每条的判据守卫 + 收口记录）。下面是部署与账号层面的缺口。
+
 1. 战役的经验值不进账号 —— 单机模拟客户端能自己算，服务端无法验证，报上去等于给了个免验证的加经验入口。账号 xp 只来自多人对局。
 2. 登录只有密码，没有找回；忘了密码只能由服主改库（`node server/audit-dump.mjs` 可查注册/登录每一种结局的 `audit` 表）。
 3. `ALLOW_ORIGIN` 留空在生产模式下**没有**做成拒绝启动（`JOIN_CODE` / `ACCOUNTS_DB` 那两条做了）—— 确实有不需要浏览器来源检查的部署；它现在由 remote-probe 在部署面上当场点名。
-4. 联机侧还没记助攻；击杀奖章已统一到 `killScore`，但只把总分发给击杀者，没有逐条奖章事件；集束空袭联机省掉手动标记那一次点击（同一按键两个模式手感略不同）；房间目前不自动放 AI。
+4. 击杀奖章已统一到 `killScore`，但只把总分发给击杀者，没有逐条奖章事件；集束空袭联机省掉手动标记那一次点击（同一按键两个模式手感略不同）；房间目前不自动放 AI；联机侧没有结算页（`matchOver` 只播一句"胜利"并把记分板钉在屏幕上，然后弹回房间）。
+   （**已收**：联机侧的助攻 —— 权威端有伤害流水账、记分板有助攻列、击杀者之外的那几个人会收到一条 `assist` 提示。）
 5. 多实例编排：跨进程房间列表与实例分派没做（目前是"一进程 N 间 + 按 map 起多进程"）。单进程内的房间列表已做，两层别混为一谈。
