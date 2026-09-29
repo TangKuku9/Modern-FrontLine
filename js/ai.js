@@ -425,6 +425,8 @@ export class Bot {
     this.model.flash.material.rotation = Math.random() * 6;
     this.anim.recoil = 1;
     if (Math.random() < 0.25) game.effects.flashLight(muzzle, 0xffb060, 2.5, 0.05, 7);
+    // 枪口烟/火星：第三人称以前也只有火光精灵，打起来一闪而过
+    if (!st.suppressed) game.effects.muzzle(muzzle, dir, pellets > 1 ? 1.2 : 1, false);
     game.audio.shot(st.sound, this.pos, st.suppressed);
     game.makeNoise(this.pos, st.suppressed ? 10 : 60, this.team);
     if (!st.suppressed) this.revealT = 1.6;

@@ -13,6 +13,8 @@ const _v = new THREE.Vector3(), _v2 = new THREE.Vector3();
 const _mw = new THREE.Vector3(), _shellP = new THREE.Vector3(), _hand = new THREE.Vector3(), _belt = new THREE.Vector3(), _magOff = new THREE.Vector3();
 // 副手抓弹匣的握点（弹匣自身坐标里往左前探一点）
 const MAG_GRAB_OFF = new THREE.Vector3(-0.03, 0.02, 0.02);
+// 枪口火光基准尺寸（枪型 → 米），霰弹枪/轻机枪最大、手枪最小
+const FLASH_BY_TYPE = { pistol: 0.15, smg: 0.17, ar: 0.21, marksman: 0.24, sniper: 0.26, lmg: 0.26, shotgun: 0.3, launcher: 0.34 };
 const smooth01 = (x) => { const t = clamp(x, 0, 1); return t * t * (3 - 2 * t); };
 
 export class Viewmodel {
@@ -53,8 +55,10 @@ export class Viewmodel {
     g.traverse(o => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; } });
     // 火光尺寸与持续时间按枪口装置走：消焰器要真的消焰 —— 原来只把点光源 4→1.5，
     // 贴片尺寸和 35ms 的闪光时间一动不动，装了它照样一大团火（名实不符）。
-    const flashScale = stats.suppressed ? 0.08 : stats.flashHide ? 0.11 : 0.22;
-    const flashDur = stats.suppressed ? 0.018 : stats.flashHide ? 0.022 : 0.035;
+    // 基准还按枪型分级：以前全枪一个 0.22，手枪和轻机枪一样大。
+    const base = FLASH_BY_TYPE[stats.type] ?? 0.21;
+    const flashScale = (stats.suppressed ? 0.36 : stats.flashHide ? 0.5 : 1) * base;
+    const flashDur = (stats.suppressed ? 0.5 : stats.flashHide ? 0.62 : 1) * 0.035;
     const flash = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.game.effects.texFlash, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: new THREE.Color(3, 2.2, 1.4) }));
     flash.scale.setScalar(flashScale); flash.visible = false;
     info.muzzle.add(flash);
@@ -104,6 +108,9 @@ export class Viewmodel {
           this.flashT = cur.flashDur;
           const mw = this.muzzleWorld(_mw);
           if (!e.suppressed) game.effects.flashLight(mw, 0xffb060, e.flashHide ? 1.5 : 4, 0.05, 8);
+          // 枪口烟与火星：以前只有一张贴片 + 一次闪光（effects.muzzle 那套只有哨戒机枪在用），
+          // 打起来是"一闪而过"。消音器把烟一并压掉（这才是"看不出谁在开枪"）。灯自己已经加过。
+          if (!e.suppressed) game.effects.muzzle(mw, e.fwd, st.type === 'shotgun' || st.type === 'lmg' ? 1.3 : st.type === 'pistol' ? 0.7 : 1, false);
           for (const p of e.tracers) game.effects.tracer(mw.clone().addScaledVector(e.fwd, 0.5), p, [1.4, 1.0, 0.55]);
           if (e.shell) {
             // 弹壳从**抛壳窗**（info.eject）出来，不是"枪口后方 0.4 m"那个固定点 ——

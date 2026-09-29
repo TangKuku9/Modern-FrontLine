@@ -128,11 +128,16 @@ export function tex(name) { return TEX[name]; }
 const camoCache = {};
 export function camoMaterial(camo, base) {
   if (!camo || camo === 'none') return base;
-  const key = camo;
+  // 迷彩是**叠在底材上**的。以前直接 new 一个统一材质（roughness 0.6 / metalness 0.15），
+  // 于是装了迷彩的枪木托和钢机匣变成同一张贴图、同一份粗糙度 —— 一整块迷彩色块。
+  // 现在以 base 克隆：金属度/粗糙度/法线都跟着底材走，只把迷彩当颜色贴图糊上去，
+  // 所以 AK 的木托与机匣在迷彩下仍分得开。缓存键必须含 base，否则不同底材质会串。
+  const key = camo + '@' + base.uuid;
   if (camoCache[key]) return camoCache[key];
-  let m;
-  if (camo === 'gold') m = new THREE.MeshStandardMaterial({ map: CAMO.gold.map, color: 0xffffff, roughness: 0.22, metalness: 1 });
-  else m = new THREE.MeshStandardMaterial({ map: CAMO[camo].map, roughness: 0.6, metalness: 0.15 });
+  const m = base.clone();
+  m.map = CAMO[camo].map;
+  m.color = new THREE.Color(0xffffff);
+  if (camo === 'gold') { m.metalness = 1; m.roughness = 0.22; }
   camoCache[key] = m;
   return m;
 }

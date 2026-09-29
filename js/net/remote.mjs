@@ -297,6 +297,7 @@ export class NetPlayer {
       this.game.effects.tracer(muzzle, _e.copy(muzzle).addScaledVector(dir, TRACER_LEN), [1.5, 1.0, 0.5]);
       this.game.audio.shot(st.sound, this.pos, st.suppressed);
       if (Math.random() < 0.25) this.game.effects.flashLight(muzzle, 0xffb060, 2.5, 0.05, 7);
+      if (!st.suppressed) this.game.effects.muzzle(muzzle, dir, 1, false);   // 枪口烟/火星（与单机同一套）
       if (!st.suppressed) this.revealT = 1.5;    // 小地图亮点（hud.js 读它，和单机同一条）
       const fl = this.model.flash;
       if (fl) { fl.visible = true; fl.material.rotation = Math.random() * 6; this._flashT = 0.04; }

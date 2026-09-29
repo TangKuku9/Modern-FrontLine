@@ -76,6 +76,19 @@ const geo = await page.evaluate(async () => {
     ok('S1⁻ 反证：照老写法补回实心照门要报红', !!r && r.blocked.some(z => z !== null), r ? `检出 ${r.blocked.filter(z => z !== null).length} 条光路被挡` : '没测到');
   }
 
+  // S7 迷彩叠在底材上：木托与钢机匣在迷彩下仍要分得开。以前两者是**同一个材质对象**
+  // （camoMaterial 只按迷彩名缓存、完全忽略 base），装了迷彩的枪就是一块迷彩色块。
+  {
+    const ak = buildGun('ak', {}, 'woodland');
+    const used = new Set();
+    ak.group.traverse(o => { if (o.isMesh) used.add(o.material); });
+    const met = mats.camoMaterial('woodland', mats.mat('gunMetal'));
+    const wd = mats.camoMaterial('woodland', mats.mat('gunWood'));
+    ok('S7 迷彩按底材质分：金属件与木件是两份材质', met !== wd && used.has(met) && used.has(wd), `枪上用到 ${used.size} 份材质`);
+    ok('S7 各自保留底材的金属度/粗糙度', met.metalness > 0.5 && wd.metalness < 0.2 && wd.roughness === mats.mat('gunWood').roughness,
+      `金属件 metalness=${met.metalness} 木件 metalness=${wd.metalness} roughness=${wd.roughness}`);
+    ok('S7⁻ 反证：不同底材不许串成同一份材质', mats.camoMaterial('woodland', mats.mat('gunMetal')) !== mats.camoMaterial('woodland', mats.mat('gunPoly')));
+  }
   // S4 AK 弹匣是橙色胶木（那段意图写了一半被自己的三元式吃掉），别的枪仍是深灰
   const magMat = (id) => { const m = buildGun(id, {}, 'none').mag; return m && m.children.length ? m.children[0].material : null; };
   ok('S4 AK 弹匣用橙色胶木材质', magMat('ak') === mats.mat('containerOrange'), String(magMat('ak') && magMat('ak').color && magMat('ak').color.getHexString()));
@@ -186,6 +199,31 @@ const play = await page.evaluate(async () => {
   ok('S5 消焰器的闪光比裸枪短', flashHider.flashDur < bare.flashDur * 0.8, `裸=${bare.flashDur} 消焰=${flashHider.flashDur}`);
   ok('S5⁻ 反证：消音器比消焰器还小', sup.flash.scale.x <= flashHider.flash.scale.x, `消焰=${flashHider.flash.scale.x.toFixed(3)} 消音=${sup.flash.scale.x.toFixed(3)}`);
 
+  // S8 火光按枪型分级 + 枪口烟。烟只数**枪口 0.6m 内**的粒子，而且抬头打天 ——
+  // 否则弹着点的尘土也算进"枪口烟"，那把尺子会把没烟的枪也量成有烟。
+  const flashOf = (id) => vm.build({ id, att: {}, camo: 'none', stats: computeStats(id, {}) }).flash.scale.x;
+  ok('S8 火光随枪型递增：手枪 < 步枪 < 霰弹枪', flashOf('m1911') < flashOf('m4') && flashOf('m4') < flashOf('m870'),
+    `手枪=${flashOf('m1911').toFixed(3)} 步枪=${flashOf('m4').toFixed(3)} 霰弹=${flashOf('m870').toFixed(3)}`);
+  const muzzleSmoke = (att) => {
+    ws.replaceSlot(0, { id: 'm4', att, camo: 'none' }, 30, 200);
+    frames(60); ws.cool = 0; ws.cycleT = 0;
+    g.player.pitch = 1.3;                   // 抬头打天（pitch>0 才是抬头）：不许有弹着点尘土混进来
+    frames(2);
+    g.effects.smoke.clear();                // 清池：烟寿命 0.8s，前面几轮的射击还挂在那儿
+    frames(1, () => { g.input.buttons = 1; });
+    g.input.buttons = 0; frames(1);
+    const mw = vm.muzzleWorld(v());
+    const n = g.effects.smoke.list.filter(p => Math.hypot(p.x - mw.x, p.y - mw.y, p.z - mw.z) < 0.6).length;
+    g.player.pitch = 0;
+    return n;
+  };
+  const smokeBare = muzzleSmoke({}), smokeSup = muzzleSmoke({ muzzle: 'suppressor' });
+  ok('S8 开火出枪口烟', smokeBare > 0, `枪口 0.6m 内 ${smokeBare} 粒`);
+  ok('S8⁻ 反证：消音器不出烟', smokeSup === 0, `枪口 0.6m 内 ${smokeSup} 粒`);
+  ws.replaceSlot(0, { id: 'm4', att: {}, camo: 'none' }, 30, 150);
+  frames(60);
+  cur = vm.groups[ws.cur];
+
   // H1 换弹时副手要动（原来手臂是枪组刚性子件，弹匣在手里下坠又回来，手纹丝不动）
   ws.w.mag = Math.min(ws.w.mag, 3);
   ws.startReload();
@@ -214,7 +252,14 @@ const play = await page.evaluate(async () => {
 // 每块 evaluate 之间页面会收到 pointerlockchange → game.pause(true)（js/main.js:528），
 // 于是 g.frame() 整个不推进 —— 截图会拍到"冻结的最后一帧"，症状像功能没生效。
 // 所以每块第一件事都是把 paused 放倒。
-const WAKE = `function wake(){ const g = window.game; g.paused = false; const el = document.getElementById('clickToPlay'); if (el) el.classList.add('hidden'); }`;
+// 截图期间把玩家设成打不死：bot 会把人打死，而死了之后 ws.update/vm.update 都不再跑
+// （js/main.js:770 只给活人跑）—— 症状是"火光贴片不亮、枪模不见了、换弹停在半路"，
+// 看着像功能坏了，其实只是这一帧的人已经死了。判据问的不是生死，别让它混进来。
+const WAKE = `function wake(){
+  const g = window.game; g.paused = false;
+  const el = document.getElementById('clickToPlay'); if (el) el.classList.add('hidden');
+  if (g.player) { g.player.maxHp = 1e9; g.player.hp = 1e9; }
+}`;
 // 驱动帧的时候把 composer.render 打桩：frame() 每帧都会真渲染，而 swiftshader 下
 // 1280×720 + 泛光一帧就要好几秒 —— 60 帧堆在合成器队列里，紧接着的 page.screenshot 会超时。
 // 截图前才真渲染一帧。
@@ -305,12 +350,19 @@ await shoot('reload', `
 const r4 = await drive(`${FRAMES}
   const g = window.game, ws = g.player.ws, vm = ws.vm;
   for (let i = 0; i < 200 && ws.state !== 'idle'; i++) frames(5);
+  // 确定性地打一发：C3 把枪留在换弹里，而 cool/cycleT 是跨枪共用的（上一把栓动的话
+  // 枪机还没复位）—— 不清这几件，"没打上枪"会被量成"火光不亮"。
+  ws.state = 'idle'; ws.stateT = 0; ws.cool = 0; ws.cycleT = 0;
+  ws.w.mag = Math.max(ws.w.mag, 1);
   frames(6);
   frames(1, () => { g.input.buttons = 1; });    // 打一发，火光还在
   g.input.buttons = 0;
-  return { flash: +vm.flashT.toFixed(4), lamp: +vm.flashLamp.intensity.toFixed(2), visible: vm.groups[ws.cur].flash.visible };
+  return {
+    flash: +vm.flashT.toFixed(4), lamp: +vm.flashLamp.intensity.toFixed(2), visible: vm.groups[ws.cur].flash.visible,
+    alive: g.player.alive, state: ws.state, mag: ws.w.mag,
+  };
 `);
-shotInfo.push(['C4 开火截图前：火光贴片与火光灯都还亮着', r4.flash > 0 && r4.lamp > 0 && r4.visible, JSON.stringify(r4)]);
+shotInfo.push(['C4 开火截图前：火光贴片与火光灯都还亮着', r4.flash > 0 && r4.lamp > 0 && r4.visible && r4.alive, JSON.stringify(r4)]);
 await shoot('flash', `window.game.input.buttons = 1;`);   // 压住扳机：火光每帧都在
 // C5 给"截图"这把尺子自己上保险：同一套机制连拍两张（开着/关掉视图模型），两张必须不一样。
 // 以前出过"判据全绿、截图里却没有枪"（截图抓的是上一次呈现的旧帧），那种红只能靠眼睛发现。

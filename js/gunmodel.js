@@ -243,7 +243,8 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   }
   if (att.under) info.leftHand.set(0, -0.06, hz0 - hand * 0.55);
   // 握把
-  const gripM = att.rear === 'rubber' ? mat('rubber') : furnBase === mat('gunWood') ? mat('gunPoly') : furnBase;
+  // 握把也吃迷彩，否则迷彩只糊了护木和枪托，握把留一块原色
+  const gripM = camoMaterial(camo, att.rear === 'rubber' ? mat('rubber') : furnBase === mat('gunWood') ? mat('gunPoly') : furnBase);
   if (M.grip === 'sniper') add(bgeo(0.03, 0.09, 0.045), gripM, 0, -0.035, 0.07, 0.35);
   else add(bgeo(0.028, 0.095, 0.04), gripM, 0, -0.04, 0.035, 0.3);
   add(bgeo(0.006, 0.006, 0.07), metal, 0, -0.032, -0.005); // 扳机护圈
