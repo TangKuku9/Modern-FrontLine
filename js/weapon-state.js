@@ -218,7 +218,11 @@ export class WeaponState {
       }
       if (anyHit) { pl.stats.hits++; game.hud.hitmarker(kill, head); game.audio.hit(kill, head); }
       // 开火事件无条件发：枪口火光、抛壳、后坐顶枪都靠它，tracers 只是其中可选的一段
-      if (wantFx) this.sink({ kind: 'shot', tracers, fwd, recoilV: st.recoilV, suppressed: st.suppressed, flashHide: st.flashHide, shell: st.type !== 'launcher' && st.type !== 'shotgun' && st.fire !== 'pump' });
+      // 抛壳按口径分，null = 不抛：发射器与左轮不抛（左轮的弹壳留在弹巢里，装弹时才退，
+      // 每发抛一颗黄铜是物理说不通的那种错）；霰弹枪以前被排除在外，其实泵动一拉就抛一个壳。
+      const shell = st.revolver || st.type === 'launcher' ? null
+        : st.type === 'shotgun' ? 'shotgun' : st.type === 'sniper' ? 'magnum' : st.type === 'pistol' ? 'pistol' : 'rifle';
+      if (wantFx) this.sink({ kind: 'shot', tracers, fwd, recoilV: st.recoilV, suppressed: st.suppressed, flashHide: st.flashHide, shell });
     }
     game.audio.shot(st.sound, null, st.suppressed);
     if (wantFx && st.fire === 'bolt') this.sink({ kind: 'sfx', name: 'bolt', at: 0.25 });

@@ -118,6 +118,8 @@ function buildMaterials() {
   MATS.laserDot = new THREE.MeshBasicMaterial({ color: 0xff3030 });
   MATS.laserDot.color.multiplyScalar(6);
   MATS.brass = new THREE.MeshStandardMaterial({ color: 0xc9a040, roughness: 0.3, metalness: 1 });
+  // 12 号霰弹壳是红色塑料弹体，不是黄铜
+  MATS.shellRed = new THREE.MeshStandardMaterial({ color: 0x8e1a12, roughness: 0.55, metalness: 0.05 });
 }
 
 export function mat(name) { const m = MATS[name]; if (!m) { (window.__matMiss = window.__matMiss || new Set()).add(name); return MATS.concrete; } return m; }

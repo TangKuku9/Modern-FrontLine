@@ -69,6 +69,16 @@ class Particles {
   clear() { this.list.length = 0; }
 }
 
+// 弹壳基准几何是 ø10×25（见 Effects.shellGeo），按口径缩放。真枪参考：
+// 9×19 ø9.9×19、5.56/7.62 ø10–11×39–45、.338 拉普阿 ø14.9×69、12 号弹壳 ø20×50（红色塑料）。
+// 全枪一个尺寸的话，手枪弹和狙击弹抛出来一样大，一眼就假。
+const SHELL_SCALE = {
+  pistol: [1.0, 0.76],
+  rifle: [1.05, 1.5],
+  magnum: [1.35, 2.1],
+  shotgun: [1.95, 1.9],
+};
+
 export class Effects {
   constructor(game) {
     this.game = game;
@@ -194,10 +204,15 @@ export class Effects {
     const f = { pos: pos.clone(), r, t: 0, dur, dmg, acc: 0 };
     this.fires.push(f); return f;
   }
-  shell(pos, dir) {
+  shell(pos, dir, kind = 'rifle') {
     let s;
     if (this.shells.length > 24) s = this.shells.shift();
     else { s = new THREE.Mesh(this.shellGeo, this.game.mat('brass')); this.scene.add(s); }
+    // 弹壳按口径分：以前全枪一个 ø5×25mm，9mm 手枪弹和 .338 狙击弹一样大。
+    // 共用同一份几何（弹壳池也只有一条），只改缩放与材质 —— 12 号霰弹是红色塑料弹壳。
+    const k = SHELL_SCALE[kind] || SHELL_SCALE.rifle;
+    s.scale.set(k[0], k[1], k[0]);
+    s.material = kind === 'shotgun' ? this.game.mat('shellRed') : this.game.mat('brass');
     s.position.copy(pos);
     s.userData.v = dir.clone().multiplyScalar(rand(1.5, 2.5)).add(new THREE.Vector3(0, rand(1.5, 2.5), 0));
     s.userData.t = 0; s.userData.bounced = false;

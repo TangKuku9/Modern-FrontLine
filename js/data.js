@@ -173,6 +173,9 @@ export function computeStats(weaponId, attachments = {}) {
     mobility: b.mobility, fire: b.fire, headMul: b.headMul, pellets: b.pellets || 1,
     sprintFire: b.sprintFire, suppressed: false, zoom: 1.2, optic: 'iron', laser: false,
     projectile: b.projectile, sound: b.sound, shellReload: !!b.shellReload, flashHide: false,
+    // 左轮的弹壳留在弹巢里（装弹时才退），所以它跟发射器一样**不抛壳** —— 这个位是给
+    // 表现层判"这一发要不要抛"用的，不是玩法量
+    revolver: !!(b.model && b.model.revolver),
   };
   if (b.defaultOptic && !attachments.optic) { s.optic = b.defaultOptic; s.zoom = findAttachment('optic', b.defaultOptic).fx.zoom; }
   for (const slot in attachments) {

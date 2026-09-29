@@ -109,7 +109,7 @@ export class Viewmodel {
             // 弹壳从**抛壳窗**（info.eject）出来，不是"枪口后方 0.4 m"那个固定点 ——
             // 枪越长偏得越多：L115A3 的弹壳原本会从护木/枪管那儿冒出来。
             const right = _v2.set(1, 0, 0).applyQuaternion(game.camera.quaternion);
-            game.effects.shell(cur.info.eject.getWorldPosition(_shellP), right);
+            game.effects.shell(cur.info.eject.getWorldPosition(_shellP), right, e.shell);
           }
           this.vmKick += 0.02 + e.recoilV * 0.012;
           this.vmRot += 0.02 + e.recoilV * 0.02;

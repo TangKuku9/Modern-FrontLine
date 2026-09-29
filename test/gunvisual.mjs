@@ -110,7 +110,7 @@ const play = await page.evaluate(async () => {
   const ws = g.player.ws, vm = ws.vm;
   frames(40);          // setLoadout 会先进 switch（0.5s）：射击与换弹都只在 idle 开门
   ok('起局后状态机回到 idle', ws.state === 'idle', 'state=' + ws.state);
-  const cur = vm.groups[ws.cur];
+  let cur = vm.groups[ws.cur];   // S6 里换过枪，枪模会重建 —— 每次换完要重新取
 
   // S2 弹壳从抛壳窗出来。老规则是"枪口后方 0.4m"，枪越长偏得越多。
   const shells = [];
@@ -130,6 +130,44 @@ const play = await page.evaluate(async () => {
   const oldRule = mw.clone().addScaledVector(fwd, -0.4).addScaledVector(right, 0.05);
   ok('S2⁻ 反证：老规则（枪口后方 0.4m）离抛壳窗足够远，两把尺子分得清', oldRule.distanceTo(ejectWorld) > 0.25,
     `老规则离抛壳窗 ${oldRule.distanceTo(ejectWorld).toFixed(3)} m`);
+
+  // S6 弹壳按口径分（读的是弹壳网格自己的缩放与材质，不是配置表）：
+  // 手枪 < 步枪 < 狙击，霰弹枪是红色塑料弹壳，左轮根本不抛（弹壳留在弹巢里）。
+  const mats = await import('/js/materials.js');
+  const fired = [];
+  const capShell = (pos, dir, kind) => {
+    realShell.call(g.effects, pos, dir, kind);   // 原型方法，自己调要补回 this
+    const m = g.effects.shells[g.effects.shells.length - 1];
+    fired.push({ kind, h: +m.scale.y.toFixed(3), red: m.material === mats.mat('shellRed') });
+  };
+  const fireWith = (id) => {
+    ws.replaceSlot(0, { id, att: {}, camo: 'none' }, 30, 200);
+    frames(60);
+    // 换枪不重置 cool/cycleT：上一把是栓动的话枪机还没复位（L115 cycleT=1.36s），
+    // 接着打的那几帧一发都出不去 —— 那样量到的是"没开枪"，不是"没抛壳"。
+    ws.cool = 0; ws.cycleT = 0;
+    const mag0 = ws.w.mag;
+    fired.length = 0;
+    g.effects.shell = capShell;
+    frames(3, () => { g.input.buttons = 1; });
+    g.input.buttons = 0; frames(3);
+    g.effects.shell = realShell;
+    // 一定要带上"真开了几枪"：判据要能分清"这枪不抛壳"和"压根没开枪"
+    return { shells: fired.slice(), shots: mag0 - ws.w.mag };
+  };
+  const kPistol = fireWith('m1911'), kRifle = fireWith('m4'), kSniper = fireWith('l115'), kShot = fireWith('m870'), kRev = fireWith('revolver');
+  const hOf = (a) => (a.shells[0] ? a.shells[0].h : 0);
+  const kinds = (a) => JSON.stringify(a.shells) + ` 开了 ${a.shots} 枪`;
+  ok('S6 手枪抛 9mm 壳', kPistol.shells.some(x => x.kind === 'pistol') && kPistol.shots > 0, kinds(kPistol));
+  ok('S6 步枪抛 rifle 壳', kRifle.shells.some(x => x.kind === 'rifle') && kRifle.shots > 0, kinds(kRifle));
+  ok('S6 狙击抛 magnum 壳', kSniper.shells.some(x => x.kind === 'magnum') && kSniper.shots > 0, kinds(kSniper));
+  ok('S6 壳的大小随口径递增', hOf(kPistol) < hOf(kRifle) && hOf(kRifle) < hOf(kSniper),
+    `手枪=${hOf(kPistol)} 步枪=${hOf(kRifle)} 狙击=${hOf(kSniper)}`);
+  ok('S6 霰弹枪抛壳且是红色塑料壳', kShot.shells.some(x => x.kind === 'shotgun' && x.red) && kShot.shots > 0, kinds(kShot));
+  ok('S6 左轮开枪但不抛壳（弹壳留在弹巢里）', kRev.shells.length === 0 && kRev.shots > 0, kinds(kRev));
+  ws.replaceSlot(0, { id: 'm4', att: {}, camo: 'none' }, 30, 150);
+  frames(60);
+  cur = vm.groups[ws.cur];
 
   // S3 开火要照得亮自己的枪模（世界那盏点光源在 game.scene，照不到 vmScene）
   frames(4);
