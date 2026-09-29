@@ -322,11 +322,16 @@ try {
       })), JSON.stringify(hall));
     ok('反证：光是站在大厅里还没连上服务器（进了大厅不等于已经进场）',
       await a.evaluate(() => !window.game.net || !window.game.net.connected));
-    // 模式那一格是**承诺**：列表里别人按它挑房。服务端没有据点、也没有占领得分的时候，
-    // 界面上给出「占领」就等于摆了一格点了会 0:0 打到时间耗尽的玩法（判据见 test/room-flow H 段）。
-    ok('建房屏的模式选择器里只有服务端判得了胜负的玩法（没有占领 / 自由混战）',
-      await a.evaluate(() => { const s = document.querySelector('#segMode');
-        return !!s && /团队死斗/.test(s.textContent) && !/占领|混战/.test(s.textContent); }),
+    // 模式那一格是**承诺**：列表里别人按它挑房 —— 界面上给得出的每一种，服务端都必须
+    // 判得出胜负（给一格判不了的 = 点进去 0:0 打到时间耗尽的假玩法，闸门见 test/room-flow）。
+    // 三种模式如今各有各的胜负规则（tdm/ffa/dom），判据改成"与服务端开放的集合**一字不差**"：
+    // 少一格（界面对不上服务端）和多一格（假承诺）都红。
+    ok('建房屏的模式选择器与服务端开放的玩法一字不差（多给一格少给一格都红）',
+      await a.evaluate(async () => {
+        const { MP_MODES } = await import('/js/data.js');
+        const s = document.querySelector('#segMode');
+        return !!s && s.textContent.replace(/\s+/g, '') === MP_MODES.filter(m => m.net).map(m => m.name).join('');
+      }),
       await a.evaluate(() => (document.querySelector('#segMode') || {}).textContent));
     await a.screenshot({ path: 'test/lobby-hall.png' });
     await a.fill('#onName', '菜单甲');
@@ -339,9 +344,12 @@ try {
       !!(await wait(a, () => (window.game.menu || {}).screen === 'onlineRoom'
         && document.querySelectorAll('#seatA .seat, #seatB .seat').length >= 2
         && !!document.querySelector('#rmChat') && !!document.querySelector('[data-a=start]') && !!document.querySelector('[data-a=leave]'))));
-    ok('房间设置那一格里也只有判得了胜负的玩法（房主点不到的那几格不该摆出来）',
-      await a.evaluate(() => { const s = document.querySelector('#rmMode');
-        return !!s && /团队死斗/.test(s.textContent) && !/占领|混战/.test(s.textContent); }),
+    ok('房间设置那一格与服务端开放的玩法一字不差（房主点不到服务端判不了的）',
+      await a.evaluate(async () => {
+        const { MP_MODES } = await import('/js/data.js');
+        const s = document.querySelector('#rmMode');
+        return !!s && s.textContent.replace(/\s+/g, '') === MP_MODES.filter(m => m.net).map(m => m.name).join('');
+      }),
       await a.evaluate(() => (document.querySelector('#rmMode') || {}).textContent));
     ok('一个人的时候不给开局，且把原因写在按钮旁边（不是把按钮藏起来）',
       await a.evaluate(() => { const s = document.querySelector('[data-a=start]'); return !!s && s.disabled === true && /至少/.test((document.querySelector('#rmWhy') || {}).textContent || ''); }),

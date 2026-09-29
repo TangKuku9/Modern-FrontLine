@@ -11,7 +11,7 @@ import { packInput, teamId, weaponId, FLAG, WORLD, uavBit } from '../quant.js';
 import { uavFromFlags } from '../match-rules.js';
 import { rollback } from './predict.mjs';
 import { clamp } from '../util.js';
-import { Sentry, Heli } from '../mp.js';
+import { Sentry, Heli, flagMesh } from '../mp.js';
 import { Projectile } from '../combat.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
@@ -27,6 +27,9 @@ export class NetClient {
     // 列表里显示房号。它**不是房号** —— 房号在 room 那一格，白名单不同（见服务端 cleanTitle）。
     this.title = opts.title || '';
     this.loadout = opts.loadout || null;
+    // 连杀选单（5 选 3 的结果，来自 profile.streaks）。join 帧带上去，服务端解析后
+    // 在 welcome.streaks 回显同一份 —— 槽位表以回显为准，这里只是把选择交出去。
+    this.streaks = opts.streaks || null;
     this.cid = null;
     this.connected = false;
     this.remotes = new Map();
@@ -61,6 +64,7 @@ export class NetClient {
     // 起手状态（位置/速度/引信）来自权威事件，之后客户端自己按同一套物理飞 —— 只看得见，
     // 一次伤害都不裁决。见 spawnProjectile。
     this.projs = new Map();                           // netId -> Projectile
+    this.pickups = new Map();                         // id -> 地上的枪（哑模型）
     this.leaving = [];                                // 正在淡出的远端玩家（已经不在权威世界里）
     this.pingSent = 0; this.pingGot = 0;
   }
@@ -80,7 +84,7 @@ export class NetClient {
         this._opened = true;
         const j = this._join;
         if (j) { clearTimeout(j.timer); j.timer = setTimeout(() => this.settleJoin(new Error('连接超时：8 秒没等到进场应答')), 8000); }
-        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout, title: this.title || undefined }));
+        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout, streaks: this.streaks, title: this.title || undefined }));
       };
       ws.onmessage = (m) => {
         if (typeof m.data === 'string') { this.onControl(JSON.parse(m.data)); return; }
@@ -134,6 +138,8 @@ export class NetClient {
   onControl(j) {
     if (j.t === 'welcome') {
       this.cid = j.cid; this.serverTick = j.tick; this.mapId = j.map;
+      this.modeId = j.mode || 'tdm';
+      this.ffa = j.mode === 'ffa';                // 记分板/小地图/结算的分叉全看这一格
       this.welcome = j;
       // 呼号以**服务端说的**为准。以前这里是客户端自己那份（URL 里读来的），
       // 于是"我屏幕上叫甲、记分板上叫乙"是常态 —— 而玩家只会以为自己串号了。
@@ -150,7 +156,7 @@ export class NetClient {
       this.streakDefs = Array.isArray(j.streaks) ? j.streaks : [];
       this.streakState = this.streakDefs.map(d => ({ id: d.id, ready: false, used: false, cost: Math.max(2, d.kills - disc) }));
       // 名字不在二进制快照里（变长字段会毁掉定长包），靠 welcome + join 事件带
-      for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team });
+      for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team, perks: o.perks || [] });
       this.snapGap = 0;         // 看门狗的基线：从进场这一刻开始数"多久没收到快照"
       this.settleJoin(null, j);
     } else if (j.t === 'ev') {
@@ -230,7 +236,12 @@ export class NetClient {
     // 每一条里最多有一条带请求 —— 服务端不需要自己再做边沿检测。不在这里过滤
     // "我这边觉得就绪了吗"：唯一的裁决者是服务端，客户端自己拦会把
     // /healthz 的 streak.rejected 读数搞脏（那个数存在的意义正是"客户端与服务端的账对不上"）。
-    this.pending.push({ tick: t16, mdx: inp.mdx, mdy: inp.mdy, keys: packed.keys, buttons: packed.buttons, view: this.viewTick, seq: t16 & 0xff, streak: inp.streak });
+    // 唯一的例外是集束空袭那一位：它要先选点（与单机 useStreak 同语义），ready 时被拦去
+    // 选点流程、确认走 {t:'streak'} 窄帧；没就绪照旧上报被拒 —— 拦掉的是"选点流程接管"，
+    // 不是"我觉得能不能用"。
+    let streak = inp.streak;
+    if (streak >= 0 && this.useStreak(streak)) streak = -1;
+    this.pending.push({ tick: t16, mdx: inp.mdx, mdy: inp.mdy, keys: packed.keys, buttons: packed.buttons, view: this.viewTick, seq: t16 & 0xff, streak });
   }
   flush() {
     if (!this.ws || this.ws.readyState !== 1 || !this.pending.length) return;
@@ -265,6 +276,7 @@ export class NetClient {
           id: e.id, name: who.name || ('玩家 ' + e.id),
           team: teamId(e.team) || (this.team === 'A' ? 'B' : 'A'),
           weapon: e.weapon,
+          perks: who.perks,
           // 起点用这一包的坐标：留 (0,0,0) 会让第一帧把别人摆在地图原点。
           // （插值本身没跑起来时，那个原点读数会一直挂着 —— 见 test/net-play.mjs 的 rendered 差值）
           x: e.x, y: e.y, z: e.z, yaw: e.yaw,
@@ -741,10 +753,19 @@ export class NetClient {
         this.history.length = 0;
         this.respawnSnaps = (this.respawnSnaps || 0) + 1;
         this.game.onNetRespawn && this.game.onNetRespawn(ev);
-      } else if (ev.e === 'join') {
-        this.roster.set(ev.cid, { name: ev.name, team: ev.team });
+      } else if (ev.e === 'respawn') {
+        // 别人的重生：技能表跟着装备回声更新（他可能在死亡画面里换了配装 ——
+        // 幽灵这类技能就挂在这张表上，不更新的话换装前后的表现会一直错着）。
         const r = this.remotes.get(ev.cid);
-        if (r) r.setName && r.setName(ev.name, ev.team);
+        if (r && ev.loadout) r.perks = (ev.loadout.perks || []).slice();
+      } else if (ev.e === 'join') {
+        this.roster.set(ev.cid, { name: ev.name, team: ev.team, perks: ev.perks || [] });
+        const r = this.remotes.get(ev.cid);
+        if (r) { r.setName && r.setName(ev.name, ev.team); r.perks = (ev.perks || []).slice(); }
+      } else if (ev.e === 'highAlert') {
+        // 高度警觉：有人（Bot）正在瞄我。位置走事件、画在自己这台机器上 ——
+        // 与 flash 同一条约定（cid 定向在客户端筛）。
+        if (ev.cid === this.cid) this.game.hud.highAlert(new THREE.Vector3(ev.x, ev.y, ev.z));
       } else if (ev.e === 'streakReady') {
         // 充能到线。槽位状态**由服务端推**，客户端不自己比 progress >= cost ——
         // 那会让"什么时候算就绪"有两个真相，而两者对不上时玩家按下去没反应。
@@ -791,6 +812,27 @@ export class NetClient {
         this.game.hud.popup(ev.text, ev.color || '#fff', true);
       } else if (ev.e === 'proj') {
         this.spawnProjectile(ev);
+      } else if (ev.e === 'pickup') {
+        this.spawnGroundPickup(ev);
+      } else if (ev.e === 'pickupGone') {
+        this.removeGroundPickup(ev.id);
+      } else if (ev.e === 'pickupAmmo') {
+        this.removeGroundPickup(ev.id);
+        if (ev.cid === this.cid) {
+          const g = this.game, pl = g.player;
+          const slot = pl && pl.ws && pl.ws.slots.find(s => s.id === ev.weapon);
+          // 装进包里的**最终值**由权威端算好带过来（cap 也它说了算），这里不再算一遍
+          if (slot) slot.reserve = ev.reserve;
+          g.hud.popup('+弹药 ' + ev.add, '#ccc');
+          g.audio.click(2200, 0.05, 0.3);
+        }
+      } else if (ev.e === 'pickupTake') {
+        this.removeGroundPickup(ev.id);
+        if (ev.cid === this.cid) {
+          const pl = this.game.player;
+          if (pl && pl.ws) pl.ws.replaceSlot(ev.idx, { id: ev.weapon, att: ev.att || {}, camo: 'none' }, ev.mag ?? undefined, ev.reserve ?? undefined);
+          this.game.audio.ui('equip');
+        }
       } else if (ev.e === 'leave') {
         const who = this.roster.get(ev.cid);
         const r = this.remotes.get(ev.cid) || this.leaving.find(x => x.id === ev.cid);
@@ -800,14 +842,29 @@ export class NetClient {
         this.board = ev;
         this.scores.A = ev.scores.A; this.scores.B = ev.scores.B;
         this.timeLeft = ev.timeLeft;
+        this.setFlagState(ev.flags);
         const me = (ev.rows || []).find(r => r.cid === this.cid);
         this.streakProgress = me ? (me.sk | 0) : 0;
+      } else if (ev.e === 'flagCap') {
+        // 换旗那一刻的颜色立刻翻（归属的大部队走记分板，2 秒一班，这个等不了）
+        this.ensureFlags();
+        const f = this.flags && this.flags.find(x => x.name === ev.name);
+        if (f) { f.owner = ev.owner; f.prog = ev.prog || 0; }
+      } else if (ev.e === 'matchStats') {
+        // 终局个人战绩（权威端报的得分/击杀/死亡/助攻）。命中率不在这儿 —— 打出多少、
+        // 命中多少是"我看到的"两个数，与单机同一口径，留在本地 pl.stats 上。
+        if (ev.cid === this.cid) this.myStats = ev;
       } else if (ev.e === 'matchOver') {
         this.over = true; this.matchWinner = ev.winner;
-        const mine = ev.winner === this.team;
-        this.game.hud.announce(mine ? '胜利' : ev.winner === 'draw' ? '平局' : '失败', '', 4);
-        this.game.audio.say(mine ? '胜利' : '失败');
+        // winner 三种形状：队名（tdm/dom）、cid（自由混战的那个人）、null（没分出胜负）
+        const win = ev.winner == null ? 'draw' : (ev.winner === this.cid || ev.winner === this.team) ? 'win' : 'lose';
+        const title = win === 'win' ? '胜利' : win === 'draw' ? '平局' : '失败';
+        this.game.ending = true;                 // 不置上的话松开指针锁那一下会弹暂停，盖在结算上
+        document.getElementById('deathScreen').classList.add('hidden');
+        this.game.hud.announce(title, '', 4);
+        this.game.audio.say(title);
         this.game.hud.showScoreboard(true);
+        this.showResults(win, title);
       }
     }
     if (this.events.length > 64) this.events.splice(0, this.events.length - 64);
@@ -829,18 +886,89 @@ export class NetClient {
     if ((this.localTick % 10) === 0) {
       const t = Math.max(0, this.timeLeft | 0);
       const mm = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
-      hud.scorebar(`<div class="sb-team a">${Math.floor(this.scores.A)}</div><div class="sb-time">${mm}</div><div class="sb-team b">${Math.floor(this.scores.B)}</div>`);
+      if (this.ffa) {
+        // 自由混战的比分条：我的击杀 + 名次 + 榜首（与单机 MPMatch.hudScore 的 ffa 分支同形）
+        const rows = (this.board && this.board.rows) || [];
+        const me = rows.findIndex(r => r.cid === this.cid);
+        const mine = me >= 0 ? rows[me] : null;
+        hud.scorebar(`<div class="sb-team a">${mine ? mine.k : 0}</div><div class="sb-time">${mm}<br><small style="font-size:11px;color:#aaa">第 ${me >= 0 ? me + 1 : '-'} 名</small></div><div class="sb-team b">${rows[0] ? rows[0].k : 0}</div>`);
+      } else {
+        // 占领点的名字条挂在旗顶（与单机 MPMatch.update 的 hudScore/markers 同形）
+        let fl = '';
+        if (this.flags) {
+          const myT = this.game.player && this.game.player.team;
+          fl = `<div class="sb-flags">${this.flags.map(f => `<div class="sb-flag ${f.owner === myT ? 'A' : f.owner ? 'B' : ''}">${f.name}</div>`).join('')}</div>`;
+        }
+        hud.scorebar(`<div class="sb-team a">${Math.floor(this.scores.A)}</div>${fl}<div class="sb-time">${mm}</div><div class="sb-team b">${Math.floor(this.scores.B)}</div>`);
+      }
     }
     // 白磷弹的屏幕效果：权威端在放它时把 WhitePhosphorus 位置 10 秒，快照每拍带过来。
     // 这一位以前从来没被写过（server/room.mjs 的 worldFlags 硬编码 0），于是联机里
     // 白磷弹除了扣血什么表现都没有。
     this.game.grade.uniforms.wp.value = (this.worldFlags & WORLD.WhitePhosphorus) ? 0.6 : 0;
+    // 集束选点的落点环与确认/取消（与单机 MPMatch.update 里的那一句同位置：每拍跑一次）
+    this.updateTargeting(inp);
+    // 占领点：旗子颜色按归属刷、名字牌挂旗顶（#markers 这层以前在联机路径下恒空）。
+    // 只在**归属变了**的那几帧刷 —— 每帧重建标记是纯浪费（低配机上会把渲染帧拖住）。
+    this.ensureFlags();
+    if (this.flags) {
+      const pl = this.game.player, myT = pl && pl.team;
+      const sig = myT + ':' + this.flags.map(f => f.owner).join(',');
+      if (sig !== this._flagSig) {
+        this._flagSig = sig;
+        for (const f of this.flags) {
+          const col = f.owner === myT ? 0x4fb4ff : f.owner ? 0xff4a3d : 0xffffff;
+          f.mesh.userData.ring.material.color.setHex(col);
+          f.mesh.userData.cloth.material.color.setHex(col);
+          f.mesh.userData.cloth.material.emissive.setHex(col);
+        }
+        this.game.hud.setMarkers(this.flags.map(f => ({
+          id: 'f' + f.name, pos: f.pos.clone().setY(f.mesh.position.y + 3.6), label: f.name,
+          cls: 'flag ' + (f.owner === myT ? 'ally' : f.owner ? 'enemy' : 'neutral'),
+        })));
+      }
+    }
   }
 
   // ---------- 连杀奖励在本地的表现 ----------
   setStreakSlot(id, patch) {
     const s = this.streakState.find(x => x.id === id);
     if (s) Object.assign(s, patch);
+  }
+
+  // 与单机 MPMatch.useStreak 同语义（js/mp.js:272）：集束空袭要先选目标，
+  // 改主意（右键）就不该扣掉 —— 所以这里只进入选点流程，一个字节都不发；
+  // 到确认那一刻才发 {t:'streak'} 窄帧，消耗与否由权威端裁。
+  // 返回 true = "这一拍的上行里不带呼叫请求"（recordInput 据此把字节抹成 -1）。
+  // 没就绪的槽不进选点：照旧上报，让服务端的 rejected 读数保持诚实。
+  useStreak(i) {
+    const s = this.streakState[i];
+    if (!s || !s.ready || s.id !== 'cluster') return false;
+    this.targeting = { slot: i };
+    this.game.hud.announce('选择空袭目标', '左键确认 · 右键取消', 2.5);
+    return true;
+  }
+  get interactPrompt() { return !!this.targeting; }
+  updateTargeting(inp) {
+    const game = this.game, t = this.targeting;
+    if (!t) { if (this.tgtMesh) this.tgtMesh.visible = false; return; }
+    if (!this.tgtMesh) {
+      this.tgtMesh = new THREE.Mesh(new THREE.RingGeometry(3, 3.5, 40), new THREE.MeshBasicMaterial({ color: new THREE.Color(3, 0.4, 0.2), transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthTest: false }));
+      this.tgtMesh.rotation.x = -Math.PI / 2; game.world.root.add(this.tgtMesh);
+    }
+    const cam = game.camera, d = cam.getWorldDirection(new THREE.Vector3());
+    const hit = game.world.raycast(cam.position, d, 200);
+    this.tgtMesh.visible = !!hit;
+    if (hit) this.tgtMesh.position.copy(hit.point).setY(hit.point.y + 0.1);
+    game.hud.prompt('<b>左键</b>确认空袭目标 · <b>右键</b>取消');
+    if (inp.firePressed && hit) {
+      // 只交**选择**（落点）：扣不扣槽、落哪儿、炸多久全部由权威端裁 —— 本地先扣槽
+      // 再发请求的话，请求被拒时那个槽就白扣了（"按下即消耗"的复发形态）。
+      this.ws.send(JSON.stringify({ t: 'streak', slot: t.slot, x: +hit.point.x.toFixed(2), z: +hit.point.z.toFixed(2) }));
+      this.targeting = null; game.hud.prompt(null);
+      game.audio.say('集束空袭已确认');
+      game.player.ws.cool = 0.3;          // 确认这一下不许顺手开一枪（与单机同句）
+    } else if (inp.adsPressed) { this.targeting = null; game.hud.prompt(null); }
   }
 
   // 别人扔出来的那一颗：在本地按**同一套物理**重建（js/combat.js:Projectile 的 dumb 模式）。
@@ -857,6 +985,45 @@ export class NetClient {
     p.netId = ev.netId;
     g.projectiles.push(p);
     this.projs.set(ev.netId, p);
+  }
+
+  // 地上的枪（击杀掉落 / 换枪留下的）：起手状态一次给全，客户端只建哑模型 ——
+  // 它不许自己消失、不许自己被捡（那是权威端的事），后续的 pickupGone / pickupTake
+  // 事件来收。id 来自服务端的 netIds 分配器，与哨戒机枪/直升机共用一套。
+  spawnGroundPickup(ev) {
+    const g = this.game;
+    if (!g.world) return;                       // 地图还没加载完时收到的迟到事件
+    const p = g.spawnPickup(ev.weapon, ev.att || {}, new THREE.Vector3(ev.x, ev.y, ev.z), ev.mag, ev.reserve);
+    if (p) { p.netId = ev.id; this.pickups.set(ev.id, p); }
+  }
+  // 权威端说"这把枪没了"（被捡走 / 同款补了弹 / 30 秒过期）。幂等：模型可能已经
+  // 被本地的 14 顶上限挤掉了，找不到就当已经没了。
+  removeGroundPickup(id) {
+    const p = this.pickups.get(id);
+    if (!p) return;
+    this.pickups.delete(id);
+    const i = this.game.pickups.indexOf(p);
+    if (i >= 0) this.game.pickups.splice(i, 1);
+    if (p.mesh) this.game.scene.remove(p.mesh);
+  }
+
+  // ---------- 占领点（dom） ----------
+  // 3D 旗各建各的：位置来自两端共读的地图（w.flagPos），只有归属/进度靠事件同步
+  // （换旗走 flagCap、大部队走记分板）。规则本身在权威端（js/match-rules.js:flagsTick）。
+  ensureFlags() {
+    if (this.flags || this.modeId !== 'dom') return;
+    const w = this.game.world;
+    if (!w || !w.flagPos || !w.flagPos.length) return;
+    this.flags = w.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, mesh: flagMesh(this.game, p) }));
+  }
+  setFlagState(list) {
+    if (!list || !list.length) return;
+    this.ensureFlags();
+    if (!this.flags) return;
+    for (const s of list) {
+      const f = this.flags.find(x => x.name === s.name);
+      if (f) { f.owner = s.owner; f.prog = s.prog; }
+    }
   }
 
   // 权威端放的哨戒机枪 / 武装直升机，在客户端建一个**不开火**的同形副本（dumb）。
@@ -957,7 +1124,15 @@ export class NetClient {
   // 小地图的 UAV 效果。hud.drawMinimap 拿它决定"要不要把敌人画出来"，
   // 而敌人位置本来就在客户端手上（remotes 的插值结果）—— 所以这里只需要回答
   // 一个问题：**我的队现在有没有 UAV**。答案在世界标志位里（两位，按队查）。
-  uavActive(team) { return uavFromFlags(this.worldFlags, team || this.team); }
+  uavActive(team) {
+    // 自由混战：每人一支"队"（'P'+cid），快照头那一位表达不了 ⇒ 读记分板那一行的
+    // 剩余秒数（2 秒一份，30 秒的效果上够用）。tdm/dom 照旧读快照头的位。
+    if (this.ffa) {
+      const me = this.board && (this.board.rows || []).find(r => r.cid === this.cid);
+      return !!(me && me.uav > 0);
+    }
+    return uavFromFlags(this.worldFlags, team || this.team);
+  }
 
   minimapMarkers() { return []; }
 
@@ -965,11 +1140,45 @@ export class NetClient {
   // 再加一行网络状态。以前只有名字/得分/击杀/死亡四列：助攻恒 '-'、没有名次、
   // 活着与躺着长得一模一样，而且 A/B 的比分标签写死了 `我方 · A` —— 我要是站 B 队，
   // 那一屏上"我方"挂的是对面的分。
+  // 结算面板。与单机 MPMatch.end 的那一段逐格对齐（含 2.5 s 的节奏）：胜负 + 比分 +
+  // 得分/击杀/死亡/K/D/命中率/经验值 + 等级条 + 再来一局（menu.showResults 画的就是这些格）。
+  // 胜负分照单机那条式子写进**本机档案**：联机里的访客没有服务器档案可写（endMatch 的
+  // rows 只收 account），但他的等级条不该因此永远是 0 —— 那正是差距清单里的"访客 0 xp"。
+  showResults(win, title) {
+    const g = this.game, pl = g.player;
+    const st = this.myStats || {};
+    const k = st.k | 0, d = st.d | 0, s = Math.round(st.s || 0);
+    const shots = (pl && pl.stats && pl.stats.shots) | 0, hits = (pl && pl.stats && pl.stats.hits) | 0;
+    const xp = s + (win === 'win' ? 500 : 150);
+    g.profile.xp += xp; g.saveProfile();
+    const meRow = (this.board && this.board.rows || []).find(r => r.cid === this.cid);
+    setTimeout(() => {
+      // 这一局可能已经先走完了：MATCH_RETURN_MS=0 的服上"回房间"发生在 1 秒内，
+      // 定时器到点时房间屏都画好了 —— 不拦的话结算面板会把房间屏整个盖掉
+      //（症状是"打完卡在结算上，回不了房"，test/net-drop 的局末那条就是这么红的）。
+      if (this.game.net !== this) return;
+      if (document.pointerLockElement) document.exitPointerLock();
+      g.menu.showResults({
+        win, title,
+        sub: this.ffa ? `第 ${meRow ? meRow.rank : '-'} 名` : `${Math.floor(this.scores.A)} : ${Math.floor(this.scores.B)}`,
+        stats: [['得分', s], ['击杀', k], ['死亡', d], ['K/D', (k / Math.max(1, d)).toFixed(2)],
+          ['命中率', Math.round(hits / Math.max(1, shots) * 100) + '%'], ['经验值', '+' + xp]],
+        board: this.scoreboardHTML(),
+        // "再来一局"在联机里的语义是**回房间**（等房主再开下一局）—— 那条连接是房间的
+        // 座位，不能关；直连对局没有房间可回，退回主菜单（与暂停菜单"退出本局"同一句）。
+        again: () => { (g.lobby && g.lobby.connected) ? g.returnToRoom() : g.exitToMenu(); },
+      });
+    }, 2500);
+  }
+
   scoreboardHTML() {
     const row = (r) => `<tr class="${r.cid === this.cid ? 'me ' : ''}${r.alive === false ? 'dead' : ''}">`
       + `<td>${r.rank || ''}</td><td>${r.name}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>${r.a || 0}</td></tr>`;
     const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>#</th><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
     const rows = (this.board && this.board.rows) || [];
+    // 自由混战：一张表按名次排（与单机 MPMatch.scoreboardHTML 同形）—— 分两队的表
+    // 在 ffa 里是假的（"我方/敌方"根本不存在）。
+    if (this.ffa) return head('自由混战', 'A') + rows.map(row).join('') + '</table>';
     const A = rows.filter(r => r.team === this.team), B = rows.filter(r => r.team !== this.team);
     const mine = this.team === 'A' ? this.scores.A : this.scores.B;
     const theirs = this.team === 'A' ? this.scores.B : this.scores.A;

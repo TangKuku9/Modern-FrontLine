@@ -507,6 +507,159 @@ try {
     (s1.accepted | 0) === 0 ? uavBits === 0 : uavBits !== 0,
     `accepted=${s1.accepted} worldFlags=${roomR2.worldFlags}`);
 
+  // ---- 集束选点：按键 → 选点流程 → 确认 / 取消（落点裁决的规则侧在 mp-rules J 量）----
+  // 环境条件只有两个是伪造的、且都不是被测对象：指针锁（无头浏览器拿不到，而 mousedown
+  // 只有锁着才算数，main.js:495）与"槽已就绪"（真对局里攒 5 杀靠运气）。按键、鼠标事件、
+  // 输入打包、{t:'streak'} 上行、服务端记账走的全是真链路。
+  for (let i = 0; i < 20 && !(await A.page.evaluate(() => window.game.player && window.game.player.alive)); i++) await sleep(250);
+  await A.page.evaluate(() => {
+    const cv = document.querySelector('canvas');
+    Object.defineProperty(document, 'pointerLockElement', { get: () => cv, configurable: true });
+    const s = (window.game.net.streakState || [])[1];      // 1 号槽 = 集束（默认表升序后）
+    if (s) s.ready = true;
+  });
+  await focus(A);
+  const calls0 = s1.calls | 0;
+  await A.page.keyboard.press('Digit4');
+  await sleep(250);
+  ok('按 4（集束槽）进入**选点流程**，不是直接呼叫', await A.page.evaluate(() => !!window.game.net.targeting));
+  // 取消（右键）：退出选点，且一个请求都不许发出去 —— "取消不扣槽"的上行那一半
+  await A.page.mouse.down({ button: 'right' }); await sleep(80); await A.page.mouse.up({ button: 'right' });
+  await sleep(350);
+  const hzC = await (await fetch(srv.base + '/healthz')).json();
+  const callsC = ((((hzC.per || []).find(r => r.id === ROOM)) || {}).streak || {}).calls | 0;
+  ok('【反证】右键取消：退出选点、没发出任何呼叫请求',
+    !(await A.page.evaluate(() => window.game.net.targeting)) && callsC === calls0, `calls ${calls0} → ${callsC}`);
+  // 确认（左键）：{t:'streak'} 真的到达服务端并记成一次呼叫。看一眼地面是环境条件 ——
+  // 准星要 raycast 得着东西才有落点；瞄准本身不是这条链路的一部分。
+  await A.page.keyboard.press('Digit4');
+  await sleep(250);
+  await A.page.evaluate(() => { if (window.game.player) window.game.player.pitch = -0.45; });
+  await sleep(300);                                          // 等 ack 走过，重放不会把俯仰拽回去
+  await A.page.mouse.down({ button: 'left' }); await sleep(80); await A.page.mouse.up({ button: 'left' });
+  await sleep(450);
+  const hzC2 = await (await fetch(srv.base + '/healthz')).json();
+  const callsC2 = ((((hzC2.per || []).find(r => r.id === ROOM)) || {}).streak || {}).calls | 0;
+  ok('左键确认：选点流程把 {t:"streak"} 发到了服务端（正好 +1；+2 = 按键字节没被拦住的双发）',
+    !(await A.page.evaluate(() => window.game.net.targeting)) && callsC2 === calls0 + 1, `calls ${calls0} → ${callsC2}`);
+
+  // ---- 结算面板：胜 / 平两格与胜负分（数的来源在 mp-rules K，这里量面板本身）----
+  // 事件从**协议入口**喂（onControl，net-drop 用的同一个口）：真对局要打满击杀目标或
+  // 等到时间耗尽才出终局，浏览器判据里凑不出来；面板的每一格仍走真的渲染链路。
+  await A.page.evaluate(() => {
+    const n = window.game.net;
+    n.onControl({ t: 'ev', ev: [{ e: 'matchStats', cid: n.cid, k: 7, d: 2, a: 1, s: 1234 }] });
+    n.onControl({ t: 'ev', ev: [{ e: 'matchOver', winner: n.team }] });
+  });
+  await sleep(3200);
+  const res1 = await A.page.evaluate(() => {
+    const el = document.querySelector('.results');
+    return el ? el.innerText.replace(/\s+/g, ' ') : '';
+  });
+  ok('结算面板出现、标题是胜利（2.5 s 后弹出，与单机同一节奏）', /胜利/.test(res1), res1.slice(0, 60));
+  ok('胜负分进了经验值（1234 + 500 = 1734，与单机同式）', /1734/.test(res1), res1.slice(0, 120));
+  ok('面板画齐了结算那几格（得分/击杀/死亡/K/D/命中率/等级）',
+    ['得分', '击杀', '死亡', 'K/D', '命中率', '等级'].every(x => res1.includes(x)), res1.slice(0, 160));
+  // 平局那一格：winner=null 不能被念成"失败"（matchOver 里 ev.winner === team 对 null 恒假）
+  await A.page.evaluate(() => window.game.net.onControl({ t: 'ev', ev: [{ e: 'matchOver', winner: null }] }));
+  await sleep(3200);
+  const res2 = await A.page.evaluate(() => {
+    const el = document.querySelector('.results');
+    return el ? el.innerText.replace(/\s+/g, ' ') : '';
+  });
+  ok('winner=null 记成平局（不是"失败"）', /平局/.test(res2), res2.slice(0, 60));
+
+  // ---- Perk 的客户端那一半：技能同步 / 拾荒者镜像 / 高度警觉（权威端那一半在 mp-rules L）----
+  const perk = await A.page.evaluate(() => {
+    const n = window.game.net, g = window.game;
+    // ① 两个同步接缝：welcome.others 带技能表（远端副本建起来就带着），join 事件会更新它。
+    //    乙兵的默认配装里有幽灵 —— 能读到它就说明第一段接缝是通的。
+    const r = n.remoteByName ? n.remoteByName('乙兵') : null;
+    const fromWelcome = !!(r && r.hasPerk && r.hasPerk('ghost'));
+    if (r) n.onControl({ t: 'ev', ev: [{ e: 'join', cid: r.id, name: '乙兵', team: r.team, perks: ['eod'] }] });
+    const fromJoin = !!(r && r.hasPerk('eod') && !r.hasPerk('ghost'));
+    // ② 拾荒者：自己的击杀事件在**本机状态机**上再跑同一份规则（弹药计数跟着补）
+    g.player.perks.add('scavenger');
+    const ws0 = g.player.ws.slots.reduce((s, w) => s + w.reserve, 0);
+    n.onControl({ t: 'ev', ev: [{ e: 'kill', killer: g.player.name, victim: '乙兵', weapon: 'm4', head: false, pts: 25 }] });
+    const ws1 = g.player.ws.slots.reduce((s, w) => s + w.reserve, 0);
+    const popped = /拾荒者/.test(document.body.innerText);
+    // ③ 高度警觉：事件落在自己头上时 hud 要有反应（提示只给屏幕外的威胁，扔一个够远的点）
+    const p = g.player.pos;
+    n.onControl({ t: 'ev', ev: [{ e: 'highAlert', cid: n.cid, x: p.x, y: p.y, z: p.z - 200 }] });
+    return { fromWelcome, fromJoin, refilled: ws1 > ws0, popped, alertT: g.hud.alertT > 0 };
+  });
+  ok('技能表从 welcome.others 进了远端副本（幽灵过滤读的就是这一格）', perk.fromWelcome, JSON.stringify(perk));
+  ok('join 事件会更新远端的技能表（换装后的表现不许一直错着）', perk.fromJoin, JSON.stringify(perk));
+  ok('拾荒者镜像：自己的击杀真的补了本机弹药计数', perk.refilled, JSON.stringify(perk));
+  ok('拾荒者弹窗画出来了', perk.popped, JSON.stringify(perk));
+  ok('高度警觉：highAlert 事件让 HUD 有反应', perk.alertT, JSON.stringify(perk));
+
+  // ---- 地上的枪：哑模型 + 事件驱动的拾取（权威端那条链在 mp-rules M）----
+  const pick = await A.page.evaluate(() => {
+    const n = window.game.net, g = window.game;
+    const n0 = g.pickups.length;
+    const at = { x: g.player.pos.x + 1, y: g.player.pos.y, z: g.player.pos.z };
+    n.onControl({ t: 'ev', ev: [{ e: 'pickup', id: 5001, weapon: 'ak', att: {}, ...at, mag: 15, reserve: 60 }] });
+    const appeared = g.pickups.length === n0 + 1 && !!n.pickups.get(5001);
+    n.onControl({ t: 'ev', ev: [{ e: 'pickupTake', cid: n.cid, id: 5001, idx: 0, weapon: 'ak', att: {}, mag: 15, reserve: 60 }] });
+    const held = !!(g.player.ws.slots[0] && g.player.ws.slots[0].id === 'ak');
+    const gone = !n.pickups.get(5001) && g.pickups.length === n0;
+    // 同款补弹：事件里的最终值直接装包（cap 由权威端说了算，客户端不算第二遍）
+    n.onControl({ t: 'ev', ev: [{ e: 'pickup', id: 5002, weapon: 'ak', att: {}, ...at, mag: 10, reserve: 30 }] });
+    const slot = g.player.ws.slots.find(s => s.id === 'ak');
+    const r0 = slot ? slot.reserve : -1;
+    n.onControl({ t: 'ev', ev: [{ e: 'pickupAmmo', cid: n.cid, id: 5002, weapon: 'ak', add: 25, reserve: r0 + 25 }] });
+    const slot2 = g.player.ws.slots.find(s => s.id === 'ak');
+    return { appeared, held, gone, ammo: !!slot2 && slot2.reserve === r0 + 25 };
+  });
+  ok('地上那把枪真的出现（哑模型，只有权威端能让它消失）', pick.appeared, JSON.stringify(pick));
+  ok('pickupTake 改了手上那把枪、模型收走', pick.held && pick.gone, JSON.stringify(pick));
+  ok('pickupAmmo 把权威端算好的弹药值装进包', pick.ammo, JSON.stringify(pick));
+
+  // ---- 自由混战的客户端分叉：记分板单表、结算写"第 N 名"（权威侧在 mp-rules N）----
+  const ffaBoard = await A.page.evaluate(() => {
+    const n = window.game.net;
+    n.ffa = true;
+    n.onControl({ t: 'ev', ev: [{ e: 'board', tick: 1, scores: { A: 0, B: 0 }, timeLeft: 120, uav: { A: false, B: false }, rows: [
+      { cid: n.cid, name: '甲兵', team: 'P1', k: 5, d: 1, a: 0, alive: true, s: 900, sk: 0, uav: 0, rank: 2 },
+      { cid: 998, name: '路人', team: 'P2', k: 7, d: 2, a: 0, alive: true, s: 1100, sk: 0, uav: 0, rank: 1 },
+    ] }] });
+    const board = n.scoreboardHTML();
+    return /自由混战/.test(board) && !/我方/.test(board);
+  });
+  ok('ffa 记分板是一张按名次的单表（"我方/敌方"在混战里是假的）', ffaBoard);
+  await A.page.evaluate(() => {
+    const n = window.game.net;
+    n.onControl({ t: 'ev', ev: [{ e: 'matchStats', cid: n.cid, k: 5, d: 1, a: 0, s: 900 }] });
+    n.onControl({ t: 'ev', ev: [{ e: 'matchOver', winner: 998 }] });
+  });
+  await sleep(3200);
+  const ffaRes = await A.page.evaluate(() => {
+    const el = document.querySelector('.results');
+    return el ? el.innerText.replace(/\s+/g, ' ') : '';
+  });
+  ok('ffa 结算按 cid 判胜负、写"第 N 名"（winner 是那个人不是队）',
+    /失败/.test(ffaRes) && /第 2 名/.test(ffaRes), ffaRes.slice(0, 80));
+
+  // ---- 占领点的客户端那一半：3D 旗 + 归属颜色（权威侧在 mp-rules O）----
+  const dom1 = await A.page.evaluate(() => {
+    const n = window.game.net;
+    n.modeId = 'dom';
+    n.ensureFlags();
+    const built = !!(n.flags && n.flags.length === 3 && n.flags[0].mesh && n.flags[0].mesh.userData.ring);
+    n.onControl({ t: 'ev', ev: [{ e: 'flagCap', name: n.flags[0] ? n.flags[0].name : 'A', owner: n.team === 'A' ? 'B' : 'A', prog: 0 }] });
+    return { built, owner: n.flags && n.flags[0] && n.flags[0].owner };
+  });
+  await sleep(250);                      // 等下一拍的旗色刷新
+  const dom2 = await A.page.evaluate(() => {
+    const n = window.game.net;
+    const f = n.flags && n.flags[0];
+    return f ? f.mesh.userData.ring.material.color.getHex() : -1;
+  });
+  ok('dom 的 3D 旗按地图据点建起来了（这层以前在联机里恒空）', dom1.built, JSON.stringify(dom1));
+  ok('flagCap 立刻翻旗色（敌占 = 红 0xff4a3d）', !!dom1.owner && dom2 === 0xff4a3d, JSON.stringify({ dom1, dom2 }));
+
   const frozen = await A.page.evaluate(() => window.game.tick);
   await sleep(500);
   const ticks2 = await A.page.evaluate(() => window.game.tick);

@@ -13,7 +13,7 @@ import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput, unpackStreak, uavBit, WORLD } from '../js/quant.js';
 import { sanitizeLoadout } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
-import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS } from '../js/match-rules.js';
+import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
 import { Sentry, Heli, BOT_WEAPONS, randomAtt } from '../js/mp.js';
 import { KILLSTREAKS, DEFAULT_STREAKS, BOT_NAMES } from '../js/data.js';
@@ -36,20 +36,38 @@ export const HURT_EVERY = 12;
 // 而且探针也没法用"包里有没有出现陌生 id"来判断串门。串门的成因见 net-server:broadcast。
 let NEXT_CID = 1;
 
-// 连杀奖励的槽位表。账户系统还没做（README 待办 1），所以默认用 DEFAULT_STREAKS 的三项。
+// 连杀奖励的槽位表。玩家自带哪三项由他自己的选（js/menu.js:pickStreaks → profile.streaks，
+// 搭 _id() 那一帧进座位），服务端**解析后回显**（welcome.streaks）—— 两端共读的仍是
+// 服务端这一份，客户端从不自己另算一份槽位表。
 // 这份表必须只列**完整实现**的项：能呼叫却生效不了（只发一条通知、实体只长在部署者
 // 那台机器上）比根本没有这一项更糟 —— 别人会被一个自己看不见的东西打死。
-// 五项都已经实现，所以这里就是随手挑一个子集；将来账号做了之后，
-// 每个人带哪三项进对局会走 `opts.streaks`（房间级）而不是全局常量。
 export const STREAK_DEFS = DEFAULT_STREAKS.map(id => KILLSTREAKS.find(k => k.id === id)).filter(Boolean);
 export const STREAK_IDS = STREAK_DEFS.map(d => d.id);
-export const resolveStreaks = (ids) => (Array.isArray(ids) ? ids : STREAK_IDS)
-  .map(id => KILLSTREAKS.find(k => k.id === id)).filter(Boolean);
+// 白名单重建，与 js/loadout.mjs 同一套哲学：非法项**换掉**而不是原样挂上、也不是整组拒绝。
+// 恰好 3 项（按 3/4/5 就是三个槽）：报了 5 项只认前 3 个合法的，不足 3 项拿 DEFAULT_STREAKS
+// 补齐。不写成"必须正好 3 项否则退回默认"：那样一个过期 id 会让玩家精心选的另外两项陪葬，
+// 而症状只是"进局发现连杀换了"，没人会想到是那一格没过期。
+// **返回前按 kills 升序**：StreakBook 的槽位、welcome 的回显、客户端按 3/4/5 报的下标
+// 全靠同一个顺序对上。顺序各排各的症状是"按 3 出来的是另一个奖励"，不报错。
+export const resolveStreaks = (ids) => {
+  const out = [];
+  for (const id of Array.isArray(ids) ? ids : []) {
+    const d = KILLSTREAKS.find(k => k.id === id);
+    if (d && !out.includes(d) && out.length < 3) out.push(d);
+  }
+  for (const id of DEFAULT_STREAKS) {
+    if (out.length >= 3) break;
+    const d = KILLSTREAKS.find(k => k.id === id);
+    if (d && !out.includes(d)) out.push(d);
+  }
+  return out.sort((a, b) => a.kills - b.kills);
+};
 
-// 联机下集束空袭的弹幕中心落在呼叫者视线前方多远。单机是玩家在地图上点的那一点
-// （距离不定），联机省掉那次点击（见 NetRoom.callStreak）。取 22 m：比一发手雷远、
-// 比半个地图近，也就是"看得见的那片开阔地"。它是**输入**的差别，不是规则的差别。
-const CLUSTER_RANGE = 22;
+// 集束空袭落点的合法距离上限。落点由玩家在屏幕上选（客户端发 {t:'streak'} 窄帧带上），
+// 权威端只负责两件事：验它在不在这半径内、把地面高度算出来。取 200 m = 单机
+// updateTargeting 的 raycast 上限（js/mp.js:428）—— 两端同一条上限，联机能点到的
+// 就是单机能点到的，不会出现"联机的空袭能炸得更远"。
+const CLUSTER_MAX = 200;
 
 // 白磷弹持续灼烧的伤害方向（"从上方烧下来"）。做成常量而不是每拍 new 一个：它只被读。
 const DOWN = new THREE.Vector3(0, -1, 0);
@@ -87,9 +105,9 @@ export class NetRoom {
     // 规则内核：分数、UAV/白磷弹计时、按拍排程的空袭，都在它里面。单机 MPMatch
     // 用的是同一个类 —— 这就是"联机规则"这一项的全部含义。
     this.rules = new MatchRules(opts.cfg || { mode: opts.mode || 'tdm' });
-    // 这一局带哪几项连杀奖励。它必须是**房间**的属性而不是客户端的：槽位表决定了
-    // "按 3/4/5 各是什么"，两端各拿一份的话，服务端换一项客户端还显示旧的 ——
-    // 症状是"按了没反应"，正是这一轮要消灭的那类静默失效。
+    // 这一局的**默认**连杀槽位表（没自带选单的客户端用它）。真人自带的三项在
+    // addClient 里解析进各自的 c.streakDefs —— 每个人的槽位表以服务端解析结果为准，
+    // welcome 回显同一份，两端才不会出现"服务端换一项客户端还显示旧的"（按了没反应）。
     this.streakDefs = resolveStreaks(opts.streaks);
     // 连杀呼叫的读数。/healthz 会带出去。它和 lag 那条链路的性质一样：**每一种失效
     // 都是静默的** —— 玩家按 3 没反应，既不报错也不崩。
@@ -134,6 +152,17 @@ export class NetRoom {
       const c = this.byPlayer.get(pl);
       if (c) this.events.push({ e: 'flash', cid: c.cid, dur: +dur.toFixed(2) });
     };
+    // 高度警觉：Bot 瞄上带这个技能的真人时（js/ai.js 问 game.highAlert），把"谁在哪瞄你"
+    // 编成事件发过去 —— 与 flashPlayer 同一个形状：真人是另一台机器上的浏览器。
+    this.game.highAlert = (pl, pos) => {
+      const c = this.byPlayer.get(pl);
+      if (c) this.events.push({ e: 'highAlert', cid: c.cid, x: +pos.x.toFixed(1), y: +pos.y.toFixed(1), z: +pos.z.toFixed(1) });
+    };
+    // 占领点：位置来自两端共读的地图（w.flagPos），这一侧只留**状态**（归属/进度）——
+    // 3D 旗在客户端各建各的（js/mp.js:flagMesh），颜色按同步过去的归属刷。
+    this.flags = (this.rules.mode === 'dom' && this.game.world.flagPos)
+      ? this.game.world.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null }))
+      : null;
     this.started = true;
     return this;
   }
@@ -158,7 +187,9 @@ export class NetRoom {
 
   spawnPoint(team) {
     const w = this.game.world;
-    const cands = [...(w.spawns[team] || []), ...(team === 'P' ? [...w.spawns.A, ...w.spawns.B] : [])];
+    // 自由混战没有"自己人的出生点"：所有人都从两边的点里挑（与单机 mp.js:121 同句）。
+    const solo = team === 'P' || this.rules.ffa;
+    const cands = [...(w.spawns[team] || []), ...(solo ? [...w.spawns.A, ...w.spawns.B] : [])];
     for (let i = 0; i < 6; i++) cands.push(w.randomWalkable());
     // Bot 也要算进"别贴着敌人出生"：房间里有 Bot 之后，只看 clients 的那份会把一堆 Bot
     // 摞在同一个出生点上（它们互相看不见对方，因为对方不在自己的敌情表里）。
@@ -176,8 +207,11 @@ export class NetRoom {
     return { pos, yaw: Math.atan2(pos.x, pos.z) };
   }
 
-  addClient({ name = '士兵', team = 'A', loadout = null, account = null } = {}) {
+  addClient({ name = '士兵', team = 'A', loadout = null, streaks = null, account = null } = {}) {
     const cid = NEXT_CID++;
+    // 自由混战：每人一支独立"队"（与单机的 'P' / 'F'+i 同义）。这不是显示用的标签 ——
+    // 友伤/闪光/白磷都按 team 判敌我，共用一支队的话同队的人互相打不掉血。
+    if (this.rules.ffa) team = 'P' + cid;
     const sp = this.spawnPoint(team);
     // rngSeed/rngTag：这个人那条私有玩法流的播种对（见 js/player.js 构造函数）。客户端要用
     // 同一对值才算得出同一个后坐/散布，而 cid 是它从 welcome 里拿到的那个 —— 服务端这里
@@ -188,17 +222,22 @@ export class NetRoom {
     // 拿一份副本算 stats，就是"本地打中了、权威说没有"那种没人报错的分歧。
     const lo = sanitizeLoadout(loadout);
     pl.equip(lo);
+    // 这个人自带的三项连杀（白名单重建过的那一份）。没带的用房间默认表兜底 ——
+    // 兜底要走同一个闸门再解析一遍：房间默认表本身也可能不是正好 3 项。
+    const sd = resolveStreaks(streaks && streaks.length ? streaks : this.streakDefs.map(d => d.id));
     this.game.entities.push(pl);
     if (!this.game.player) this.game.player = pl;   // 第一个人占住"本机玩家"那个老位置，
     // 其余的人靠 NetRoom.step 传的 pairs 列表被推进。
     const c = {
       cid, pl, name, team, loadout: lo, lastInput: decodeInputBits(0, 0), q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0,
       // —— 对局规则的簿记（每个人一份）——
+      // streakDefs：他自带的三项。welcome 回显的就是这一份，HUD 按它画三个槽。
       // book：连杀槽。成本里含"强硬路线"的减 1 —— 那是装备带来的，所以要在装好装备之后
       // （pl.equip 已经在上面跑过）算，且中途换职业时要重算（js/match-rules.js:setDiscount）。
       // kills/deaths/score：记分板要读。以前这三个数只存在于单机的 pl.stats 上，
       // 联机侧没有任何地方记 —— 于是记分板是空的。
-      book: new StreakBook(this.streakDefs, pl.hasPerk('hardline') ? 1 : 0),
+      streakDefs: sd,
+      book: new StreakBook(sd, pl.hasPerk('hardline') ? 1 : 0),
       kills: 0, deaths: 0, score: 0, assists: 0,
       // 局内换配装：只**记住**，到重生那一刻才生效（与单机 MPMatch 的语义一致 ——
       // 死亡画面里换的装备在下次部署时到手）。以前联机侧连这个入口都没有，而暂停菜单
@@ -219,7 +258,7 @@ export class NetRoom {
     };
     this.clients.set(cid, c);
     this.byPlayer.set(pl, c);
-    this.events.push({ e: 'join', cid, name, team, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw });
+    this.events.push({ e: 'join', cid, name, team, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw, perks: lo.perks || [] });
     return c;
   }
 
@@ -350,6 +389,52 @@ export class NetRoom {
         if (rng.next() < DT * 2) e.takeDamage(6, { attacker: this.wpOwner, weapon: '白磷弹', explosive: true, dir: DOWN });
       }
     }
+    // UAV 给持有方的 Bot 报点（幽灵除外）：规则在 js/match-rules.js:uavHints，单机跑的是
+    // 同一份。skipTeam=null —— 服务端没有"我"，每队的 UAV 都喂自己的 Bot。
+    uavHints(this.game, this.rules, this, DT, null, (team) => this.enemiesOf(team));
+    // 占领点：规则在 js/match-rules.js:flagsTick（单机跑的是同一份）。换旗那一刻编
+    // 两条定向播报 + 一条 flagCap（旗子的颜色要立刻翻，等下一班记分板太慢）。
+    if (this.flags) {
+      for (const cap of flagsTick(this.flags, this.rules, this.game.entities, DT).caps) {
+        this.events.push({ e: 'flagCap', name: cap.f.name, owner: cap.team, prog: 0 });
+        this.events.push({ e: 'announce', team: cap.team, to: 'own', text: `已占领 ${cap.f.name} 点` });
+        this.events.push({ e: 'announce', team: cap.team, to: 'foes', text: `${cap.f.name} 点已失守` });
+        for (const e of cap.inRange) {
+          if (!e.alive || e.team !== cap.team) continue;
+          const cc = this.byPlayer.get(e);
+          if (cc) { cc.score += 200; this.events.push({ e: 'popup', cid: cc.cid, text: '+200 占领' }); }
+          else if (e.isBot) e.score += 200;
+        }
+      }
+    }
+    // 地上的枪：过期收掉、谁够得着谁捡。规则在 js/match-rules.js（单机同一份）——
+    // 这一侧裁完编事件，客户端照事件改自己那份（它只算提示、不许自己裁）。
+    for (const p of pickupsExpire(this.game, DT)) {
+      this.events.push({ e: 'pickupGone', id: p.netId, why: 'expire' });
+    }
+    for (const { c, inp } of inputs) {
+      const r = pickupAction(this.game, c.pl, inp);
+      for (const a of r.ammo) {
+        this.events.push({ e: 'pickupAmmo', cid: c.cid, id: a.p.netId, weapon: a.p.weaponId, add: a.add, reserve: a.reserve });
+      }
+      if (r.swap) {
+        // 换枪留下的旧枪**是真实体**：像击杀掉落一样编一条 'pickup'（客户端的 pickupTake
+        // 处理只改手上的枪、不建模型 —— 两头都建的话地上会有两把）。
+        const old = r.swap.old;
+        const oldP = old ? this.game.spawnPickup(old.id, old.att, c.pl.pos, old.mag, old.reserve) : null;
+        if (oldP) {
+          oldP.netId = ++this.netIds;
+          this.events.push({
+            e: 'pickup', id: oldP.netId, weapon: oldP.weaponId, att: oldP.att,
+            x: oldP.pos.x, y: oldP.pos.y, z: oldP.pos.z, mag: oldP.mag, reserve: oldP.reserve,
+          });
+        }
+        this.events.push({
+          e: 'pickupTake', cid: c.cid, id: r.swap.p.netId, idx: r.swap.idx,
+          weapon: r.swap.st.id, att: r.swap.st.att, mag: r.swap.p.mag, reserve: r.swap.p.reserve,
+        });
+      }
+    }
     // 连杀奖励生成的东西（哨戒机枪 / 武装直升机）：和 bot 一样是权威实体，每拍由这里推进。
     // 伤害是在**这一台**机器上算出来的（Sentry.update 里走 fireHitscan），这才是"权威"
     // 二字的全部含义 —— 客户端那边只有一个不开火的同形副本（dumb），它负责"看得见"。
@@ -388,7 +473,9 @@ export class NetRoom {
     // 给它一个被问到的机会 —— 和 onKill 那次是同一个函数，不是第二份真相。
     if (!this.matchOverSent && this.tick % 60 === 0) {
       this.rules.checkEnd();
-      if (this.rules.over) this.endMatch(this.rules.over.winner);
+      // 自由混战的赢家是**名次第一的那个人** —— 规则内核只说"结束了"（它不认人，
+      // over.winner 是 null），名次在房间里才排得出来。
+      if (this.rules.over) this.endMatch(this.rules.ffa ? this.ffaWinner() : this.rules.over.winner);
     }
     // 挨打要能被"看见"。本地玩家在联机里的血量是**快照直接覆盖**的（js/net/predict.mjs），
     // 全程不走 takeDamage ⇒ 方向指示、痛感音、镜头冲击四处全断（js/main.js 的死亡视角
@@ -556,6 +643,13 @@ export class NetRoom {
       pts = sc.points;
       if (kc) {
         kc.kills++; kc.score += sc.points;
+        // 自由混战的赢家是名次里的人（规则内核只认队伍）：杀到目标数在这儿收，
+        // 与单机 MPMatch.onKill 的 `k >= scoreLimit → end(killer)` 同一条。
+        if (R.ffa && kc.kills >= R.scoreLimit) this.endMatch(kc.cid);
+        // 拾荒者 / 速愈：击杀生效的两个 Perk，规则在 js/match-rules.js:onKillPerks（单机
+        // playerKill、客户端自己的击杀镜像用的是同一份）。这一侧只管权威端的血量与弹药；
+        // 客户端屏幕上那份计数由它的击杀事件自己跑同一份 —— 各应用一次、互不覆盖。
+        onKillPerks(killer);
         for (const i of kc.book.charge(1)) {
           R.charged++;
           this.events.push({ e: 'streakReady', cid: kc.cid, slot: i, id: kc.book.slots[i].id, name: kc.book.slots[i].name });
@@ -595,6 +689,17 @@ export class NetRoom {
     }
     const w = R.checkEnd();
     if (w) this.endMatch(w);
+    // 掉落武器（规则与单机共用 js/match-rules.js:maybeDropWeapon）：地上那把枪是权威实体，
+    // 事件带起手状态，客户端照它建一个哑模型（'pickup' 事件）—— 谁捡走由后续的权威裁决
+    // 说了算（那一层见 NetRoom.step 里的 pickupTick）。
+    const drop = maybeDropWeapon(this.game, victim);
+    if (drop) {
+      drop.netId = ++this.netIds;
+      this.events.push({
+        e: 'pickup', id: drop.netId, weapon: drop.weaponId, att: drop.att,
+        x: drop.pos.x, y: drop.pos.y, z: drop.pos.z, mag: drop.mag, reserve: drop.reserve,
+      });
+    }
     this.killExtra.push({ killer: killer && killer.name, victim: victim && victim.name, pts });
     if (this.killExtra.length > 16) this.killExtra.splice(0, this.killExtra.length - 16);
   }
@@ -602,6 +707,12 @@ export class NetRoom {
   endMatch(winner) {
     if (this.matchOverSent) return;
     this.matchOverSent = true;
+    // 终局个人战绩**先于** matchOver 下发：结算面板要画得分/击杀/死亡，而权威端是这三个数
+    // 的唯一来源（本地预测的 pl.stats.kills 在联机里根本不计数 —— 击杀是这边裁的）。
+    // 带 cid 由客户端各取各的：定向在客户端筛，与 hurt / flash 同一条约定。
+    for (const c of this.clients.values()) {
+      this.events.push({ e: 'matchStats', cid: c.cid, k: c.kills, d: c.deaths, a: c.assists | 0, s: Math.round(c.score) });
+    }
     this.events.push({ e: 'matchOver', winner });
     // ── 战绩**不在这里落库**，只把名单和数字挂到队列上 ──
     // 这里跑在 60 拍/秒的权威循环里。写账号这一步以后完全可能（也理应）变成一次
@@ -610,15 +721,18 @@ export class NetRoom {
     // 加多少经验、单人上限多少，那一处定义在 accounts.addResult 里，这里不重复一份。
     const rows = [];
     for (const c of this.clients.values()) {
+      const won = winner != null && (winner === c.team || winner === c.cid);
       if (!c.account) continue;                 // 访客没有档案可写（REQUIRE_ACCOUNT=0 时）
       rows.push({
         account: c.account,                       // 账号 key，不是呼号 —— 呼号可以改，key 不行
-        xp: Math.round(c.score),
+        // 胜负分与单机逐字同式（js/mp.js:end = score + 胜 500 / 平负 150）。少这一项的
+        // 症状是"联机打一晚上涨的经验比单机慢一大截"，而没人会去核对那条式子。
+        xp: Math.round(c.score) + (won ? 500 : 150),
         kills: c.kills, deaths: c.deaths,
-        // winner 是队名（'A'/'B'）或 null（FFA、或者时间到了还没分出队伍赢家）。
+        // winner 是队名（'A'/'B'）、cid（自由混战的那个人）或 null（时间到了没分出胜负）。
         // 写成"winner === null 就不给胜场"，而不是拿进球的队去猜 —— 猜的那一版会把
         // 每一局平局都记成一方的胜场，而表现只是"胜率慢慢偏高"，没人会去查。
-        win: !!winner && winner === c.team,
+        win: won,
       });
     }
     this.__results.push({ tick: this.tick, winner: winner || null, rows });
@@ -636,10 +750,19 @@ export class NetRoom {
     return out;
   }
 
+  // 自由混战的名次（与单机 MPMatch.ranking 同一把尺：击杀优先、得分次之）。
+  // 只有"人"才排得出名次 —— 这就是规则内核把 ffa 的赢家留成 null 的原因。
+  ffaWinner() {
+    const list = [...this.clients.values()].sort((a, b) => b.kills - a.kills || b.score - a.score);
+    return list.length ? list[0].cid : null;
+  }
+
   pushBoard() {
     const rows = [];
     for (const c of this.clients.values()) {
-      rows.push({ cid: c.cid, name: c.name, team: c.team, k: c.kills, d: c.deaths, a: c.assists | 0, alive: !!c.pl.alive, s: Math.round(c.score), sk: Math.floor(c.book.progress) });
+      // uav = 这个人自己的 UAV 还剩几秒。自由混战的队伍键是每人一支（'P'+cid），
+      // 快照头那一位表达不了，只能随记分板走（2 秒一份 —— 30 秒的效果上够用）。
+      rows.push({ cid: c.cid, name: c.name, team: c.team, k: c.kills, d: c.deaths, a: c.assists | 0, alive: !!c.pl.alive, s: Math.round(c.score), sk: Math.floor(c.book.progress), uav: Math.ceil(this.rules.uavLeft(c.pl.team) / 60) });
     }
     // Bot 也进记分板：它在这一局里真的在杀人、也真的在给队伍加分（onKill 那条路与真人同一句）。
     // 不列出来的话，房主加满一屋子 Bot 之后会看到一张只有真人的表，而比分却在涨 ——
@@ -656,6 +779,8 @@ export class NetRoom {
       scores: { A: Math.round(this.rules.scores.A), B: Math.round(this.rules.scores.B) },
       timeLeft: Math.round(this.rules.timeLeft()),
       uav: { A: this.rules.uavActive('A'), B: this.rules.uavActive('B') },
+      // 占领点的归属/进度随记分板走（2 秒一份）；换旗那一拍另有 flagCap 事件顶着即时性
+      flags: this.flags ? this.flags.map(f => ({ name: f.name, owner: f.owner, prog: Math.round(f.prog * 100) / 100 })) : undefined,
       rows,
     });
   }
@@ -684,11 +809,31 @@ export class NetRoom {
     return true;
   }
 
+  // 连杀呼叫的窄帧入口（{t:'streak'}，集束空袭的选点确认走这条路）。与 requestRespawn
+  // 同一条纪律：只认"这条连接当前的座位"，死了的人叫不动（与输入字节那条路同一句 alive 闸门）。
+  // 槽位就绪与否仍然只由 callStreak → StreakBook 裁决，这里不重复判断。
+  requestStreak(cid, slot, target) {
+    const c = this.clients.get(cid);
+    if (!c || !c.pl.alive) return null;
+    return this.callStreak(c, slot, target);
+  }
+
   // 呼叫一个连杀奖励。**唯一入口**：槽位是否就绪由 StreakBook 裁决，这里不重复判断 ——
   // 两边各判一次的话，"什么时候算就绪"就有了两个真相。
-  callStreak(c, i) {
+  callStreak(c, i, target = null) {
     const S = this.streak;
     S.calls++;
+    // 集束空袭必须带落点（走选点确认那条窄帧）。没带 / 落点不合法就拒，而且**槽不消耗** ——
+    // 消耗发生在下面 book.take 里，这条提前返回保证"取消与乱按都扣不掉槽"（与单机同语义：
+    // js/mp.js 的 useStreak 到确认那一刻才 consume）。旧的"按下即消耗"就是这么丢的槽。
+    const want = c.book.slots[i];
+    const dist = (target && Number.isFinite(target.x) && Number.isFinite(target.z))
+      ? Math.hypot(target.x - c.pl.pos.x, target.z - c.pl.pos.z) : Infinity;
+    if (want && want.id === 'cluster' && dist > CLUSTER_MAX) {
+      S.rejected++;
+      if (S.why.length < 6) S.why.push({ cid: c.cid, slot: i, reason: 'cluster-needs-target', dist: dist === Infinity ? null : +dist.toFixed(1) });
+      return null;
+    }
     const s = c.book.take(i);
     if (!s) {
       // 报了请求但拿不到槽。HUD 只让按就绪的那些，所以正常情况下这里该是 0；
@@ -709,14 +854,14 @@ export class NetRoom {
       this.rules.uavStart(pl.team);
       this.events.push({ e: 'announce', team: pl.team, text: 'UAV 已上线' });
     } else if (s.id === 'cluster') {
-      // 弹幕中心 = 呼叫者**视线前方**一段距离的地面。单机那边是"玩家在地图上点一下"，
-      // 联机这边省掉了那一步：选目标要占用屏幕和鼠标，而联机里你还在被人打。
-      // 落点用权威端的 yaw 算 —— 客户端本地预测的 yaw 与权威差在一两拍内，屏幕上
-      // 准心指哪儿弹就落哪儿。这是**输入**的差别（规则本身共用同一份 clusterStrike）。
-      const fwd = pl.forward(new THREE.Vector3()); fwd.y = 0; fwd.normalize();
-      const center = pl.pos.clone().addScaledVector(fwd, CLUSTER_RANGE);
-      center.y = game.world.groundHeight(center.x, center.z, center.y + 1, 0.5);
-      clusterStrike(game, this.rules.clock, center, pl, Math.atan2(fwd.z, fwd.x));
+      // 弹幕中心 = 玩家**在屏幕上选的那一点**（与单机 updateTargeting 同语义）：
+      // 选择来自客户端的确认帧，地面高度与成不成立由权威端算。
+      const center = new THREE.Vector3(target.x, 0, target.z);
+      center.y = game.world.groundHeight(center.x, center.z, pl.pos.y + 1, 0.5);
+      // 投放轴线角与单机逐字一致（pl.yaw + π/2，js/mp.js:434）：两端各写一个"等价"
+      // 式子的话，弹幕走向会不一样而没人会去量它（曾经这里写过 atan2(fwd.z, fwd.x)，
+      // 与单机差一个镜像 —— 弹从反方向飞来）。
+      clusterStrike(game, this.rules.clock, center, pl, pl.yaw + Math.PI / 2);
       this.events.push({ e: 'announce', team: pl.team, to: 'own', text: '集束空袭已呼叫' });
       // 「来袭」是**给对面**的那一句：单机里它是 announce('敌方空袭来袭！','立即寻找掩护')，
       // 联机以前只播"谁呼叫了什么"，被炸的那一方屏幕上没有任何预警。

@@ -259,7 +259,11 @@ export class HUD {
       if (e === pl || !e.alive || !e.pos) continue;
       if (e.team === pl.team && !(mode && mode.ffa)) dot(e.pos.x, e.pos.z, '#4fb4ff', 3.5, true, e.yaw || 0);
       else {
-        const show = uav || (e.revealT > 0);
+        // 幽灵：敌方 UAV 照不见他（本地敌人是 Bot、没有技能，所以这一条只在联机里
+        // 真正生效 —— 但过滤必须长在这里：小地图是两端共用的一张图）。开火亮点
+        // （revealT）不受幽灵影响：那是他自己暴露的，不是 UAV 给的。
+        const blind = uav && e.hasPerk && e.hasPerk('ghost');
+        const show = (uav && !blind) || (e.revealT > 0);
         if (show) dot(e.pos.x, e.pos.z, '#ff3b30', 4);
       }
     }

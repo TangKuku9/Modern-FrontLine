@@ -8,7 +8,7 @@
 // 协议：
 //   上行 二进制 = 若干个 13 字节输入包（按 tick 打时间戳，攒一帧一起发）
 //        文本   = {t:'join'|'ping'} 控制帧
-//               | 对局内：{t:'loadout'|'respawn'}（死亡画面里换配装 / 按空格提前部署）
+//               | 对局内：{t:'loadout'|'respawn'|'streak'}（换配装 / 提前部署 / 集束选点确认）
 //               | 大厅与房间：{t:'lobby'|'say'|'createRoom'|'joinRoom'|'quickRoom'|
 //                 'leaveRoom'|'ready'|'team'|'roomCfg'|'start'}（判据在 server/lobby.mjs）
 //   下行 二进制 = 快照（server/codec.mjs 的定长格式）
@@ -487,14 +487,17 @@ async function pickRoom(requested, user = null) {
 // 两个调用点：直连对局的 join 帧，和房主按下开始（beginLive）。之所以只留一份：
 // welcome 那一格里装着槽位表、装备回声、种子与 cid —— 每一格的失效都是静默的
 // （少一格槽位表就是"那条路上按 3 没反应"），而两份副本必然会在某次改动后少一格。
-function enterMatch(room, ws, { name, team, loadout, account }) {
-  const c = room.addClient({ name, team, loadout, account });
+function enterMatch(room, ws, { name, team, loadout, streaks, account }) {
+  const c = room.addClient({ name, team, loadout, streaks, account });
   ws.__cid = c.cid; ws.__room = room; c.ws = ws;
   return c;
 }
 function welcomeFrame(room, c) {
   return {
     t: 'welcome', cid: c.cid, room: room.id, tick: room.tick, map: room.mapId, seed: room.seed,
+    // 模式由服务端说：记分板怎么排（ffa 单表按名次）、小地图给谁画蓝点、结算写"第 N 名"
+    // 还是比分 —— 这些分叉全看它。客户端自己猜（比如按房间名）会在直连那条路上猜错。
+    mode: room.rules.mode,
     // 你的呼号由**服务端**告诉你，而不是你告诉服务端。客户端拿到之后把它盖到本地那份上 ——
     // 不盖的话 HUD 上会一直显示 URL 里那个名字，而记分板上是另一个，玩家会以为串号了。
     name: c.name,
@@ -509,12 +512,14 @@ function welcomeFrame(room, c) {
     // 连杀奖励的槽位表。**必须由服务端给**：按 3/4/5 各是什么、每个要几杀，
     // 这两件事的真相在权威端（规则内核里）；客户端自己按 data.js 那份渲染的话，
     // 服务端换一项客户端还显示旧的，症状是"按了没反应"。
-    streaks: room.streakDefs.map(d => ({ id: d.id, name: d.name, icon: d.icon, kills: d.kills })),
+    // 每个人回显**他自己那一份**（自带的三项经 addClient 白名单重建后的结果），
+    // 不是房间统一的一份 —— 客户端只按这一格画槽位，从不自己挑。
+    streaks: c.streakDefs.map(d => ({ id: d.id, name: d.name, icon: d.icon, kills: d.kills })),
     // 房里的 Bot 也进 others：客户端按这一份建 NetPlayer（一个插值缓存 + 一个名牌），
     // 而 Bot 在权威端是**真的**实体（会开枪、会裁决伤害）。不把它列进来的症状是
     // 房主加了一屋子 Bot，所有人进去却一个也看不见 —— 然后被看不见的东西打死。
     // bot:true 那一格只给界面看（座位栏上要能区分），判定不读它。
-    others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team }))
+    others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team, perks: (x.loadout && x.loadout.perks) || [] }))
       .concat((room.game ? room.game.bots : []).filter(b => b.netId).map(b => ({ id: b.netId, name: b.name, team: b.team, bot: true }))),
   };
 }
@@ -542,7 +547,7 @@ async function beginLive(wroom) {
   const put = [];
   for (const s of wroom.seats.values()) {
     if (!s.ws || s.ws.readyState !== 1) continue;         // 掉线的人不进对局：他在名单上已经不在了
-    put.push({ s, c: enterMatch(live, s.ws, { name: s.name, team: s.team, loadout: s.loadout, account: s.account }) });
+    put.push({ s, c: enterMatch(live, s.ws, { name: s.name, team: s.team, loadout: s.loadout, streaks: s.streaks, account: s.account }) });
   }
   // Bot 在**所有人安放完之后**再放：welcomeFrame 的 others 要能列出它们，
   // 而 spawnPoint 挑出生点时也要避开已经站在场上的人（先放 Bot 的话，第一个 Bot
@@ -767,19 +772,20 @@ wss.on('connection', (ws, req) => {
         const c = enterMatch(room, ws, {
           // 要账号的服上这一格来自会话；访客可玩的服上是自报呼号（已过白名单）。
           // 两条路都**不用再 slice(0,24)**：白名单本身限了 2~16 个字。
-          name, team: msg.team === 'B' ? 'B' : 'A', loadout: msg.loadout || null, account: user ? user.key : null,
+          name, team: msg.team === 'B' ? 'B' : 'A', loadout: msg.loadout || null, streaks: msg.streaks || null, account: user ? user.key : null,
         });
         ws.send(JSON.stringify(welcomeFrame(room, c)));
         console.log(`[join] ${c.name} → cid ${c.cid} @ ${room.id}（在线 ${room.clients.size}，本机 ${wss.clients.size} 连接 / ${rooms.size} 间）`);
       } else if (msg.t === 'ping') {
         ws.send(JSON.stringify({ t: 'pong', c: msg.c, s: Date.now(), tick: ws.__room?.tick ?? 0 }));
-      } else if (msg.t === 'loadout' || msg.t === 'respawn') {
-        // 对局内的两条**窄**控制帧。它们都只认"这条连接当前在哪个房间的哪个座位"，
+      } else if (msg.t === 'loadout' || msg.t === 'respawn' || msg.t === 'streak') {
+        // 对局内的三条**窄**控制帧。它们都只认"这条连接当前在哪个房间的哪个座位"，
         // 而那个座位是握手时定下的 ⇒ 客户端报不了别人的 cid，也没有越权的余地。
         const room = ws.__room;
         if (!room || ws.__cid == null) return;
         if (msg.t === 'loadout') room.applyLoadout(ws.__cid, msg.loadout || null);
-        else room.requestRespawn(ws.__cid);
+        else if (msg.t === 'respawn') room.requestRespawn(ws.__cid);
+        else room.requestStreak(ws.__cid, msg.slot, { x: msg.x, z: msg.z });
       } else if (LOBBY_FRAMES.has(msg.t)) {
         // ── 大厅与房间：这一层只接线，判据全在 server/lobby.mjs ──
         // 身份和 join 同源（joinName）：要账号的服上呼号来自会话，访客可玩的服上才看自报那格。
@@ -788,7 +794,7 @@ wss.on('connection', (ws, req) => {
         const id = () => {
           const n = joinName(ws.__user, msg.name);
           ws.__name = n;
-          return { name: n, account: ws.__user ? ws.__user.key : null, xp: ws.__user ? (ws.__user.xp | 0) : 0, loadout: msg.loadout || null };
+          return { name: n, account: ws.__user ? ws.__user.key : null, xp: ws.__user ? (ws.__user.xp | 0) : 0, loadout: msg.loadout || null, streaks: msg.streaks || null };
         };
         if (msg.t === 'lobby') lobby.attach(ws);
         else if (msg.t === 'say') lobby.say(ws, msg);

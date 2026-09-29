@@ -268,8 +268,13 @@ export class Bot {
       // 射击
       const facing = Math.abs(angleDiff(this.yaw, lookYaw)) < 0.25;
       if (game.time > this.acquireT && facing && this.reloadT <= 0) this.tryFire(dt, t, dist);
-      // 高度警觉提示
-      if (t.isPlayer && t.hasPerk('highalert')) game.hud.highAlert(this.pos);
+      // 高度警觉提示。真人在权威端是**另一台机器上的浏览器**（与 combat.js:flashAt 同一个
+      // 理由）：game.hud 在那台机器上够不着，所以 game.highAlert 由 NetRoom 提供、把
+      // "谁在瞄你"编成事件发过去；浏览器侧没有这个钩子就照旧本地提示。
+      if (t.isPlayer && t.hasPerk('highalert')) {
+        if (game.highAlert) game.highAlert(t, this.pos);
+        else game.hud.highAlert(this.pos);
+      }
     } else if (this.lastSeenPos && game.time - this.lastSeenT < 12 && (this.alerted) && !this.static) {
       // 搜索
       const lp = this.lastSeenPos;

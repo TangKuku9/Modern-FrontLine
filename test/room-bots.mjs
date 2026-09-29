@@ -129,9 +129,10 @@ ok('F1 记分板事件里有 Bot 那几行（bot 标记随行，界面要能区�
   !!board && board.rows.filter(r => r.bot).length === 3, JSON.stringify(board && board.rows.map(r => r.name + (r.bot ? '(B)' : ''))));
 ok('F2 Bot 那一行带的是它自己的击杀/死亡/分数（不是空壳）',
   !!board && board.rows.some(r => r.bot && r.name === '雷霆' && r.k >= 1), JSON.stringify(board && board.rows.find(r => r.name === '雷霆')));
-// 反证臂：真人那两行不能被 Bot 挤掉
-ok('F3【反证】真人那两行还在，且 Bot 排在真人之后（顺序不影响正确性，但读数会跳）',
-  !!board && board.rows.length === 5 && board.rows[0].name === '甲' || board.rows[0].name === '乙',
+// 反证臂：真人那两行不能被 Bot 挤掉。名次按击杀排（rank 就是排序结果），Bot 杀得多
+// 排在前面是**对的** —— 曾经这里钉着"第一行必须是真人"，于是 Bot 超常发挥就假红。
+ok('F3【反证】真人那两行还在（名次按击杀排，Bot 杀得多可以排在真人前面）',
+  !!board && board.rows.length === 5 && board.rows.some(r => r.name === '甲') && board.rows.some(r => r.name === '乙'),
   JSON.stringify(board && board.rows.map(r => r.name)));
 
 // ═══════════════════════════════════════════════════════════════════════════

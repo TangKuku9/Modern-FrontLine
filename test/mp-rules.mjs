@@ -10,8 +10,8 @@
 //
 // 每一节都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。下面每条的措辞写的就是"这条红了说明什么坏了"。
-import { NetRoom, DT, STREAK_DEFS } from '../server/room.mjs';
-import { StreakBook, TickClock, MatchRules, killScore, KILL_POINTS, UAV_SECONDS, uavFromFlags } from '../js/match-rules.js';
+import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
+import { StreakBook, TickClock, MatchRules, killScore, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks } from '../js/match-rules.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
@@ -200,16 +200,12 @@ const roomC = new NetRoom({ id: 'rules-c', mapId: 'yard', seed: 20260926 });
 await roomC.start();
 const CA = roomC.addClient({ name: '甲', team: 'A' });
 const CB = roomC.addClient({ name: '乙', team: 'B' });
-let tickC = 0;
-const feedC = (c, streak) => {
-  tickC++;
-  roomC.applyInput(c.cid, { tick: tickC, mdx: 0, mdy: 0, keys: 0, buttons: 0, view: 0, seq: tickC & 0xff, streak });
-};
 for (let i = 0; i < 5; i++) roomC.game.onKill(CA.pl, CB.pl, 'm4', false, {});
 ok('C1 5 杀之后 cluster（cost 5）就绪、wp（cost 10）还没', CA.book.slots[1].ready === true && CA.book.slots[2].ready === false);
 
-feedC(CA, 1);
-roomC.step();
+// 集束空袭走**选点确认**那条窄帧（{t:'streak'} 带落点，见 NetRoom.requestStreak），
+// 排程时序从确认那一刻起算 —— 与单机"点下左键那一刻"同一起点。
+roomC.requestStreak(CA.cid, 1, { x: CA.pl.pos.x, z: CA.pl.pos.z - 12 });
 const t0 = roomC.tick;
 ok('C2 呼叫被接受', roomC.streak.accepted === 1 && roomC.streak.byId.cluster === 1, JSON.stringify(roomC.streak.byId));
 ok('C3 呼叫那一刻还没有弹（落点算好了，但投放时刻还没到）', roomC.game.projectiles.length === 0, `n=${roomC.game.projectiles.length}`);
@@ -369,6 +365,393 @@ ok('H2 合法下标原样', [0, 1, 2, 7].every(i => packStreak(i) === i && unpac
 ok('H3【反证】越界值与 0xff 一律落到"没请求"，不会与下标 0 混起来',
   packStreak(8) === STREAK_NONE && packStreak(99) === STREAK_NONE && packStreak(1.5) === STREAK_NONE && unpackStreak(STREAK_NONE) === -1 && packStreak(0) === 0);
 ok('H4 "没请求"与"呼叫 0 号槽"是两个不同的字节', packStreak(-1) !== packStreak(0));
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('I. 连杀选单：每人自带三项（白名单重建 + 一人一本账）');
+// ═══════════════════════════════════════════════════════════════════════════
+
+{
+  const ids = (list) => resolveStreaks(list).map(d => d.id).join(',');
+  ok('I1 没带选单 = 默认三项（按 kills 升序）', ids(null) === 'uav,cluster,heli', ids(null));
+  ok('I2 自带的三项都在，且按 kills 升序排（槽位下标靠同一个顺序两端对齐）',
+    ids(['wp', 'sentry', 'uav']) === 'uav,sentry,wp', ids(['wp', 'sentry', 'uav']));
+  // 反证臂：这条红了 = 闸门只查了"每个 id 合不合法"、没限 3 项 —— 报 5 项的人
+  // 会拿到 5 个槽，而按 3/4/5 的上行只有 3 个下标，第 4、5 项能带进局却永远叫不出来。
+  ok('I3【反证】报 5 项只认 3 个', ids(['uav', 'cluster', 'sentry', 'heli', 'wp']) === 'uav,cluster,sentry',
+    ids(['uav', 'cluster', 'sentry', 'heli', 'wp']));
+  // 反证臂：这条红了 = 非法项被原样挂上（账上出现 undefined 槽），
+  // 或者整组退回默认（玩家精心选的另两项被一个过期 id 连坐）。
+  ok('I4【反证】非法项与重复项被换掉而不是挂上/连坐（补进来的默认项也一起升序）', ids(['uav', 'uav', '不存在', 'wp']) === 'uav,cluster,wp',
+    ids(['uav', 'uav', '不存在', 'wp']));
+}
+
+{
+  const roomI = new NetRoom({ id: 'pick', mapId: 'yard', seed: 20260926 });
+  await roomI.start();
+  const C = roomI.addClient({ name: '丙', team: 'A', streaks: ['wp', 'sentry', 'uav'] });
+  const D = roomI.addClient({ name: '丁', team: 'B' });
+  ok('I5 带了选单的人，账本上的槽就是他选的那三项（升序）',
+    C.streakDefs.map(d => d.id).join(',') === 'uav,sentry,wp' && C.book.ids.join(',') === 'uav,sentry,wp',
+    `defs=${C.streakDefs.map(d => d.id).join(',')} book=${C.book.ids.join(',')}`);
+  ok('I6 没带的人用房间默认表兜底（不是空账）',
+    D.streakDefs.map(d => d.id).join(',') === 'uav,cluster,heli', D.streakDefs.map(d => d.id).join(','));
+  // 反证臂：这条红了 = 一本账被全房共享（甲选的槽出现在乙的账上），症状是
+  // "HUD 画的是我选的三项，按 3/4/5 出来的却是别人那一套"。
+  ok('I7【反证】一人一本账：两本槽位表互不串，且账本与回显同一顺序',
+    C.book.ids.join(',') !== D.book.ids.join(',') && C.book.ids.join(',') === C.streakDefs.map(d => d.id).join(','),
+    `C=${C.book.ids.join(',')} D=${D.book.ids.join(',')}`);
+  // 反证臂：这条红了 = 账本建在"解析之前"（比如直接拿上报的数组建账），
+  // 越权的第 4 项会真的变成一个能叫的槽。
+  const E = roomI.addClient({ name: '戊', team: 'A', streaks: ['wp', 'sentry', 'uav', 'cluster', 'heli'] });
+  ok('I8【反证】报了 5 项的人进局也只有 3 个槽', E.book.length === 3, `len=${E.book.length}`);
+  roomI.step();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('J. 集束空袭选点：取消不扣槽、落点跟上报的点走');
+// ═══════════════════════════════════════════════════════════════════════════
+// 量具是**投放起点**（弹出生那一拍的位置，9 颗都看得到）。不用"弹落点"是因为落点
+// 依赖地形与私有常数，而投放起点的**垂线分量**是常数无关的：投放点在"落点后方 25 m"
+// 只挪沿轴线的分量，垂线分量恒等于落点的垂线分量。
+
+const roomJ = new NetRoom({ id: 'rules-j', mapId: 'yard', seed: 20260926 });
+await roomJ.start();
+const JA = roomJ.addClient({ name: '甲', team: 'A' });
+const JB = roomJ.addClient({ name: '乙', team: 'B' });
+for (let i = 0; i < 5; i++) roomJ.game.onKill(JA.pl, JB.pl, 'm4', false, {});
+ok('J1 先决：5 杀之后 cluster 就绪、还没被用过', JA.book.slots[1].ready === true && JA.book.slots[1].used === false);
+
+// —— 反证臂①：按键上行那条路不再触发集束，而且**槽不消耗** ——
+let tickJ = 0;
+const feedJ = (streak) => {
+  tickJ++;
+  roomJ.applyInput(JA.cid, { tick: tickJ, mdx: 0, mdy: 0, keys: 0, buttons: 0, view: 0, seq: tickJ & 0xff, streak });
+};
+feedJ(1); roomJ.step();
+ok('J2【反证】按键那一位报到集束槽：被拒且槽没被扣掉（"取消/乱按不扣槽"，旧的"按下即消耗"）',
+  roomJ.streak.rejected === 1 && JA.book.slots[1].ready === true && JA.book.slots[1].used === false,
+  `rej=${roomJ.streak.rejected} ready=${JA.book.slots[1].ready} used=${JA.book.slots[1].used}`);
+
+// —— 反证臂②：确认帧不带落点 / 落点超界 ⇒ 同样拒、同样不扣槽 ——
+roomJ.requestStreak(JA.cid, 1, null);
+ok('J3【反证】确认帧没带落点：被拒不扣槽', roomJ.streak.rejected === 2 && JA.book.slots[1].ready === true && JA.book.slots[1].used === false);
+roomJ.requestStreak(JA.cid, 1, { x: JA.pl.pos.x + 500, z: JA.pl.pos.z });
+ok('J4【反证】落点超出射程上限（500 m > 200 m）：被拒不扣槽',
+  roomJ.streak.rejected === 3 && JA.book.slots[1].ready === true && JA.book.slots[1].used === false);
+
+// —— 正臂：带落点确认 → 生效、槽被扣、弹幕围着上报的那一点 ——
+// yaw=1 是挑过的：这个角度下"旧的固定落点（面前 22 m）"与上报点的垂线分量差 5 m、
+// 而旧轴线与新轴线（单机的 yaw+π/2）差 65° —— 两种回归形态各有一条判据能红。
+const yaw = 1.0;
+JA.pl.yaw = yaw;
+const dirX = Math.cos(yaw + Math.PI / 2), dirZ = Math.sin(yaw + Math.PI / 2);
+const px = -dirZ, pz = dirX;                                   // 轴线的垂线
+const perp = (x, z) => x * px + z * pz;
+// 垂线方向挪 35 m：与"旧的固定落点（面前 22 m，垂线分量偏 20 m）"拉开 15 m —— 
+// 两条判据各自的容错（1.5 / 3）都远小于这个间距。
+const TJ = { x: JA.pl.pos.x + px * 35, z: JA.pl.pos.z + pz * 35 };
+roomJ.requestStreak(JA.cid, 1, TJ);
+ok('J5 带落点的确认被接受，槽被消耗', roomJ.streak.accepted === 1 && roomJ.streak.byId.cluster === 1 && JA.book.slots[1].used === true,
+  `acc=${roomJ.streak.accepted} rej=${roomJ.streak.rejected}`);
+
+const seen = new Map();
+for (let i = 0; i < 200 && seen.size < 9; i++) {
+  roomJ.step();
+  for (const p of roomJ.game.projectiles) if (!seen.has(p)) seen.set(p, { x: p.pos.x, z: p.pos.z });
+}
+const list = [...seen.values()];
+const mean = list.reduce((a, v) => ({ x: a.x + v.x / list.length, z: a.z + v.z / list.length }), { x: 0, z: 0 });
+ok('J6 九颗弹的投放点垂线分量 ≈ 上报落点（抖动 ±1.5 的余量）',
+  seen.size === 9 && Math.abs(perp(mean.x, mean.z) - perp(TJ.x, TJ.z)) < 1.5,
+  `n=${seen.size} Δ=${(perp(mean.x, mean.z) - perp(TJ.x, TJ.z)).toFixed(2)}`);
+// 反证臂：这条红了 = 落点退回"呼叫者视线前方 22 m"那个固定点（垂线分量挪回20 m 附近）
+const oldPerp = perp(JA.pl.pos.x - Math.sin(yaw) * 22, JA.pl.pos.z - Math.cos(yaw) * 22);
+ok('J7【反证】投放点不在旧的固定落点上（红了 = 回退成视线前方固定落点）',
+  Math.abs(perp(mean.x, mean.z) - oldPerp) > 3, `Δ=${(perp(mean.x, mean.z) - oldPerp).toFixed(2)}`);
+// 反证臂②：投放轴线的方向必须与单机同式（yaw+π/2）。红了 = 有人把角度又改回 atan2
+// （与单机差一个镜像，弹从反方向飞来 —— 没人会去量它）。
+const v0 = list[0], v8 = list[8];
+const ax = v8.x - v0.x, az = v8.z - v0.z, al = Math.hypot(ax, az) || 1;
+ok('J8【反证】投放轴线 = 单机那条（yaw + π/2）', Math.abs((ax / al) * dirZ - (az / al) * dirX) < 0.3,
+  `cross=${((ax / al) * dirZ - (az / al) * dirX).toFixed(3)}`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('K. 终局结算：胜负分 + 逐人战绩（结算面板的数从哪儿来）');
+// ═══════════════════════════════════════════════════════════════════════════
+
+const roomK = new NetRoom({ id: 'rules-k', mapId: 'yard', seed: 20260926 });
+await roomK.start();
+const KA = roomK.addClient({ name: '甲', team: 'A', account: 'hero' });
+const KB = roomK.addClient({ name: '乙', team: 'B', account: 'rival' });
+const KG = roomK.addClient({ name: '丙', team: 'B' });            // 访客（没有 account）
+for (let i = 0; i < 3; i++) roomK.game.onKill(KA.pl, KB.pl, 'm4', false, {});
+roomK.game.onKill(KB.pl, KA.pl, 'm4', true, {});
+ok('K1 先决：甲 3 杀 1 死、乙 1 杀 3 死、访客没有档案',
+  KA.kills === 3 && KA.deaths === 1 && KB.kills === 1 && KB.deaths === 3 && KG.account == null,
+  `A=${KA.kills}/${KA.deaths} B=${KB.kills}/${KB.deaths}`);
+
+roomK.endMatch('A');
+const KK = roomK.takeResults()[0];
+const hero = KK.rows.find(r => r.account === 'hero');
+const rival = KK.rows.find(r => r.account === 'rival');
+ok('K2 赢家的档案经验 = 得分 + 500（与单机 js/mp.js:end 同一条式子）',
+  !!hero && hero.win === true && hero.xp === Math.round(KA.score) + 500, JSON.stringify(hero));
+// 反证臂：这条红了 = 平/负没拿那 150 —— "打一晚上比单机慢一大截"就是这一格丢了
+ok('K3【反证】平/负那 150 在（不是只有赢家有胜负分）',
+  !!rival && rival.win === false && rival.xp === Math.round(KB.score) + 150, JSON.stringify(rival));
+ok('K4 访客不进档案队列（没有档案可写），但也不该报错',
+  KK.rows.length === 2 && KK.rows.every(r => r.account), JSON.stringify(KK.rows.map(r => r.account)));
+
+const kEvs = roomK.events;
+const kStats = kEvs.filter(e => e.e === 'matchStats');
+const iOver = kEvs.findIndex(e => e.e === 'matchOver');
+ok('K5 终局个人战绩每人一条，且先于 matchOver（面板在终局那一刻就有数可画）',
+  kStats.length === 3 && kStats.every(e => Number.isFinite(e.k) && Number.isFinite(e.d) && Number.isFinite(e.s))
+  && kStats.findIndex(e => e.cid === KA.cid) < iOver && iOver >= 0,
+  JSON.stringify(kStats));
+// 反证臂：这条红了 = 面板上那一行 k/d 只能拿本地预测的 pl.stats.kills 画 ——
+// 联机里那个数恒 0（击杀是服务端裁的），结算画出来是"0/0 的赢家"。
+const kaS = kStats.find(e => e.cid === KA.cid);
+ok('K6【反证】matchStats 里的数就是权威端的账（3/1/得分）',
+  !!kaS && kaS.k === 3 && kaS.d === 1 && kaS.s === Math.round(KA.score), JSON.stringify(kaS));
+
+// 平局：winner=null 时两队都记"没赢"，各自拿 150 —— 不许拿进球的队去猜赢家。
+const roomK2 = new NetRoom({ id: 'rules-k2', mapId: 'yard', seed: 20260926 });
+await roomK2.start();
+const K2A = roomK2.addClient({ name: '甲', team: 'A', account: 'hero2' });
+roomK2.game.onKill(K2A.pl, K2A.pl, 'm4', false, {});   // 自杀：谁都不赢
+roomK2.endMatch(null);
+const K2R = roomK2.takeResults()[0].rows[0];
+ok('K7【反证】winner=null 的那局：win=false、经验 = 得分 + 150（平局不许记成胜场）',
+  K2R.win === false && K2R.xp === Math.round(K2A.score) + 150, JSON.stringify(K2R));
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('L. Perk 在权威端生效：拾荒者 / 速愈 / 幽灵 / 高度警觉');
+// ═══════════════════════════════════════════════════════════════════════════
+// 以前这四项在联机里全是空转（规则长在 MPMatch / ai.js 的 hud 调用里，权威端够不着）。
+// 这一节量的是**权威端那份状态**：弹药/血量在服务端真的变了、报点真的跳过了幽灵、
+// 瞄准真的发出了事件。客户端屏幕上的那份镜像（弹药计数、弹窗）由 net-play 的真浏览器验。
+
+const KITP = (perks) => ({ primary: { id: 'm4', att: {}, camo: 'none' }, secondary: { id: 'm1911', att: {}, camo: 'none' }, lethal: 'frag', tactical: 'flash', perks });
+
+const KL = new NetRoom({ id: 'rules-l', mapId: 'yard', seed: 20260926 });
+await KL.start();
+const LP = KL.addClient({ name: '拾荒者', team: 'A', loadout: KITP(['scavenger', 'quickfix']) });
+const EN = KL.addClient({ name: '敌人', team: 'B' });
+LP.pl.hp = 50; LP.pl.dmgT = 0;
+KL.game.onKill(LP.pl, EN.pl, 'm4', false, {});
+ok('L1 速愈：击杀回 40 血、回血计时归位（权威端的血）', LP.pl.hp === 90 && LP.pl.dmgT === 99, `hp=${LP.pl.hp} dmgT=${LP.pl.dmgT}`);
+
+const reserve = (pl) => pl.ws.slots.reduce((s, w) => s + w.reserve, 0);
+// 先把致命装备用掉再杀：开局就是满的（2/2），满着不动才是对的行为（不许溢出）。
+LP.pl.lethal.count = 0;
+const rBefore = reserve(LP.pl), lBefore = (LP.pl.lethal && LP.pl.lethal.count) | 0;
+KL.game.onKill(LP.pl, EN.pl, 'm4', false, {});
+ok('L2 拾荒者：击杀补储备弹药（权威端的弹药）', reserve(LP.pl) > rBefore, `${rBefore} → ${reserve(LP.pl)}`);
+ok('L3 拾荒者：致命装备 +1（用掉之后补一枚，不许溢出上限）', !!LP.pl.lethal && LP.pl.lethal.count === lBefore + 1, `${lBefore} → ${LP.pl.lethal && LP.pl.lethal.count}`);
+
+// 返回值的契约：文案归表现层（客户端镜像靠 texts 画弹窗），机制归这里。
+const stub = { hasPerk: (id) => id === 'scavenger', ws: { refill: () => { stub.refilled = true; } }, lethal: { count: 0, max: 2 }, maxHp: 100, hp: 100, dmgT: 0 };
+const pkOut = onKillPerks(stub);
+ok('L4 onKillPerks 的返回契约：文案给表现层、refill 记在返回里',
+  pkOut.texts.length === 1 && pkOut.refill === 0.35 && stub.refilled === true, JSON.stringify(pkOut));
+
+// —— 幽灵：UAV 报点跳过带幽灵的敌人 ——
+const KGH = new NetRoom({ id: 'rules-l2', mapId: 'yard', seed: 20260926 });
+await KGH.start();
+const GhostP = KGH.addClient({ name: '幽灵', team: 'B', loadout: KITP(['ghost']) });
+const CivP = KGH.addClient({ name: '平民', team: 'B', loadout: KITP(['eod']) });
+const botG = KGH.spawnBot({ name: '哨兵', team: 'A', skill: 1 });
+botG.perceiveT = 1e9;                       // 感知冻住：这一条量的是报点本身，不是它找人的本事
+GhostP.pl.pos.copy(botG.pos.clone().add(new THREE.Vector3(3, 0, 0)));
+CivP.pl.pos.copy(botG.pos.clone().add(new THREE.Vector3(8, 0, 0)));
+KGH.rules.uavStart('A');
+KGH.step();
+ok('L5 幽灵：UAV 报点跳过带幽灵的敌人（报给更远的那个）',
+  !!botG.lastSeenPos && botG.lastSeenPos.distanceTo(CivP.pl.pos) < 1,
+  botG.lastSeenPos ? `→ ${botG.lastSeenPos.distanceTo(CivP.pl.pos).toFixed(1)}m@平民` : '没有报点');
+// 反证臂：这条红了 = 报点这一路整个没接（或者过滤写成了"全跳过"）
+GhostP.pl.perks.delete('ghost');
+KGH.uavPing = -1;
+KGH.step();
+ok('L6【反证】没有幽灵时报的是更近的那个（报点本身没坏）',
+  !!botG.lastSeenPos && botG.lastSeenPos.distanceTo(GhostP.pl.pos) < 1,
+  botG.lastSeenPos ? `→ ${botG.lastSeenPos.distanceTo(GhostP.pl.pos).toFixed(1)}m@幽灵` : '没有报点');
+
+// —— 高度警觉：Bot 瞄上带技能的真人 → 事件发到那台机器 ——
+const KH = new NetRoom({ id: 'rules-l3', mapId: 'yard', seed: 20260926 });
+await KH.start();
+const HP = KH.addClient({ name: '警觉', team: 'A', loadout: KITP(['highalert']) });
+const HP2 = KH.addClient({ name: '路人', team: 'A', loadout: KITP(['eod']) });
+const botH = KH.spawnBot({ name: '猎手', team: 'B', skill: 1 });
+botH.perceiveT = 1e9;
+botH.pos.copy(HP.pl.pos.clone().add(new THREE.Vector3(4, 0, 0)));
+botH.target = HP.pl; botH.targetVisible = true;
+botH.update(0.016);
+ok('L7 高度警觉：Bot 瞄上带技能的真人 → highAlert 事件（cid 定向）',
+  KH.events.some(e => e.e === 'highAlert' && e.cid === HP.cid),
+  JSON.stringify(KH.events.filter(e => e.e === 'highAlert')));
+// 反证臂：这条红了 = 事件滥发（谁被瞄都发，那这条就不再是指路的提示而是噪声）
+botH.target = HP2.pl; botH.targetVisible = true;
+botH.update(0.016);
+ok('L8【反证】没技能的真人被瞄：没有事件',
+  !KH.events.some(e => e.e === 'highAlert' && e.cid === HP2.cid),
+  JSON.stringify(KH.events.filter(e => e.e === 'highAlert')));
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('M. 地上的枪：掉落 / 过期 / 补弹 / 换枪（权威端那条链）');
+// ═══════════════════════════════════════════════════════════════════════════
+
+const roomM = new NetRoom({ id: 'rules-m', mapId: 'yard', seed: 20260926 });
+await roomM.start();
+const MA = roomM.addClient({ name: '甲', team: 'A', loadout: KITP([]) });
+const MB = roomM.addClient({ name: '乙', team: 'B' });
+
+// —— 掉落规则：真人不掉、Bot 六成掉 ——
+for (let i = 0; i < 10; i++) roomM.game.onKill(MA.pl, MB.pl, 'm4', false, {});
+ok('M1 真人不掉枪（他的配装跟着重生走）',
+  roomM.game.pickups.length === 0 && !roomM.events.some(e => e.e === 'pickup'),
+  `地上 ${roomM.game.pickups.length} 把`);
+const botM = roomM.spawnBot({ name: '掉枪', team: 'B', skill: 1 });
+for (let i = 0; i < 20 && !roomM.game.pickups.length; i++) roomM.game.onKill(MA.pl, botM, 'm4', false, {});
+const dropEv = roomM.events.find(e => e.e === 'pickup');
+const dropP = roomM.game.pickups[0];
+ok('M2 Bot 掉枪：地上有实体、事件带得起手状态（武器/弹药/位置）',
+  !!dropP && !!dropEv && dropEv.weapon === dropP.weaponId && dropEv.id === dropP.netId
+  && dropEv.mag === dropP.mag && dropEv.reserve === dropP.reserve,
+  dropEv ? JSON.stringify({ w: dropEv.weapon, mag: dropEv.mag, rsv: dropEv.reserve }) : '没有事件');
+
+// —— 过期 ——
+dropP.t = 31;
+roomM.step();
+ok('M3 30 秒到点收掉：实体没了、gone 事件带着同一个 id',
+  roomM.game.pickups.length === 0 && roomM.events.some(e => e.e === 'pickupGone' && e.id === dropEv.id));
+
+// —— 同款走近自动补弹药 ——
+let tickM = 0;
+const feedM = (keys) => {
+  tickM++;
+  roomM.applyInput(MA.cid, { tick: tickM, mdx: 0, mdy: 0, keys, buttons: 0, view: 0, seq: tickM & 0xff, streak: -1 });
+};
+const rsv0 = MA.pl.ws.slots.find(s => s.id === 'm4').reserve;
+const pA = roomM.game.spawnPickup('m4', {}, MA.pl.pos.clone(), 10, 30);
+pA.netId = ++roomM.netIds;
+feedM(0);
+roomM.step();
+const rsv1 = MA.pl.ws.slots.find(s => s.id === 'm4').reserve;
+const ammoEv = roomM.events.find(e => e.e === 'pickupAmmo');
+ok('M4 同款走近自动补弹药：包里多了、事件带最终值、地上那把没了',
+  rsv1 > rsv0 && !!ammoEv && ammoEv.reserve === rsv1 && ammoEv.id === pA.netId && roomM.game.pickups.length === 0,
+  `弹药 ${rsv0} → ${rsv1} ${JSON.stringify(ammoEv)}`);
+
+// —— 异款按 F 换枪（旧枪落地）——
+const pB2 = roomM.game.spawnPickup('ak', {}, MA.pl.pos.clone(), 15, 60);
+pB2.netId = ++roomM.netIds;
+feedM(0);                       // 没按 F：只算靠近，不换
+roomM.step();
+ok('M5【反证】没按 F 不换枪（"靠近"与"捡起"是两件事）',
+  MA.pl.ws.slots[0].id === 'm4' && roomM.game.pickups.includes(pB2), `手上 ${MA.pl.ws.slots[0].id}`);
+feedM(2048);                    // KEY.InteractPressed
+roomM.step();
+const takeEv = roomM.events.find(e => e.e === 'pickupTake');
+const oldEv = roomM.events.filter(e => e.e === 'pickup').pop();
+ok('M6 按 F 换枪：手上换成了 ak、take 事件带槽位与弹药、旧枪落地',
+  MA.pl.ws.slots[0].id === 'ak' && !!takeEv && takeEv.weapon === 'ak' && takeEv.idx === 0
+  && !!oldEv && oldEv.weapon === 'm4' && roomM.game.pickups.some(p => p.weaponId === 'm4'),
+  `手上 ${MA.pl.ws.slots[0].id} ${JSON.stringify(takeEv)}`);
+ok('M7 换走的那把从场上消失（gone 由 take 语义覆盖：同一个 id 不再出现在地上）',
+  !roomM.game.pickups.includes(pB2), `地上 ${roomM.game.pickups.map(p => p.weaponId).join(',')}`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('N. 自由混战进联机：独立队伍 / 杀到目标 / 名次判赢家');
+// ═══════════════════════════════════════════════════════════════════════════
+
+const roomN = new NetRoom({ id: 'rules-n', mapId: 'yard', seed: 20260926, mode: 'ffa' });
+await roomN.start();
+const NA = roomN.addClient({ name: '甲', team: 'A', account: 'alpha' });
+const NB = roomN.addClient({ name: '乙', team: 'A' });        // 座位同队 —— ffa 里这不作数
+ok('N1 每人一支独立"队"（同队打不掉血的坑就在这）',
+  NA.pl.team !== 'A' && NB.pl.team !== 'A' && NA.pl.team !== NB.pl.team, `${NA.pl.team} / ${NB.pl.team}`);
+// 反证臂：这条红了 = 两个人共用一支队 —— 友伤/闪光全按 team 判敌我，那之后谁也打不死谁
+ok('N2【反证】敌我判定把两个人算成敌人',
+  roomN.enemiesOf(NA.pl.team).some(e => e === NB.pl) && roomN.enemiesOf(NB.pl.team).some(e => e === NA.pl));
+
+// —— 杀到目标数就收（与单机 js/mp.js 的 `k >= scoreLimit → end(killer)` 同一条）——
+NA.kills = roomN.rules.scoreLimit - 1;
+roomN.game.onKill(NA.pl, NB.pl, 'm4', false, {});
+const nOver = roomN.events.find(e => e.e === 'matchOver');
+ok('N3 杀到目标数：对局收，winner 是**那个人的 cid**（不是队名）',
+  roomN.matchOverSent && !!nOver && nOver.winner === NA.cid, JSON.stringify(nOver));
+const nRes = roomN.takeResults()[0];
+ok('N4 档案按"我赢没赢"记：cid 口径下赢家 win=true',
+  !!nRes && nRes.rows.length === 1 && nRes.rows[0].account === 'alpha' && nRes.rows[0].win === true,
+  JSON.stringify(nRes && nRes.rows));
+
+// —— 时间到：名次第一的那个人赢 ——
+const roomN2 = new NetRoom({ id: 'rules-n2', mapId: 'yard', seed: 20260926, mode: 'ffa' });
+await roomN2.start();
+const N2A = roomN2.addClient({ name: '甲', team: 'A', account: 'alpha2' });
+const N2B = roomN2.addClient({ name: '乙', team: 'B', account: 'beta2' });
+for (let i = 0; i < 3; i++) roomN2.game.onKill(N2A.pl, N2B.pl, 'm4', false, {});
+roomN2.rules.tick = roomN2.rules.timeLimit * 3600 + 1;       // 时间到（规则内核只说"结束了"）
+for (let i = 0; i < 60 && !roomN2.matchOverSent; i++) roomN2.step();
+const n2Over = roomN2.events.find(e => e.e === 'matchOver');
+ok('N5 时间到：名次第一的那个人赢（名次在房间侧排 —— 规则内核不认人）',
+  roomN2.matchOverSent && !!n2Over && n2Over.winner === N2A.cid, JSON.stringify(n2Over));
+const n2Res = roomN2.takeResults()[0];
+// 反证臂：这条红了 = 赢家判定把"队"当成了唯一口径，输家会被记成胜场
+ok('N6【反证】输家不记胜场（cid 口径只给赢家 win=true）',
+  !!n2Res && n2Res.rows.find(r => r.account === 'alpha2').win === true
+  && n2Res.rows.find(r => r.account === 'beta2').win === false, JSON.stringify(n2Res && n2Res.rows));
+
+// —— 记分板行带每人 UAV 剩余秒（快照头那一位在 ffa 里表达不了）——
+roomN2.rules.uavStart(N2A.pl.team);
+roomN2.pushBoard();
+const n2Board = roomN2.events.filter(e => e.e === 'board').pop();
+const uavA = (n2Board.rows.find(r => r.cid === N2A.cid) || {}).uav | 0;
+const uavB = (n2Board.rows.find(r => r.cid === N2B.cid) || {}).uav | 0;
+ok('N7 记分板行带每人 UAV 剩余秒（甲有、乙是 0）', uavA > 0 && uavB === 0, `甲 ${uavA}s 乙 ${uavB}s`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('O. 占领进联机：据点归属、占领得分、换旗事件');
+// ═══════════════════════════════════════════════════════════════════════════
+
+const roomO = new NetRoom({ id: 'rules-o', mapId: 'yard', seed: 20260926, mode: 'dom' });
+await roomO.start();
+const OA = roomO.addClient({ name: '甲', team: 'A' });
+const OB = roomO.addClient({ name: '乙', team: 'B' });
+ok('O1 先决：dom 房里有据点（地图给的 A/B/C）', !!roomO.flags && roomO.flags.length === 3, `flags=${roomO.flags && roomO.flags.length}`);
+
+const fA = roomO.flags[0];
+OA.pl.pos.copy(fA.pos);
+roomO.step();
+ok('O2 独占开始涨进度（0.18+0.07×1/秒那条式子）', fA.prog > 0 && fA.capTeam === OA.pl.team, `prog=${fA.prog.toFixed(4)} capTeam=${fA.capTeam}`);
+OB.pl.pos.copy(fA.pos);
+const prog0 = fA.prog;
+roomO.step();
+// 反证臂：这条红了 = 两边都站在点里也在涨 —— 混战的点被"抢穿"，谁人多谁永远占得住
+ok('O3【反证】两边都站在点里：进度一格不动', fA.prog === prog0, `prog=${fA.prog.toFixed(4)}`);
+OB.pl.pos.copy(fA.pos.clone().add(new THREE.Vector3(20, 0, 0)));
+for (let i = 0; i < 300 && !fA.owner; i++) roomO.step();   // 0.25/秒 ⇒ ~240 拍到线
+const capEv = roomO.events.find(e => e.e === 'flagCap');
+ok('O4 独占到线：换旗 + flagCap 事件（客户端旗子的颜色靠它立刻翻）',
+  fA.owner === OA.pl.team && !!capEv && capEv.name === fA.name && capEv.owner === OA.pl.team,
+  JSON.stringify({ owner: fA.owner, capEv }));
+ok('O5 换旗那两句定向播报（own=已占领 / foes=已失守）',
+  roomO.events.some(e => e.e === 'announce' && e.to === 'own' && /已占领/.test(e.text))
+  && roomO.events.some(e => e.e === 'announce' && e.to === 'foes' && /已失守/.test(e.text)));
+
+const s0 = roomO.rules.scores[OA.pl.team];
+roomO.step(); roomO.step();
+ok('O6 占领得分挂在旗上（0.6/秒/点，两拍之后 A 队涨了）',
+  roomO.rules.scores[OA.pl.team] > s0, `${s0.toFixed(3)} → ${roomO.rules.scores[OA.pl.team].toFixed(3)}`);
+
+roomO.pushBoard();
+const oBoard = roomO.events.filter(e => e.e === 'board').pop();
+// 反证臂：这条红了 = 归属只活在服务端内存里 —— 客户端的旗子永远是白的
+ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）',
+  !!oBoard.flags && oBoard.flags.length === 3 && oBoard.flags.find(f => f.name === fA.name).owner === OA.pl.team,
+  JSON.stringify(oBoard.flags));
 
 // ═══════════════════════════════════════════════════════════════════════════
 const pass = checks.filter(c => c[0]).length;

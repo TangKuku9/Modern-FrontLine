@@ -39,6 +39,10 @@ export class NetPlayer {
     this.vel = new THREE.Vector3();
     this.yaw = o.yaw || 0; this.pitch = 0;
     this.hp = 100; this.maxHp = 100; this.alive = true;
+    // 技能表（服务端同步：welcome.others / join / respawn 的 loadout 三处喂）。
+    // 小地图的幽灵过滤靠它（hud.drawMinimap 里的 hasPerk('ghost')）—— 协议里没有逐人
+    // 技能字段，也不该有：技能跟着装备走，装备的真相在服务端，跟着那三处事件走就够。
+    this.perks = Array.isArray(o.perks) ? o.perks.slice() : [];
     this.crouchT = 0; this.onGround = true; this.sprinting = false; this.sliding = false;
     this.revealT = 0; this.dmgT = 99; this.stealthy = false;
     this.radius = 0.35;
@@ -62,6 +66,8 @@ export class NetPlayer {
     this.leaving = false; this.leaveT = 0;          // 离房淡出
     this._fadeMats = null;
   }
+  // 与 Player.hasPerk 同签名（hud 的小地图过滤对两端的实体一视同仁）
+  hasPerk(id) { return this.perks.includes(id); }
   dispose() {
     if (this._fadeMats) for (const m of this._fadeMats) m.opacity = 1;
     this.game.scene.remove(this.model.root);

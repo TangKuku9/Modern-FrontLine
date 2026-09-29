@@ -78,7 +78,7 @@ const roomId = (raw) => String(raw == null ? '' : raw).slice(0, 32).replace(/[^A
 // 一张等待态房间。刻意不做成类：它没有行为，行为全在下面的 Lobby 里 ——
 // 分两处放的话"改一处的规则"会在另一处漏掉，而这类漏掉都不会报错。
 //   stage: 'waiting' 只有一张名单，没有 sim；'playing' 已经有对应的 live 房间在跑
-//   seat:  {sid, name, team, ready, xp, account, ws, loadout}
+//   seat:  {sid, name, team, ready, xp, account, ws, loadout, streaks}
 // ready 是**每个人自己的声明**，isHost 只有一个真（房主离开时要能移交给下一个活着的人）。
 
 export class Lobby {
@@ -198,8 +198,8 @@ export class Lobby {
     this.rooms.set(id, room);
     return room;
   }
-  _seat(ws, name, loadout, xp, account) {
-    return { sid: sidOf(ws), name, team: 'A', ready: false, xp: xp | 0, account: account || null, ws, loadout: loadout || null };
+  _seat(ws, name, loadout, xp, account, streaks) {
+    return { sid: sidOf(ws), name, team: 'A', ready: false, xp: xp | 0, account: account || null, ws, loadout: loadout || null, streaks: Array.isArray(streaks) ? streaks : null };
   }
   _total(room) { return room.seats.size + (room.bots ? room.bots.size : 0); }
   _teamCount(room, t) {
@@ -263,7 +263,7 @@ export class Lobby {
     const room = this._mkRoom(id, flat(msg.title, 24), MAP_IDS.has(msg.map) ? msg.map : 'yard',
       MODE_IDS.has(msg.mode) ? msg.mode : 'tdm', cleanMinutes(msg.minutes));
     room.hostKey = hostKey;
-    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account);
+    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks);
     seat.ready = true;                      // 房主不用点准备：他按下开始就是他的准备
     room.hostSid = seat.sid;
     if (!this._place(room, seat)) { this.rooms.delete(id); this.stat.full++; return { ok: false, message: '房间已满' }; }
@@ -278,7 +278,7 @@ export class Lobby {
     const room = this.rooms.get(id);
     if (!room) { this.stat.badId++; return { ok: false, message: '那间房已经不在了' }; }
     if (room.stage !== 'waiting') { this.stat.playing++; return { ok: false, message: '那间房正在对局中，等它打完或在列表里另找一间' }; }
-    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account);
+    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks);
     if (!this._place(room, seat)) { this.stat.full++; return { ok: false, message: '那间房已经满了（上限 ' + MAX_SEATS + ' 个位置，Bot 也占位置）' }; }
     this.stat.join++;
     this._sys(room, seat.name + ' 进来了');
@@ -323,6 +323,9 @@ export class Lobby {
     // 那种错位没有机会发生 —— 少这一条的症状是"我明明换了枪，进局还是 m4"。
     // 装备的**清洗**不在这里做：开局那一刻 room.addClient 会按表重建（js/loadout.mjs）。
     if (msg.loadout && typeof msg.loadout === 'object') seat.loadout = msg.loadout;
+    // 连杀选单搭同一句车（同一条理由）：从"编辑装备"回房间屏时重发的这一句把它一起刷新。
+    // 只存不洗：开局那一刻 room.addClient 的 resolveStreaks 会白名单重建，非法项在那一关被换掉。
+    if (Array.isArray(msg.streaks)) seat.streaks = msg.streaks;
     if (room.stage !== 'waiting') return;         // 开局之后这一格没有意义
     // 房主恒为已准备（见 createRoom）。让他"取消准备"会造出一个自相矛盾的状态：
     // 判据要求人人准备，而唯一能让它不成立的那个人正是能按开始的那个人。

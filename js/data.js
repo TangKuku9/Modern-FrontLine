@@ -268,17 +268,18 @@ export const MP_MAPS = [
   { id: 'yard', name: '货柜场', desc: '夕阳下的小型集装箱堆场，节奏极快的混战地图。', style: '港口 · 黄昏', grad: 'linear-gradient(135deg,#ff9a3c,#5a2a3a)' },
 ];
 
-// net = **权威服务端判得出这一模式的胜负**，不是"代码里有这个名字"。判据在那一头
-// （server/room.mjs:onKill 只给 tdm 加分，js/match-rules.js:checkEnd 只认队伍分数），
-// 这里只是把结论写成两端共读的一格 —— 联机的房间选择器按它画（js/menu.js:ONLINE_MODES），
+// net = **权威服务端判得出这一模式的胜负**，不是"代码里有这个名字"。三种都判得了：
+// tdm 按击杀加分（server/room.mjs:onKill）、ffa 杀到目标数或时间到按名次（NetRoom.ffaWinner）、
+// dom 按据点归属加分（js/match-rules.js:flagsTick + NetRoom.step）。这里只是把结论写成
+// 两端共读的一格 —— 联机的房间选择器按它画（js/menu.js:ONLINE_MODES），
 // 服务端按它拒（server/lobby.mjs:MODE_IDS）。
 // 为什么值得专门立一个标记：房主选了「占领」而服务器里没有据点、没有占领得分时，
 // 比分就 0:0 走到时间耗尽，而房间标题上那一格从头到尾是假的 —— 玩家据此挑房。
 // 少了这一格，症状要到有人真开了一局才看得见。
 export const MP_MODES = [
   { id: 'tdm', name: '团队死斗', desc: '两支队伍对抗，率先达到击杀目标的队伍获胜。', net: true },
-  { id: 'dom', name: '占领', desc: '夺取并守住 A、B、C 三个据点以获取分数。', net: false },
-  { id: 'ffa', name: '自由混战', desc: '人人为敌，率先达到击杀目标者获胜。', net: false },
+  { id: 'dom', name: '占领', desc: '夺取并守住 A、B、C 三个据点以获取分数。', net: true },
+  { id: 'ffa', name: '自由混战', desc: '人人为敌，率先达到击杀目标者获胜。', net: true },
 ];
 
 // 房主能选的一局时长（分钟）。放在这张表里是因为**两端都要读它**：服务端按它验

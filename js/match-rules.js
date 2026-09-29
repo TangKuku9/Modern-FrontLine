@@ -13,6 +13,7 @@
 // （单机 MPMatch 播 HUD/音效，权威端 NetRoom 编成事件下发）。所以它不 import
 // THREE、不 import hud/audio/effects，也不碰 document。
 import { WORLD, uavBit } from './quant.js';
+import { rng } from './rng.js';
 
 // 上行协议里 streak 那一个字节的编码定义在 js/quant.js（和 KEY/BTN 同性质：它属于
 // "协议怎么摆位"，不属于"规则怎么判"）。这里只用一句约定：拿到的值不是合法槽位下标
@@ -232,6 +233,155 @@ export function killScore(o) {
   if (o.revenge) { points += KILL_POINTS.revenge; tags.push('revenge'); }
   if ((o.chain | 0) >= 2) { points += o.chain * KILL_POINTS.chain; tags.push('chain' + Math.min(o.chain, 6)); }
   return { points, tags };
+}
+
+// ---------- 击杀时生效的 Perk（拾荒者 / 速愈） ----------
+// 两端共用这一份：单机 MPMatch.playerKill 与联机权威端 NetRoom.onKill 都调它；联机的
+// 客户端在**自己的**击杀事件上再跑一遍它自己那份状态机（服务端管权威血量/弹药，客户端
+// 管屏幕上的计数，各应用一次、互不覆盖）。返回的 texts 是弹窗文案 —— 文案归表现层，
+// 这里只报告"发生了什么"，谁爱画谁画。
+export function onKillPerks(pl) {
+  const out = { refill: 0, texts: [] };
+  if (!pl || !pl.hasPerk) return out;
+  if (pl.hasPerk('scavenger')) {
+    if (pl.ws && pl.ws.refill) pl.ws.refill(0.35);
+    if (pl.lethal && pl.lethal.count < pl.lethal.max) pl.lethal.count++;
+    out.refill = 0.35;
+    out.texts.push('拾荒者：弹药补给');
+  }
+  if (pl.hasPerk('quickfix')) { pl.dmgT = 99; pl.hp = Math.min(pl.maxHp, pl.hp + 40); }
+  return out;
+}
+
+// ---------- UAV 给持有方的 Bot 报点（幽灵除外） ----------
+// 语义与单机 MPMatch.update 里那段一致：谁的 UAV 在天上，谁的 Bot 就每 2.5 秒拿到一次
+// "敌人在哪"的提示（hint → 搜索走向），带幽灵的玩家从名单里剔掉。两端各调一遍：
+// 单机传 pl.team 当 skipTeam（"我方 UAV 走小地图、不喂 Bot"是从那**一个**玩家的视角
+// 写的），联机服务端传 null —— 那边没有"我"，每队的 UAV 都该喂自己的 Bot。
+// 计时器在队伍循环**外面**走一次：两个队同时开着 UAV 时按循环里各减一次会把节奏减半。
+// 返回被报点的次数（判据读数）。
+export function uavHints(game, rules, state, dt, skipTeam, enemiesOf) {
+  state.uavPing = (state.uavPing || 0) - dt;
+  if (state.uavPing > 0) return 0;
+  state.uavPing = 2.5;
+  let hinted = 0;
+  for (const t of ['A', 'B']) {
+    if (t === skipTeam || !rules.uavActive(t)) continue;
+    for (const b of game.bots) {
+      if (b.team !== t || !b.alive) continue;
+      const tg = enemiesOf(t).filter(e => !(e.isPlayer && e.hasPerk && e.hasPerk('ghost')));
+      if (!tg.length) continue;
+      tg.sort((a, c) => a.pos.distanceTo(b.pos) - c.pos.distanceTo(b.pos));
+      b.hint(tg[0].pos);
+      hinted++;
+    }
+  }
+  return hinted;
+}
+
+// ---------- 击杀掉落武器 ----------
+// 两端共用这一份（单机 MPMatch.onKill 与联机权威端 NetRoom.onKill 都调）：掉不掉（60%）、
+// 掉多少弹药（半匣 + 一匣储备）全在这里。真人不掉枪（他自己的配装跟着重生走）——
+// 与改造前 mp.js 里那句逐字同义。返回掉落物（调用方拿它编事件 / 挂模型），没掉返回 null。
+export function maybeDropWeapon(game, victim) {
+  if (!victim || victim.isPlayer || !victim.weaponId || !game || !game.spawnPickup) return null;
+  if (rng.next() >= 0.6) return null;
+  return game.spawnPickup(victim.weaponId, victim.att, victim.pos, Math.ceil(victim.stats.mag * 0.5), victim.stats.mag);
+}
+
+// ---------- 地上的枪：过期与拾取 ----------
+// 这两条规则两端共用（单机在 Game.updatePickups、联机权威端在 NetRoom.step 都调），
+// 常数只在这一处（1.3 m 自动补弹、1.8 m 换枪、30 秒过期）—— 抄两份的症状是
+// "单机弯腰就能捡、联机要踩上去"，而没人会去量那两个距离。
+
+// 时间走一格：到 30 秒的枪从场上收掉。返回被收掉的那些（调用方拆模型 / 编事件）。
+// 每拍**只由一个人调**（联机是房间调，不是每个客户端各调）—— 否则 p.t 一拍走好几格。
+export function pickupsExpire(game, dt) {
+  const out = [];
+  for (let i = game.pickups.length - 1; i >= 0; i--) {
+    const p = game.pickups[i];
+    p.t += dt;
+    if (p.t > 30) { out.push(p); game.pickups.splice(i, 1); }
+  }
+  return out;
+}
+
+// 一个人的拾取判定：同款走近自动补弹药，异款走近按 F 换枪（旧枪落地）。
+// apply=false 时只算"身边有什么"（联机客户端用它画提示 —— 它不许自己改状态，
+// 换没换成由权威端的事件说了算），为真时把弹药/换枪的变更当场做完。
+// 返回 { near, ammo: [{p, add, reserve}], swap: {p, idx, st, old, reserve} | null }。
+export function pickupAction(game, pl, inp, apply = true) {
+  const out = { near: null, ammo: [], swap: null };
+  let nd = 1.8;
+  for (let i = game.pickups.length - 1; i >= 0; i--) {
+    const p = game.pickups[i];
+    if (!pl || !pl.alive) continue;
+    const d = Math.hypot(p.pos.x - pl.pos.x, p.pos.z - pl.pos.z);
+    const slot = pl.ws.slots.find(s => s.id === p.weaponId);
+    if (slot && d < 1.3) {
+      if (slot.reserve >= slot.stats.reserve * 2) continue;
+      if (apply) {
+        const add = Math.max(5, Math.floor((p.reserve ?? slot.stats.mag) * 0.5 + (p.mag || 0)));
+        slot.reserve = Math.min(slot.stats.reserve * 2, slot.reserve + add);
+        game.pickups.splice(i, 1);
+        out.ammo.push({ p, add, reserve: slot.reserve });
+      }
+      continue;
+    }
+    if (!slot && d < nd) { out.near = p; nd = d; }
+  }
+  if (out.near && apply && inp && inp.interactPressed && pl && pl.alive) {
+    const p = out.near, ws = pl.ws, def = p.weaponId;
+    const isSecondary = ['m1911', 'revolver', 'rpg'].includes(def);
+    let idx = ws.cur;
+    if (ws.slots.length > 1) idx = isSecondary ? 1 : 0;
+    if (ws.slots[idx] && ws.slots[idx].stats.type === 'pistol' && !isSecondary && ws.cur === 0) idx = 0;
+    const old = ws.slots[idx];
+    const st = { id: def, att: p.att, camo: 'none' };
+    ws.replaceSlot(idx, st, p.mag ?? undefined, p.reserve ?? undefined);
+    const j = game.pickups.indexOf(p);
+    if (j >= 0) game.pickups.splice(j, 1);
+    out.swap = { p, idx, st, old, reserve: (ws.slots[idx] && ws.slots[idx].reserve) | 0 };
+  }
+  return out;
+}
+
+// ---------- 占领点（dom） ----------
+// 与单机 MPMatch.update 里那段同规则：4.5 m 半径（高度差 3 m 内）、0.18+0.07×人数 的
+// 占领速度（3 人封顶）、没人时 0.1/秒 的回退、每个据点 0.6/秒 的得分。两端共用：
+// 单机在 MPMatch.update、联机在 NetRoom.step 都调它。**只有状态与分数** —— 网格、
+// 颜色、进度条、播报全归调用方（返回值告诉它们发生了什么、点里站着谁）。
+// 返回 { caps: [{f, team, inRange}], flags: [{f, teams, cnt, inRange, capped}] }。
+export function flagsTick(flags, rules, entities, dt) {
+  const out = { caps: [], flags: [] };
+  for (const f of flags) {
+    const cnt = {}, inRange = [];
+    for (const e of entities) {
+      if (!e.alive || !e.pos || e.targetable === false || e.isTurret) continue;
+      if (Math.hypot(e.pos.x - f.pos.x, e.pos.z - f.pos.z) < 4.5 && Math.abs(e.pos.y - f.pos.y) < 3) {
+        cnt[e.team] = (cnt[e.team] || 0) + 1;
+        inRange.push(e);
+      }
+    }
+    const teams = Object.keys(cnt);
+    let capped = null;
+    if (teams.length === 1 && teams[0] !== f.owner) {
+      const t = teams[0];
+      if (f.capTeam !== t) { f.capTeam = t; f.prog = 0; }
+      f.prog += dt * (0.18 + 0.07 * Math.min(3, cnt[t]));
+      if (f.prog >= 1) {
+        f.owner = t; f.prog = 0; f.capTeam = null;
+        capped = t;
+        out.caps.push({ f, team: t, inRange });
+      }
+    } else if (teams.length !== 1) {
+      if (f.capTeam && teams.length === 0) f.prog = Math.max(0, f.prog - dt * 0.1);
+    }
+    // 得分挂在**旗**上不挂在人上：谁占着谁涨，0.6/秒/点（与单机同一条式子）。
+    if (f.owner) rules.addScore(f.owner, dt * 0.6);
+    out.flags.push({ f, teams, cnt, inRange, capped });
+  }
+  return out;
 }
 
 export { WORLD };

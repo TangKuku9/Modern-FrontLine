@@ -7,7 +7,7 @@ import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, comput
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
-import { StreakBook, MatchRules, WP_SECONDS, killScore, KILL_POINTS } from './match-rules.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick } from './match-rules.js';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
 // 这是"联机的 Bot 和单机的 Bot 手感一样"唯一的一处定义。抄一份的话，两边的 Bot
@@ -22,6 +22,21 @@ export function randomAtt(wid) {
     if (opts.length && rng.next() < 0.7) att[s] = pick(opts).id;
   }
   return att;
+}
+
+// 据点的3D 旗（环 + 杆 + 布）。抽成模块函数是因为**联机客户端也要建同一种旗**：
+// 位置来自两端共读的地图（w.flagPos），只有归属状态靠事件/记分板同步。
+export function flagMesh(game, p) {
+  const g = new THREE.Group();
+  const ring = new THREE.Mesh(new THREE.RingGeometry(4.3, 4.6, 48), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; ring.position.y = 0.05; g.add(ring);
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 3.2, 8), mat('steel')); pole.position.y = 1.6; g.add(pole);
+  const cloth = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.7), new THREE.MeshStandardMaterial({ color: 0xffffff, side: THREE.DoubleSide, emissive: 0xffffff, emissiveIntensity: 0.2 }));
+  cloth.position.set(0.56, 2.8, 0); g.add(cloth);
+  g.position.set(p.x, game.world.groundHeight(p.x, p.z, 1, 0.3), p.z);
+  game.world.root.add(g);
+  g.userData = { ring, cloth };
+  return g;
 }
 
 export class MPMatch {
@@ -72,24 +87,12 @@ export class MPMatch {
     for (let i = 0; i < enemyCount; i++) this.addBot(this.ffa ? 'F' + i : 'B', names[ni++ % names.length], this.ffa ? pick([def.styles[1], 'enemy', 'insurgent']) : def.styles[1]);
     const mname = { tdm: '团队死斗', dom: '占领', ffa: '自由混战' }[this.type];
     if (this.type === 'dom') {
-      this.flags = w.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null, mesh: this.flagMesh(p) }));
+      this.flags = w.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null, mesh: flagMesh(game, p) }));
     }
     game.hud.reset();
     game.hud.announce(mname, `${def.name} · ${this.ffa ? '率先达到 ' + this.scoreLimit + ' 次击杀' : '目标分数 ' + this.scoreLimit}`, 4);
     game.audio.say(mname + '，行动开始');
     this.updateStreakHUD();
-  }
-  flagMesh(p) {
-    const g = new THREE.Group();
-    const ring = new THREE.Mesh(new THREE.RingGeometry(4.3, 4.6, 48), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6, side: THREE.DoubleSide }));
-    ring.rotation.x = -Math.PI / 2; ring.position.y = 0.05; g.add(ring);
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 3.2, 8), mat('steel')); pole.position.y = 1.6; g.add(pole);
-    const cloth = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.7), new THREE.MeshStandardMaterial({ color: 0xffffff, side: THREE.DoubleSide, emissive: 0xffffff, emissiveIntensity: 0.2 }));
-    cloth.position.set(0.56, 2.8, 0); g.add(cloth);
-    g.position.set(p.x, this.game.world.groundHeight(p.x, p.z, 1, 0.3), p.z);
-    this.game.world.root.add(g);
-    g.userData = { ring, cloth };
-    return g;
   }
   addBot(team, name, style) {
     const game = this.game;
@@ -178,8 +181,8 @@ export class MPMatch {
       this.rules.firstBlood = true;
       if (killer.isPlayer) { game.hud.popup('首杀', '', true); pl.stats.score += 50; }
     }
-    // 掉落武器
-    if (!victim.isPlayer && victim.weaponId && rng.next() < 0.6) game.spawnPickup(victim.weaponId, victim.att, victim.pos, Math.ceil(victim.stats.mag * 0.5), victim.stats.mag);
+    // 掉落武器：规则在 js/match-rules.js:maybeDropWeapon（联机权威端跑的是同一份）
+    maybeDropWeapon(game, victim);
     // 复活安排
     if (victim.isPlayer) {
       game.dead = true; game.deathKiller = killer;
@@ -223,8 +226,9 @@ export class MPMatch {
     if (sc.tags.includes('revenge')) game.hud.popup(`复仇 +${KILL_POINTS.revenge}`, '', true);
     if (pl.stats.streak % 5 === 0) game.hud.popup(`连杀 ×${pl.stats.streak}`, '', true);
     pl.stats.score += sc.points;
-    if (pl.hasPerk('scavenger')) { pl.ws.refill(0.35); if (pl.lethal && pl.lethal.count < pl.lethal.max) pl.lethal.count++; game.hud.popup('拾荒者：弹药补给', '#9cf'); }
-    if (pl.hasPerk('quickfix')) { pl.dmgT = 99; pl.hp = Math.min(pl.maxHp, pl.hp + 40); }
+    // 拾荒者 / 速愈：规则在 js/match-rules.js:onKillPerks —— 联机权威端与客户端镜像
+    // 用的是同一份；这里只负责把返回的文案画成弹窗。
+    for (const t of onKillPerks(pl).texts) game.hud.popup(t, '#9cf');
     if (this.type === 'ffa') { }
     this.chargeStreak(1);
   }
@@ -347,53 +351,39 @@ export class MPMatch {
     }
     // 占领
     if (this.flags) {
-      for (const f of this.flags) {
-        const cnt = {};
-        for (const e of game.entities) {
-          if (!e.alive || !e.pos || e.targetable === false || e.isTurret) continue;
-          if (Math.hypot(e.pos.x - f.pos.x, e.pos.z - f.pos.z) < 4.5 && Math.abs(e.pos.y - f.pos.y) < 3) cnt[e.team] = (cnt[e.team] || 0) + 1;
-        }
-        const teams = Object.keys(cnt);
-        if (teams.length === 1 && teams[0] !== f.owner) {
-          const t = teams[0];
-          if (f.capTeam !== t) { f.capTeam = t; f.prog = 0; }
-          f.prog += dt * (0.18 + 0.07 * Math.min(3, cnt[t]));
-          if (pl.alive && t === pl.team && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < 4.5) game.hud.progress(f.prog);
-          if (f.prog >= 1) {
-            f.owner = t; f.prog = 0; f.capTeam = null;
-            const mine = t === pl.team;
-            game.hud.announce(`${mine ? '已占领' : '失去'} ${f.name} 点`, '', 2);
-            game.audio.say(mine ? `已占领${f.name}点` : `${f.name}点已失守`);
-            if (mine && pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < 4.5) { pl.stats.score += 200; pl.stats.captures++; game.hud.popup('+200 占领', '', true); }
-            for (const b of game.bots) if (b.team === t && b.alive && Math.hypot(b.pos.x - f.pos.x, b.pos.z - f.pos.z) < 4.5) { b.score += 200; b.captures++; }
-            game.hud.progress(null);
+      // 占领的规则（半径/速度/回退/得分）在 js/match-rules.js:flagsTick —— 联机权威端
+      // 跑的是同一份。这一段只剩表现：进度条、旗帜颜色、+200 弹窗与播报。
+      const ft = flagsTick(this.flags, this.rules, game.entities, dt);
+      for (const { f, teams, inRange, capped } of ft.flags) {
+        const pd = pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < 4.5;
+        if (capped) {
+          const mine = capped === pl.team;
+          game.hud.announce(`${mine ? '已占领' : '失去'} ${f.name} 点`, '', 2);
+          game.audio.say(mine ? `已占领${f.name}点` : `${f.name}点已失守`);
+          for (const e of inRange) {
+            if (!e.alive || e.team !== capped) continue;
+            if (e.isPlayer) { e.stats.score += 200; e.stats.captures++; game.hud.popup('+200 占领', '', true); }
+            else if (e.isBot) { e.score += 200; e.captures++; }
           }
+          game.hud.progress(null);
+        } else if (teams.length === 1 && teams[0] !== f.owner) {
+          if (pd && teams[0] === pl.team) game.hud.progress(f.prog);
         } else if (teams.length !== 1) {
-          if (f.capTeam && teams.length === 0) f.prog = Math.max(0, f.prog - dt * 0.1);
-          if (pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < 4.5 && teams.length > 1) game.hud.progress(f.prog);
-        } else if (f.owner === teams[0] && pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < 4.5) game.hud.progress(null);
-        if (pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) >= 4.5 && this.nearFlag === f) game.hud.progress(null);
-        if (pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < 4.5) this.nearFlag = f; else if (this.nearFlag === f) this.nearFlag = null;
+          if (pd && teams.length > 1) game.hud.progress(f.prog);
+        } else if (f.owner === teams[0] && pd) game.hud.progress(null);
+        if (!pd && this.nearFlag === f) game.hud.progress(null);
+        if (pd) this.nearFlag = f; else if (this.nearFlag === f) this.nearFlag = null;
         const col = f.owner === pl.team ? 0x4fb4ff : f.owner ? 0xff4a3d : 0xffffff;
         f.mesh.userData.ring.material.color.setHex(col);
         f.mesh.userData.cloth.material.color.setHex(col); f.mesh.userData.cloth.material.emissive.setHex(col);
         f.mesh.userData.cloth.rotation.y = Math.sin(game.time * 2 + f.pos.x) * 0.3;
-        if (f.owner) this.scores[f.owner === pl.team ? 'A' : 'B'] += dt * 0.6;
       }
     }
     // 敌方 UAV 给我的敌人报点（我方 UAV 的效果走小地图，见 hud.drawMinimap）。
     // 计时本身在 rules.step() 里 —— 以前它在这里自减，于是"还剩多久"有两个来源。
-    for (const t of ['A', 'B']) {
-      if (t === pl.team || !this.rules.uavActive(t)) continue;
-      this.uavPing = (this.uavPing || 0) - dt;
-      if (this.uavPing <= 0) {
-        this.uavPing = 2.5;
-        for (const b of game.bots) if (b.team === t && b.alive) {
-          const tg = this.enemiesOf(t).filter(e => !(e.isPlayer && e.hasPerk('ghost')));
-          if (tg.length) { tg.sort((a, c) => a.pos.distanceTo(b.pos) - c.pos.distanceTo(b.pos)); b.hint(tg[0].pos); }
-        }
-      }
-    }
+    // 报点的规则在 js/match-rules.js:uavHints，联机权威端跑的是同一份（幽灵的过滤也在
+    // 里面）；skipTeam 只有单机才传 —— "我方 UAV 不喂 Bot"是单人视角的语义。
+    uavHints(game, this.rules, this, dt, pl.team, (team) => this.enemiesOf(team));
     if (this.rules.wpTicks > 0) { game.grade.uniforms.wp.value = Math.min(1, this.rules.wpTicks / (3 * 60)) * 0.6; for (const e of this.enemiesOf(pl.team)) if (rng.next() < dt * 2) e.takeDamage(6, { attacker: pl, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) }); }
     else game.grade.uniforms.wp.value = 0;
     // 连杀奖励

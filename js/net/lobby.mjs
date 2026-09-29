@@ -65,9 +65,15 @@ export class LobbyClient {
   }
 
   // 身份那一格：每次进房 / 建房都要带上，服务端拿它决定"这个人叫什么、带哪把枪进对局"。
+  // streaks 是配装屏里 5 选 3 的那一份（profile.streaks）：槽位表以服务端解析回显为准，
+  // 这里只负责把**选择**交上去。
   _id() {
     const g = this.game;
-    return { name: this.name, loadout: g.buildNetLoadout ? g.buildNetLoadout(g.profile.classes[g.profile.selClass || 0]) : null };
+    return {
+      name: this.name,
+      loadout: g.buildNetLoadout ? g.buildNetLoadout(g.profile.classes[g.profile.selClass || 0]) : null,
+      streaks: Array.isArray(g.profile.streaks) ? [...g.profile.streaks] : null,
+    };
   }
   send(o) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(o)); }
 

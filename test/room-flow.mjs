@@ -242,22 +242,25 @@ try {
   h.send({ t: 'lobby' });
   await h.until(j => j.t === 'lobby');
   const bm0 = (await health(srv3.base)).lobby.badMode | 0;
-  h.send({ t: 'createRoom', room: 'cap', name: '壬1', mode: 'dom' });
+  h.send({ t: 'createRoom', room: 'cap', name: '壬1', mode: 'conquest' });
   const errD = await h.until(j => j.t === 'err', 4000);
-  ok('建一间「占领」的房会被当场拒（而不是悄悄建成团队死斗）', !!errD && /占领/.test(errD.msg || ''), JSON.stringify(errD && errD.msg));
+  ok('开一个**不存在**的模式会被当场拒（而不是悄悄建成团队死斗）', !!errD && /conquest/.test(errD.msg || ''), JSON.stringify(errD && errD.msg));
   ok('被拒之后这间不在清单上（没说出口的接受等于假房）',
     !(await apiRooms(srv3.base)).some(x => x.id === 'cap'), JSON.stringify((await apiRooms(srv3.base)).map(x => x.id)));
-  h.send({ t: 'createRoom', room: 'cap', name: '壬1', mode: 'tdm' });
+  h.send({ t: 'createRoom', room: 'cap', name: '壬1', mode: 'dom' });
   const rH = await h.until(j => j.t === 'room' && j.room && j.room.id === 'cap', 6000);
-  ok('换成服务端判得了胜负的那种，同一间就建起来了', !!rH && rH.room.mode === 'tdm', JSON.stringify(rH && rH.room.mode));
+  ok('三种模式都开得起来（tdm / ffa / dom 的胜负权威端都判得了）', !!rH && rH.room.mode === 'dom', JSON.stringify(rH && rH.room.mode));
   h.frames.length = 0;
   h.send({ t: 'roomCfg', mode: 'ffa' });
+  const okF = await h.until(j => j.t === 'room' && j.room && j.room.mode === 'ffa', 6000);
+  ok('房主把设置改成「自由混战」：接得下（服务端判得出它的胜负了）', !!okF, JSON.stringify(okF && okF.room.mode));
+  h.send({ t: 'roomCfg', mode: 'conquest' });
   const errF = await h.until(j => j.t === 'err', 4000);
-  ok('房主把设置改成「自由混战」同样被拒', !!errF && /混战/.test(errF.msg || ''), JSON.stringify(errF && errF.msg));
+  ok('改成不存在的模式仍被拒（放行三种不等于放行一切）', !!errF && /conquest/.test(errF.msg || ''), JSON.stringify(errF && errF.msg));
   // 被拒的那一句 setCfg 直接 return，不会推新的房间状态 —— 所以这里读清单，不等帧。
   // 量错的帧会让这条**假红**（时间到而房间确实没变）。
   const rowH = (await apiRooms(srv3.base)).find(x => x.id === 'cap') || {};
-  ok('拒完之后这间还是团队死斗（没有偷偷换玩法）', rowH.mode === 'tdm', JSON.stringify(rowH));
+  ok('拒完之后这间还是自由混战（没有偷偷换玩法）', rowH.mode === 'ffa', JSON.stringify(rowH));
   const bm1 = (await health(srv3.base)).lobby.badMode | 0;
   ok('两种拒绝都在 /healthz 上数得出来（静默失效要显形）', bm1 - bm0 === 2, `${bm0} → ${bm1}`);
   h.close();
@@ -363,6 +366,67 @@ try {
     !!i2 && i2.me.isHost === true && (i2.bots || []).length === 13, JSON.stringify(i2 && { host: i2.me.name, bots: (i2.bots || []).length }));
   q.close();
   srv4.kill();
+
+  console.log('\n── H：连杀选单走完整条链（选 → 座位 → 开局 → 各回各的回显）──');
+  const srv5 = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
+  const u = client(srv5.ws, '选甲'), v = client(srv5.ws, '选乙'), w = client(srv5.ws, '选丙');
+  await u.opened; await v.opened; await w.opened;
+  u.send({ t: 'lobby' }); v.send({ t: 'lobby' }); w.send({ t: 'lobby' });
+  await u.until(j => j.t === 'lobby'); await v.until(j => j.t === 'lobby'); await w.until(j => j.t === 'lobby');
+  u.send({ t: 'createRoom', room: 'pick', name: '选甲', title: '选单房', streaks: ['wp', 'sentry', 'uav'] });
+  await u.until(j => j.t === 'room' && j.room && j.room.id === 'pick', 6000);
+  v.send({ t: 'joinRoom', room: 'pick', name: '选乙', streaks: ['cluster', 'heli', 'uav'] });
+  await v.until(j => j.t === 'room' && j.me, 6000);
+  // 带垃圾项的选单：白名单重建要把它变成"合法的三项"，而不是原样挂上、也不是整组退回默认。
+  w.send({ t: 'joinRoom', room: 'pick', name: '选丙', streaks: ['uav', 'uav', '不存在', 'wp'] });
+  await w.until(j => j.t === 'room' && j.me, 6000);
+  // 改选单搭"准备"那句车：从编辑装备回房间屏时这一句会重发，welcome 必须是**最后一份**。
+  // 反证臂：这条红了 = 座位上留着旧选单，症状是"我改了连杀，进局还是上一套"。
+  v.send({ t: 'ready', on: true, streaks: ['heli', 'wp', 'uav'] });
+  w.send({ t: 'ready', on: true });
+  await u.until(j => j.t === 'room' && j.canStart === true, 6000);
+  u.send({ t: 'start' });
+  const su = await u.until(j => j.t === 'welcome', 15000);
+  const sv = await v.until(j => j.t === 'welcome', 15000);
+  const sw = await w.until(j => j.t === 'welcome', 15000);
+  const idsOf = (wk) => ((wk && wk.streaks) || []).map(s => s.id).join(',');
+  ok('自带三项的人拿到自己那三项（回显按 kills 升序，槽位下标两端一致）',
+    idsOf(su) === 'uav,sentry,wp', idsOf(su));
+  ok('开局前改过选单的人，回显的是**最后一份**（改了没带进对局 = 静默失效）',
+    idsOf(sv) === 'uav,heli,wp', idsOf(sv));
+  // 反证臂：这条红了 = 垃圾项被原样挂上（第 4 格是个 undefined）或整组退回默认
+  //（另两项被一个过期 id 连坐）。
+  ok('【反证】带垃圾项的选单被白名单重建：留下的两项 + 默认补齐，恰好 3 项',
+    idsOf(sw) === 'uav,cluster,wp' && (sw.streaks || []).length === 3, idsOf(sw));
+  // 反证臂：这条红了 = 全房回显同一份（一人一本账没接上），症状是"HUD 是我选的、按 3/4/5 是别人那套"。
+  ok('【反证】三个人三份账，互不串', idsOf(su) !== idsOf(sv) && idsOf(sv) !== idsOf(sw) && idsOf(su) !== idsOf(sw),
+    JSON.stringify({ 甲: idsOf(su), 乙: idsOf(sv), 丙: idsOf(sw) }));
+  u.close(); v.close(); w.close();
+  srv5.kill();
+
+  console.log('\n── I：自由混战进联机（模式随 welcome 下发、每人一支队）──');
+  const srv6 = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
+  const x = client(srv6.ws, '混甲'), y = client(srv6.ws, '混乙');
+  await x.opened; await y.opened;
+  x.send({ t: 'lobby' }); y.send({ t: 'lobby' });
+  await x.until(j => j.t === 'lobby'); await y.until(j => j.t === 'lobby');
+  x.send({ t: 'createRoom', room: 'ffaroom', name: '混甲', title: '混战房', mode: 'ffa' });
+  await x.until(j => j.t === 'room' && j.room && j.room.id === 'ffaroom', 6000);
+  y.send({ t: 'joinRoom', room: 'ffaroom', name: '混乙' });
+  await y.until(j => j.t === 'room' && j.me, 6000);
+  y.send({ t: 'ready', on: true });
+  await x.until(j => j.t === 'room' && j.canStart === true, 6000);
+  x.send({ t: 'start' });
+  const wx = await x.until(j => j.t === 'welcome', 15000);
+  const wy = await y.until(j => j.t === 'welcome', 15000);
+  ok('ffa 房开得起来、模式随 welcome 下发（客户端按它切记分板/结算）',
+    !!wx && wx.mode === 'ffa' && !!wy, JSON.stringify(wx && { mode: wx.mode, map: wx.map }));
+  // 反证臂：这条红了 = 两个人共用一支队 —— 友伤按 team 判敌我，那之后谁也打不死谁
+  ok('【反证】welcome 带回的队各不相同（ffa 里座位上的 A/B 不作数）',
+    !!wx && !!wy && wx.team !== wy.team && /^P/.test(wx.team) && /^P/.test(wy.team),
+    JSON.stringify({ 甲: wx && wx.team, 乙: wy && wy.team }));
+  x.close(); y.close();
+  srv6.kill();
 
   console.log(`\n${bad ? '❌' : '✅'} ${n - bad}/${n} 通过`);
   for (const line of String(srv2.log()).split('\n').filter(x => /^\[room|开局|结果|拒绝/.test(x)).slice(-6)) console.log('  服务端: ' + line);

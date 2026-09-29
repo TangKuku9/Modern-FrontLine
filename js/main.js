@@ -18,6 +18,7 @@ import { Menu } from './menu.js';
 import { MPMatch } from './mp.js';
 import { Campaign } from './campaign.js';
 import { Player } from './player.js';
+import { onKillPerks, pickupsExpire, pickupAction } from './match-rules.js';
 import { NetClient } from './net/client.mjs';
 import { LobbyClient } from './net/lobby.mjs';
 import { buildGun } from './gunmodel.js';
@@ -204,7 +205,7 @@ class Game {
     // 以及"连接中"那一屏能显示一个名字而不是"士兵"。
     // 两种情况下真正的呼号都在连上之后由 welcome 覆盖（见 NetClient 的 onControl('welcome')）。
     // title 同理是可选的显示名（大厅"创建房间"带上来），不带就是没起名。
-    const net = this.net = new NetClient(this, { name: q.get('name') || '士兵', team: q.get('team') || 'A', loadout, title: q.get('title') || '' });
+    const net = this.net = new NetClient(this, { name: q.get('name') || '士兵', team: q.get('team') || 'A', loadout, streaks: this.profile.streaks, title: q.get('title') || '' });
     // 不带 ?room= 时交给服务端自动分配（fill-first，见 server/net-server.mjs:pickRoom）。
     // 默认写死一个房号会让每台新实例都从"互相看不见"开始。
     net.room = q.get('room') || 'auto';
@@ -350,6 +351,10 @@ class Game {
     if (killer.isPlayer) {
       this.hud.popup(`${ev.pts ? '+' + ev.pts + '  ' : ''}击杀 ${escHtml(ev.victim)}`, '#d4f24a');
       this.audio.hit(true, !!ev.head);
+      // 拾荒者 / 速愈在**我这台机器的**状态机上再跑一遍同一份规则（js/match-rules.js:
+      // onKillPerks）：服务端那份管权威血量与弹药，这份管屏幕上的计数 —— 缺了它的症状是
+      // "拾荒者一点反应没有"（弹药数永远是旧的，要等到下一次重生才对上）。
+      for (const t of onKillPerks(me).texts) this.hud.popup(t, '#9cf');
     }
   }
   onNetDeath(ev) {
@@ -794,41 +799,35 @@ class Game {
   }
   updatePickups(dt, inp) {
     const pl = this.player;
-    let near = null, nd = 1.8;
-    for (let i = this.pickups.length - 1; i >= 0; i--) {
-      const p = this.pickups[i];
-      p.t += dt;
-      if (p.t > 30) { this.scene.remove(p.mesh); this.pickups.splice(i, 1); continue; }
-      if (!pl || !pl.alive) continue;
-      const d = Math.hypot(p.pos.x - pl.pos.x, p.pos.z - pl.pos.z);
-      // 相同武器自动拾取弹药
-      const slot = pl.ws.slots.find(s => s.id === p.weaponId);
-      if (slot && d < 1.3) {
-        const add = Math.max(5, Math.floor((p.reserve ?? slot.stats.mag) * 0.5 + (p.mag || 0)));
-        if (slot.reserve < slot.stats.reserve * 2) { slot.reserve = Math.min(slot.stats.reserve * 2, slot.reserve + add); this.hud.popup('+弹药 ' + add, '#ccc'); this.audio.click(2200, 0.05, 0.3); this.scene.remove(p.mesh); this.pickups.splice(i, 1); continue; }
-      }
-      if (!slot && d < nd) { near = p; nd = d; }
+    // 过期与拾取的规则在 js/match-rules.js（单机 / 联机权威端共用同一份，距离与秒数
+    // 只有那一处定义）。联机这边只**算**不**裁**：换没换成由权威端说了算，等
+    // pickupTake / pickupAmmo 事件回来再改自己那份枪 —— 两头都裁的话，换枪留下的
+    // 那把旧枪会被地上建出两个模型（本地一个、事件一个）。
+    if (this.net) {
+      const rn = pickupAction(this, pl, null, false);
+      this.nearPickup = rn.near;
+      if (this.mode && this.mode.interactPrompt) return;
+      if (rn.near && pl && pl.alive) this.hud.prompt(`<b>F</b>拾取 ${buildName(rn.near.weaponId)}`);
+      else if (!this.mode || !this.mode.interactPrompt) this.hud.prompt(null);
+      return;
     }
-    this.nearPickup = near;
+    for (const p of pickupsExpire(this, dt)) this.scene.remove(p.mesh);
+    const r = pickupAction(this, pl, inp);
+    this.nearPickup = r.near;
+    for (const a of r.ammo) {
+      this.scene.remove(a.p.mesh);
+      this.hud.popup('+弹药 ' + a.add, '#ccc');
+      this.audio.click(2200, 0.05, 0.3);
+    }
+    if (r.swap) {
+      const s = r.swap;
+      if (s.old) this.spawnPickup(s.old.id, s.old.att, pl.pos, s.old.mag, s.old.reserve);
+      this.scene.remove(s.p.mesh);
+      this.audio.ui('equip');
+    }
     if (this.mode && this.mode.interactPrompt) return;
-    if (near && pl && pl.alive) {
-      const def = near.weaponId;
-      this.hud.prompt(`<b>F</b>拾取 ${buildName(def)}`);
-      if (inp.interactPressed) {
-        const ws = pl.ws;
-        const cur = ws.w;
-        const isSecondary = ['m1911', 'revolver', 'rpg'].includes(def);
-        let idx = ws.cur;
-        if (ws.slots.length > 1) idx = isSecondary ? 1 : 0;
-        if (ws.slots[idx] && ws.slots[idx].stats.type === 'pistol' && !isSecondary && ws.cur === 0) idx = 0;
-        const old = ws.slots[idx];
-        if (old) this.spawnPickup(old.id, old.att, pl.pos, old.mag, old.reserve);
-        const st = { id: def, att: near.att, camo: 'none' };
-        ws.replaceSlot(idx, st, near.mag ?? undefined, near.reserve ?? undefined);
-        this.scene.remove(near.mesh); this.pickups = this.pickups.filter(p => p !== near);
-        this.audio.ui('equip');
-      }
-    } else if (!this.mode || !this.mode.interactPrompt) this.hud.prompt(null);
+    if (r.near && pl && pl.alive) this.hud.prompt(`<b>F</b>拾取 ${buildName(r.near.weaponId)}`);
+    else if (!this.mode || !this.mode.interactPrompt) this.hud.prompt(null);
   }
 }
 

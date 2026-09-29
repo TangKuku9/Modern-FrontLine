@@ -401,8 +401,8 @@ try {
     chk(batch[0].rows.length === 1 && batch[0].rows[0].account === 'key-a',
       'E3 **访客不产生档案记录**（account 为 null 的人被筛掉了，否则会往库里塞一个不存在的 key）',
       JSON.stringify(batch[0].rows));
-    chk(batch[0].rows[0].xp === 1370 && batch[0].rows[0].kills === 9 && batch[0].rows[0].win === true,
-      'E4 批次里带的是权威 sim 自己算出来的数（XP 来自 score，不是客户端上报的）', JSON.stringify(batch[0].rows[0]));
+    chk(batch[0].rows[0].xp === 1370 + 500 && batch[0].rows[0].kills === 9 && batch[0].rows[0].win === true,
+      'E4 批次里带的是权威 sim 自己算出来的数（XP = score + 胜 500，两段都是服务端的式子，不是客户端上报的）', JSON.stringify(batch[0].rows[0]));
     chk(room.takeResults().length === 0, 'E5 排干语义：取过一次就空了（不然同一局会被反复落库，经验值一直涨）');
     room.endMatch('B');
     chk(room.takeResults().length === 0, 'E6 matchOverSent 守卫还在：第二次 endMatch 不产生第二批');
