@@ -115,6 +115,10 @@ html, body { position: fixed; inset: 0; }
 .chat-line b { color: #8fb8ff; font-weight: 700; }
 .chat-line.team b { color: #7fe07f; }
 .chat-line .ct-time { font-style: normal; font-size: 10px; color: #8a8a8a; margin-right: 6px; }
+/* 私聊与表情动作（差距 45）：私聊压低声调，动作行是"某某做了什么"的陈述句 */
+.chat-line.whisper { color: #c9b6e8; }
+.chat-line.whisper .cw { font-style: normal; font-size: 10px; color: #a487d4; margin: 0 6px; letter-spacing: 1px; }
+.chat-line.emote { color: #9fd8a2; font-style: italic; }
 .chat-line b.me { color: var(--acc); }
 .chat-line span { margin-left: 6px; color: #e8e8e8; word-break: break-all; }
 .chat-line.sys { color: #8a8a8a; }

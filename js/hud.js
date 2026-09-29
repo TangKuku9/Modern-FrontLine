@@ -19,7 +19,7 @@ export class HUD {
     this.buildCompass();
     this.fpsAcc = 0; this.fpsN = 0;
     // 对局内聊天（差距 43）：行的缓冲、开合状态与频道都归 HUD —— 它是唯一画这块的层。
-    // 命令（/mute /report）的判定在 js/net/chat.mjs（与菜单屏共用），这里只做分发。
+    // 命令（/w 私聊 · /emote 表情 · /mute /report）的判定在 js/net/chat.mjs（与菜单屏共用），这里只做分发。
     this.chatRows = []; this.chatActive = false; this.chatChannel = 'match';
     const ci = $('chatSay');
     if (ci) ci.addEventListener('keydown', e => {
@@ -96,7 +96,7 @@ export class HUD {
     box.classList.remove('hidden'); box.classList.add('open');
     $('chatCh').textContent = this.chatChannel === 'team' ? '队伍' : '全体';
     inp.value = '';
-    inp.placeholder = this.chatChannel === 'team' ? '说给队友…（/mute /report）' : '说点什么…（/mute /report）';
+    inp.placeholder = this.chatChannel === 'team' ? '说给队友…（/w 私聊 · /emote 表情 · /mute /report）' : '说点什么…（/w 私聊 · /emote 表情 · /mute /report）';
     inp.focus();
     this.chatRender();
   }
@@ -119,6 +119,12 @@ export class HUD {
       this.chatClose();                          // 发完就收：回车 = 说一句，不是留在框里
       return;
     }
+    if (cmd.op === 'whisper' || cmd.op === 'emote') {
+      // 私聊与表情同样"发完就收"（与发言一致）：它们是要说给人听的话，不是设置项
+      if (g.net) cmd.op === 'whisper' ? g.net.say('whisper', cmd.text, cmd.name) : g.net.emote(cmd.name);
+      this.chatClose();
+      return;
+    }
     // 命令留在框上（可能连着 /mute、/unmute 用），反馈画进聊天条 —— 不弹 announce：
     // 弹窗是"战场上的事"，命令的回执是"聊天框里的事"。
     if (cmd.op === 'mute' || cmd.op === 'unmute') {
@@ -135,7 +141,7 @@ export class HUD {
       if (cmd.name === self) this.chatLocal('不能举报自己');
       else if (g.net) { g.net.report(cmd.name, cmd.reason); this.chatLocal(`正在举报「${cmd.name}」…`); }
     } else {
-      this.chatLocal(`不认得命令「${cmd.text}」——可用：/mute /unmute /muted /report`);
+      this.chatLocal(`不认得命令「${cmd.text}」——可用：/w 私聊 · /emote 表情 · /mute /unmute /muted · /report`);
     }
     this.chatRender();
   }

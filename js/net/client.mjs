@@ -199,9 +199,15 @@ export class NetClient {
   // 直连进来的局是自己拨的那条 —— 服务端按 ws.__cid 路由，两条路同一副形状。
   // 不在这里判"能不能发"：限流与频道合法性是服务端的账（lobby.allowSay / matchSay），
   // 客户端再判一遍就会出现"这边不让发、服务端其实收"的两套规则。
-  say(ch, text) {
+  say(ch, text, to) {
     const t = String(text || '').trim().slice(0, 120);
-    if (t && this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'say', ch: ch === 'team' ? 'team' : 'match', text: t }));
+    if (!t || !this.ws || this.ws.readyState !== 1) return;
+    const f = { t: 'say', ch: ch === 'team' ? 'team' : ch === 'whisper' ? 'whisper' : 'match', text: t };
+    if (ch === 'whisper') f.to = String(to || '').slice(0, 16);   // 私聊的目标是**名字**（快照里没有 cid 可给）
+    this.ws.send(JSON.stringify(f));
+  }
+  emote(id) {
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'say', ch: 'emote', emote: String(id || '') }));
   }
   report(name, reason) {
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'report', name: String(name || '').slice(0, 16), reason: String(reason || '').slice(0, 60) }));

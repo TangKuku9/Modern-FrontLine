@@ -100,7 +100,15 @@ export class Lobby {
     this.rooms = new Map();                         // id -> 等待态房间
     this.seatOf = new Map();                        // sid -> { room, seat }
     this.conns = new Set();                         // 挂在大厅频道上的连接
-    this.chat = [];                                 // 全服频道（进大厅就能看到最近几句）
+    // 全服频道（进大厅就能看到最近几句）。**历史活得过服务重启**（差距 45 的"历史不持久化"）：
+    // 开局时从存储回填（loadChat），每说一句回存一格（saveChat）。这两个钩子由 net-server
+    // 接到 store.meta 上 —— 这一层不摸磁盘，判据就能用内存版换掉它。
+    // 房间里的聊天**不**落盘：房间本身不活过重启（座位/准备/Bot 名单全在内存），
+    // 只有"这间房在"才有这段对话的语境，为它存档只会留一堆没人认领的旧话。
+    this.loadChat = opts.loadChat || (() => []);
+    this.saveChat = opts.saveChat || (() => {});
+    const hist = this.loadChat();
+    this.chat = Array.isArray(hist) ? hist : [];
     this.rate = new WeakMap();                      // ws -> 聊天速率窗口
     // 每一种拒绝都要数得出来。理由和 lag / streak 那两组计数一模一样：
     // **这些失效全是静默的** —— "开始游戏点了没反应""聊天发不出去"在玩家侧都只是"这游戏坏了"，
@@ -110,6 +118,10 @@ export class Lobby {
       // 举报：来了多少条、多少条找不到人、多少条是自己举报自己。后两者都是"报了但没用"——
       // 与 streak.rejected 同一性质的读数：没生效的举报在玩家侧只表现为"石沉大海"。
       report: 0, reportNoTarget: 0, reportSelf: 0,
+      // 私聊与表情：同样把"发了但没用"单列（找不到人 / 私聊自己 / 没有这个表情），
+      // 否则它们和正常发言混在一格里，谁也归不了因。
+      whisper: 0, whisperNoTarget: 0, whisperSelf: 0,
+      emote: 0, emoteBad: 0,
       join: 0, full: 0, playing: 0, dupId: 0, badId: 0, quota: 0, badMode: 0,
       badMode: 0,
       starts: 0, notHost: 0, tooFew: 0, notReady: 0,
@@ -551,6 +563,7 @@ export class Lobby {
     } else {
       this.chat.push(row);
       if (this.chat.length > LOBBY_CHAT_HIST) this.chat.splice(0, this.chat.length - LOBBY_CHAT_HIST);
+      this.saveChat(this.chat);                     // 落盘（重启后 hist 要接得上，差距 45）
       const m = JSON.stringify({ t: 'chat', ch, ...row });
       for (const c of this.conns) this.send(c, m);
     }

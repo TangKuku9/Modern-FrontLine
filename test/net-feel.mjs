@@ -815,6 +815,27 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     chatRowHtml({ ...row, ch: 'team' }, {}).includes('team') && !chatRowHtml(row, {}).match(/chat-line team/));
   ok('Z11 系统回执（举报/屏蔽的反馈）画得出来，且不被屏蔽名单误杀',
     chatRowHtml({ sys: true, text: '已记录', at: 0 }, { muted: ['甲'] }).includes('已记录'));
+  // —— 私聊 / @ 与表情（差距 45 的"无私聊/@"、"无表情"）——
+  ok('Z12 私聊三条写法解析到同一条路（/w · /私聊 · @名字）',
+    p('/w 甲 秘密').op === 'whisper' && p('/w 甲 秘密').name === '甲' && p('/w 甲 秘密').text === '秘密'
+    && p('/私聊 乙 你好').op === 'whisper' && p('@甲 你好').name === '甲' && p('@甲 你好').text === '你好');
+  ok('Z12【反证】没有内容的私聊不算数（发出去是一行没有字的"悄悄"）',
+    p('/w 甲').op === 'unknown' && p('@甲').op === 'unknown');
+  ok('Z13 表情按白名单解析：/emote 词 · 裸别名 /敬礼',
+    p('/emote 敬礼').op === 'emote' && p('/emote 敬礼').name === 'salute' && p('/敬礼').op === 'emote' && p('/敬礼').name === 'salute');
+  ok('Z13【反证】白名单外的表情不许过（自由文本动作等于替人造句）',
+    p('/emote 跳舞').op === 'unknown' && p('/跳舞').op === 'unknown' && p('/emote 敬了个礼').op === 'unknown');
+  ok('Z14 私聊行画得出"悄悄 › 对方"，动作行画得出 "* 谁做了什么"',
+    chatRowHtml({ ch: 'whisper', from: '甲', to: '乙', text: '秘密', at: 0 }, {}).includes('悄悄 › 乙')
+    && chatRowHtml({ ch: 'emote', from: '甲', text: '敬了个礼', at: 0 }, {}).includes('* 甲敬了个礼'));
+  ok('Z14【反证】动作行不是普通发言行（同形就分不出谁在做什么）',
+    !chatRowHtml({ ch: 'emote', from: '甲', text: '敬了个礼', at: 0 }, {}).includes('chat-line"'));
+  ok('Z15 表情符号（emoji）原样过渲染（"表情"的另一半：字面意义上的表情）',
+    chatRowHtml({ ch: 'match', from: '甲', text: '👍 敬礼', at: 0 }, {}).includes('👍'));
+  ok('Z15【反证】屏蔽同样盖住私聊与动作行（被屏蔽的人不该换个花样还能出现）',
+    chatRowHtml({ ch: 'whisper', from: '甲', to: '乙', text: 'x', at: 0 }, { muted: ['甲'] }) === ''
+    && chatRowHtml({ ch: 'emote', from: '甲', text: '敬了个礼', at: 0 }, { muted: ['甲'] }) === ''
+    && chatRowHtml({ ch: 'whisper', from: '丙', to: '乙', text: 'x', at: 0 }, { muted: ['甲'] }).includes('x'));
 }
 
 // ───────────────────────── 收口 ─────────────────────────

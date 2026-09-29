@@ -11,6 +11,20 @@
 // 曾经只长在 js/menu.js 里；对局内的聊天输入也要同一把尺子（两个定义迟早会分叉）。
 export const isImeKey = (e) => !!(e && (e.isComposing || e.keyCode === 229));
 
+// 表情动作（差距 45 的"无表情"）：**白名单**，两端共读这一份 —— 服务端按它校验、
+// 客户端按它认别名。抄两份的症状是"客户端认、服务端拒"（按了没反应）。
+// 为什么不放开自由文本动作（IRC /me 那种）：动作行是"某某做了什么"的陈述句，
+// 自由文本等于允许替别人造句；白名单内的动作都是自己对自己说的。
+export const EMOTES = [
+  { id: 'salute', words: ['敬礼', 'salute'], text: '敬了个礼' },
+  { id: 'lol', words: ['笑', 'lol'], text: '笑了出来' },
+  { id: 'cry', words: ['哭', 'cry'], text: '哭了出来' },
+  { id: 'thumbs', words: ['赞', 'thumbs'], text: '竖了个大拇指' },
+  { id: 'clap', words: ['鼓掌', 'clap'], text: '鼓起了掌' },
+  { id: 'shrug', words: ['无奈', 'shrug'], text: '摊了摊手' },
+];
+export const emoteByWord = (w) => EMOTES.find(e => e.id === w || e.words.includes(w)) || null;
+
 // 聊天行的 HTML。菜单屏（大厅/房间）与对局 HUD 共用这一份 —— 各画各的会出现
 // "大厅里有时间戳、对局里没有"这种只在两个界面之间才看得见的差异。
 // muted 时返回**空串**：屏蔽是渲染侧的事（名单不上行，见 toggleMute 的注释），
@@ -24,6 +38,11 @@ export function chatRowHtml(x, opts = {}) {
   const t = `<i class="ct-time">${chatTime(x.at)}</i>`;
   if (x.sys) return `<div class="chat-line sys">${t}${esc(x.text)}</div>`;
   const mine = opts.mine ? ' me' : '';
+  if (x.ch === 'emote') return `<div class="chat-line emote">${t}* ${esc(x.from || x.name || '')}${esc(x.text || '')}</div>`;
+  if (x.ch === 'whisper') {
+    // 私聊行只到两个人手上（发送者 + 目标，服务端只发这两条），所以这里不用再筛"给谁看"
+    return `<div class="chat-line whisper">${t}<b class="${mine.trim()}">${esc(x.from || x.name || '')}</b><i class="cw">悄悄 › ${esc(x.to || '')}</i><span>${esc(x.text || '')}</span></div>`;
+  }
   const team = x.ch === 'team' ? ' team' : '';
   return `<div class="chat-line${team}">${t}<b class="${mine.trim()}">${esc(x.from || x.name || '')}</b><span>${esc(x.text || '')}</span></div>`;
 }
@@ -57,6 +76,8 @@ export function toggleMute(muted, name, on) {
 //                                      那是一份会把人际纠纷变成服务端状态的名单）
 //   {op:'muted'}                       列一遍当前屏蔽着谁
 //   {op:'report', name, reason}        举报（要上行，服务端记档，见 net-server 的 doReport）
+//   {op:'whisper', name, text}         私聊：/w 名字 内容、/私聊、或 @名字 内容（只到对面手上）
+//   {op:'emote', name}                 表情动作（name 是白名单里的 id，见 EMOTES）
 //   {op:'unknown', text}               以 / 开头但认不出 —— 回一句提示，别当发言发出去
 //                                      （发出去的话房间里会看到一行 "/mut 甲"，没人知道发生了什么）
 const COMMANDS = {
@@ -64,15 +85,37 @@ const COMMANDS = {
   unmute: 'unmute', 解除屏蔽: 'unmute',
   muted: 'muted', 屏蔽列表: 'muted',
   report: 'report', 举报: 'report',
+  w: 'whisper', whisper: 'whisper', 私聊: 'whisper',
+  emote: 'emote', 表情: 'emote',
 };
 export function parseChatCommand(raw) {
   const text = String(raw == null ? '' : raw).trim();
   if (!text) return { op: 'say', text: '' };
+  // @名字 内容 = 私聊（与 /w 同一条路）。只有 @名字 没有内容不算 ——
+  // 发一条空私聊出去，对面看到的是一行没有字的"悄悄"，不如当场说清楚。
+  if (text[0] === '@') {
+    const m = /^@(\S+)\s*(.+)$/.exec(text);
+    return m ? { op: 'whisper', name: m[1], text: m[2].trim().slice(0, 120) } : { op: 'unknown', text };
+  }
   if (text[0] !== '/') return { op: 'say', text };
   const m = /^\/(\S+)\s*(.*)$/.exec(text);
-  const op = m ? COMMANDS[m[1].toLowerCase()] : null;
-  if (!op) return { op: 'unknown', text };
+  const head = m ? m[1].toLowerCase() : '';
   const rest = (m[2] || '').trim();
+  const op = COMMANDS[head];
+  if (op === 'whisper') {
+    const nm = /^(\S+)\s+(.+)$/.exec(rest);
+    return nm ? { op, name: nm[1], text: nm[2].trim().slice(0, 120) } : { op: 'unknown', text };
+  }
+  if (op === 'emote') {
+    const e = emoteByWord(rest.split(/\s+/)[0] || '');
+    return e ? { op, name: e.id } : { op: 'unknown', text };
+  }
+  if (!op) {
+    // 裸表情别名：/敬礼（第一词本身就是表情词，后面没有别的字）
+    const e = emoteByWord(head);
+    if (e && !rest) return { op: 'emote', name: e.id };
+    return { op: 'unknown', text };
+  }
   if (op === 'muted') return { op };
   // 名字到下一个空格为止：呼号白名单不放行空白（服务端 flat 会把连续空白拍平），
   // 所以"第一个词就是名字"这句话成立 —— 空出来的 reason 允许为 0 个词。

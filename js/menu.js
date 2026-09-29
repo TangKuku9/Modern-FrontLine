@@ -601,7 +601,7 @@ export class Menu {
     return `<div class="panel chat-box">
       <div class="lb-hd"><span>${esc(label)}</span></div>
       <div id="${id}" class="chat-lines"></div>
-      <div class="chat-in"><input id="${inp}" maxlength="120" placeholder="说点什么…（/mute 屏蔽 · /report 举报）" autocomplete="off"><button class="btn small ghost" data-a="say">发送</button></div>
+      <div class="chat-in"><input id="${inp}" maxlength="120" placeholder="说点什么…（/w 私聊 · /emote 表情 · /mute 屏蔽 · /report 举报）" autocomplete="off"><button class="btn small ghost" data-a="say">发送</button></div>
     </div>`;
   }
   bindChat(root, ch) {
@@ -629,8 +629,13 @@ export class Menu {
       } else if (cmd.op === 'report') {
         if (cmd.name === lb.name) this.localChat(ch, '不能举报自己');
         else { lb.send({ t: 'report', name: cmd.name, reason: cmd.reason }); this.localChat(ch, `正在举报「${cmd.name}」…`); }
+      } else if (cmd.op === 'whisper') {
+        // 私聊与表情的裁决全在服务端（找不找得到人、表情是不是白名单里的），这里只转交
+        if (cmd.text) lb.send({ t: 'say', ch: 'whisper', to: cmd.name, text: cmd.text.slice(0, 120) });
+      } else if (cmd.op === 'emote') {
+        lb.send({ t: 'say', ch: 'emote', emote: cmd.name });
       } else {
-        this.localChat(ch, `不认得命令「${cmd.text}」——可用：/mute /unmute /muted /report`);
+        this.localChat(ch, `不认得命令「${cmd.text}」——可用：/w 私聊 · /emote 表情 · /mute /unmute /muted · /report`);
       }
     };
     if (btn) btn.addEventListener('click', fire);

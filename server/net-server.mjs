@@ -29,6 +29,7 @@ import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } fro
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
 import { normalizeName, validName, NAME_RULE_TEXT } from './accounts.mjs';
 import { kitsOf } from '../js/loadout.mjs';
+import { emoteByWord } from '../js/net/chat.mjs';
 
 // ── 进房时那个呼号从哪来：一个来源，但分两种情况，而且判据只有这一处 ──
 //   · 要账号的服（默认）：来自**握手那一刻验过的会话**，join 里的 name 一格都不看。
@@ -415,6 +416,19 @@ const lobby = new Lobby({
   liveBusy: (id) => rooms.has(id),
   maxWaiting: CFG.maxRooms * 2,        // 等待态一份 sim 都不建，给两倍额度；上限仍是一道闸
   maxPerUser: CFG.roomsPerUser,        // 和 live 那一份共用 ROOMS_PER_USER：一个人能开的房就这么多
+  // 全服频道的历史活得过重启（差距 45 的"历史不持久化"）：钩子接到账号那套存储的
+  // meta 抽屉上（server/store.mjs）。没设 ACCOUNTS_DB 的部署用的是内存版存储 ——
+  // 那种部署本来就是"重启就没"（账号同命），聊天历史跟着同命，不是新的缺陷。
+  // 只存**全服频道**最近 50 条：房间里的对话随房间生灭（座位/准备都不活过重启）。
+  loadChat: () => {
+    try {
+      const rows = JSON.parse(auth.store.getMeta('chatLobby') || '[]');
+      return Array.isArray(rows) ? rows.slice(-50) : [];
+    } catch { return []; }
+  },
+  saveChat: (rows) => {
+    try { auth.store.setMeta('chatLobby', JSON.stringify(rows.slice(-50))); } catch { /* store.stat.errors 留字据 */ }
+  },
 });
 
 function ownedRooms(userKey) {
@@ -570,6 +584,90 @@ function matchSay(ws, room, msg) {
   }
 }
 
+// ── 这条连接"看得见谁"：私聊与举报共用这一个寻人面 ──
+// 对局里 = 这间 sim 的人（含 Bot 名单里没有连接的那些）；房间里 = 这间房的座位；
+// 只挂在大厅、哪都没进 = 空（"只能对同一局/同一房间里的人说话"）。
+// 各写一份寻人的话，"举报得到人、私聊找不到"这种分叉就有了机会。
+function peopleOf(ws) {
+  const room = ws.__room;
+  if (room && ws.__cid != null) {
+    const me = room.clients.get(ws.__cid) || {};
+    return {
+      me: { name: me.name || ws.__name || '访客', cid: me.cid, team: me.team },
+      people: [...room.clients.values()].map(x => ({
+        name: x.name, account: x.account || null, self: x.cid === ws.__cid, ws: x.ws, cid: x.cid, team: x.team,
+      })),
+    };
+  }
+  const at = lobby.seat(ws);
+  if (at && at.room) {
+    return {
+      me: { name: at.seat.name, sid: at.seat.sid, team: at.seat.team },
+      people: [...at.room.seats.values()].map(s => ({
+        name: s.name, account: s.account || null, self: s.sid === at.seat.sid, ws: s.ws, sid: s.sid, team: s.team,
+      })),
+    };
+  }
+  return { me: { name: ws.__name || '访客' }, people: [] };
+}
+
+// ── 私聊（差距 45 的"无私聊 / @"）：只到目标与发送者两条连接 ──
+// 不进任何历史、不落盘（saveChat 只收全服频道）：悄悄话存进别人的档案是两件事。
+function doWhisper(ws, msg) {
+  const to = flat(msg.to, 16);
+  const text = flat(msg.text, CHAT_LEN);
+  if (!text) { lobby.stat.sayEmpty++; return; }
+  if (!lobby.allowSay(ws, Date.now())) {
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '说得太快了，歇半秒再说' }));
+    return;
+  }
+  const { me, people } = peopleOf(ws);
+  const target = people.find(p => p.name === to);
+  if (!target) {
+    lobby.stat.whisperNoTarget++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '找不到「' + to + '」（只能私聊同一局或同一房间里的人）' }));
+    return;
+  }
+  if (target.self) {
+    lobby.stat.whisperSelf++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '不用私聊自己，直接说就行' }));
+    return;
+  }
+  lobby.stat.whisper++;
+  const row = { t: 'chat', ch: 'whisper', from: me.name, name: me.name, to: target.name, text, at: Date.now(), cid: me.cid, team: me.team };
+  const m = JSON.stringify(row);
+  // **两条**连接、同一行字：目标与发送者。第三个人拿到这条就是泄密 ——
+  // 它没有报错的形状，只能靠"第三人确实收不到"的反证臂钉住（room-flow K）。
+  lobby.send(ws, m);
+  if (target.ws) lobby.send(target.ws, m);
+}
+
+// ── 表情动作（差距 45 的"无表情"）：白名单广播行，形如 "* 甲兵敬了个礼" ──
+// 为什么白名单见 js/net/chat.mjs:EMOTES 的注释（动作行是陈述句，自由文本等于替人造句）。
+function doEmote(ws, msg) {
+  const e = emoteByWord(String(msg.emote == null ? '' : msg.emote).trim().toLowerCase());
+  if (!e) {
+    lobby.stat.emoteBad++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '没有这个表情' }));
+    return;
+  }
+  if (!lobby.allowSay(ws, Date.now())) {
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '说得太快了，歇半秒再说' }));
+    return;
+  }
+  const { me, people } = peopleOf(ws);
+  if (!people.length) {
+    // 只挂在大厅时没有"看见你做动作"的人。当场说清楚，不悄悄广播给全服 ——
+    // 表情是"对这一屋子人"的，不是对整个服务器的。
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '要先在一局或一间房间里，才有人看得见' }));
+    return;
+  }
+  lobby.stat.emote++;
+  const row = { t: 'chat', ch: 'emote', from: me.name, name: me.name, text: e.text, at: Date.now(), cid: me.cid, team: me.team };
+  const m = JSON.stringify(row);
+  for (const p of people) if (p.ws && p.ws.readyState === 1) lobby.send(p.ws, m);
+}
+
 // ── 举报（差距 45）：**只记档，不自动处罚** ──
 // 记档是真的（服务端日志 + /healthz 计数，运维能查能回溯），处罚是人的判断：
 // 自动封禁的误伤成本远高于"这次没封"，而聊天里的纠纷谁先动手只有记录看得出来。
@@ -585,19 +683,10 @@ function doReport(ws, msg) {
     return;
   }
   // 目标只在同一局 / 同一房间里找：举报一个不相干房间里的名字没有可核对的语境，
-  // 只会变成骚扰工具（随便填个名字就能让服务端给人记档）。
-  let target = null, meName = ws.__name || '访客';
-  const room = ws.__room;
-  if (room && ws.__cid != null) {
-    meName = (room.clients.get(ws.__cid) || {}).name || meName;
-    for (const x of room.clients.values()) if (x.name === who) { target = { name: x.name, account: x.account || null, cid: x.cid, self: x.cid === ws.__cid }; break; }
-  } else {
-    const at = lobby.seat(ws);
-    if (at && at.room) {
-      meName = at.seat.name;
-      for (const s of at.room.seats.values()) if (s.name === who) { target = { name: s.name, account: s.account || null, self: s.sid === at.seat.sid }; break; }
-    }
-  }
+  // 只会变成骚扰工具（随便填个名字就能让服务端给人记档）。寻人面与私聊同一份。
+  const { me, people } = peopleOf(ws);
+  const meName = me.name;
+  const target = people.find(p => p.name === who) || null;
   if (!target) {
     lobby.stat.reportNoTarget++;
     lobby.send(ws, JSON.stringify({ t: 'err', msg: '找不到「' + who + '」（只能举报同一局或同一房间里的人）' }));
@@ -887,12 +976,17 @@ wss.on('connection', (ws, req) => {
         };
         if (msg.t === 'lobby') lobby.attach(ws);
         else if (msg.t === 'say') {
-          // 对局内频道（match / team）路由给 matchSay；**老频道（room / lobby）保持原样**
-          // —— 老客户端与探针在对局中也发 ch:'room'，改道会把它悄悄变成另一条频道
-          //（room-flow 的 E 段就是这么假红的）。matchSay 也只认"这条连接已经占了 sim
-          // 里的座位"：直连进来的局没有 lobby 座位，走 lobby.say 会被静默丢掉（sayNoRoom）。
+          // 频道路由，四代语义一次列清（混在一起的症状是"老判据莫名其妙红"）：
+          //   whisper / emote —— 私聊与表情动作（差距 45），两种状态都走这一层；
+          //   match / team    —— 对局内频道（差距 43），只有已经占了 sim 座位的连接；
+          //   room / lobby    —— **老频道，语义不变**（老客户端与探针在对局中也发 ch:'room'）。
+          // matchSay 只认"这条连接已经占了 sim 里的座位"：直连进来的局没有 lobby 座位，
+          // 走 lobby.say 会被静默丢掉（sayNoRoom++）。
+          const ch = msg.ch;
           const live = ws.__room && ws.__cid != null;
-          if (live && (msg.ch === 'match' || msg.ch === 'team')) matchSay(ws, ws.__room, msg);
+          if (ch === 'whisper') doWhisper(ws, msg);
+          else if (ch === 'emote') doEmote(ws, msg);
+          else if (live && (ch === 'match' || ch === 'team')) matchSay(ws, ws.__room, msg);
           else lobby.say(ws, msg);
         }
         else if (msg.t === 'report') doReport(ws, msg);

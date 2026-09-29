@@ -87,6 +87,7 @@ export class MemoryStore {
   constructor({ now = Date.now } = {}) {
     this.users = new Map();
     this.sessions = new Map();
+    this.meta = new Map();
     this.auditLog = [];
     this.now = now;
     this.flushes = 0;
@@ -105,6 +106,9 @@ export class MemoryStore {
   deleteUserSessions(key) { for (const [t, s] of this.sessions) if (s.key === key) this.sessions.delete(t); }
   countUsers() { return this.users.size; }
   countSessions() { return this.sessions.size; }
+  // meta 是"小 JSON 片段"的杂项抽屉（聊天历史就在里面）。内存版只保证形状与 SQLite 版一致。
+  getMeta(k) { return this.meta.get(k) ?? null; }
+  setMeta(k, v) { this.meta.set(k, String(v)); }
   // 审计的**契约与 SQLite 版一致**：不许往调用方抛（审计失败不许挡住注册/登录），
   // 内存上限只影响留多少条 —— 判据里量的是形状，不是容量。
   audit(ev, name, ip) {
@@ -148,6 +152,7 @@ export class SqliteStore {
     this._delSess = this.db.prepare('delete from sessions where token = ?');
     this._delExp = this.db.prepare('delete from sessions where exp <= ?');
     this._insAudit = this.db.prepare('insert into audit (t,ev,name,ip) values (?,?,?,?)');
+    this._insMeta = this.db.prepare('insert into meta (k,v) values (?,?) on conflict(k) do update set v=excluded.v');
 
     this.timer = setInterval(() => { try { this.flush(); } catch { /* 由 stat.errors 记账 */ } }, this.idleMs);
     // unref：这个定时器不该让进程活着。忘了它的话服务停不下来，
@@ -188,6 +193,15 @@ export class SqliteStore {
   }
   getAudit(limit = 50) {
     return this.db.prepare('select t, ev, name, ip from audit order by id desc limit ?').all(limit | 0);
+  }
+  // meta 直写，与 audit 同一条理由：一次一句小 upsert，量级与登录时的审计写相同，
+  // 且**不许**往调用方抛 —— 聊天历史写不进去不该挡住聊天本身（stat.errors 留字据）。
+  getMeta(k) {
+    try { const r = this.db.prepare('select v from meta where k = ?').get(String(k)); return r ? r.v : null; }
+    catch { this.stat.errors++; return null; }
+  }
+  setMeta(k, v) {
+    try { this._insMeta.run(String(k), String(v)); } catch { this.stat.errors++; }
   }
   get pending() { return this.dirtyUsers.size + this.dirtySessions.size + this.goneSessions.size; }
 

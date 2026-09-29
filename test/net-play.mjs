@@ -230,6 +230,27 @@ try {
     repB.some(t => /已记录/.test(t)) && repB.some(t => /正在举报/.test(t)), JSON.stringify(repB));
   ok('举报的回执只到举报人自己（对面不该收到）',
     !(await A.page.evaluate(() => window.game.hud.chatRows.map(r => r.text).some(t => /已记录/.test(t || '')))));
+
+  // 私聊与表情（差距 45 余下两项的浏览器这半）：路由 / 白名单在 room-flow K 量，这里量面板画没画。
+  await focus(A);
+  await openChat(A.page);
+  await A.page.keyboard.type('/w 乙兵 小声点');
+  await A.page.keyboard.press('Enter');
+  await sleep(800);
+  const whB = await B.page.evaluate(() => window.game.hud.chatRows.map(r => ({ ch: r.ch, text: r.text, to: r.to })));
+  const whA = await A.page.evaluate(() => window.game.hud.chatRows.map(r => ({ ch: r.ch, text: r.text })));
+  ok('私聊：对面收到（行里写着给谁），自己也有同一行',
+    whB.some(r => r.ch === 'whisper' && r.text === '小声点' && r.to === '乙兵') && whA.some(r => r.ch === 'whisper' && r.text === '小声点'),
+    JSON.stringify(whB));
+  await focus(A);
+  await openChat(A.page);
+  await A.page.keyboard.type('/敬礼');
+  await A.page.keyboard.press('Enter');
+  await sleep(800);
+  const emB = await B.page.evaluate(() => window.game.hud.chatRows.map(r => ({ ch: r.ch, text: r.text })));
+  ok('表情动作到对面手上（"* 甲兵敬了个礼"那种行，裸别名 /敬礼 就够）',
+    emB.some(r => r.ch === 'emote' && /敬了个礼/.test(r.text || '')), JSON.stringify(emB));
+
   await focus(A);
   await openChat(A.page);                             // 先开面板
   await A.page.keyboard.press('Escape');              // Esc 只关聊天，不弹暂停

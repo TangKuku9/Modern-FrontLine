@@ -546,6 +546,114 @@ try {
   f1.close(); f2.close();
   srv7.kill();
 
+  console.log('\n── K：私聊、表情与历史持久化（差距 45 余下三项）──');
+  // 私聊的命门是**第三个人确实收不到**（泄密没有报错的形状）；表情的命门是白名单
+  // （自由文本动作等于替人造句）；历史的命门是"重启之后真的还在"（说持久就得过重启）。
+  const srv8 = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
+  const k1 = client(srv8.ws, '私甲'), k2 = client(srv8.ws, '私乙'), k3 = client(srv8.ws, '私丙');
+  await k1.opened; await k2.opened; await k3.opened;
+  k1.send({ t: 'lobby' }); k2.send({ t: 'lobby' }); k3.send({ t: 'lobby' });
+  await k1.until(j => j.t === 'lobby'); await k2.until(j => j.t === 'lobby'); await k3.until(j => j.t === 'lobby');
+  k1.send({ t: 'createRoom', room: 'talk3', name: '私甲', title: '私聊房' });
+  await k1.until(j => j.t === 'room' && j.room && j.room.id === 'talk3', 6000);
+  k2.send({ t: 'joinRoom', room: 'talk3', name: '私乙' });
+  await k2.until(j => j.t === 'room' && j.me, 6000);
+  k2.send({ t: 'team', team: 'A' });
+  await k2.until(j => j.t === 'room' && j.me && j.me.team === 'A', 6000);
+  k3.send({ t: 'joinRoom', room: 'talk3', name: '私丙' });
+  await k3.until(j => j.t === 'room' && j.me, 6000);
+
+  k1.send({ t: 'say', ch: 'whisper', to: '私乙', text: '就咱俩知道' });
+  const w1 = await k2.until(j => j.t === 'chat' && j.ch === 'whisper', 3000);
+  ok('等待态房间里，私聊到对面手上（行里写着"给谁"）', !!w1 && w1.text === '就咱俩知道' && w1.to === '私乙' && w1.from === '私甲', JSON.stringify(w1));
+  ok('发送者自己也收到同一行（他要看得见自己说了什么）',
+    !!(await k1.until(j => j.t === 'chat' && j.ch === 'whisper', 1000)));
+  ok('【反证】第三个人收不到私聊（泄密不报错，只能靠这一条臂）',
+    !(await k3.until(j => j.t === 'chat' && j.ch === 'whisper', 800)));
+  await sleep(700);
+
+  k1.send({ t: 'say', ch: 'emote', emote: '敬礼' });
+  const e1 = await k3.until(j => j.t === 'chat' && j.ch === 'emote', 3000);
+  ok('表情动作广播到整间房（"* 私甲敬了个礼"）', !!e1 && e1.text === '敬了个礼' && e1.from === '私甲', JSON.stringify(e1));
+  await sleep(700);
+  const eb0 = (await health(srv8.base)).lobby.emoteBad | 0;
+  k1.send({ t: 'say', ch: 'emote', emote: '跳舞' });
+  const e2 = await k1.until(j => j.t === 'err', 3000);
+  ok('【反证】白名单外的表情被拒（自由文本动作等于替人造句）', !!e2 && /没有这个表情/.test(e2.msg || ''), JSON.stringify(e2 && e2.msg));
+  ok('被拒的单独计数（emote 与 emoteBad 两格，不混进发言）',
+    (await health(srv8.base)).lobby.emoteBad === eb0 + 1, `emoteBad ${eb0} → ${(await health(srv8.base)).lobby.emoteBad}`);
+  await sleep(700);
+
+  k2.send({ t: 'ready', on: true }); k3.send({ t: 'ready', on: true });
+  await k1.until(j => j.t === 'room' && j.canStart === true, 6000);
+  k1.send({ t: 'start' });
+  await k1.until(j => j.t === 'welcome', 15000);
+  await k2.until(j => j.t === 'welcome', 15000);
+  await k3.until(j => j.t === 'welcome', 15000);
+
+  k1.send({ t: 'say', ch: 'match', text: '👍 敬礼' });
+  const em = await k2.until(j => j.t === 'chat' && j.ch === 'match', 3000);
+  ok('emoji 过了服务端的拍平还在（字面意义上的表情也是表情）', !!em && em.text === '👍 敬礼', JSON.stringify(em));
+  await sleep(700);
+
+  k1.send({ t: 'say', ch: 'whisper', to: '私丙', text: '对局里也能私聊' });
+  const w2 = await k3.until(j => j.t === 'chat' && j.ch === 'whisper', 3000);
+  ok('对局中同样收得到私聊', !!w2 && w2.text === '对局里也能私聊', JSON.stringify(w2));
+  ok('【反证】对局中的私聊同样不给第三人（换了状态不许泄密）',
+    !(await k2.until(j => j.t === 'chat' && j.ch === 'whisper', 800)));
+  await sleep(700);
+  const wh0 = (await health(srv8.base)).lobby;
+  k1.send({ t: 'say', ch: 'whisper', to: '查无此人', text: 'x' });
+  const w3 = await k1.until(j => j.t === 'err', 3000);
+  ok('私聊一个不在局里的名字被拒', !!w3 && /找不到/.test(w3.msg || ''), JSON.stringify(w3 && w3.msg));
+  ok('"找不到人"单独计数（whisperNoTarget，不混进 whisper）',
+    (await health(srv8.base)).lobby.whisperNoTarget === wh0.whisperNoTarget + 1);
+  await sleep(700);
+  k1.send({ t: 'say', ch: 'whisper', to: '私甲', text: 'x' });
+  const w4 = await k1.until(j => j.t === 'err', 3000);
+  ok('私聊自己被拒', !!w4 && /不用私聊自己/.test(w4.msg || ''), JSON.stringify(w4 && w4.msg));
+  ok('它也单独计数', (await health(srv8.base)).lobby.whisperSelf === wh0.whisperSelf + 1);
+  k1.close(); k2.close(); k3.close();
+  srv8.kill();
+
+  // ── 历史持久化：同一份 ACCOUNTS_DB 起两台服务，重启后 hist 要接上 ──
+  // 反证臂是最后一段：**没设** ACCOUNTS_DB 的部署用内存存储，重启就是没有 ——
+  // 两段一起才证明"还在的那句"真的来自落盘，而不是哪儿缓存了一份。
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dbFile = join(tmpdir(), 'mf-chat-' + Date.now() + '.db');
+  const chatFlow = async (env, text) => {
+    const srv = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '', ...env });
+    const c = client(srv.ws, '史者');
+    await c.opened;
+    c.send({ t: 'lobby' });
+    await c.until(j => j.t === 'lobby');
+    c.send({ t: 'say', ch: 'lobby', text });
+    await c.until(j => j.t === 'chat' && j.text === text, 3000);
+    c.close();
+    srv.kill();
+    await sleep(300);
+    return srv;
+  };
+  const readHist = async (env) => {
+    const srv = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '', ...env });
+    const c = client(srv.ws, '史者');
+    await c.opened;
+    c.send({ t: 'lobby' });
+    const hist = await c.until(j => j.t === 'chat' && Array.isArray(j.hist), 4000);
+    c.close();
+    srv.kill();
+    return (hist && hist.hist) || [];
+  };
+  await chatFlow({ ACCOUNTS_DB: dbFile }, '重启前的一句话');
+  const hist2 = await readHist({ ACCOUNTS_DB: dbFile });
+  ok('重启之后 hist 里还有那句话（说持久就得活过重启）',
+    hist2.some(r => r.text === '重启前的一句话'), JSON.stringify(hist2.map(r => r.text)));
+  await chatFlow({}, '只在内存里的一句话');
+  const hist3 = await readHist({});
+  ok('【反证】没设 ACCOUNTS_DB 的部署就是没有（这段红了 = 判据在量缓存而不是落盘）',
+    !hist3.some(r => r.text === '只在内存里的一句话'), JSON.stringify(hist3.map(r => r.text)));
+
   console.log(`\n${bad ? '❌' : '✅'} ${n - bad}/${n} 通过`);
   for (const line of String(srv2.log()).split('\n').filter(x => /^\[room|开局|结果|拒绝/.test(x)).slice(-6)) console.log('  服务端: ' + line);
   process.exit(bad ? 1 : 0);
