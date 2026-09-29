@@ -89,6 +89,19 @@ const geo = await page.evaluate(async () => {
       `金属件 metalness=${met.metalness} 木件 metalness=${wd.metalness} roughness=${wd.roughness}`);
     ok('S7⁻ 反证：不同底材不许串成同一份材质', mats.camoMaterial('woodland', mats.mat('gunMetal')) !== mats.camoMaterial('woodland', mats.mat('gunPoly')));
   }
+  // S10 配件装了要看得出差别：凹槽枪管 / 三种握把胶带 / 两种激光模块。
+  // 以前 fluted、grain、stip、mw1 四个配件只改数值不改模型与材质，装了等于没装。
+  {
+    const meshes = (att) => { let n = 0; buildGun('m4', att, 'none').group.traverse(o => { if (o.isMesh) n++; }); return n; };
+    ok('S10 凹槽枪管比标准枪管多几何', meshes({ barrel: 'fluted' }) > meshes({}), `标准=${meshes({})} 凹槽=${meshes({ barrel: 'fluted' })}`);
+    const gripMat = (rear) => buildGun('m4', { rear }, 'none').grip.material;
+    const rub = gripMat('rubber'), gr = gripMat('grain'), st = gripMat('stip');
+    ok('S10 三种握把胶带各是各的材质', rub !== gr && gr !== st && st !== rub,
+      `橡胶=${rub.color.getHexString()} 颗粒=${gr.color.getHexString()} 防滑=${st.color.getHexString()}`);
+    const laserW = (id) => buildGun('m4', { laser: id }, 'none').laserMod.geometry.parameters.width;
+    ok('S10 两种激光模块大小不同', laserW('tac') !== laserW('mw1'), `5mW 宽=${laserW('tac')} 1mW 宽=${laserW('mw1')}`);
+  }
+
   // S4 AK 弹匣是橙色胶木（那段意图写了一半被自己的三元式吃掉），别的枪仍是深灰
   const magMat = (id) => { const m = buildGun(id, {}, 'none').mag; return m && m.children.length ? m.children[0].material : null; };
   ok('S4 AK 弹匣用橙色胶木材质', magMat('ak') === mats.mat('containerOrange'), String(magMat('ak') && magMat('ak').color && magMat('ak').color.getHexString()));

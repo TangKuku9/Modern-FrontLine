@@ -31,7 +31,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   const root = new THREE.Group();
   // eject 是**抛壳口**的锚点：弹壳从这里出来，不是从枪口后方 0.4 m 的固定点。
   // 它必须是挂在枪上的 Object3D（跟 muzzle 一样），否则枪一动弹壳就落在旧位置。
-  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Object3D(), optic: 'iron', reticle: null, slide: null, bolt: null, pump: null, cylinder: null };
+  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Object3D(), optic: 'iron', reticle: null, slide: null, bolt: null, pump: null, cylinder: null, grip: null, laserMod: null };
   root.add(info.eject);
   const low = !!opts.low;
 
@@ -98,7 +98,11 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     }
     if (att.muzzle === 'suppressor') { add(cgeo(0.018, 0.018, 0.14), mat('gunPoly'), 0, 0.05, -0.25); info.muzzle.position.z -= 0.14; }
     else if (att.muzzle) { add(cgeo(0.014, 0.014, 0.04), metal, 0, 0.05, -0.2); info.muzzle.position.z -= 0.04; }
-    if (att.laser) { add(bgeo(0.025, 0.022, 0.05), mat('gunPoly'), 0, 0.005, -0.12); addLaser(add, 0, 0.005, -0.146); }
+    if (att.laser) {
+      const small = att.laser === 'mw1';
+      info.laserMod = add(bgeo(small ? 0.02 : 0.025, small ? 0.018 : 0.022, small ? 0.04 : 0.05), mat('gunPoly'), 0, 0.005, -0.12);
+      addLaser(add, 0, 0.005, -0.146);
+    }
     if (att.optic === 'reddot') {
       add(bgeo(0.03, 0.006, 0.04), metal, 0, 0.07, -0.02);
       add(bgeo(0.004, 0.035, 0.012), metal, -0.016, 0.09, -0.035);
@@ -145,7 +149,14 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   info.leftHand.set(0, -0.005, hz0 - hand * 0.55);
   // 枪管
   const bz0 = hz1, bz1 = hz1 - barrel;
-  add(cgeo(0.0095, 0.0095, barrel + 0.05), mat('gunMetal'), 0, 0.035, (bz0 + bz1) / 2 + 0.025);
+  // 枪管：凹槽管比标准管细一圈，外加 6 条纵向筋（真枪是车掉的槽，这里用筋做出同一件事的
+  // "看得出这是凹槽管"）。以前 'fluted' 只改数值不改模型，装了等于没装。
+  const flute = att.barrel === 'fluted';
+  add(cgeo(flute ? 0.0082 : 0.0095, flute ? 0.0082 : 0.0095, barrel + 0.05), mat('gunMetal'), 0, 0.035, (bz0 + bz1) / 2 + 0.025);
+  if (flute && !low) for (let i = 0; i < 6; i++) {
+    const a = i * Math.PI / 3;
+    add(bgeo(0.0024, 0.0024, barrel + 0.04), mat('gunSteel'), Math.cos(a) * 0.0086, 0.035 + Math.sin(a) * 0.0086, (bz0 + bz1) / 2 + 0.018);
+  }
   let muzzleZ = bz1;
   if (M.mag === 'tube') add(cgeo(0.015, 0.015, hand + barrel * 0.7), metal, 0, 0.005, hz0 - (hand + barrel * 0.7) / 2);
   if (M.stock === 'ak' && M.color === 'wood') add(cgeo(0.012, 0.012, hand * 0.9), metal, 0, 0.07, (hz0 + hz1) / 2); // 导气管
@@ -231,7 +242,10 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   }
   // 激光
   if (att.laser) {
-    add(bgeo(0.022, 0.025, 0.06), mat('gunPoly'), 0.038, 0.03, hz1 + 0.05);
+    // 两种激光模块各是各的：1mW（mw1）小方块，5mW（tac）大一号带散热片。以前两者同一个模型。
+    const small = att.laser === 'mw1';
+    info.laserMod = add(bgeo(small ? 0.018 : 0.022, small ? 0.02 : 0.025, small ? 0.045 : 0.06), mat('gunPoly'), 0.038, 0.03, hz1 + 0.05);
+    if (!small) add(bgeo(0.024, 0.004, 0.05), mat('gunSteel'), 0.038, 0.045, hz1 + 0.05);
     addLaser(add, 0.038, 0.03, hz1 + 0.019);
   }
   // 下挂
@@ -244,10 +258,10 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   }
   if (att.under) info.leftHand.set(0, -0.06, hz0 - hand * 0.55);
   // 握把
-  // 握把也吃迷彩，否则迷彩只糊了护木和枪托，握把留一块原色
-  const gripM = camoMaterial(camo, att.rear === 'rubber' ? mat('rubber') : furnBase === mat('gunWood') ? mat('gunPoly') : furnBase);
-  if (M.grip === 'sniper') add(bgeo(0.03, 0.09, 0.045), gripM, 0, -0.035, 0.07, 0.35);
-  else add(bgeo(0.028, 0.095, 0.04), gripM, 0, -0.04, 0.035, 0.3);
+  // 握把也吃迷彩，否则迷彩只糊了护木和枪托，握把留一块原色。三种胶带各是各的材质。
+  const gripM = camoMaterial(camo, att.rear === 'rubber' ? mat('rubber') : att.rear === 'grain' ? mat('gripGrain') : att.rear === 'stip' ? mat('gripStip') : furnBase === mat('gunWood') ? mat('gunPoly') : furnBase);
+  if (M.grip === 'sniper') info.grip = add(bgeo(0.03, 0.09, 0.045), gripM, 0, -0.035, 0.07, 0.35);
+  else info.grip = add(bgeo(0.028, 0.095, 0.04), gripM, 0, -0.04, 0.035, 0.3);
   add(bgeo(0.006, 0.006, 0.07), metal, 0, -0.032, -0.005); // 扳机护圈
   // 弹匣
   const magG = new THREE.Group(); magG.position.set(0, -0.01, -0.035); root.add(magG);

@@ -76,6 +76,9 @@ function buildMaterials() {
   MATS.darkMetal = new THREE.MeshStandardMaterial({ color: 0x2a2c2e, roughness: 0.5, metalness: 0.7 });
   MATS.steel = new THREE.MeshStandardMaterial({ color: 0x8e9398, roughness: 0.35, metalness: 0.9 });
   MATS.rubber = new THREE.MeshStandardMaterial({ color: 0x151515, roughness: 0.9 });
+  // 三种握把胶带要看得出差别：橡胶 / 颗粒（浅一点更糙）/ 防滑（最暗最糙）
+  MATS.gripGrain = new THREE.MeshStandardMaterial({ color: 0x33302c, roughness: 0.95, metalness: 0.05 });
+  MATS.gripStip = new THREE.MeshStandardMaterial({ color: 0x1b1a19, roughness: 1.0, metalness: 0.05 });
   MATS.glass = new THREE.MeshStandardMaterial({ color: 0x223040, roughness: 0.05, metalness: 0.9, transparent: true, opacity: 0.55 });
   MATS.windowLit = new THREE.MeshStandardMaterial({ color: 0x222222, emissive: 0xffc27a, emissiveIntensity: 1.2 });
   MATS.windowDark = new THREE.MeshStandardMaterial({ color: 0x0a0c10, roughness: 0.1, metalness: 0.8 });
