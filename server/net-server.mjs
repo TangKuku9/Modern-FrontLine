@@ -28,6 +28,7 @@ import { Lobby, MAX_SEATS } from './lobby.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
 import { normalizeName, validName, NAME_RULE_TEXT } from './accounts.mjs';
+import { kitsOf } from '../js/loadout.mjs';
 
 // ── 进房时那个呼号从哪来：一个来源，但分两种情况，而且判据只有这一处 ──
 //   · 要账号的服（默认）：来自**握手那一刻验过的会话**，join 里的 name 一格都不看。
@@ -519,8 +520,15 @@ function welcomeFrame(room, c) {
     // 而 Bot 在权威端是**真的**实体（会开枪、会裁决伤害）。不把它列进来的症状是
     // 房主加了一屋子 Bot，所有人进去却一个也看不见 —— 然后被看不见的东西打死。
     // bot:true 那一格只给界面看（座位栏上要能区分），判定不读它。
-    others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({ id: x.cid, name: x.name, team: x.team, perks: (x.loadout && x.loadout.perks) || [] }))
-      .concat((room.game ? room.game.bots : []).filter(b => b.netId).map(b => ({ id: b.netId, name: b.name, team: b.team, bot: true }))),
+    // kits：每人（含 Bot）手上那把枪的配件/迷彩，远端模型按它建（差距 29）——
+    // 与 join 事件、respawn 的 loadout 回声走的是同一张表（js/loadout.mjs:kitsOf）。
+    others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({
+      id: x.cid, name: x.name, team: x.team, perks: (x.loadout && x.loadout.perks) || [], kits: kitsOf(x.loadout),
+    }))
+      .concat((room.game ? room.game.bots : []).filter(b => b.netId).map(b => ({
+        id: b.netId, name: b.name, team: b.team, bot: true,
+        kits: { [b.weaponId || 'm4']: { att: b.att || {}, camo: b.camo || 'none' } },
+      }))),
   };
 }
 

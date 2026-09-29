@@ -8,12 +8,15 @@ import { createServer } from 'node:net';
 
 // 让内核挑一个空闲端口再把它放掉（然后拿去 bind）。这里有一个理论上的竞态窗口，
 // 但比"写死 8090"强得多 —— 后者在第二个测试同时跑时必然撞。
+// 探测面必须和 net-server 的绑定面**同一个**（0.0.0.0）：以前这里探 127.0.0.1，
+// 而服务绑 0.0.0.0 —— 某些占着通配地址的进程在探测里是看不见的，于是子进程起来就
+// `EADDRINUSE 0.0.0.0:P`，报成"临时服务没起来"（实测撞过一次，红得没信息量）。
 // 导出是因为 test/hardening.mjs 也要起进程（那一段要量**拒绝启动**，用不了 withServer）。
 export function freePort() {
   return new Promise((res, rej) => {
     const s = createServer();
     s.on('error', rej);
-    s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); });
+    s.listen(0, '0.0.0.0', () => { const p = s.address().port; s.close(() => res(p)); });
   });
 }
 

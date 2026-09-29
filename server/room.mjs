@@ -11,7 +11,7 @@ import { Bot } from '../js/ai.js';
 import { MAPS } from '../js/maps.js';
 import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput, unpackStreak, uavBit, WORLD } from '../js/quant.js';
-import { sanitizeLoadout } from '../js/loadout.mjs';
+import { sanitizeLoadout, kitsOf } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
 import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
@@ -29,6 +29,9 @@ export const INPUT_QUEUE = 60;
 // 受伤事件的最小间隔（拍）。12 拍 = 0.2 s：正常人挨一枪到下一枪之间比这长；
 // 而火焰那种每拍掉血的连续伤害会被压成 5 条/秒 —— 再密就不是"反馈"是刷屏了。
 export const HURT_EVERY = 12;
+// 直升机损伤状态（头顶血量标记 / 七成以下冒烟）的同步节奏（拍）。0.2 s 一条、只在变化时发：
+// 那条百分比是给人看"我还在不在有效输出"的，不需要 60 Hz，而每拍发是纯浪费。
+export const HELI_HP_EVERY = 12;
 
 // cid 必须是"这台进程范围内唯一"，不能每个房间各自从 1 开始编号。
 // 各房间自己数的话，房间 A 的 1 号和房间 B 的 1 号同名 —— 只看自己房间时不出事，
@@ -68,6 +71,9 @@ export const resolveStreaks = (ids) => {
 // updateTargeting 的 raycast 上限（js/mp.js:428）—— 两端同一条上限，联机能点到的
 // 就是单机能点到的，不会出现"联机的空袭能炸得更远"。
 const CLUSTER_MAX = 200;
+
+// Bot 的迷彩池（五格里两格 'none' = 一半不涂）。与 js/mp.js:101 的那一行同池。
+const BOT_CAMOS = ['none', 'none', 'desert', 'woodland', 'digital'];
 
 // 白磷弹持续灼烧的伤害方向（"从上方烧下来"）。做成常量而不是每拍 new 一个：它只被读。
 const DOWN = new THREE.Vector3(0, -1, 0);
@@ -258,7 +264,9 @@ export class NetRoom {
     };
     this.clients.set(cid, c);
     this.byPlayer.set(pl, c);
-    this.events.push({ e: 'join', cid, name, team, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw, perks: lo.perks || [] });
+    // kits = 他手上那两把枪各自的配件/迷彩（js/loadout.mjs:kitsOf，与 welcome.others 同一张表）。
+    // 远端模型按它建 —— 少了这一格的症状是"人人一把素枪"，而协议里根本没有这两个字段（差距 29）。
+    this.events.push({ e: 'join', cid, name, team, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw, perks: lo.perks || [], kits: kitsOf(lo) });
     return c;
   }
 
@@ -439,6 +447,19 @@ export class NetRoom {
     // 伤害是在**这一台**机器上算出来的（Sentry.update 里走 fireHitscan），这才是"权威"
     // 二字的全部含义 —— 客户端那边只有一个不开火的同形副本（dumb），它负责"看得见"。
     for (const a of this.active) a.update(DT);
+    // 直升机的**损伤状态**同步（新产生那条差距：伤害与被击落在联机里是完整的 —— 那是这边
+    // 裁的；缺的只是"还剩多少"这一路读数，哑副本没有血量可显示）。头顶的血量标记与七成以下
+    // 的冒烟都靠这条事件（客户端的 Heli.update 跑的是同一段冒烟代码，喂进 hp 就会冒）。
+    // 按变化发、每 HELI_HP_EVERY 拍最多一条：那条百分比是给人判断"我还在不在有效输出"的，
+    // 0.2 s 的粒度足够，而每拍发是 60 条/秒的无用功。
+    for (const a of this.active) {
+      if (!a.isHeli || !a.alive) continue;
+      const hp = Math.max(0, Math.round(a.hp));
+      if (hp !== a.__hpSent && (a.__hpTick === undefined || this.tick - a.__hpTick >= HELI_HP_EVERY)) {
+        a.__hpSent = hp; a.__hpTick = this.tick;
+        this.events.push({ e: 'heliHp', netId: a.netId, hp, maxHp: Math.round(a.maxHp) });
+      }
+    }
     for (const a of this.active) {
       if (a.alive || a.__gone) continue;
       a.__gone = true;
@@ -567,10 +588,13 @@ export class NetRoom {
     const wid = BOT_WEAPONS[Math.floor(rng.next() * BOT_WEAPONS.length) % BOT_WEAPONS.length];
     const def = MAPS[this.mapId] || {};
     const styles = def.styles || ['ally', 'enemy'];
+    // 迷彩池与单机 addBot 同一份（js/mp.js:101 的 pick 那五格）：Bot 在联机里也是别人屏幕上的
+    // 远端玩家，"本地 AI 是随机配件+随机迷彩"这一条对它同样成立（差距 29）。
     const bot = new Bot(this.game, {
       team, name, weaponId: wid, att: randomAtt(wid), difficulty: skill,
       pos: sp.pos, yaw: sp.yaw, role: 'mp',
-      style: team === 'A' ? styles[0] : styles[1], camo: 'none',
+      style: team === 'A' ? styles[0] : styles[1],
+      camo: BOT_CAMOS[Math.floor(rng.next() * BOT_CAMOS.length) % BOT_CAMOS.length],
     });
     bot.isBot = true;
     // 同步 id 与真人的 cid **共用同一个分配器**。两边各起一套编号的话，某天一个 Bot 的 id
@@ -626,6 +650,14 @@ export class NetRoom {
     return { first, n };
   }
 
+  // 连杀槽进度的**即时**读数（差距 40 的那半条）。HUD 上"还差几杀"以前只随记分板走
+  // （2 秒一份 = 0.5 Hz），而单机是每次击杀立刻充 —— 玩家看到的是自己刚杀了人、
+  // 槽却过一两秒才动。charge / onDeath 每动一次账就发一条，客户端照它刷 HUD；
+  // 记分板那份照旧带 sk（兜底：事件丢了也不会永远停在旧值上）。
+  pushStreakCharge(c) {
+    this.events.push({ e: 'streakCharge', cid: c.cid, sk: Math.floor(c.book.progress) });
+  }
+
   // 击杀的规则侧：分数、连杀充能、首杀。表现走事件。
   // 这是 MPMatch.onKill 的**规则那一半**；分值问的是 js/match-rules.js:killScore。
   onKill(killer, victim, weapon, head, info) {
@@ -633,7 +665,7 @@ export class NetRoom {
     R.kills++;
     const kc = killer ? this.byPlayer.get(killer) : null;
     const vc = victim ? this.byPlayer.get(victim) : null;
-    if (vc) { vc.deaths++; vc.book.onDeath(); }
+    if (vc) { vc.deaths++; vc.book.onDeath(); this.pushStreakCharge(vc); }
     let pts = 0;
     if (killer && killer !== victim) {
       // 团队分：只有 tdm 按击杀加分，占领模式靠占点（与单机 MPMatch 的规则一致）
@@ -654,6 +686,7 @@ export class NetRoom {
           R.charged++;
           this.events.push({ e: 'streakReady', cid: kc.cid, slot: i, id: kc.book.slots[i].id, name: kc.book.slots[i].name });
         }
+        this.pushStreakCharge(kc);
       } else if (killer && killer.isBot) {
         // Bot 的账记在它自己身上（js/ai.js:51 那三个字段，单机记分板读的就是它们）。
         // 不记的话，Bot 杀了人却在自己那一行显示 0 —— 而队伍分是加了 1 的，
@@ -683,6 +716,7 @@ export class NetRoom {
             R.charged++;
             this.events.push({ e: 'streakReady', cid: ac.cid, slot: i, id: ac.book.slots[i].id, name: ac.book.slots[i].name });
           }
+          this.pushStreakCharge(ac);
         }
         this.game.dmgBy.delete(victim);
       }
@@ -900,6 +934,9 @@ export class NetRoom {
       this.events.push({
         e: 'turret', netId: h.netId, kind: 'heli', team: pl.team,
         ang: h.ang, dur: HELI_SECONDS, height: h.height, radius: h.radius,
+        // 血量随出生一起给（之后的每一跳走 heliHp）：刚进场的人不该看到一架"100% 满血"
+        // 的直升机 —— 它可能已经被打掉一半了，而下一班 heliHp 还没到。
+        hp: Math.round(h.hp), maxHp: Math.round(h.maxHp),
       });
       this.events.push({ e: 'announce', team: pl.team, to: 'self', cid: c.cid, text: '武装直升机已就位' });
       // 对面那一句：单机是 announce('敌方武装直升机', '')（js/mp.js:255），联机原来完全没有 ——

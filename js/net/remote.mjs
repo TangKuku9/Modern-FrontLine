@@ -51,12 +51,21 @@ export class NetPlayer {
     this.buf = [];                                  // 到达时间 → 快照，插值的原料
     this.renderT = performance.now() / 1000 - INTERP_DELAY;
     this.weaponId = WEAPON_IDS[o.weapon ?? 0] || 'm4';
-    this.model = createSoldierModel(o.style || (this.team === 'A' ? 'ally' : 'enemy'), this.weaponId, {}, 'none');
+    // 套件（配件与迷彩）按**武器 id** 索引，跟着 welcome/join/respawn/pickupTake 四条
+    // 接缝走（js/loadout.mjs:kitsOf 是两端共用的那张表）。以前这里恒 {} / 'none' ——
+    // 远端人人一把素枪，与单机（随机配件 + 随机迷彩）对不上，而协议里根本没有这两个字段。
+    this.kits = {};
+    if (o.kits) for (const id of Object.keys(o.kits)) {
+      const k = o.kits[id] || {};
+      this.kits[id] = { att: k.att || {}, camo: k.camo || 'none' };
+    }
+    this.modelStyle = o.style || null;
+    this.model = this.buildModel();
     applyFlashTex(this.model);
     this.model.root.position.copy(this.pos);
     game.scene.add(this.model.root);
     this.tag = null; this.buildTag();
-    this.anim = { speed: 0, phase: 0, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0 };
+    this.anim = { speed: 0, phase: 0, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0 };
     // —— 表现层账本（见文件头）——
     this.fireCool = 0;                              // 下一发枪声还要等多久
     this.stepDist = 0;                              // 从上一声脚步起走了多少米
@@ -68,6 +77,26 @@ export class NetPlayer {
   }
   // 与 Player.hasPerk 同签名（hud 的小地图过滤对两端的实体一视同仁）
   hasPerk(id) { return this.perks.includes(id); }
+  kitOf(wid) { return this.kits[wid] || { att: {}, camo: 'none' }; }
+  buildModel() {
+    const kit = this.kitOf(this.weaponId);
+    return createSoldierModel(this.modelStyle || (this.team === 'A' ? 'ally' : 'enemy'), this.weaponId, kit.att, kit.camo);
+  }
+  // 装备回声里的套件表（join / respawn / pickupTake 三条路都走它）。手上那把枪的套件
+  // 变了就重建模型 —— 不重建的话换装之后要等到下一次换枪才看得出来，而"换了职业没生效"
+  // 正是玩家最会报的那种假象。
+  setKits(kits) {
+    if (!kits) return;
+    // 比**表项身份**而不是内容：表里每格都是新对象，所以"当前这把在不在这一批里"
+    // 就是 before !== after。按 kitOf 的返回值比会永远为真（它每次交回一个新字面量），
+    // 于是别人的换枪也会把我手上的模型重建一遍。
+    const before = this.kits[this.weaponId];
+    for (const id of Object.keys(kits)) {
+      const k = kits[id] || {};
+      this.kits[id] = { att: k.att || {}, camo: k.camo || 'none' };
+    }
+    if (!this.leaving && before !== this.kits[this.weaponId]) this.swapWeapon(this.weaponId);
+  }
   dispose() {
     if (this._fadeMats) for (const m of this._fadeMats) m.opacity = 1;
     this.game.scene.remove(this.model.root);
@@ -193,6 +222,10 @@ export class NetPlayer {
         phase: a.s.phase === undefined ? undefined : a.s.phase + angleDiff(a.s.phase, b.s.phase) * k,
         vx: lerp(a.s.vx, b.s.vx, k), vz: lerp(a.s.vz, b.s.vz, k),
         weapon: b.s.weapon,
+        // mag 要跟着插值对象一起搬：这个分支是**新拼出来的** plain object，抄漏任何一格
+        // 它就静默变成 undefined（两端点分支拿到的是原快照，于是"有的包有、有的包没有"）。
+        // 以前 mag 就这么丢的 —— 它是"到了没人消费"那一半的真正成因。
+        mag: b.s.mag,
       };
     }
     if (!s) return;
@@ -230,6 +263,11 @@ export class NetPlayer {
     a.dead = !this.alive;
     if (!this.alive) { a.deadT += dt; } else a.deadT = 0;
     a.recoil = (s.flags & FLAG.Firing) ? 1 : 0;
+    // 举枪 / 滑铲两个姿态通道：权威位是 0/1，按帧平滑（12/s）再交给 animateSoldier ——
+    // 直接跳变会让模型"啪"地弹进姿态。位本身来自快照（FLAG.Ads / FLAG.Sliding），
+    // 以前只存不用：对方据枪瞄你和腰射在画面上一模一样，滑铲的人立着滑。
+    a.ads = lerp(a.ads, (s.flags & FLAG.Ads) ? 1 : 0, Math.min(1, dt * 12));
+    a.slide = lerp(a.slide, this.sliding ? 1 : 0, Math.min(1, dt * 12));
     animateSoldier(this.model, a, dt);
 
     // 受击抖动：模型沿弹道方向被推一下，幅度线性衰减。纯表现，不改 pos（pos 是权威的）。
@@ -286,12 +324,17 @@ export class NetPlayer {
     // 正好对上本机那条链的三段音（weapon-state.js 的 out / in）。
     const rl = this.alive && !!(s.flags & FLAG.Reloading);
     if (rl !== this.reloading) { this.game.audio.reload(rl ? 'out' : 'in'); this.reloading = rl; }
+    // mag 的消费点：霰弹枪是**一发一发**装的，单机那边每入膛一发响一声（weapon-state.js
+    // 的 audio.reload('shell')），而 Reloading 位只有"开始/结束"两个跳变 —— m870 的装弹声
+    // 在联机里因此整段只剩两声。mag 每 +1 就是一发入膛，正好把中间那几声补回来。
+    const prevMag = this.lastMag;
+    this.lastMag = s.mag;
+    if (rl && st.shellReload && prevMag !== undefined && s.mag > prevMag) this.game.audio.reload('shell');
   }
   swapWeapon(wid) {
     this.weaponId = wid;
     this.game.scene.remove(this.model.root);
-    const style = this.modelStyle || (this.team === 'A' ? 'ally' : 'enemy');
-    this.model = createSoldierModel(style, wid, {}, 'none');
+    this.model = this.buildModel();          // 配件/迷彩按 kits 表走（差距 29）
     applyFlashTex(this.model);
     this.model.root.position.copy(this.pos);
     this.model.root.rotation.y = this.yaw;      // 同 update：不加 π

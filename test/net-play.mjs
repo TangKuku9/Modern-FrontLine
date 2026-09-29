@@ -584,9 +584,15 @@ try {
     n.onControl({ t: 'ev', ev: [{ e: 'kill', killer: g.player.name, victim: '乙兵', weapon: 'm4', head: false, pts: 25 }] });
     const ws1 = g.player.ws.slots.reduce((s, w) => s + w.reserve, 0);
     const popped = /拾荒者/.test(document.body.innerText);
-    // ③ 高度警觉：事件落在自己头上时 hud 要有反应（提示只给屏幕外的威胁，扔一个够远的点）
-    const p = g.player.pos;
-    n.onControl({ t: 'ev', ev: [{ e: 'highAlert', cid: n.cid, x: p.x, y: p.y, z: p.z - 200 }] });
+    // ③ 高度警觉：事件落在自己头上时 hud 要有反应。提示只给**屏幕外**的威胁
+    //    （js/hud.js:highAlert 那句投影判断），所以威胁点要按**相机朝向**放到背后 200 m。
+    //    写死世界坐标（p.z - 200）的话玩家一转身那个点就进了屏幕、判据跟着朝向闪 ——
+    //    这条实测红过一次（alertT:false，复跑又绿），是量具在赌运气，不是被测对象的问题。
+    const p = g.player.pos.clone();
+    const d = g.player.pos.clone();
+    g.camera.getWorldDirection(d);
+    const q = p.addScaledVector(d, -200);
+    n.onControl({ t: 'ev', ev: [{ e: 'highAlert', cid: n.cid, x: q.x, y: q.y, z: q.z }] });
     return { fromWelcome, fromJoin, refilled: ws1 > ws0, popped, alertT: g.hud.alertT > 0 };
   });
   ok('技能表从 welcome.others 进了远端副本（幽灵过滤读的就是这一格）', perk.fromWelcome, JSON.stringify(perk));

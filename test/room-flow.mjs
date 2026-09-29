@@ -344,6 +344,17 @@ try {
   const botOthers = (wp2 && wp2.others || []).filter(o => o.bot);
   ok('Bot 随 welcome 一起下发（客户端按这一份建插值缓存与名牌）',
     botOthers.length === 13, `others 里 ${botOthers.length} 个 Bot（共 ${(wp2 && wp2.others || []).length}）`);
+  // 套件（差距 29）：others 每一格都要带 kits —— 远端模型按它建。两条分支各查一条：
+  // 真人那支是 kitsOf(loadout)，Bot 那支是"手上那把枪"那一格（concat 出来的那半最容易漏，
+  // 漏了的症状是"Bot 全是素枪"，而它不报错）。
+  const kit1 = (o) => o.kits && Object.values(o.kits)[0];
+  const humanOthers = (wp2.others || []).filter(o => !o.bot);
+  ok('welcome.others 的真人那支带套件表（att / camo 两格都要在）',
+    humanOthers.length > 0 && humanOthers.every(o => kit1(o) && kit1(o).att && typeof kit1(o).camo === 'string'),
+    JSON.stringify(humanOthers[0] && humanOthers[0].kits));
+  ok('【反证】Bot 那支也带（旧写法两格都没有 ⇒ 这两条一起红）',
+    botOthers.length > 0 && botOthers.every(o => kit1(o) && kit1(o).att && typeof kit1(o).camo === 'string'),
+    JSON.stringify(botOthers[0] && botOthers[0].kits));
   await sleep(900);
   // 包长反推实体数：11 + n×25。这条同时证明 Bot 编进了快照、且每实体仍是 25 字节。
   const entN = p.lastBytes() ? (p.lastBytes() - 11) / 25 : -1;

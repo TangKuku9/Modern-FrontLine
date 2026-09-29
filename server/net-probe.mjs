@@ -209,6 +209,15 @@ ok(`模块按 text/javascript 发出（${js.ct}）`, js.code === 200 && /^text\/
       send(A, encodeInput({ tick: ++tick, mdx: 0, mdy: 0, keys: 0, buttons: BTN.Fire, seq: i, view: view(A.last.tick) }));
       await sleep(16);
     }
+    // 收尾要**松开扳机**再落账：停火那 300 ms 里服务端还在拿最后一份输入折叠空跑，
+    // 而那一份的按钮位还按着 Fire —— 折叠出来的每一发都会算进**下一臂**的读数。
+    // 实测形状：正臂的"不许新增 noView"被上一臂（view=0）的折叠弹打红过一次
+    // （新增 stale 0 / 新增 noView 1），同一份代码另一次跑又是绿的 —— 典型的量具竞态。
+    // 松开扳机的这几发不裁决任何伤害，只是把服务端手里那份换成"没开火"。
+    for (let i = 0; i < 3; i++) {
+      send(A, encodeInput({ tick: ++tick, mdx: 0, mdy: 0, keys: 0, buttons: 0, seq: i, view: view(A.last.tick) }));
+      await sleep(16);
+    }
     await sleep(300);
     return (await hz()).lag;
   };

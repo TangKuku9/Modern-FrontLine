@@ -92,6 +92,7 @@ export function createSoldierModel(styleName, weaponId, attachments = {}, camo =
     mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
     torso.add(mesh);
   };
+  parts.gunHome = gun.position.clone();
   const grip = gun.position.clone().add(new THREE.Vector3(0, -0.03, 0.04));
   const fore = gun.position.clone().add(gunInfo.leftHand);
   const shR = new THREE.Vector3(0.23, 0.5, 0), shL = new THREE.Vector3(-0.23, 0.5, 0);
@@ -143,16 +144,30 @@ export function animateSoldier(p, s, dt) {
   // 漏掉任何一处都会在那一路上复现。ai.js 的 respawn 里那句 rotation.set(0,yaw,0) 保留 ——
   // 它管的是同一帧就位，这里管的是"之后每一帧都不会被旧姿态污染"。
   p.root.rotation.x = 0; p.root.rotation.z = 0;
+  // 滑铲与举枪是两个**只给模型**的姿态通道（0..1）。它们的源头是权威状态位
+  // （FLAG.Sliding / FLAG.Ads），由 NetPlayer 平滑后递进来；本地 Bot 不产生它们
+  // （ai.js 里没有这两个状态），缺省 0 ⇒ 模型与从前逐帧一致。本机玩家是第一人称，
+  // 这两件事在单机里体现在相机上（滑铲降 0.25 m、侧倾 0.06，js/player.js:331,357），
+  // 第三人称的姿态只在联机看别人时才有观众。
+  const sl = s.slide || 0, ad = s.ads || 0;
   const moving = s.speed > 0.3;
   const sw = moving ? Math.sin(s.phase) : 0;
   const amp = Math.min(1, s.speed / 5) * (1 - c * 0.5);
-  const baseThigh = c * 1.25, baseKnee = -c * 1.7;
+  const baseThigh = c * 1.25 + sl * 0.85, baseKnee = -c * 1.7 - sl * 0.55;
   p.legL.leg.rotation.x = baseThigh + sw * 0.55 * amp;
   p.legR.leg.rotation.x = baseThigh - sw * 0.55 * amp;
   p.legL.knee.rotation.x = baseKnee - Math.max(0, -Math.cos(s.phase)) * 0.9 * amp;
   p.legR.knee.rotation.x = baseKnee - Math.max(0, Math.cos(s.phase)) * 0.9 * amp;
-  p.hips.position.y = 0.95 - c * 0.36 + (moving ? Math.abs(Math.cos(s.phase)) * 0.04 * amp : 0);
-  p.torso.rotation.x = s.pitch * 0.8 - c * 0.1 + (s.recoil || 0) * 0.12;
+  p.hips.position.y = 0.95 - c * 0.36 - sl * 0.3 + (moving ? Math.abs(Math.cos(s.phase)) * 0.04 * amp : 0);
+  p.torso.rotation.x = s.pitch * 0.8 - c * 0.1 + sl * 0.3 + (s.recoil || 0) * 0.12;
   p.torso.rotation.y = moving ? sw * 0.06 : 0;
   p.neck.rotation.x = s.pitch * 0.2;
+  // 举枪：枪从持枪位收到肩/眼线上（GUN_ADS 是终点，ad=0 时恰好回到 createSoldierModel
+  // 摆的那一位 —— 所以不传 ads 的调用点一个字都不会变）。
+  if (p.gun && p.gunHome) p.gun.position.lerpVectors(p.gunHome, GUN_ADS, ad);
 }
+
+// 举枪到位的枪位（torso 局部坐标）。取"贴中线、抬到眼线"：模型正面在 -Z，
+// 值由 createSoldierModel 的持枪位 (0.08, 0.4, -0.3) 收上来的那一小段，别问它像不像
+// 真的据枪 —— 它要回答的问题只是"这个人正在瞄我吗"，而那一位在持枪位上看不出来。
+const GUN_ADS = new THREE.Vector3(0.02, 0.52, -0.24);

@@ -88,3 +88,18 @@ export function sanitizeLoadout(raw) {
     perks,
   };
 }
+
+// 这个人手上那两把枪各自的配件与迷彩 —— 远端玩家的模型按它建（差距清单 29）。
+// 真相在装备表里（服务端净化后的那份 loadout），所以它跟着 welcome/join/respawn
+// 那三条**已经带着 loadout** 的接缝走，不另开一条协议字段：技能表（perks）就是
+// 同一个做法。两端共用这一个函数算同一张表，客户端就不可能算出第二份答案。
+// 按武器 id 索引（不是"当前那把"）：快照里换枪只有 1 字节的武器号，模型要能随时
+// 按手上的枪查到它自己的配件 —— 只同步"当前那把"的话，切一下手枪就丢。
+export function kitsOf(lo) {
+  const out = {};
+  if (!lo) return out;
+  for (const g of [lo.primary, lo.secondary]) {
+    if (g && g.id) out[g.id] = { att: { ...(g.att || {}) }, camo: g.camo || 'none' };
+  }
+  return out;
+}

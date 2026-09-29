@@ -26,7 +26,7 @@ import { NetClient } from '../js/net/client.mjs';
 import { NetRoom } from '../server/room.mjs';
 import { HeadlessGame, preloadMaterials } from '../server/headless-game.mjs';
 import { pauseActions, isImeKey } from '../js/menu.js';
-import { FLAG } from '../js/quant.js';
+import { FLAG, WEAPON_IDS } from '../js/quant.js';
 import { WEAPONS } from '../js/data.js';
 
 const out = [];
@@ -39,11 +39,14 @@ const angDiff = (a, b) => { let d = (b - a) % TWO_PI; if (d > Math.PI) d -= TWO_
 // 记录"表现层到底调了什么"。刻意不用真 Effects/Audio：那一层要 WebGL 与 AudioContext，
 // 而这里要断言的是**调用次数与参数**，不是听感。
 function makeGame() {
-  const log = { shot: 0, step: 0, reload: [], tracer: 0, flashLight: 0, ring: [], hurt: 0 };
+  const log = { shot: 0, step: 0, reload: [], tracer: 0, flashLight: 0, ring: [], hurt: 0, markers: null, smoke: 0 };
   const game = {
     time: 0, scene: new THREE.Scene(), entities: [], projectiles: [],
     world: { def: { surface: 'dirt' }, lineBlocked: () => false },
     player: { name: '我', team: 'A', pos: new THREE.Vector3(), alive: true },
+    // Heli.update 拿相机位置调旋翼音量 —— 桩里没这一格的话 X 段会 TypeError，
+    // 而"桩不全崩掉"不是判据的失败形状（见文件头纪律③）。
+    camera: { position: new THREE.Vector3() },
     // NetClient.update 每次都要写这一格（白磷弹的屏幕效果）。不给它的话 R 段会因为
     // "桩不全"而抛错，而那看起来像"ping 那条判据红了" —— 桩的缺口要在这里补齐，不要改被测对象。
     grade: { uniforms: { wp: { value: 0 } } },
@@ -52,12 +55,22 @@ function makeGame() {
       shot: () => { log.shot++; }, step: () => { log.step++; },
       reload: (s) => log.reload.push(s), ring: () => { log.ring.push(1); },
       hurt: () => { log.hurt++; }, explosion: () => {}, whoosh: () => {}, say: () => {}, beep: () => {},
+      // 直升机的旋翼循环音走这三个（Heli 构造/update 要用）
+      loop: () => {}, setLoopVol: () => {}, stopLoop: () => {}, click: () => {}, ui: () => {},
     },
-    effects: { tracer: () => { log.tracer++; }, flashLight: () => { log.flashLight++; }, flashbang: () => {}, explosion: () => {}, blood: () => {}, impact: () => {} },
+    effects: {
+      tracer: () => { log.tracer++; }, flashLight: () => { log.flashLight++; }, flashbang: () => {}, explosion: () => {}, blood: () => {}, impact: () => {},
+      // 直升机冒烟（Heli.update 的 hp < 70% 那一段）按次计数 —— 它是"损伤状态看得见"的证据
+      smoke: { emit: () => { log.smoke++; } }, add: { emit: () => {} },
+    },
     // explode 末尾会 makeNoise 一下（把爆炸报给 AI 的听觉）。少了它 P 段抛的是 TypeError，
     // 而"抛异常"不是判决 —— 判据的失败必须是断言红，不能是桩不全崩掉。
     makeNoise: () => {},
-    hud: { announce: () => {}, popup: () => {}, killfeed: () => {}, damageFrom: () => {}, flash: () => {}, scorebar: () => {}, streaks: () => {}, showScoreboard: () => {}, hitmarker: () => {} },
+    hud: {
+      announce: () => {}, popup: () => {}, killfeed: () => {}, damageFrom: () => {}, flash: () => {}, scorebar: () => {},
+      streaks: (list, kills) => { log.streaks = { list, kills }; }, showScoreboard: () => {}, hitmarker: () => {},
+      setMarkers: (l) => { log.markers = l; }, prompt: () => {}, progress: () => {}, highAlert: () => {},
+    },
   };
   return game;
 }
@@ -582,6 +595,187 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   ok('T4 反证臂：普通字符键也不该被吞掉', isImeKey({ isComposing: false, keyCode: 65 }) === false, 'keyCode=65（A）');
   ok('T5 事件对象缺失时不抛异常（否则整个 keydown 回调会因为一个 undefined 崩掉）',
     isImeKey(undefined) === false && isImeKey(null) === false);
+}
+
+// ───────────────────────── U. 远端套件与迷彩（差距 29）─────────────────────────
+// 远端模型以前恒以 {} / 'none' 建 —— 人人一把素枪，而单机的 AI 是随机配件 + 随机迷彩。
+// 套件的真相在装备表里（服务端净化后那份 loadout），跟着 welcome/join/respawn/pickupTake
+// 四条接缝走（js/loadout.mjs:kitsOf 两端共用）。这里量的是"到了之后模型真的按它建"：
+// 可观察量挑枪口位（消音器把 muzzle 后移 0.19，js/gunmodel.js:142）与枪上的材质色。
+// 反证臂就是**素枪那把**：旧写法下两个模型逐帧重合，U1/U2 必红。
+{
+  const g = makeGame();
+  const plain = mkRemote(g);
+  const kitted = mkRemote(g, { kits: { m4: { att: { muzzle: 'suppressor' }, camo: 'desert' } } });
+  const zPlain = plain.model.muzzle.position.z, zKit = kitted.model.muzzle.position.z;
+  ok('U1 配件上了模型：消音器把枪口后移了（素枪那把是旧写法的样子）',
+    zKit < zPlain - 0.05, `枪口 z：素 ${zPlain.toFixed(3)} vs 带消音 ${zKit.toFixed(3)}`);
+  const cols = (m) => { const s = new Set(); m.gun.traverse(o => { if (o.isMesh && o.material && o.material.color) s.add(o.material.color.getHexString()); }); return [...s].sort().join(','); };
+  ok('U2 迷彩上了色：同一把枪的材质集合与素枪不同',
+    cols(kitted.model) !== cols(plain.model), `素="${cols(plain.model)}" 迷彩="${cols(kitted.model)}"`);
+  // 换装回声：手上那把枪变了样要当场重建模型（等下次换枪才看得出来 = "换了职业没生效"的假象）
+  kitted.setKits({ m4: { att: {}, camo: 'none' } });
+  const zBack = kitted.model.muzzle.position.z;
+  ok('U3 换装回声生效：套件改了，模型当场换（枪口位回到素枪那一位）',
+    Math.abs(zBack - zPlain) < 1e-6 && kitted.model !== undefined, `枪口 z 回到 ${zBack.toFixed(3)}`);
+  ok('U4【反证】U1 不是恒真的绿灯：同一个模型在套件摘掉之后确实变回去了', zBack > zKit + 0.05, `zKit=${zKit.toFixed(3)} → ${zBack.toFixed(3)}`);
+  // 换枪按**新枪的**套件建：kits 按武器 id 索引，不许把上一把的配件套到捡来的枪上
+  kitted.setKits({ m4: { att: { muzzle: 'suppressor' }, camo: 'none' }, ak: { att: {}, camo: 'none' } });
+  kitted.push(snap({ weapon: 1 }), 0);            // 1 = ak
+  kitted.push(snap({ weapon: 1 }), 0.05);
+  kitted.update(1 / 60, 0.05 + INTERP_DELAY);
+  const plainAk = mkRemote(g);
+  plainAk.push(snap({ weapon: 1 }), 0); plainAk.push(snap({ weapon: 1 }), 0.05);
+  plainAk.update(1 / 60, 0.05 + INTERP_DELAY);
+  ok('U5 换枪之后按新枪自己的套件建模（上一把的消音器不许跟过来）',
+    kitted.weaponId === 'ak' && Math.abs(kitted.model.muzzle.position.z - plainAk.model.muzzle.position.z) < 1e-6,
+    `ak 枪口 z=${kitted.model.muzzle.position.z.toFixed(3)} · 素 ak=${plainAk.model.muzzle.position.z.toFixed(3)}`);
+  // 第四条接缝 pickupTake：别人捡了把带配件的枪，他模型上那把要跟着换 ——
+  // 事件里 att 是现成的（replaceSlot 那条路一直在用），以前只有拿枪的人自己消费。
+  const g2 = makeGame();
+  const c2 = new NetClient(g2, { url: 'ws://127.0.0.1:1/ws', name: '我', team: 'A' });
+  c2.cid = 7;
+  c2.onSnapshot({
+    tick: 1, seq: 0, worldFlags: 0, rngState: 0,
+    entities: [{ id: 2, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hp: 100, flags: FLAG.Alive, weapon: 0, mag: 30, phase: 0, vx: 0, vz: 0, team: 1, ack: 0, rep: 0 }],
+  }, 0.2);
+  const r2 = c2.remotes.get(2);
+  const zBefore = r2.model.muzzle.position.z;
+  c2.onEvents({ ev: [{ e: 'pickupTake', cid: 2, id: 9, idx: 0, weapon: 'm4', att: { muzzle: 'suppressor' }, mag: 20, reserve: 90 }] });
+  ok('U6 pickupTake 接缝：别人换枪，配件跟着上模型（否则"他捡了把消音的枪"看不出来）',
+    r2.model.muzzle.position.z < zBefore - 0.05, `枪口 z ${zBefore.toFixed(3)} → ${r2.model.muzzle.position.z.toFixed(3)}`);
+}
+
+// ───────────────────────── V. 举枪与滑铲的姿态（差距 30 那条未编号）─────────────────────────
+// FLAG.Ads / FLAG.Sliding 早就同步了，客户端只存不用：对方据枪瞄你和腰射一个样，
+// 滑铲的人立着滑。姿态通道在 animateSoldier 里（slide / ads），源头是快照位、按帧平滑。
+{
+  const drive = (flags, n = 40) => {
+    const g = makeGame();
+    const r = mkRemote(g);
+    r.push(snap({ flags }), 0);
+    r.push(snap({ flags }), 0.05);
+    for (let i = 0; i < n; i++) r.update(1 / 60, 0.05 + INTERP_DELAY);
+    return { g, r };
+  };
+  const base = drive(FLAG.Alive | FLAG.OnGround);
+  const ads = drive(FLAG.Alive | FLAG.OnGround | FLAG.Ads);
+  const dGun = ads.r.model.gun.position.distanceTo(ads.r.model.gunHome);
+  ok('V1 据枪位（FLAG.Ads）真的把枪收到了肩线上', ads.r.anim.ads > 0.9 && dGun > 0.02,
+    `anim.ads=${ads.r.anim.ads.toFixed(2)} 枪位移 ${dGun.toFixed(3)} m`);
+  ok('V2【反证】不带 Ads 的那一位枪不动 —— 判据不是"反正都能看到位移"',
+    base.r.anim.ads < 0.01 && base.r.model.gun.position.distanceTo(base.r.model.gunHome) < 1e-6,
+    `anim.ads=${base.r.anim.ads.toFixed(3)}`);
+  const slide = drive(FLAG.Alive | FLAG.OnGround | FLAG.Sliding);
+  const yBase = base.r.model.hips.position.y, ySlide = slide.r.model.hips.position.y;
+  ok('V3 滑铲（FLAG.Sliding）把人压低了（单机自己滑的时候相机也降 0.25 m）',
+    slide.r.anim.slide > 0.9 && ySlide < yBase - 0.15, `髋高 ${yBase.toFixed(3)} → ${ySlide.toFixed(3)}`);
+  ok('V4【反证】不带 Sliding 的那一位不趴（否则这条判据永远绿）',
+    base.r.anim.slide < 0.01 && Math.abs(yBase - 0.95) < 1e-6, `anim.slide=${base.r.anim.slide.toFixed(3)} 髋高=${yBase.toFixed(3)}`);
+}
+
+// ───────────────────────── W. mag 的消费点：霰弹逐发装填（差距 30 那条未编号）─────────────────────────
+// mag 以前到了没人消费，而且它连插值都过不去（中间那条插值分支拼的是新对象，抄漏一格就
+// 静默 undefined）。它的消费点是**霰弹枪一发一发装**：单机每入膛一发响一声
+// （weapon-state.js 的 audio.reload('shell')），而 Reloading 位只有开始/结束两个跳变。
+{
+  const M870 = WEAPON_IDS.indexOf('m870');
+  const fire = (weapon, mags) => {
+    const g = makeGame();
+    const r = mkRemote(g);
+    const flags = FLAG.Alive | FLAG.OnGround | FLAG.Reloading;
+    mags.forEach((mag, i) => {
+      r.push(snap({ weapon, mag, flags }), i * 0.1);
+      r.update(1 / 60, i * 0.1 + INTERP_DELAY);
+    });
+    return g.log.reload.filter(x => x === 'shell').length;
+  };
+  const shells = fire(M870, [0, 1, 2, 3]);
+  ok('W1 霰弹枪装一发响一声（与单机同一句 audio.reload(\'shell\')）', shells === 3, `响了 ${shells} 声`);
+  const stale = fire(M870, [0, 0, 0, 0]);
+  ok('W2【反证】mag 不动就一声不响（不是"Reloading 位一亮就响"）', stale === 0, `响了 ${stale} 声`);
+  const other = fire(0, [0, 1, 2, 3]);            // 0 = m4，整匣换弹
+  ok('W3 普通枪整匣换弹没有逐发声（shellReload 只属于霰弹）', other === 0, `响了 ${other} 声`);
+  // 插值中间点那一格：两包之间渲染时 mag 只从 b 那一包来 —— 旧写法那个分支抄漏了 mag
+  const g = makeGame();
+  const r = mkRemote(g);
+  const flags = FLAG.Alive | FLAG.OnGround | FLAG.Reloading;
+  r.push(snap({ weapon: M870, mag: 0, flags }), 0);
+  r.push(snap({ weapon: M870, mag: 0, flags }), 0.5);
+  r.update(1 / 60, 0.5 + INTERP_DELAY);           // 记账：上一发是 0
+  r.push(snap({ weapon: M870, mag: 1, flags }), 1.0);
+  r.update(1 / 60, 0.75 + INTERP_DELAY);          // 落在两包正中间 ⇒ 走插值分支
+  ok('W4 mag 能穿过插值分支（中间点那一帧也要看得见这一发入膛）',
+    g.log.reload.filter(x => x === 'shell').length === 1, `reload 记录=${g.log.reload.join(',')}`);
+}
+
+// ───────────────────────── X. 服务端推下来的读数，客户端画不画（差距 40 / 直升机损伤状态）─────────────────────────
+// streakCharge：连杀槽进度以前只随记分板走（2 秒一份 = 0.5 Hz），单机是每次击杀立刻充。
+// heliHp：哑副本的血量只由权威端说，头顶百分比与七成以下的冒烟都靠它。
+{
+  const g = makeGame();
+  const c = new NetClient(g, { url: 'ws://127.0.0.1:1/ws', name: '我', team: 'A' });
+  c.cid = 7;
+  c.onEvents({ ev: [{ e: 'board', scores: { A: 0, B: 0 }, timeLeft: 600, rows: [{ cid: 7, name: '我', team: 'A', k: 0, d: 0, s: 0, sk: 0 }] }] });
+  c.update(1 / 60, {});
+  ok('X1 前提：记分板那一班给的还是旧值 0（0.5 Hz 的那个迟滞就是它）',
+    g.log.streaks.kills === 0, `HUD 充能=${g.log.streaks.kills}`);
+  c.onEvents({ ev: [{ e: 'streakCharge', cid: 7, sk: 3 }] });
+  c.update(1 / 60, {});
+  ok('X2 streakCharge 一到 HUD 立刻刷（不用等下一班记分板）', g.log.streaks.kills === 3,
+    `HUD 充能=${g.log.streaks.kills}`);
+  c.onEvents({ ev: [{ e: 'streakCharge', cid: 99, sk: 9 }] });
+  c.update(1 / 60, {});
+  ok('X3【反证】别人的充能不许串到我头上（定向在客户端筛，与 hurt/flash 同一条约定）',
+    g.log.streaks.kills === 3, `HUD 充能=${g.log.streaks.kills}（别人那条 sk=9 不该进来）`);
+
+  // 直升机的损伤状态：出生事件带初值，之后每一跳 heliHp
+  c.onEvents({ ev: [{ e: 'turret', netId: 5, kind: 'heli', team: 'B', ang: 0, dur: 45, height: 24, radius: 20, hp: 600, maxHp: 600 }] });
+  const t = c.turrets.get(5);
+  c.frameUpdate(1 / 60); c.update(1 / 60, {});
+  const marker = () => (g.log.markers || []).find(m => m.id === 'heli5');
+  ok('X4 前提：满血的敌方直升机头顶标着 100%，而且不冒烟',
+    !!marker() && marker().text === '100%' && g.log.smoke === 0, `marker=${marker() && marker().text} smoke=${g.log.smoke}`);
+  c.onEvents({ ev: [{ e: 'heliHp', netId: 5, hp: 300, maxHp: 600 }] });
+  c.frameUpdate(1 / 60); c.update(1 / 60, {});
+  ok('X5 heliHp 到了：头顶百分比跟着变，七成以下开始冒烟（冒烟那段代码两端同一份）',
+    t.hp === 300 && marker().text === '50%' && g.log.smoke > 0,
+    `hp=${t.hp} marker=${marker().text} smoke=${g.log.smoke}`);
+  ok('X6【反证】友军直升机不进标记（与单机同一句：只标敌方）',
+    (() => {
+      c.onEvents({ ev: [{ e: 'turret', netId: 6, kind: 'heli', team: 'A', ang: 0, dur: 45, height: 24, radius: 20, hp: 600, maxHp: 600 }] });
+      c.frameUpdate(1 / 60); c.update(1 / 60, {});
+      return !(g.log.markers || []).some(m => m.id === 'heli6');
+    })());
+}
+
+// ───────────────────────── Y. 权威端那半：套件下发 + 连杀进度即时（差距 29 / 40）─────────────────────────
+// X 段量的是"到了画不画"，这一段量的是"发没发"。真 NetRoom 跑一遍：join 事件带套件表、
+// 击杀/死亡各推一条 streakCharge（而不是等 2 秒一班的记分板）。
+{
+  const room = new NetRoom({ id: 'kits', mapId: 'yard', seed: 20260928 });
+  await room.start();
+  const A = room.addClient({
+    name: '甲', team: 'A',
+    loadout: { primary: { id: 'm4', att: { muzzle: 'suppressor' }, camo: 'woodland' }, secondary: { id: 'm1911', att: {}, camo: 'none' }, perks: ['ghost'] },
+  });
+  const B = room.addClient({ name: '乙', team: 'B' });
+  const j = room.events.find(e => e.e === 'join' && e.cid === A.cid);
+  ok('Y1 join 事件带套件表（远端模型按它建）',
+    !!j && !!j.kits && j.kits.m4 && j.kits.m4.att.muzzle === 'suppressor' && j.kits.m4.camo === 'woodland',
+    JSON.stringify(j && j.kits));
+  ok('Y2【反证】没选配件的那把是素的（不是把上一把的表抄过去）',
+    !!j && !!j.kits.m1911 && !j.kits.m1911.att.muzzle && j.kits.m1911.camo === 'none');
+  room.events.length = 0;
+  room.game.onKill(A.pl, B.pl, 'm4', false, {});
+  const sc = room.events.filter(e => e.e === 'streakCharge' && e.cid === A.cid).pop();
+  ok('Y3 击杀那一刻就有一条 streakCharge（0.5 Hz 的迟滞就是这么丢的）',
+    !!sc && sc.sk === Math.floor(A.book.progress) && sc.sk > 0, `sk=${sc && sc.sk} book=${A.book.progress}`);
+  room.events.length = 0;
+  room.game.onKill(B.pl, A.pl, 'ak', false, {});
+  const sd = room.events.filter(e => e.e === 'streakCharge' && e.cid === A.cid).pop();
+  ok('Y4 自己死了清账也推一条（HUD 上的充能跟着归零，不用等记分板）',
+    !!sd && sd.sk === 0 && A.book.progress === 0, `sk=${sd && sd.sk} book=${A.book.progress}`);
 }
 
 // ───────────────────────── 收口 ─────────────────────────

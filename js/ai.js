@@ -25,6 +25,7 @@ export class Bot {
     this.difficulty = o.difficulty ?? 1;
     this.weaponId = o.weaponId || 'ak';
     this.att = o.att || {};
+    this.camo = o.camo || 'none';   // 挂在人身上：联机的套件同步（welcome.others 的 kits）要读它
     this.stats = computeStats(this.weaponId, this.att);
     this.maxHp = o.hp || 100; this.hp = this.maxHp;
     this.pos = o.pos.clone(); this.vel = new THREE.Vector3();

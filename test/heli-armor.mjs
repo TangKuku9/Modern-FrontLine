@@ -18,7 +18,7 @@ import * as THREE from 'three';
 import { makeStubs } from '../server/stubs.mjs';
 import { Heli, HELI_ARMOR, HELI_HITBOXES } from '../js/mp.js';
 import { fireHitscan, explode, Projectile } from '../js/combat.js';
-import { NetRoom } from '../server/room.mjs';
+import { NetRoom, HELI_HP_EVERY } from '../server/room.mjs';
 import { WEAPONS } from '../js/data.js';
 
 const checks = [];
@@ -282,6 +282,55 @@ const CB = room.addClient({ name: '乙', team: 'B' });
     !h2.alive && room2.events.some(e => e.e === 'gone' && e.kind === 'heli')
     && !room2.events.some(e => e.e === 'announce' && e.text === '武装直升机被摧毁')
     && !room2.events.some(e => e.e === 'popup'), `events=${room2.events.map(e => e.e).join(',')}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('G. 损伤状态要发得出去：头顶血量标记与冒烟的那路读数（差距清单"新产生"那条）');
+// ═══════════════════════════════════════════════════════════════════════════
+// 伤害与被击落在联机里是完整的（F 段已钉），缺的只是"还剩多少"：哑副本没有血量可显示，
+// 而协议里没有 hp 字段。这里量的是权威端那条下发链 —— turret 出生事件带初值、之后每一跳
+// 走 heliHp（按变化、限流）。客户端那一半（喂进 hp 就冒烟、头顶百分比跟着变）在
+// test/net-feel.mjs 的 X 段。
+{
+  const room3 = new NetRoom({ id: 'heli3', mapId: 'yard', seed: 20260927 });
+  await room3.start();
+  const C3 = room3.addClient({ name: '甲三', team: 'A' });
+  const D3 = room3.addClient({ name: '乙三', team: 'B' });
+  for (let i = 0; i < 7; i++) room3.game.onKill(C3.pl, D3.pl, 'm4', false, {});
+  room3.callStreak(C3, 2);
+  const h3 = room3.active.find(a => a.isHeli);
+  const tEv = room3.events.find(e => e.e === 'turret' && e.kind === 'heli');
+  ok('G1 turret 出生事件带着 hp / maxHp（刚进场的人不该看到一架"满血"的残骸）',
+    !!tEv && tEv.hp === Math.round(h3.hp) && tEv.maxHp === Math.round(h3.maxHp) && tEv.maxHp === HELI_ARMOR.hp,
+    tEv ? `hp=${tEv.hp}/${tEv.maxHp}` : '没有 turret 事件');
+
+  h3.pos.set(0, 20, 0); h3.yaw = 0; h3.enter = 0;
+  const before = h3.hp;
+  fireHitscan(room3.game, D3.pl, P(0, 10, 0), D(0, 1, 0), m4, M4.name);
+  room3.step();
+  const hpEv = room3.events.filter(e => e.e === 'heliHp');
+  const last = hpEv[hpEv.length - 1];
+  ok('G2 打掉血之后 0.2 s 内有一跳 heliHp，报的数就是权威端那架的血',
+    !!last && last.netId === h3.netId && last.hp === Math.round(h3.hp) && h3.hp < before,
+    `hp=${last && last.hp}  actual=${Math.round(h3.hp)}`);
+  ok('G3【反证】报出来的不是"永远满血"那一格 —— 旧写法没有这条事件，这一条必红',
+    !!last && last.hp < last.maxHp, `hp=${last && last.hp}/${last && last.maxHp}`);
+
+  // 限流：同一窗口里的第二枪不许再发一跳（按变化、每 HELI_HP_EVERY 拍最多一条）。
+  // 每次开火前都要把机**重新钉回射线下**：Heli.update 会把它推回航线圆上（radius 那一圈），
+  // 隔着一步再沿原方向打就是打空气 —— 判据错一次的样子就是 G4/G5 一起红。
+  room3.events.length = 0;
+  h3.pos.set(0, 20, 0); h3.enter = 0;
+  const before2 = h3.hp;
+  fireHitscan(room3.game, D3.pl, P(0, 10, 0), D(0, 1, 0), m4, M4.name);
+  room3.step();
+  const n1 = room3.events.filter(e => e.e === 'heliHp').length;
+  for (let i = 0; i < HELI_HP_EVERY + 2; i++) room3.step();
+  const n2 = room3.events.filter(e => e.e === 'heliHp').length;
+  ok('G4 限流在服务端：同一窗口里不刷屏，过了窗口该补的那一跳一定到',
+    n1 === 0 && n2 === 1, `窗口内 ${n1} 条，过窗 ${n2} 条`);
+  ok('G5【反证】这条限流判据不是恒真的：血确实又掉了一截（第二枪打中了）',
+    h3.hp < before2, `第二枪后 ${Math.round(h3.hp)}（打前 ${Math.round(before2)}）`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

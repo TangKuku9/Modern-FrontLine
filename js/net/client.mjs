@@ -9,6 +9,7 @@ import * as THREE from 'three';
 import { NetPlayer, INTERP_DELAY } from './remote.mjs';import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit } from '../quant.js';
 import { uavFromFlags } from '../match-rules.js';
+import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { clamp } from '../util.js';
 import { Sentry, Heli, flagMesh } from '../mp.js';
@@ -155,8 +156,9 @@ export class NetClient {
       const disc = (((j.loadout || {}).perks) || []).includes('hardline') ? 1 : 0;
       this.streakDefs = Array.isArray(j.streaks) ? j.streaks : [];
       this.streakState = this.streakDefs.map(d => ({ id: d.id, ready: false, used: false, cost: Math.max(2, d.kills - disc) }));
-      // 名字不在二进制快照里（变长字段会毁掉定长包），靠 welcome + join 事件带
-      for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team, perks: o.perks || [] });
+      // 名字不在二进制快照里（变长字段会毁掉定长包），靠 welcome + join 事件带。
+      // 技能表与套件表（配件/迷彩）同理 —— 它们跟着装备走，装备的真相在服务端。
+      for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team, perks: o.perks || [], kits: o.kits || null });
       this.snapGap = 0;         // 看门狗的基线：从进场这一刻开始数"多久没收到快照"
       this.settleJoin(null, j);
     } else if (j.t === 'ev') {
@@ -277,6 +279,7 @@ export class NetClient {
           team: teamId(e.team) || (this.team === 'A' ? 'B' : 'A'),
           weapon: e.weapon,
           perks: who.perks,
+          kits: who.kits,
           // 起点用这一包的坐标：留 (0,0,0) 会让第一帧把别人摆在地图原点。
           // （插值本身没跑起来时，那个原点读数会一直挂着 —— 见 test/net-play.mjs 的 rendered 差值）
           x: e.x, y: e.y, z: e.z, yaw: e.yaw,
@@ -756,12 +759,13 @@ export class NetClient {
       } else if (ev.e === 'respawn') {
         // 别人的重生：技能表跟着装备回声更新（他可能在死亡画面里换了配装 ——
         // 幽灵这类技能就挂在这张表上，不更新的话换装前后的表现会一直错着）。
+        // 套件表（配件/迷彩）同一条接缝：换职业后他手上的枪变了样，模型要跟着换。
         const r = this.remotes.get(ev.cid);
-        if (r && ev.loadout) r.perks = (ev.loadout.perks || []).slice();
+        if (r && ev.loadout) { r.perks = (ev.loadout.perks || []).slice(); r.setKits(kitsOf(ev.loadout)); }
       } else if (ev.e === 'join') {
-        this.roster.set(ev.cid, { name: ev.name, team: ev.team, perks: ev.perks || [] });
+        this.roster.set(ev.cid, { name: ev.name, team: ev.team, perks: ev.perks || [], kits: ev.kits || null });
         const r = this.remotes.get(ev.cid);
-        if (r) { r.setName && r.setName(ev.name, ev.team); r.perks = (ev.perks || []).slice(); }
+        if (r) { r.setName && r.setName(ev.name, ev.team); r.perks = (ev.perks || []).slice(); r.setKits(ev.kits); }
       } else if (ev.e === 'highAlert') {
         // 高度警觉：有人（Bot）正在瞄我。位置走事件、画在自己这台机器上 ——
         // 与 flash 同一条约定（cid 定向在客户端筛）。
@@ -832,7 +836,20 @@ export class NetClient {
           const pl = this.game.player;
           if (pl && pl.ws) pl.ws.replaceSlot(ev.idx, { id: ev.weapon, att: ev.att || {}, camo: 'none' }, ev.mag ?? undefined, ev.reserve ?? undefined);
           this.game.audio.ui('equip');
+        } else {
+          // 别人换了枪：他模型上那把要跟着换（配件随事件来，迷彩与 replaceSlot 那句同值 ——
+          // 捡来的枪就是 'none'，两端看同一把素枪才有共同语言）。
+          const r = this.remotes.get(ev.cid);
+          if (r && ev.weapon) r.setKits({ [ev.weapon]: { att: ev.att || {}, camo: 'none' } });
         }
+      } else if (ev.e === 'streakCharge') {
+        // 连杀槽进度的即时读数（差距 40）：charge/onDeath 每动一次账服务端就发一条。
+        // 记分板那份（2 秒一班）照旧兜底 —— 但"刚杀了人槽不动"这一两秒的迟滞靠这条消灭。
+        if (ev.cid === this.cid) this.streakProgress = ev.sk | 0;
+      } else if (ev.e === 'heliHp') {
+        // 直升机的损伤状态：血量只由权威端说，哑副本照它冒烟、照它画头顶的百分比。
+        const t = this.turrets.get(ev.netId);
+        if (t && t.isHeli) { t.hp = ev.hp; if (ev.maxHp) t.maxHp = ev.maxHp; }
       } else if (ev.e === 'leave') {
         const who = this.roster.get(ev.cid);
         const r = this.remotes.get(ev.cid) || this.leaving.find(x => x.id === ev.cid);
@@ -911,8 +928,8 @@ export class NetClient {
     // 占领点：旗子颜色按归属刷、名字牌挂旗顶（#markers 这层以前在联机路径下恒空）。
     // 只在**归属变了**的那几帧刷 —— 每帧重建标记是纯浪费（低配机上会把渲染帧拖住）。
     this.ensureFlags();
+    const pl = this.game.player, myT = pl && pl.team;
     if (this.flags) {
-      const pl = this.game.player, myT = pl && pl.team;
       const sig = myT + ':' + this.flags.map(f => f.owner).join(',');
       if (sig !== this._flagSig) {
         this._flagSig = sig;
@@ -922,12 +939,27 @@ export class NetClient {
           f.mesh.userData.cloth.material.color.setHex(col);
           f.mesh.userData.cloth.material.emissive.setHex(col);
         }
-        this.game.hud.setMarkers(this.flags.map(f => ({
-          id: 'f' + f.name, pos: f.pos.clone().setY(f.mesh.position.y + 3.6), label: f.name,
-          cls: 'flag ' + (f.owner === myT ? 'ally' : f.owner ? 'enemy' : 'neutral'),
-        })));
       }
     }
+    // 标记层 = 旗子名字牌 + **敌方直升机的血量百分比**（与单机 MPMatch.update 的那一段同形，
+    // js/mp.js:401-404）。直升机在 24 m 高空，一梭子下去掉的血看不见 —— 没有这条读数，
+    // 玩家没法判断自己在不在有效输出。血量由权威端同步（turret 出生值 + heliHp 每一跳）。
+    const markers = [];
+    if (this.flags) for (const f of this.flags) {
+      markers.push({
+        id: 'f' + f.name, pos: f.pos.clone().setY(f.mesh.position.y + 3.6), label: f.name,
+        cls: 'flag ' + (f.owner === myT ? 'ally' : f.owner ? 'enemy' : 'neutral'),
+      });
+    }
+    for (const t of this.turrets.values()) {
+      if (!t.isHeli || !t.alive || t.team === myT) continue;
+      markers.push({
+        id: 'heli' + t.netId, pos: t.pos.clone().setY(t.pos.y + 2.4), label: t.name, cls: 'enemy',
+        text: `${Math.max(1, Math.ceil(t.hp / t.maxHp * 100))}%`, hideDist: true,
+      });
+    }
+    const msig = markers.map(m => `${m.id}:${m.cls}:${m.text || ''}`).join('|');
+    if (msig !== this._mSig) { this._mSig = msig; this.game.hud.setMarkers(markers); }
   }
 
   // ---------- 连杀奖励在本地的表现 ----------
@@ -1042,6 +1074,9 @@ export class NetClient {
       ent = new Heli(g, ev.team, owner, { dumb: true, duration: ev.dur, ang: ev.ang, height: ev.height, radius: ev.radius });
     }
     ent.netId = ev.netId;
+    // 血量随出生事件给（之后的每一跳走 heliHp）：直升机可能在你进场前就被打残了，
+    // 只有初始值 100% 的话，那架冒烟的直升机头顶写着满血。
+    if (ev.hp !== undefined) { ent.hp = ev.hp; if (ev.maxHp) ent.maxHp = ev.maxHp; }
     this.turrets.set(ev.netId, ent);
   }
 
