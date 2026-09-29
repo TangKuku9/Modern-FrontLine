@@ -224,9 +224,41 @@ const play = await page.evaluate(async () => {
   frames(60);
   cur = vm.groups[ws.cur];
 
+  // S9 分件动作：套筒/拉机柄/泵动护木/弹巢要**自己**动。以前它们是死几何，
+  // 栓动=整枪滚 0.2 rad、泵动=整枪推 4cm，动的是整把枪。判据读的是分件自己的位移。
+  const partZ = (part) => {
+    const p = vm.groups[ws.cur].info[part];
+    return p && p.userData.base ? +(p.position.z - p.userData.base.z).toFixed(4) : null;
+  };
+  const withGun = (id, fn) => {
+    ws.replaceSlot(0, { id, att: {}, camo: 'none' }, 30, 200);
+    frames(60); ws.cool = 0; ws.cycleT = 0;
+    const r = fn();
+    ws.replaceSlot(0, { id: 'm4', att: {}, camo: 'none' }, 30, 150);
+    frames(60);
+    return r;
+  };
+  const shot = () => { frames(1, () => { g.input.buttons = 1; }); g.input.buttons = 0; };
+  const slideBack = withGun('m1911', () => { shot(); frames(1); return partZ('slide'); });
+  ok('S9 手枪击发时套筒后坐', slideBack !== null && slideBack > 0.01, `套筒后移 ${slideBack} m`);
+  const slideEmpty = withGun('m1911', () => { ws.w.mag = 1; shot(); frames(20); return partZ('slide'); });
+  ok('S9 打空后套筒停在后方（空仓挂机）', slideEmpty !== null && slideEmpty > 0.02, `套筒偏移 ${slideEmpty} m`);
+  const boltBack = withGun('l115', () => { shot(); frames(10); return partZ('bolt'); });
+  ok('S9 栓动上膛时拉机柄后拉', boltBack !== null && boltBack > 0.01, `拉机柄后移 ${boltBack} m`);
+  const pumpBack = withGun('m870', () => { shot(); frames(10); return partZ('pump'); });
+  ok('S9 泵动上膛时护木后推', pumpBack !== null && pumpBack > 0.01, `护木后移 ${pumpBack} m`);
+  const cyl = withGun('revolver', () => {
+    const b = vm.groups[ws.cur].info.cylinder.rotation.z;
+    shot(); frames(2);
+    return +(vm.groups[ws.cur].info.cylinder.rotation.z - b).toFixed(3);
+  });
+  ok('S9 左轮弹巢每发转一格', cyl > 0.5, `转过 ${cyl} rad`);
+
   // H1 换弹时副手要动（原来手臂是枪组刚性子件，弹匣在手里下坠又回来，手纹丝不动）
   ws.w.mag = Math.min(ws.w.mag, 3);
   ws.startReload();
+  frames(1);
+  cur = vm.groups[ws.cur];   // S9 里换过枪，旧的 cur 已经被 syncLoadout 摘下 holder
   const arm = cur.arms;
   const mag = cur.info.mag;
   let away = 0, grab = 0, n = 0;

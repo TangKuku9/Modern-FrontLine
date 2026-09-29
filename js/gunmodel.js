@@ -31,7 +31,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   const root = new THREE.Group();
   // eject 是**抛壳口**的锚点：弹壳从这里出来，不是从枪口后方 0.4 m 的固定点。
   // 它必须是挂在枪上的 Object3D（跟 muzzle 一样），否则枪一动弹壳就落在旧位置。
-  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Object3D(), optic: 'iron', reticle: null };
+  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Object3D(), optic: 'iron', reticle: null, slide: null, bolt: null, pump: null, cylinder: null };
   root.add(info.eject);
   const low = !!opts.low;
 
@@ -71,7 +71,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     if (M.revolver) {
       add(bgeo(0.028, 0.035, 0.16), body, 0, 0.055, -0.1);
       add(cgeo(0.011, 0.011, 0.2), body, 0, 0.06, -0.14);
-      add(cgeo(0.028, 0.028, 0.05, 12), metal, 0, 0.05, -0.02);
+      info.cylinder = add(cgeo(0.028, 0.028, 0.05, 12), metal, 0, 0.05, -0.02);   // 弹巢：每发转一格
       add(bgeo(0.03, 0.1, 0.045), mat('gunWood'), 0, -0.02, 0.04, 0.3);
       add(bgeo(0.004, 0.012, 0.01), metal, 0, 0.078, -0.23);
       info.muzzle.position.set(0, 0.06, -0.25);
@@ -79,7 +79,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
       info.eject.position.set(0.034, 0.05, -0.02);   // 弹巢与底把之间的缝，装弹时才打开
       info.mag = add(bgeo(0.001, 0.001, 0.001), metal, 0, 0.05, -0.02);
     } else {
-      add(bgeo(0.03, 0.032, 0.2), body, 0, 0.05, -0.07);
+      info.slide = add(bgeo(0.03, 0.032, 0.2), body, 0, 0.05, -0.07);   // 套筒：击发时后坐、空仓挂机
       add(bgeo(0.028, 0.025, 0.16), metal, 0, 0.022, -0.06);
       add(bgeo(0.03, 0.1, 0.045), furn, 0, -0.03, 0.03, 0.25);
       add(bgeo(0.005, 0.03, 0.04), metal, 0, 0.0, -0.035);
@@ -131,12 +131,13 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   if (!low) {
     for (let i = 0; i < Math.floor(recv / 0.02); i++) add(bgeo(0.026, 0.004, 0.008), metal, 0, railY + 0.014, zRear - 0.01 - i * 0.02);
     add(bgeo(0.005, 0.025, 0.06), mat('gunSteel'), 0.027, 0.035, -0.03); // 抛壳窗
-    add(bgeo(0.02, 0.01, 0.03), metal, 0.03, 0.045, zRear - 0.04); // 拉机柄
+    info.bolt = add(bgeo(0.02, 0.01, 0.03), metal, 0.03, 0.045, zRear - 0.04); // 拉机柄：上膛时后拉
   }
   // 护木
   const hz0 = zFront, hz1 = zFront - hand;
   const handH = M.color === 'wood' ? 0.05 : 0.06;
-  add(bgeo(0.056, handH, hand), furn, 0, 0.03, (hz0 + hz1) / 2);
+  const forend = add(bgeo(0.056, handH, hand), furn, 0, 0.03, (hz0 + hz1) / 2);
+  if (M.mag === 'tube') info.pump = forend;   // 泵动霰弹枪的护木就是护木：上膛时前后推
   if (!low && M.color !== 'wood') {
     for (let i = 0; i < 4; i++) add(bgeo(0.058, 0.006, 0.03), metal, 0, 0.03 + (i % 2 ? -0.012 : 0.012), hz0 - 0.03 - i * (hand / 4.5));
   }

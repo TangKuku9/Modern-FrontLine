@@ -67,7 +67,9 @@ export class Viewmodel {
       laserDot = new THREE.Mesh(new THREE.SphereGeometry(0.02, 8, 6), new THREE.MeshBasicMaterial({ color: new THREE.Color(8, 0.5, 0.5) }));
       this.game.scene.add(laserDot); laserDot.visible = false;
     }
-    return { info, group: g, arms, flash, flashDur, laserDot };
+    // 分件动作的基准位：套筒/拉机柄/泵动护木都从原位往后/往前推
+    for (const p of [info.slide, info.bolt, info.pump]) if (p && !p.userData.base) p.userData.base = p.position.clone();
+    return { info, group: g, arms, flash, flashDur, laserDot, act: 0, cylStep: 0 };
   }
   syncLoadout() {
     if (this.ws.loadoutVersion === this.seenVersion) return;
@@ -120,6 +122,8 @@ export class Viewmodel {
           }
           this.vmKick += 0.02 + e.recoilV * 0.012;
           this.vmRot += 0.02 + e.recoilV * 0.02;
+          cur.act = 1;       // 套筒后坐
+          cur.cylStep = 1;   // 左轮弹巢转一格
         } else if (e.kind === 'sfx') {
           this.sfx.push({ t: e.at, name: e.name });
         }
@@ -132,6 +136,7 @@ export class Viewmodel {
     }
     this.vmKick = damp(this.vmKick, 0, 14, dt);
     this.vmRot = damp(this.vmRot, 0, 10, dt);
+    cur.act = damp(cur.act, 0, 14, dt);
     this.flashT -= dt;
     cur.flash.visible = this.flashT > 0;
     if (cur.flash.visible) cur.flash.material.rotation = Math.random() * 6;
@@ -214,8 +219,20 @@ export class Viewmodel {
       const e = ws.state === 'cook' ? 1 : Math.sin(k * Math.PI);
       pos.y -= e * 0.25; rx -= e * 0.5; pos.x += e * 0.05;
     }
-    if (st.fire === 'bolt' && ws.cycleT > 0) { const e = Math.sin((1 - ws.cycleT / (60 / st.rpm)) * Math.PI); rz += e * 0.2 * (1 - ae * 0.5); pos.y -= e * 0.02; }
-    if (st.fire === 'pump' && ws.cycleT > 0) { const e = Math.sin((1 - ws.cycleT / (60 / st.rpm)) * Math.PI); pos.z += e * 0.04; }
+    // 分件动作。以前栓动是"整枪滚 0.2 rad"、泵动是"整枪推 4cm" —— 动的是整把枪，
+    // 而真正该动的拉机柄/泵动护木是死几何。现在分件自己走，整枪只留一点后坐回落。
+    const cyc = ws.cycleT > 0 ? Math.sin((1 - ws.cycleT / (60 / st.rpm)) * Math.PI) : 0;
+    if (st.fire === 'bolt') { rz += cyc * 0.06 * (1 - ae * 0.5); pos.y -= cyc * 0.012; }
+    if (st.fire === 'pump') pos.z += cyc * 0.015;
+    if (cur.info.bolt && cur.info.bolt.userData.base) cur.info.bolt.position.copy(cur.info.bolt.userData.base).add(_magOff.set(0, 0, 0.055 * cyc));
+    if (cur.info.pump && cur.info.pump.userData.base) cur.info.pump.position.copy(cur.info.pump.userData.base).add(_magOff.set(0, 0, 0.09 * cyc));
+    // 套筒：击发后坐再回位；打空了停在后方（空仓挂机）
+    if (cur.info.slide && cur.info.slide.userData.base) {
+      const back = w.mag <= 0 ? 1 : cur.act;
+      cur.info.slide.position.copy(cur.info.slide.userData.base).add(_magOff.set(0, 0, 0.032 * back));
+    }
+    // 弹巢每发转一格（左轮不抛壳，但弹巢确实要跟着转）
+    if (cur.info.cylinder && cur.cylStep) { cur.info.cylinder.rotation.z += Math.PI / 3; cur.cylStep = 0; }
     this.holder.position.copy(pos);
     this.holder.rotation.set(rx, ry, rz);
     // 瞄具遮罩：高倍镜隐藏模型（scopeState 本身已由 WeaponState 给出，这里只管模型可见性）
