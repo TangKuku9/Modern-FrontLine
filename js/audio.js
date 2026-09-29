@@ -1,3 +1,20 @@
+// 播报音色偏好：Natural 神经网络女声优先（Edge 在线音色），本地音色做离线降级，男声垫底。
+const VOICE_FEMALE = /xiaoxiao|xiaoyi|xiaobei|xiaochen|xiaoni|huihui|yaoyao|tingting/i;
+const VOICE_MALE = /kangkang|yunxi|yunyang|yunjian|yunxia|yunze|yunye|yunfeng/i;
+
+export function pickZhVoices(voices) {
+  const score = v => {
+    let s = 0;
+    if (/natural/i.test(v.name)) s += 40;
+    if (VOICE_FEMALE.test(v.name)) s += 20;
+    if (VOICE_MALE.test(v.name)) s -= 100;
+    return s;
+  };
+  const ranked = voices.filter(v => v.lang && v.lang.toLowerCase().startsWith('zh'))
+    .sort((a, b) => score(b) - score(a));
+  return { primary: ranked[0] || null, fallback: ranked.find(v => v.localService) || ranked[0] || null };
+}
+
 // WebAudio 程序化音效
 export class Audio {
   constructor() {
@@ -5,6 +22,7 @@ export class Audio {
     this.listener = { x: 0, y: 0, z: 0, yaw: 0 };
     this.loops = {};
     this.voice = true;
+    this.picked = null;
   }
   init() {
     if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
@@ -197,11 +215,21 @@ export class Audio {
   say(text, rate = 1.1, pitch = 0.9) {
     if (!this.voice || !window.speechSynthesis) return;
     try {
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = 'zh-CN'; u.rate = rate; u.pitch = pitch; u.volume = Math.min(1, this.volume + 0.1);
-      const v = speechSynthesis.getVoices().find(v => v.lang && v.lang.startsWith('zh'));
-      if (v) u.voice = v;
-      speechSynthesis.speak(u);
+      const list = speechSynthesis.getVoices();
+      if (!this.picked || (!this.picked.primary && list.length)) this.picked = pickZhVoices(list);
+      const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      const speak = (v, canRetry) => {
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'zh-CN'; u.rate = rate; u.pitch = pitch; u.volume = Math.min(1, this.volume + 0.1);
+        if (v) u.voice = v;
+        // 在线音色断网时会报网络类错误 —— 降级到本地音色再说一遍；cancel 触发的
+        // interrupted/canceled 不在此列，否则 stopAll() 之后会把刚掐掉的句子重播出来。
+        if (canRetry && this.picked.fallback && v !== this.picked.fallback) u.onerror = e => {
+          if (e.error === 'network' || e.error === 'synthesis-unavailable' || e.error === 'voice-unavailable') speak(this.picked.fallback, false);
+        };
+        speechSynthesis.speak(u);
+      };
+      speak((offline && this.picked.fallback) || this.picked.primary, true);
     } catch (e) { }
   }
 }

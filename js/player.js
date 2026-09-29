@@ -213,7 +213,9 @@ export class Player {
     if (!this.alive) return;
     // 视角
     const ws = this.ws;
-    const zoom = lerp(1, ws.w ? ws.w.stats.zoom : 1, ws.adsT);
+    // 插值曲线必须跟 updateCamera 里的相机 zoom 一致（同用 adsT²）：不一致时开镜过程中
+    // 视野还没收到位、灵敏度已经先降了，手感是"手比眼慢"。
+    const zoom = lerp(1, ws.w ? ws.w.stats.zoom : 1, ws.adsT * ws.adsT);
     const sens = game.settings.sens * 0.0022 * (ws.adsT > 0.5 ? game.settings.adsSens / Math.pow(zoom, 0.85) : 1);
     this.yaw -= input.mdx * sens;
     this.pitch -= input.mdy * sens * (game.settings.invertY ? -1 : 1);

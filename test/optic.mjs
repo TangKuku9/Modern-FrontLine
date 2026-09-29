@@ -297,6 +297,20 @@ const geo = await page.evaluate(async () => {
     // 高倍镜那一串必须仍然比裸枪慢
     ok('O8⁻ 反证：高倍镜仍然比裸枪慢', acog > iron && therm > iron, `acog=${acog.toFixed(3)} thermal=${therm.toFixed(3)} 裸=${iron.toFixed(3)}`);
   }
+
+  // O9：配件名字里写了倍数的，fx.zoom 必须就是那个数。2026-09-28 用户报"4 倍镜跟没放大差不多"，
+  // 查出来是名字叫"4 倍 ACOG"而 fx.zoom 配 3 —— 枪匠卡片上名字和"● 放大倍率 3x"并排自相矛盾。
+  // 名字是玩家读到的承诺，zoom 是相机真收的 FOV（player.js updateCamera），两处必须同数。
+  {
+    const { ATTACHMENTS } = await import('/js/data.js');
+    const bad = [];
+    for (const a of ATTACHMENTS.optic) {
+      const m = a.name.match(/(\d+(?:\.\d+)?)\s*倍/);
+      if (m && parseFloat(m[1]) !== a.fx.zoom) bad.push(`${a.name}→${a.fx.zoom}x`);
+    }
+    ok('O9 名字里写的倍数 == fx.zoom', bad.length === 0,
+      bad.length ? bad.join(' ') : ATTACHMENTS.optic.map(a => `${a.id}:${a.fx.zoom}x`).join(' '));
+  }
   return out;
 });
 
@@ -442,6 +456,39 @@ const px = await page.evaluate(async () => {
   // 角落也有差分的话，说明"世界静止"这个前提没成立，O5⁺ 量到的是噪声不是红点。
   ok('O5⁻ 反证：远离中心的同尺寸窗口几乎无差分', k.n <= 2, `cornerDiffPx=${k.n}`);
 
+  // ---------- 阶段 C：ACOG 的三角形分划画在 HUD 遮罩层（CSS）里，不在枪模里 ----------
+  // 2026-09-28 用户嫌三角形太大：整体缩 50%（底 14→7px、高 12→6px），再在左右各加一条辅助细线。
+  // 跟 O6 一样立成判据且两个方向都卡 —— 只写"不许大"的话，缩到 0（分划整个消失）也照样全绿。
+  // 判据走**真实路径**：换上 ACOG、拉满 ADS，由 weapon-state/hud 自己把 #scope 挂成 acog；
+  // 手动 sc.className='acog' 去量 CSS 的话，hud 那头坏了判据也绿（量具绕开了被测对象）。
+  {
+    const rc2 = g.composer.render.bind(g.composer);
+    g.composer.render = () => {};                 // 驱动期同阶段 B：不真渲染，省 swiftshader
+    ws.replaceSlot(0, { id: 'm4', att: { optic: 'acog' }, camo: 'none' }, 30, 150);
+    // 循环条件必须连 ws.state 一起看：replaceSlot 会置 state='switch'（0.45s），换枪期间
+    // wantAds 为假、adsT 在掉。只写 adsT<0.995 的话，接在阶段 B（adsT 已经满）后面
+    // 一次都不进循环 —— replaceSlot 没生效，判据量到的还是红点那一屏（第一版就是这么错的）。
+    for (let i = 0; i < 300 && (ws.state !== 'idle' || ws.adsT < 0.995); i++) { g.input.buttons = 4; g.frame(); }
+    g.composer.render = rc2;
+    const sc = document.getElementById('scope');
+    ok('C0 真实路径：满 ADS 时 hud 把 #scope 挂成 acog', g.scopeState === 'acog' && sc.className === 'acog' && ws.adsT > 0.99,
+      `scopeState=${g.scopeState} class=${sc.className} adsT=${ws.adsT.toFixed(3)}`);
+    const dot = sc.querySelector('.scope-dot');
+    const cs = getComputedStyle(dot);
+    const n = (v) => parseFloat(v);
+    const triH = n(cs.borderBottomWidth), triW = n(cs.borderLeftWidth) + n(cs.borderRightWidth);
+    const col = (cs.borderBottomColor.match(/\d+/g) || []).map(Number);
+    ok('C1 三角形高 6px（5–7px，两个方向都判）', triH >= 5 && triH <= 7, `高=${triH}px（旧 12px）`);
+    ok('C2 三角形底宽 7px（5.5–8.5px，两个方向都判）', triW >= 5.5 && triW <= 8.5, `底=${triW}px（旧 14px）`);
+    ok('C2b 三角形是实心红的（不是透明占位）', col[0] > 150 && col[1] < 120 && (col[3] === undefined || col[3] > 0), cs.borderBottomColor);
+    const b4 = getComputedStyle(dot, '::before'), a4 = getComputedStyle(dot, '::after');
+    const lw = n(b4.width), rw = n(a4.width);
+    ok('C3 左右辅助细线都在（长 22px，14–30px 两个方向都判）', lw >= 14 && lw <= 30 && rw >= 14 && rw <= 30,
+      `左=${b4.width} 右=${a4.width}（NaN=伪元素没生成）`);
+    ok('C3b 是细线（高 1px，0.5–1.5px）且左右对称', n(b4.height) >= 0.5 && n(b4.height) <= 1.5 && n(a4.height) >= 0.5 && n(a4.height) <= 1.5 && b4.right === a4.left,
+      `左高=${b4.height} 右高=${a4.height} 边距 L=${b4.right} R=${a4.left}`);
+  }
+
   g.clock = realClock; realClock.getDelta();      // 还原真时钟再恢复主循环（截图要按真实节奏跑）
   g.renderer.setAnimationLoop(() => g.frame());
   // 注意 buttons 别清零：恢复 loop 后玩家要保持 ADS，下面的截图才是"瞄着的时候"的画面
@@ -449,6 +496,22 @@ const px = await page.evaluate(async () => {
 });
 
 try { await page.mouse.click(320, 180); } catch { /* pointer lock 恢复不了也不影响判据 */ }
+await page.waitForTimeout(1500);
+// "点击屏幕继续"是丢指针锁后挂的提示，正好压在屏幕中心的准星上 —— 截图前摘掉
+await page.evaluate(() => document.getElementById('clickToPlay').classList.add('hidden'));
+// 阶段 C 收尾停在 ACOG 满 ADS：这一屏就是三角形分划 + 左右细线的肉眼证据
+await page.screenshot({ path: 'test/acog-reticle.png' });
+// 中心特写：三角形只有 6px 高、细线 1px，整屏图上看不出尺寸。先把 DPR 提到 4 让浏览器
+// 按 4 倍像素密度重绘这块 DOM（比事后拉伸位图清楚）；同时停掉渲染循环 —— 免得 swiftshader
+// 在 5120×2880 的同步帧里被 watchdog 掐掉上下文，掐掉会冒 console.error 把整局判据染红。
+await page.evaluate(() => window.game.renderer.setAnimationLoop(null));
+const cdp = await page.context().newCDPSession(page);
+await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 4, mobile: false });
+await page.screenshot({ path: 'test/acog-reticle-close.png', clip: { x: 545, y: 340, width: 190, height: 40 } });
+await cdp.send('Emulation.clearDeviceMetricsOverride');
+await page.evaluate(() => window.game.renderer.setAnimationLoop(() => window.game.frame()));
+// 切回红点再拍 optic.png —— 这张图自 O3/O5 起就是"红点 ADS"的证据，别让 ACOG 把它占了
+await page.evaluate(() => { window.game.player.ws.replaceSlot(0, { id: 'm4', att: { optic: 'reddot' }, camo: 'none' }, 30, 150); });
 await page.waitForTimeout(1500);
 await page.screenshot({ path: 'test/optic.png' });
 await browser.close();
