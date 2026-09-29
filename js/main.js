@@ -69,7 +69,7 @@ const MAX_STEPS_PER_FRAME = 8;     // 单帧最多补几步，超出就丢时间
 class Game {
   constructor() {
     this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true, fixedStep: true }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
-    this.profile = Object.assign({ xp: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
+    this.profile = Object.assign({ xp: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null, muted: [] }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
     if (!this.profile.classes || this.profile.classes.length < 5) this.profile.classes = JSON.parse(JSON.stringify(DEFAULT_CLASSES));
     // 存档里读出来的东西要过一遍表：mf_profile 是玩家能自己编辑的文件，一个不存在的枪 id
     // 会让菜单在 new Menu → buildScene → buildGun 里抛，整个页面停在"初始化失败"。
@@ -281,8 +281,13 @@ class Game {
     // 后者只重画整块列表 —— 拿它走追加路径会画出一条没有 text 的空行，
     // 而"新进来的人看不到之前说过什么"这种缺陷没人会当 bug 报，只会以为频道本来就是空的。
     if (Array.isArray(j.hist)) { if (j.ch === 'lobby' && this.menu.screen === 'online') this.menu.renderChat(this.menu.el, 'lobby'); return; }
+    // 对局里的话（match/team 频道 + 举报回执那类 sys 行）上 HUD 的聊天条（差距 43）。
+    // 分流判据是**频道**，不是"在不在对局里"：回执在房间屏上也是要看见的。
+    if (this.state === 'play' && j.ch !== 'lobby' && j.ch !== 'room') { this.hud.chatPush(j); return; }
     if (j.ch === 'lobby') { if (this.menu.screen === 'online') this.menu.pushChat(this.menu.el, 'lobby', j); return; }
+    // 剩下的是房间行与 sys 回执：按当前那一屏画进对应面板
     if (this.menu.screen === 'onlineRoom') this.menu.pushChat(this.menu.el, 'room', j);
+    else if (j.ch === 'sys' && this.menu.screen === 'online') this.menu.pushChat(this.menu.el, 'lobby', j);
   }
   onLobbyNote(msg) {
     // 服务端下线时那一句：在对局里就报在 HUD 上，在菜单里就写在当前那一屏上。
@@ -472,6 +477,14 @@ class Game {
         if (e.code === 'Tab') this.hud.showScoreboard(true);
         if (e.code === 'Escape' && !document.pointerLockElement && !this.paused && !this.menu.overlayOpen) this.pause(true);
         if (this.dead && e.code === 'KeyC' && this.mode && this.mode.canChangeClass) this.menu.showClassSelect();
+        // 对局内聊天（差距 43）：Enter 全体、Y 队伍。**只在联机局里**开 ——
+        // 单机没有第二个说话的人，开了就是个发不出去的输入框。断线后也不开：
+        // 那时 Enter 归"按 Enter 重新连接"（netLostUi），抢过来会让重连这条路消失。
+        if (this.net && !this.net.lost && !this.paused && !this.menu.overlayOpen && !this.hud.chatActive
+          && (e.code === 'Enter' || e.code === 'NumpadEnter' || e.code === 'KeyY')) {
+          this.hud.chatOpen(e.code === 'KeyY' ? 'team' : 'match');
+          e.preventDefault();
+        }
       }
     });
     window.addEventListener('keyup', e => { I.keys[e.code] = false; if (e.code === 'Tab' && this.state === 'play') this.hud.showScoreboard(false); });
@@ -481,6 +494,9 @@ class Game {
     const MF = this.mouseFilter = { since: 0, avg: 0, strikes: 0, lastT: 0 };
     window.addEventListener('mousemove', e => {
       if (document.pointerLockElement !== cv) return;
+      // 打字时视角不动：鼠标还在指针锁里，不拦的话每敲一个字视角跟着甩（聊天输入
+      // 是键盘优先的，鼠标这时归"别碰"，见 setupInput 里 chatActive 的另外两处）。
+      if (this.hud && this.hud.chatActive) return;
       const now = performance.now();
       if (now - MF.since < 120) return;                       // 锁定刚生效：丢弃
       const dx = e.movementX || 0, dy = e.movementY || 0;
@@ -496,11 +512,14 @@ class Game {
       I.mdx += dx; I.mdy += dy;
     });
     window.addEventListener('mousedown', e => {
+      // 打字时点鼠标什么都不会发生（不重新锁、不开火）：瞄准那一枪打在聊天框上
+      // 是这类叠加 UI 最容易被否掉的形状（键盘优先，鼠标这时是"别碰"）。
+      if (this.hud && this.hud.chatActive) return;
       if (this.state === 'play' && !this.paused && document.pointerLockElement !== cv && !this.menu.overlayOpen && e.target === cv) { this.lock(); return; }
       if (document.pointerLockElement === cv) { I.buttons |= (1 << e.button); I.pressed['Mouse' + e.button] = true; }
     });
     window.addEventListener('mouseup', e => { I.buttons &= ~(1 << e.button); });
-    window.addEventListener('wheel', e => { if (document.pointerLockElement === cv) I.wheel += Math.sign(e.deltaY); }, { passive: true });
+    window.addEventListener('wheel', e => { if (document.pointerLockElement === cv && !(this.hud && this.hud.chatActive)) I.wheel += Math.sign(e.deltaY); }, { passive: true });
     window.addEventListener('contextmenu', e => e.preventDefault());
     document.addEventListener('pointerlockchange', () => {
       const locked = document.pointerLockElement === cv;
@@ -559,6 +578,14 @@ class Game {
   // 帧输入快照
   snapshotInput() {
     const I = this.input, K = I.keys, P = I.pressed;
+    // 打字时（对局内聊天开着）人要站住：W 是开聊天之前按下的，不清掉的话输入框里
+    // 每敲一个字母人都往前挪一格，而服务端照单全收这些移动 —— 不报错、没人拦。
+    // 清的是**本地这份**：服务端那边靠同一份空输入对齐（预测与权威一起站住）。
+    if (this.hud && this.hud.chatActive) {
+      for (const k in K) K[k] = false;
+      for (const k in P) delete P[k];
+      I.mdx = 0; I.mdy = 0; I.wheel = 0; I.buttons = 0;
+    }
     const s = {
       fwd: K.KeyW, back: K.KeyS, left: K.KeyA, right: K.KeyD,
       sprint: K.ShiftLeft || K.ShiftRight, jumpPressed: P.Space, crouchPressed: P.KeyC || P.ControlLeft,

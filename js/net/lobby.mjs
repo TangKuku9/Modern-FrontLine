@@ -117,7 +117,9 @@ export class LobbyClient {
       if (Array.isArray(j.hist)) { if (j.ch === 'lobby') this.chat = j.hist.slice(); }
       else {
         if (j.ch === 'lobby') { this.chat.push(j); if (this.chat.length > 60) this.chat.shift(); }
-        else if (this.state && this.state.chat) { this.state.chat.push(j); if (this.state.chat.length > 60) this.state.chat.shift(); }
+        // 只有**房间频道**进房间历史。match/team（对局里的话）与 sys（举报回执）不进 ——
+        // 混进来的症状是"打完回到房间，聊天框里翻出上一局对战中的闲聊"，而且删不掉。
+        else if (j.ch === 'room' && this.state && this.state.chat) { this.state.chat.push(j); if (this.state.chat.length > 60) this.state.chat.shift(); }
       }
       this.onChat(j);
     } else if (j.t === 'welcome') {

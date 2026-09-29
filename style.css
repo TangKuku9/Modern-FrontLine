@@ -113,6 +113,8 @@ html, body { position: fixed; inset: 0; }
 .chat-box { display: flex; flex-direction: column; min-height: 0; }
 .chat-lines { flex: 1; min-height: 88px; max-height: 158px; overflow-y: auto; font-size: 12px; line-height: 1.7; color: #cfcfcf; }
 .chat-line b { color: #8fb8ff; font-weight: 700; }
+.chat-line.team b { color: #7fe07f; }
+.chat-line .ct-time { font-style: normal; font-size: 10px; color: #8a8a8a; margin-right: 6px; }
 .chat-line b.me { color: var(--acc); }
 .chat-line span { margin-left: 6px; color: #e8e8e8; word-break: break-all; }
 .chat-line.sys { color: #8a8a8a; }
@@ -310,6 +312,20 @@ html, body { position: fixed; inset: 0; }
 .sb-flag.A { border-color: var(--ally); color: var(--ally); }
 .sb-flag.B { border-color: var(--enemy); color: var(--enemy); }
 #killfeed { position: absolute; right: 24px; top: 24px; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+/* 对局内聊天条（差距 43）：左下角，收起时只有最近 12 秒的几行、不吃鼠标事件 */
+#chatBox { position: absolute; left: 18px; bottom: 132px; width: 360px; font-size: 12px; pointer-events: none; }
+#chatBox.open { pointer-events: auto; }
+#chatLog { max-height: 172px; overflow-y: auto; line-height: 1.7; color: #cfcfcf; text-shadow: 0 1px 2px rgba(0, 0, 0, .8); }
+#chatLog .ct-time { font-style: normal; font-size: 10px; color: #8a8a8a; margin-right: 6px; }
+#chatLog .chat-line b { color: #8fb8ff; font-weight: 700; }
+#chatLog .chat-line b.me { color: var(--acc); }
+#chatLog .chat-line.team b { color: #7fe07f; }
+#chatLog .chat-line.sys { color: #9a9a9a; }
+#chatLog .chat-line span { margin-left: 6px; color: #e8e8e8; word-break: break-all; }
+#chatIn { display: none; gap: 8px; margin-top: 6px; align-items: center; }
+#chatBox.open #chatIn { display: flex; }
+#chatCh { color: var(--acc); font-size: 11px; letter-spacing: 2px; }
+#chatSay { flex: 1; min-width: 0; background: rgba(0, 0, 0, .55); border: 1px solid rgba(255, 255, 255, .2); color: #eee; padding: 6px 10px; font: inherit; letter-spacing: 1px; }
 .kf { background: rgba(0,0,0,.55); padding: 5px 10px; font-size: 13px; display: flex; gap: 8px; align-items: center; animation: kfIn .2s; }
 .kf .w { color: #aaa; font-size: 11px; border: 1px solid #555; padding: 0 5px; }
 .kf .A { color: var(--ally); } .kf .B { color: var(--enemy); } .kf .me { color: var(--acc); }

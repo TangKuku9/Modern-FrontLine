@@ -439,6 +439,113 @@ try {
   x.close(); y.close();
   srv6.kill();
 
+  console.log('\n── J：对局中的聊天与举报（差距 43/45）──');
+  // 聊天以前只长在大厅/房间两屏：对局中发不出去也收不到。判据的形状与别处一样 ——
+  // 每一种失效都是静默的（"发了没人看见""对面收到了我不该看见的话""举报石沉大海"），
+  // 所以每条都数服务端**真的发给了谁**，并且每条都配一条反证臂。
+  const srv7 = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
+  const t1 = client(srv7.ws, '聊甲'), t2 = client(srv7.ws, '聊乙'), t3 = client(srv7.ws, '聊丙');
+  await t1.opened; await t2.opened; await t3.opened;
+  t1.send({ t: 'lobby' }); t2.send({ t: 'lobby' }); t3.send({ t: 'lobby' });
+  await t1.until(j => j.t === 'lobby'); await t2.until(j => j.t === 'lobby'); await t3.until(j => j.t === 'lobby');
+  t1.send({ t: 'createRoom', room: 'talk', name: '聊甲', title: '说话房' });
+  await t1.until(j => j.t === 'room' && j.room && j.room.id === 'talk', 6000);
+  t2.send({ t: 'joinRoom', room: 'talk', name: '聊乙' });
+  await t2.until(j => j.t === 'room' && j.me, 6000);
+  t2.send({ t: 'team', team: 'A' });                       // 与房主同队
+  await t2.until(j => j.t === 'room' && j.me && j.me.team === 'A', 6000);
+  t3.send({ t: 'joinRoom', room: 'talk', name: '聊丙' });
+  await t3.until(j => j.t === 'room' && j.me, 6000);
+  t3.send({ t: 'team', team: 'B' });
+  await t3.until(j => j.t === 'room' && j.me && j.me.team === 'B', 6000);
+
+  // 等待态的队伍频道（差距 45 的"无队伍频道"）：只发同队座位
+  t1.send({ t: 'say', ch: 'team', text: '集合' });
+  const wt = await t2.until(j => j.t === 'chat' && j.ch === 'team', 3000);
+  ok('等待态房间里，队伍频道只到同队的人', !!wt && wt.text === '集合' && wt.from === '聊甲', JSON.stringify(wt));
+  ok('【反证】对面收不到队伍频道（收到的话这一条就是全房间广播）',
+    !(await t3.until(j => j.t === 'chat' && j.ch === 'team', 800)));
+  await sleep(700);
+
+  t2.send({ t: 'ready', on: true }); t3.send({ t: 'ready', on: true });
+  await t1.until(j => j.t === 'room' && j.canStart === true, 6000);
+  t1.send({ t: 'start' });
+  const ta = await t1.until(j => j.t === 'welcome', 15000);
+  const tb = await t2.until(j => j.t === 'welcome', 15000);
+  const tc = await t3.until(j => j.t === 'welcome', 15000);
+  ok('三个人都进对局了（这一段下面全是"对局中"的判据）', !!ta && !!tb && !!tc);
+
+  t1.send({ t: 'say', ch: 'match', text: '在吗' });
+  const m1 = await t2.until(j => j.t === 'chat' && j.ch === 'match', 3000);
+  const m1b = await t3.until(j => j.t === 'chat' && j.ch === 'match', 1000);
+  ok('对局中说的话，全场（含对面）都收到', !!m1 && m1.text === '在吗' && !!m1b, JSON.stringify(m1));
+  ok('行里带 cid 与 team（认"这是谁说的"不靠名字 —— 访客服上两个"游客"同名）',
+    !!m1 && m1.cid === ta.cid && m1.team === 'A' && m1.from === '聊甲', JSON.stringify(m1));
+  await sleep(700);
+
+  t1.send({ t: 'say', ch: 'team', text: 'B 点集合' });
+  const m2 = await t2.until(j => j.t === 'chat' && j.ch === 'team', 3000);
+  ok('对局中的队伍频道到队友手上', !!m2 && m2.text === 'B 点集合', JSON.stringify(m2));
+  ok('【反证】对面收不到（这条红了 = 队伍频道退化成全场广播）',
+    !(await t3.until(j => j.t === 'chat' && j.ch === 'team', 800)));
+  await sleep(700);
+
+  // 举报：记档（服务端日志 + /healthz 计数）+ 回执。三种"报了但没用"各有各的读数。
+  const rep0 = (await health(srv7.base)).lobby;
+  t1.send({ t: 'report', name: '聊丙', reason: '刷屏' });
+  const rp = await t1.until(j => j.t === 'chat' && j.sys, 3000);
+  ok('举报有回执（"石沉大海"正是这一项要消灭的症状）',
+    !!rp && /聊丙/.test(rp.text || ''), JSON.stringify(rp));
+  ok('举报在服务端真的记了档（/healthz 数得出）', (await health(srv7.base)).lobby.report === rep0.report + 1);
+  ok('【反证】对面收不到举报这回事（举报不是一条聊天）',
+    !(await t3.until(j => j.t === 'chat' && j.sys, 800)));
+  await sleep(700);
+
+  t1.send({ t: 'report', name: '查无此人', reason: 'x' });
+  const rp2 = await t1.until(j => j.t === 'err', 3000);
+  ok('举报一个不在局里的名字被拒，话说清楚了', !!rp2 && /找不到/.test(rp2.msg || ''), JSON.stringify(rp2 && rp2.msg));
+  ok('这一类"报了但没用"单独计数（不和真举报混在一格）',
+    (await health(srv7.base)).lobby.reportNoTarget === rep0.reportNoTarget + 1);
+  await sleep(700);
+
+  t1.send({ t: 'report', name: '聊甲', reason: 'x' });
+  const rp3 = await t1.until(j => j.t === 'err', 3000);
+  ok('举报自己被拒', !!rp3 && /不能举报自己/.test(rp3.msg || ''), JSON.stringify(rp3 && rp3.msg));
+  ok('它也单独计数', (await health(srv7.base)).lobby.reportSelf === rep0.reportSelf + 1);
+  await sleep(700);
+
+  // 限流是**按连接**共一个闸（大厅/房间/对局三个入口）：刷屏没有双倍额度。
+  const rate0j = (await health(srv7.base)).lobby.sayRate | 0;
+  for (let i = 0; i < 10; i++) t1.send({ t: 'say', ch: 'match', text: '刷屏' + i });
+  await sleep(400);
+  const rejJ = await t1.until(j => j.t === 'err', 2000);
+  ok('对局里刷屏一样被限住，而且当场说一声', !!rejJ && /太快/.test(rejJ.msg || ''), JSON.stringify(rejJ && rejJ.msg));
+  ok('限流在 /healthz 上数得出来', (await health(srv7.base)).lobby.sayRate - rate0j >= 7,
+    `sayRate ${rate0j} → ${(await health(srv7.base)).lobby.sayRate}`);
+
+  // 自由混战没有队伍频道：每人一支独立"队"，"只发队友"等于只发给自己 ——
+  // 所以当场拒，而不是悄悄改频道（悄悄改的话玩家以为对面能看见）。
+  t1.close(); t2.close(); t3.close();
+  const f1 = client(srv7.ws, '队甲'), f2 = client(srv7.ws, '队乙');
+  await f1.opened; await f2.opened;
+  f1.send({ t: 'lobby' }); f2.send({ t: 'lobby' });
+  await f1.until(j => j.t === 'lobby'); await f2.until(j => j.t === 'lobby');
+  f1.send({ t: 'createRoom', room: 'ffatalk', name: '队甲', mode: 'ffa' });
+  await f1.until(j => j.t === 'room' && j.room && j.room.id === 'ffatalk', 6000);
+  f2.send({ t: 'joinRoom', room: 'ffatalk', name: '队乙' });
+  await f2.until(j => j.t === 'room' && j.me, 6000);
+  f2.send({ t: 'ready', on: true });
+  await f1.until(j => j.t === 'room' && j.canStart === true, 6000);
+  f1.send({ t: 'start' });
+  await f1.until(j => j.t === 'welcome', 15000);
+  await sleep(700);
+  f1.send({ t: 'say', ch: 'team', text: '有人吗' });
+  const ffaErr = await f1.until(j => j.t === 'err', 3000);
+  ok('【反证】ffa 里发队伍频道被当场拒（而不是发成"只有自己看得见"）',
+    !!ffaErr && /自由混战/.test(ffaErr.msg || ''), JSON.stringify(ffaErr && ffaErr.msg));
+  f1.close(); f2.close();
+  srv7.kill();
+
   console.log(`\n${bad ? '❌' : '✅'} ${n - bad}/${n} 通过`);
   for (const line of String(srv2.log()).split('\n').filter(x => /^\[room|开局|结果|拒绝/.test(x)).slice(-6)) console.log('  服务端: ' + line);
   process.exit(bad ? 1 : 0);

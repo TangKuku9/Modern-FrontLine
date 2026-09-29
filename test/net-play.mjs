@@ -52,6 +52,12 @@ async function openPage(browser, name, team) {
 }
 // 每个交互前把窗口带到前台：后台标签页的 rAF 会被降频，而降频会直接改变下面的读数
 const focus = async (p) => { await p.page.bringToFront(); await sleep(150); };
+// 开聊天面板（幂等）：上一条命令留着面板没关时，直接按 Enter 会变成"空提交 + 关面板"，
+// 后面打的字就丢了 —— 那是量具自己的坑，不是被测对象的。所以每次都先归零再按。
+const openChat = async (page, key = 'Enter') => {
+  await page.evaluate(() => { if (window.game.hud.chatActive) window.game.hud.chatClose(); });
+  await page.keyboard.press(key);
+};
 
 // 这些用例量的是**游戏层**（预测回滚、命中裁决、联机规则），所以刻意用访客身份跑
 // （REQUIRE_ACCOUNT=0）。账号与两道闸门由 test/hardening.mjs 专门量，两边不重复 ——
@@ -108,6 +114,128 @@ try {
   ok('两个窗口的模拟节拍够快（≥50Hz），后面的厘米级容差才有意义', hzA >= 50 && hzB >= 50, `甲 ${hzA}Hz / 乙 ${hzB}Hz`);
   const seenOther = await B.page.evaluate(cid => !!(window.game.net.roster.get(cid) || window.game.net.remotes.get(cid)), sa.cid);
   ok('乙的 roster 里认得甲', seenOther);
+
+  // ---- 对局内聊天：面板开合 / 跨窗口送达 / 输入法保护 / 队伍频道 / 屏蔽 / 举报（差距 43/45）----
+  // 判据全是**跨窗口**的：甲打的字要在乙的聊天条里出现（或不出现）。单窗口自问自答的
+  // 版本全绿也证明不了"服务端发给了谁" —— 那一半在 room-flow J 量，这里量浏览器这半。
+  console.log('\n── 对局内聊天 ──');
+  const chat0 = await A.page.evaluate(() => ({
+    active: window.game.hud.chatActive,
+    inVisible: getComputedStyle(document.getElementById('chatIn')).display !== 'none',
+  }));
+  ok('先决：不打字时输入行不出现（聊天条只在说话时露脸）', !chat0.active && !chat0.inVisible, JSON.stringify(chat0));
+
+  await focus(A);
+  // 守卫读数：Enter 打不开面板时，这几格一次说清是哪一格拦的（别靠猜）
+  const gA = await A.page.evaluate(() => {
+    const g = window.game;
+    return { state: g.state, lost: !!(g.net && g.net.lost), paused: g.paused, overlay: g.menu.overlayOpen, screen: g.menu.screen, active: !!g.hud.chatActive };
+  });
+  console.log('  甲的开面板守卫读数：' + JSON.stringify(gA));
+  await openChat(A.page);
+  const chat1 = await A.page.evaluate(() => ({
+    active: window.game.hud.chatActive,
+    ch: window.game.hud.chatChannel,
+    label: document.getElementById('chatCh').textContent,
+    focused: document.activeElement && document.activeElement.id,
+  }));
+  ok('Enter 打开聊天（全体频道，焦点进输入框）',
+    chat1.active && chat1.ch === 'match' && chat1.label === '全体' && chat1.focused === 'chatSay', JSON.stringify(chat1));
+  // 打字时人要站住：开着聊天时按住的 W 不许再进上行输入（否则每敲一个字人往前挪一格）
+  const froze = await A.page.evaluate(() => {
+    const g = window.game;
+    g.input.keys.KeyW = true;
+    const s = g.snapshotInput();
+    return { active: g.hud.chatActive, fwd: s.fwd, back: s.back };
+  });
+  ok('打字时人站住（开着聊天时 W 不再进上行输入）', froze.active && !froze.fwd && !froze.back, JSON.stringify(froze));
+
+  // 输入法保护（差距 44）：选词中的回车是"上屏"，合成一个 isComposing 的 Enter ——
+  // 它把半成品发出去的话，这一条就红。反证臂是下面那条**真回车**必须发得出去。
+  await A.page.evaluate(() => {
+    const inp = document.getElementById('chatSay');
+    inp.value = 'ban cheng pin';
+    inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, isComposing: true, bubbles: true }));
+    inp.value = '';
+  });
+  await sleep(500);
+  const ime = await A.page.evaluate(() => ({
+    active: window.game.hud.chatActive,
+    rows: window.game.hud.chatRows.map(r => r.text),
+  }));
+  ok('【反证】选词中的回车不发送也不关面板（发出去就是一行拼音）',
+    ime.active && !ime.rows.some(t => /ban cheng pin/.test(t || '')), JSON.stringify(ime));
+
+  await A.page.keyboard.type('在吗');
+  await A.page.keyboard.press('Enter');
+  await sleep(800);
+  const saidA = await A.page.evaluate(() => ({ active: window.game.hud.chatActive, rows: window.game.hud.chatRows.map(r => r.text) }));
+  const saidB = await B.page.evaluate(() => window.game.hud.chatRows.map(r => r.text));
+  ok('真回车发送并收起面板，自己那行也回到聊天条上', !saidA.active && saidA.rows.includes('在吗'), JSON.stringify(saidA));
+  ok('跨窗口：乙的聊天条里出现甲那句话（这行字是服务端转的）', saidB.includes('在吗'), JSON.stringify(saidB));
+
+  await focus(A);
+  await openChat(A.page, 'y');
+  const chatY = await A.page.evaluate(() => ({ ch: window.game.hud.chatChannel, label: document.getElementById('chatCh').textContent }));
+  ok('Y 打开队伍频道', chatY.ch === 'team' && chatY.label === '队伍', JSON.stringify(chatY));
+  await A.page.keyboard.type('B点集合');
+  await A.page.keyboard.press('Enter');
+  await sleep(800);
+  const teamB = await B.page.evaluate(() => window.game.hud.chatRows.map(r => r.text));
+  const teamA = await A.page.evaluate(() => window.game.hud.chatRows.map(r => r.text));
+  ok('队伍频道：自己（同队）收得到', teamA.includes('B点集合'), JSON.stringify(teamA));
+  ok('【反证】乙是 B 队，收不到 A 队的队伍频道（收到就是全房间广播）',
+    !teamB.includes('B点集合'), JSON.stringify(teamB));
+
+  // 屏蔽（差距 45）：/mute 之后他的话一行都不画。过滤在渲染侧、名单在本地 ——
+  // 所以判据读的是**画出来的** HTML，不是缓冲（缓冲里留着是设计好的）。
+  await focus(B);
+  await openChat(B.page);
+  await B.page.keyboard.type('/mute 甲兵');
+  await B.page.keyboard.press('Enter');
+  await sleep(300);
+  const mutedSys = await B.page.evaluate(() => window.game.hud.chatRows.map(r => r.text).filter(t => /屏蔽/.test(t || '')));
+  ok('/mute 有本地回执（命令留在面板上，回执画进聊天条）', mutedSys.length > 0, JSON.stringify(mutedSys));
+  await focus(A);
+  await openChat(A.page);
+  await A.page.keyboard.type('看得见吗');
+  await A.page.keyboard.press('Enter');
+  await sleep(800);
+  const muteB = await B.page.evaluate(() => document.getElementById('chatLog').innerHTML);
+  const muteA = await A.page.evaluate(() => document.getElementById('chatLog').innerHTML);
+  ok('【反证】屏蔽之后乙看不见甲的新话（同一条 HTML 编译路径下甲自己看得见）',
+    !muteB.includes('看得见吗') && muteA.includes('看得见吗'));
+  await focus(B);
+  await openChat(B.page);
+  await B.page.keyboard.type('/unmute 甲兵');
+  await B.page.keyboard.press('Enter');
+  await sleep(300);
+  await focus(A);
+  await openChat(A.page);
+  await A.page.keyboard.type('现在呢');
+  await A.page.keyboard.press('Enter');
+  await sleep(800);
+  ok('解除屏蔽之后又看得见了（"恒不画"的过滤器也能被这条臂抓住）',
+    (await B.page.evaluate(() => document.getElementById('chatLog').innerHTML)).includes('现在呢'));
+
+  // 举报（差距 45）：命令 → 上行 → 服务端记档 + 回执。全链路在 room-flow J 也有一份，
+  // 这里量的是"浏览器里这条命令真的走通了"。
+  await focus(B);
+  await openChat(B.page);
+  await B.page.keyboard.type('/report 甲兵 刷屏');
+  await B.page.keyboard.press('Enter');
+  await sleep(800);
+  const repB = await B.page.evaluate(() => window.game.hud.chatRows.map(r => r.text).filter(t => /举报/.test(t || '')));
+  ok('/report 有回执画进聊天条（"石沉大海"正是这一项要消灭的症状）',
+    repB.some(t => /已记录/.test(t)) && repB.some(t => /正在举报/.test(t)), JSON.stringify(repB));
+  ok('举报的回执只到举报人自己（对面不该收到）',
+    !(await A.page.evaluate(() => window.game.hud.chatRows.map(r => r.text).some(t => /已记录/.test(t || '')))));
+  await focus(A);
+  await openChat(A.page);                             // 先开面板
+  await A.page.keyboard.press('Escape');              // Esc 只关聊天，不弹暂停
+  const esc = await A.page.evaluate(() => ({ active: window.game.hud.chatActive, paused: window.game.paused }));
+  ok('Esc 收起面板，而且不弹暂停（Esc 归聊天输入框，stopPropagation 挡住了暂停那条）',
+    !esc.active && !esc.paused, JSON.stringify(esc));
 
   // ---- 移动：甲按住 W 一秒，乙必须看到同一个人走到同一个位置 ----
   console.log('\n── 移动复制 ──');

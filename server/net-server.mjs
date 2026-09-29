@@ -10,7 +10,7 @@
 //        文本   = {t:'join'|'ping'} 控制帧
 //               | 对局内：{t:'loadout'|'respawn'|'streak'}（换配装 / 提前部署 / 集束选点确认）
 //               | 大厅与房间：{t:'lobby'|'say'|'createRoom'|'joinRoom'|'quickRoom'|
-//                 'leaveRoom'|'ready'|'team'|'roomCfg'|'start'}（判据在 server/lobby.mjs）
+//                 'leaveRoom'|'ready'|'team'|'roomCfg'|'start'|'report'}（判据在 server/lobby.mjs）
 //   下行 二进制 = 快照（server/codec.mjs 的定长格式）
 //        文本   = {t:'welcome'|'ev'|'err'|'pong'|'note'}
 //               | 大厅与房间：{t:'lobby'|'room'|'chat'}
@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { WebSocketServer } from 'ws';
 import { NetRoom, DT, SNAP_EVERY, RESPAWN_DELAY } from './room.mjs';
-import { Lobby, MAX_SEATS } from './lobby.mjs';
+import { Lobby, MAX_SEATS, CHAT_LEN, flat } from './lobby.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
 import { normalizeName, validName, NAME_RULE_TEXT } from './accounts.mjs';
@@ -212,7 +212,7 @@ const auth = await createAuth({ cfg: CFG });
 // 下面那个分支要按这张表判断"这帧归大厅管"，而漏一条的症状不是报错，是**这帧被静默丢掉**
 // —— 房主按开始没反应、聊天发不出去，都属于这一类。
 const LOBBY_FRAMES = new Set(['lobby', 'say', 'createRoom', 'joinRoom', 'quickRoom', 'leaveRoom',
-  'ready', 'team', 'roomCfg', 'start', 'botAdd', 'botDel']);
+  'ready', 'team', 'roomCfg', 'start', 'botAdd', 'botDel', 'report']);
 
 // 房间的显示名（联机大厅"创建房间"带来的那一格）。它**不是房号** ——
 // 房号另有白名单（pickRoom 的 [A-Za-z0-9_.-]），中文房名直接当房号会被清洗成空串、
@@ -532,6 +532,87 @@ function welcomeFrame(room, c) {
   };
 }
 
+// ── 对局内的聊天（差距 43）：给**在跑的这间 sim** 里的人说话的地方 ──
+// 为什么不在 lobby.say 里顺手办：那一层按**座位**认人（等待态房间的名单），而直连
+// 对局（?online=1 与所有探针）根本没有座位 —— 混在一起的症状是"房间开出来的局能聊、
+// 直连进来的局谁都发不出去"，而那看起来像"聊天功能时好时坏"。身份同样只认
+// ws.__cid 那份（与 join / 三条窄控制帧同源），这一帧带来的名字一个字都不看。
+function matchSay(ws, room, msg) {
+  const c = room.clients.get(ws.__cid);
+  if (!c) return;
+  const now = Date.now();
+  const text = flat(msg.text, CHAT_LEN);
+  if (!text) { lobby.stat.sayEmpty++; return; }
+  // 限流共用大厅那一个**按连接**的闸（lobby.allowSay）：两个入口各数各的，
+  // 等于给刷屏发了双倍额度。
+  if (!lobby.allowSay(ws, now)) {
+    lobby.stat.sayRate++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '说得太快了，歇半秒再说' }));
+    return;
+  }
+  // 自由混战没有队伍频道：那边每人一支独立"队"（见 room.mjs 的 ffa 分支），
+  // "只发队友"等于只发给自己。当场说清楚，不悄悄改频道 ——
+  // 悄悄改的话玩家以为对面能看见，其实谁都没看见。
+  const ch = msg.ch === 'team' ? 'team' : 'match';
+  if (ch === 'team' && room.rules.ffa) {
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '自由混战没有队伍频道，用全体发' }));
+    return;
+  }
+  lobby.stat.say++;
+  // cid / team 都带上：客户端拿 cid 认"这是我说的"（访客服上两个"游客"同名，
+  // 按名字认会把别人的行标成我的），拿 team 给队伍频道的行上色。
+  const row = { t: 'chat', ch, from: c.name, name: c.name, text, at: now, cid: c.cid, team: c.team };
+  const m = JSON.stringify(row);
+  for (const x of room.clients.values()) {
+    if (!x.ws || x.ws.readyState !== 1) continue;
+    if (ch === 'team' && x.team !== c.team) continue;
+    lobby.send(x.ws, m);
+  }
+}
+
+// ── 举报（差距 45）：**只记档，不自动处罚** ──
+// 记档是真的（服务端日志 + /healthz 计数，运维能查能回溯），处罚是人的判断：
+// 自动封禁的误伤成本远高于"这次没封"，而聊天里的纠纷谁先动手只有记录看得出来。
+// 找不到人 / 举报自己这两类"报了但没用"单独计数 —— 玩家侧只表现为"石沉大海"，
+// 不报错、不回执，正是那类必须留读数的静默失效。
+function doReport(ws, msg) {
+  const who = flat(msg.name, 16);
+  const reason = flat(msg.reason, 60);
+  // 举报也过聊天那一个**按连接**的闸：不限的话"刷屏"换成"刷档"，服务端日志与
+  // 计数被一个人灌满 —— 而那两样恰恰是运维要看的东西。
+  if (!lobby.allowSay(ws, Date.now())) {
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '举报得太快了，歇半秒再说' }));
+    return;
+  }
+  // 目标只在同一局 / 同一房间里找：举报一个不相干房间里的名字没有可核对的语境，
+  // 只会变成骚扰工具（随便填个名字就能让服务端给人记档）。
+  let target = null, meName = ws.__name || '访客';
+  const room = ws.__room;
+  if (room && ws.__cid != null) {
+    meName = (room.clients.get(ws.__cid) || {}).name || meName;
+    for (const x of room.clients.values()) if (x.name === who) { target = { name: x.name, account: x.account || null, cid: x.cid, self: x.cid === ws.__cid }; break; }
+  } else {
+    const at = lobby.seat(ws);
+    if (at && at.room) {
+      meName = at.seat.name;
+      for (const s of at.room.seats.values()) if (s.name === who) { target = { name: s.name, account: s.account || null, self: s.sid === at.seat.sid }; break; }
+    }
+  }
+  if (!target) {
+    lobby.stat.reportNoTarget++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '找不到「' + who + '」（只能举报同一局或同一房间里的人）' }));
+    return;
+  }
+  if (target.self) {
+    lobby.stat.reportSelf++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: '不能举报自己' }));
+    return;
+  }
+  lobby.stat.report++;
+  console.log(`[report] ${meName}${ws.__user ? '(' + ws.__user.key + ')' : ''} → ${target.name}${target.account ? '(' + target.account + ')' : ''}: ${reason || '（没写原因）'}`);
+  lobby.send(ws, JSON.stringify({ t: 'chat', ch: 'sys', sys: true, at: Date.now(), text: `已记录对「${target.name}」的举报，已转给运维` }));
+}
+
 // 房主按下开始。这里只负责"把名单变成一局"，判据全在 server/lobby.mjs:startGate。
 // 顺序有讲究：先把所有人安放进 sim，再逐个发 welcome —— others 是"我进这一间时房里有谁"，
 // 边放边发的话第一个进的人看不见后面那几个，症状是房主的世界一开始是空的。
@@ -805,7 +886,16 @@ wss.on('connection', (ws, req) => {
           return { name: n, account: ws.__user ? ws.__user.key : null, xp: ws.__user ? (ws.__user.xp | 0) : 0, loadout: msg.loadout || null, streaks: msg.streaks || null };
         };
         if (msg.t === 'lobby') lobby.attach(ws);
-        else if (msg.t === 'say') lobby.say(ws, msg);
+        else if (msg.t === 'say') {
+          // 对局内频道（match / team）路由给 matchSay；**老频道（room / lobby）保持原样**
+          // —— 老客户端与探针在对局中也发 ch:'room'，改道会把它悄悄变成另一条频道
+          //（room-flow 的 E 段就是这么假红的）。matchSay 也只认"这条连接已经占了 sim
+          // 里的座位"：直连进来的局没有 lobby 座位，走 lobby.say 会被静默丢掉（sayNoRoom）。
+          const live = ws.__room && ws.__cid != null;
+          if (live && (msg.ch === 'match' || msg.ch === 'team')) matchSay(ws, ws.__room, msg);
+          else lobby.say(ws, msg);
+        }
+        else if (msg.t === 'report') doReport(ws, msg);
         else if (msg.t === 'leaveRoom') lobby.leaveRoom(ws);
         else if (msg.t === 'ready') lobby.setReady(ws, msg);
         else if (msg.t === 'team') lobby.setTeam(ws, msg.team);

@@ -26,6 +26,7 @@ import { NetClient } from '../js/net/client.mjs';
 import { NetRoom } from '../server/room.mjs';
 import { HeadlessGame, preloadMaterials } from '../server/headless-game.mjs';
 import { pauseActions, isImeKey } from '../js/menu.js';
+import { parseChatCommand, toggleMute, isMuted, chatRowHtml, chatTime } from '../js/net/chat.mjs';
 import { FLAG, WEAPON_IDS } from '../js/quant.js';
 import { WEAPONS } from '../js/data.js';
 
@@ -776,6 +777,44 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   const sd = room.events.filter(e => e.e === 'streakCharge' && e.cid === A.cid).pop();
   ok('Y4 自己死了清账也推一条（HUD 上的充能跟着归零，不用等记分板）',
     !!sd && sd.sk === 0 && A.book.progress === 0, `sk=${sd && sd.sk} book=${A.book.progress}`);
+}
+
+// ───────────────────────── Z. 聊天的判定与渲染（差距 43/45）─────────────────────────
+// 命令解析 / 屏蔽过滤 / 行渲染在 js/net/chat.mjs（菜单屏与对局 HUD 共用一份）。
+// 每一种失效都是静默的：拼错命令被当发言广播出去、屏蔽了还看得见、名字没过转义 ——
+// 全都不报错，只在别人的界面上显形。反证臂是"没被屏蔽的那行必须还在"与
+// "真的发言必须是 say"（把判定做成恒 unknown/恒屏蔽都能被这两条臂抓住）。
+{
+  const p = parseChatCommand;
+  ok('Z1 普通发言：不带斜杠就是 say，文本原样', p('在吗').op === 'say' && p('在吗').text === '在吗');
+  ok('Z2 空输入什么也不发（上层拿 text 为空当"别发帧"）', p('   ').op === 'say' && p('').text === '');
+  ok('Z3 /mute /unmute 解析出名字，中文别名同一条路',
+    p('/mute 甲').op === 'mute' && p('/mute 甲').name === '甲'
+    && p('/屏蔽 乙').op === 'mute' && p('/屏蔽 乙').name === '乙'
+    && p('/unmute 甲').op === 'unmute' && p('/解除屏蔽 乙').name === '乙');
+  ok('Z4 /report 带原因；不带原因也算报（reason 空串）',
+    p('/report 甲 刷屏').op === 'report' && p('/report 甲 刷屏').name === '甲' && p('/report 甲 刷屏').reason === '刷屏'
+    && p('/举报 乙').op === 'report' && p('/举报 乙').reason === '');
+  ok('Z5【反证】拼错的命令不许当发言发出去（发出去就是房间里一行"/mut 甲"）',
+    p('/mut 甲').op === 'unknown' && p('/mute').op === 'unknown' && p('/report').op === 'unknown');
+  ok('Z6 屏蔽过滤：名单上的人不显示', isMuted('甲', ['甲', '乙']) === true);
+  ok('Z6【反证】名单外的人照常显示（恒 true 的过滤器也能被这条臂抓住）',
+    isMuted('丙', ['甲', '乙']) === false && isMuted('甲', []) === false && isMuted('甲', null) === false);
+  ok('Z7 toggleMute：加上去、再加不重复、去掉就真没了',
+    toggleMute([], '甲', true).join() === '甲'
+    && toggleMute(['甲'], '甲', true).join() === '甲'
+    && toggleMute(['甲', '乙'], '甲', false).join() === '乙');
+  const row = { ch: 'match', from: '甲', text: '大家好', at: Date.now(), cid: 3, team: 'A' };
+  ok('Z8 渲染带时间戳（差距 45 的"无时间戳"）', /\d{2}:\d{2}/.test(chatRowHtml(row, {})) && /^\d{2}:\d{2}$/.test(chatTime(row.at)));
+  ok('Z8【反证】被屏蔽的人一行都不画（过滤的唯一实施点就是这一句）',
+    chatRowHtml(row, { muted: ['甲'] }) === '' && chatRowHtml(row, { muted: ['乙'] }).includes('大家好'));
+  ok('Z9 名字与文本都过转义（聊天是最容易往别人界面里塞标签的地方）',
+    chatRowHtml({ ch: 'match', from: '<img>', text: '<b>x</b>', at: 0 }, {})
+      .includes('&lt;img&gt;') && !chatRowHtml({ ch: 'match', from: '<img>', text: '<b>x</b>', at: 0 }, {}).includes('<b>x</b>'));
+  ok('Z10 队伍频道的行带 team 样式（一眼分得出是全场说的还是队内说的）',
+    chatRowHtml({ ...row, ch: 'team' }, {}).includes('team') && !chatRowHtml(row, {}).match(/chat-line team/));
+  ok('Z11 系统回执（举报/屏蔽的反馈）画得出来，且不被屏蔽名单误杀',
+    chatRowHtml({ sys: true, text: '已记录', at: 0 }, { muted: ['甲'] }).includes('已记录'));
 }
 
 // ───────────────────────── 收口 ─────────────────────────

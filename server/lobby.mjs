@@ -66,7 +66,9 @@ const sidOf = (ws) => ws.__sid == null ? (ws.__sid = NEXT_SID++) : ws.__sid;
 // 面向广播的用户文本一律先拍平再用。控制字符能伪造聊天行（换行），零宽字符能让
 // "甲"和"甲"看起来是两个人 —— 而这两种都只会在别人的界面上显形。少洗一处的症状
 // 是"某人发一条消息，别人那儿的界面跟着乱"。
-function flat(s, n) {
+// 导出给 net-server 的对局内聊天（matchSay / doReport）用同一把拍子 —— 各洗各的
+// 会出现"大厅里发不出来、对局里发得出去"的第二种规则。
+export function flat(s, n) {
   return String(s == null ? '' : s)
     .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/g, ' ')
     .replace(/\s+/g, ' ').trim().slice(0, n);
@@ -105,6 +107,9 @@ export class Lobby {
     // 而原因（不是房主 / 有人没准备 / 刷屏被限流 / 房间号撞了）完全不同，只能从这里分辨。
     this.stat = {
       say: 0, sayRate: 0, sayEmpty: 0, sayNoRoom: 0,
+      // 举报：来了多少条、多少条找不到人、多少条是自己举报自己。后两者都是"报了但没用"——
+      // 与 streak.rejected 同一性质的读数：没生效的举报在玩家侧只表现为"石沉大海"。
+      report: 0, reportNoTarget: 0, reportSelf: 0,
       join: 0, full: 0, playing: 0, dupId: 0, badId: 0, quota: 0, badMode: 0,
       badMode: 0,
       starts: 0, notHost: 0, tooFew: 0, notReady: 0,
@@ -493,7 +498,9 @@ export class Lobby {
   // ── 聊天 ──
   // 两条频道：'lobby'（所有挂在大厅上的连接）与 'room'（同一间的座位）。
   // 速率与长度都在这里判，一条都不交给客户端 —— 客户端那些只是回车键的体验。
-  _allow(ws, now) {
+  // 公开给 net-server 的对局内聊天用（matchSay）：限流是**按连接**的账，
+  // 大厅一条、对局一条各数各的就等于给了刷屏双倍额度 —— 所以两个入口共这一个闸。
+  allowSay(ws, now) {
     let r = this.rate.get(ws);
     if (!r) { r = { last: 0, burst: [] }; this.rate.set(ws, r); }
     if (now - r.last < SAY_MIN_MS) return false;
@@ -506,28 +513,40 @@ export class Lobby {
     const now = Date.now();
     const text = flat(msg.text, CHAT_LEN);
     if (!text) { this.stat.sayEmpty++; return; }
-    if (!this._allow(ws, now)) {
+    if (!this.allowSay(ws, now)) {
       this.stat.sayRate++;
       // 被限流要当场说一声。不响的话玩家只会以为自己打的字没保存，于是一条"防线"
       // 在人的经验里就变成了"这游戏连聊天都做不好"。
       this.send(ws, JSON.stringify({ t: 'err', msg: '说得太快了，歇半秒再说' }));
       return;
     }
-    const ch = msg.ch === 'room' ? 'room' : 'lobby';
+    // 三个频道：lobby（全服）、room（这间房的全体）、team（这间房里自己的队）。
+    // team 与 room 同样只认座位 —— 没进房就没有"队"可言（差距 45 的"无队伍频道"）。
+    const ch = msg.ch === 'room' ? 'room' : msg.ch === 'team' ? 'team' : 'lobby';
     const at = this.seat(ws);
-    if (ch === 'room' && (!at || !at.room)) { this.stat.sayNoRoom++; return; }
+    if ((ch === 'room' || ch === 'team') && (!at || !at.room)) { this.stat.sayNoRoom++; return; }
     this.stat.say++;
     // 名字取**座位上那份**（座位上的名字来自会话或访客白名单），不是这一帧带来的：
     // 聊天是最容易被拿来冒充别人的地方，而"服务端不用客户端给的身份"这一条
     // 在 join 那里已经立过一次（见 net-server:joinName），这里不能开个反例。
-    const from = ch === 'room' ? at.seat.name : (ws.__name || flat(msg.name, 16) || '路人');
-    const row = { ch, from, name: from, text, at: now };
-    if (ch === 'room') {
+    const from = ch === 'lobby' ? (ws.__name || flat(msg.name, 16) || '路人') : at.seat.name;
+    // sid 与 team 是"哪一行是谁说的、该给谁看"的判据：客户端拿 sid 认自己那行
+    // （访客服上两个"游客"同名时，按名字认会把别人的行标成我的），拿 team 上色。
+    const row = ch === 'lobby'
+      ? { ch, from, name: from, text, at: now }
+      : { ch, from, name: from, text, at: now, sid: at.seat.sid, team: at.seat.team };
+    if (ch === 'room' || ch === 'team') {
       const room = at.room;
       room.chat.push(row);
       if (room.chat.length > ROOM_CHAT_HIST) room.chat.splice(0, room.chat.length - ROOM_CHAT_HIST);
-      const m = JSON.stringify({ t: 'chat', ch, ...row });
-      for (const s of room.seats.values()) if (s.ws) this.send(s.ws, m);
+      const m = JSON.stringify({ t: 'chat', ...row });
+      // team 频道只发同队的座位。判据是**座位上那份 team**（服务端自己发下去的），
+      // 不是这一帧报上来的 —— 队友名单是可以被谎报的那种东西。
+      for (const s of room.seats.values()) {
+        if (!s.ws) continue;
+        if (ch === 'team' && s.team !== at.seat.team) continue;
+        this.send(s.ws, m);
+      }
       this.touch(room);
     } else {
       this.chat.push(row);

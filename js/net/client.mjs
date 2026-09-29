@@ -177,6 +177,11 @@ export class NetClient {
       this.serverNote = String(j.msg || '');
       this.events.push({ e: 'note', msg: this.serverNote });
       this.game.onNetNote && this.game.onNetNote(this.serverNote);
+    } else if (j.t === 'chat') {
+      // 对局内的聊天行（match/team 频道 + sys 回执）。直连这条路没有 LobbyClient，
+      // 这一格就是它唯一的收口 —— 少了的症状是"房间局能聊、直连局收不到"。
+      // 房间那条路走 js/net/lobby.mjs 的同名分支（同一条 socket 在它手里）。
+      if (this.game && this.game.hud) this.game.hud.chatPush(j);
     }
   }
 
@@ -188,6 +193,18 @@ export class NetClient {
 
   sendPing() {
     if (this.ws && this.ws.readyState === 1) { this.pingSent = (this.pingSent || 0) + 1; this.ws.send(JSON.stringify({ t: 'ping', c: performance.now() })); }
+  }
+
+  // 对局内聊天与举报（差距 43/45）走**这条连接**：房间开出来的局它是大厅那条 socket，
+  // 直连进来的局是自己拨的那条 —— 服务端按 ws.__cid 路由，两条路同一副形状。
+  // 不在这里判"能不能发"：限流与频道合法性是服务端的账（lobby.allowSay / matchSay），
+  // 客户端再判一遍就会出现"这边不让发、服务端其实收"的两套规则。
+  say(ch, text) {
+    const t = String(text || '').trim().slice(0, 120);
+    if (t && this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'say', ch: ch === 'team' ? 'team' : 'match', text: t }));
+  }
+  report(name, reason) {
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'report', name: String(name || '').slice(0, 16), reason: String(reason || '').slice(0, 60) }));
   }
 
   // 我这一帧渲染的是服务端的哪一拍 —— 这正是延迟补偿要的量。

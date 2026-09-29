@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import { KILLSTREAKS } from './data.js';
 import { fmtTime, clamp } from './util.js';
+import { parseChatCommand, toggleMute, chatRowHtml, isImeKey } from './net/chat.mjs';
 
 const $ = id => document.getElementById(id);
 const _v = new THREE.Vector3();
@@ -17,6 +18,18 @@ export class HUD {
     this.announceT = 0;
     this.buildCompass();
     this.fpsAcc = 0; this.fpsN = 0;
+    // 对局内聊天（差距 43）：行的缓冲、开合状态与频道都归 HUD —— 它是唯一画这块的层。
+    // 命令（/mute /report）的判定在 js/net/chat.mjs（与菜单屏共用），这里只做分发。
+    this.chatRows = []; this.chatActive = false; this.chatChannel = 'match';
+    const ci = $('chatSay');
+    if (ci) ci.addEventListener('keydown', e => {
+      // stopPropagation：开着聊天时，游戏那套快捷键一个都不许再接走（Esc 的暂停、
+      // Tab 的记分板、WASD 的移动都会从这个输入框抢按键）。
+      e.stopPropagation();
+      if (isImeKey(e)) return;                    // 选词中的回车是"上屏"，不是"发送"（差距 44）
+      if (e.key === 'Enter') { e.preventDefault(); this.chatSubmit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); ci.value = ''; this.chatClose(); }
+    });
   }
   show(v) { this.el.classList.toggle('hidden', !v); }
   buildCompass() {
@@ -37,6 +50,11 @@ export class HUD {
     $('fade').style.opacity = 0; $('flashOverlay').style.opacity = 0; this.flashT = 0;
     $('announce').style.opacity = 0; $('scorebar').innerHTML = ''; $('streaks').innerHTML = '';
     this.markerEls = {};
+    // 聊天条也是上一局的残留：不清的话上一局的话会跟着新局一起开（与 deathScreen 同一类事）
+    this.chatRows = []; this.chatActive = false; this.chatChannel = 'match'; clearTimeout(this.chatT);
+    const cb = $('chatBox');
+    if (cb) { cb.classList.add('hidden'); cb.classList.remove('open'); }
+    $('chatLog').innerHTML = '';
   }
   hitmarker(kill, head) {
     const h = $('hitmarker');
@@ -65,6 +83,92 @@ export class HUD {
     kf.prepend(d);
     while (kf.children.length > 6) kf.lastChild.remove();
     setTimeout(() => d.remove(), 6000);
+  }
+  // ── 对局内聊天（差距 43）──
+  // 开合与发送都在这里，键位在 main.js（Enter 全体 / Y 队伍）。指针锁**不解**：
+  // 解锁会顺带触发"失去指针锁 = 暂停"那条既有逻辑，而打字时对局在联机里照跑 ——
+  // 鼠标改成在 main.js 里按 chatActive 静音（不动视角、不开火）。
+  chatOpen(ch) {
+    this.chatActive = true;
+    this.chatChannel = ch === 'team' ? 'team' : 'match';
+    const box = $('chatBox'), inp = $('chatSay');
+    if (!box || !inp) return;
+    box.classList.remove('hidden'); box.classList.add('open');
+    $('chatCh').textContent = this.chatChannel === 'team' ? '队伍' : '全体';
+    inp.value = '';
+    inp.placeholder = this.chatChannel === 'team' ? '说给队友…（/mute /report）' : '说点什么…（/mute /report）';
+    inp.focus();
+    this.chatRender();
+  }
+  chatClose() {
+    this.chatActive = false;
+    const box = $('chatBox'); if (!box) return;
+    box.classList.remove('open');
+    const inp = $('chatSay'); if (inp) inp.blur();
+    this.chatRender();
+    if (this.game.lock) this.game.lock();      // 已经锁着就是无操作；为"解锁过"的旧路径兜底
+  }
+  chatSubmit() {
+    const inp = $('chatSay');
+    const raw = inp ? inp.value : '';
+    if (inp) inp.value = '';
+    const cmd = parseChatCommand(raw);
+    const g = this.game;
+    if (cmd.op === 'say') {
+      if (cmd.text && g.net) g.net.say(this.chatChannel, cmd.text);
+      this.chatClose();                          // 发完就收：回车 = 说一句，不是留在框里
+      return;
+    }
+    // 命令留在框上（可能连着 /mute、/unmute 用），反馈画进聊天条 —— 不弹 announce：
+    // 弹窗是"战场上的事"，命令的回执是"聊天框里的事"。
+    if (cmd.op === 'mute' || cmd.op === 'unmute') {
+      g.profile.muted = toggleMute(g.profile.muted, cmd.name, cmd.op === 'mute');
+      if (g.saveProfile) g.saveProfile();
+      this.chatLocal(cmd.op === 'mute'
+        ? `已屏蔽「${cmd.name}」，他的话不再显示（/unmute ${cmd.name} 可恢复）`
+        : `已解除对「${cmd.name}」的屏蔽`);
+    } else if (cmd.op === 'muted') {
+      const list = (g.profile && g.profile.muted) || [];
+      this.chatLocal(list.length ? '当前屏蔽：' + list.join('、') : '当前没有屏蔽任何人');
+    } else if (cmd.op === 'report') {
+      const self = g.net ? g.net.name : '';
+      if (cmd.name === self) this.chatLocal('不能举报自己');
+      else if (g.net) { g.net.report(cmd.name, cmd.reason); this.chatLocal(`正在举报「${cmd.name}」…`); }
+    } else {
+      this.chatLocal(`不认得命令「${cmd.text}」——可用：/mute /unmute /muted /report`);
+    }
+    this.chatRender();
+  }
+  // 本地回执（命令结果）：只进自己这台机器的聊天条，不上行。
+  chatLocal(text) {
+    this.chatRows.push({ sys: true, text, at: Date.now() });
+    if (this.chatRows.length > 30) this.chatRows.shift();
+    this.chatRender();
+    clearTimeout(this.chatT);
+    this.chatT = setTimeout(() => this.chatRender(), 12000);
+  }
+  // 一行聊天进来（服务端下发，或本地回执经 chatLocal）。屏蔽过滤在渲染侧
+  // （chatRowHtml 按 muted 名单返回空串）—— 名单是本地的，谁被屏蔽这件事不上行、
+  // 也不告诉对方。
+  chatPush(row) {
+    if (!row || row.sys) { if (row) this.chatLocal(row.text); return; }
+    this.chatRows.push(row);
+    if (this.chatRows.length > 30) this.chatRows.shift();
+    this.chatRender();
+    clearTimeout(this.chatT);
+    this.chatT = setTimeout(() => this.chatRender(), 12000);  // 12 秒没新话就淡出收起
+  }
+  chatRender() {
+    const box = $('chatBox'), log = $('chatLog');
+    if (!box || !log) return;
+    const open = !!this.chatActive, now = Date.now();
+    // 关着只留最近 12 秒的行（别把战场糊住）；开着翻最近 30 行
+    const rows = (open ? this.chatRows : this.chatRows.filter(r => now - (r.at || now) < 12000)).slice(-30);
+    const mine = this.game.net ? this.game.net.cid : null;
+    const muted = (this.game.profile && this.game.profile.muted) || [];
+    log.innerHTML = rows.map(r => chatRowHtml(r, { mine: r.cid != null && r.cid === mine, muted })).join('');
+    box.classList.toggle('hidden', !rows.length && !open);
+    log.scrollTop = log.scrollHeight;
   }
   popup(text, color = '#fff', medal = false) {
     const p = $('popups');

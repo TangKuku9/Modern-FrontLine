@@ -36,6 +36,11 @@
   <div id="minimapWrap"><canvas id="minimap" width="220" height="220"></canvas><div id="mmLabel"></div></div>
   <div id="scorebar"></div>
   <div id="killfeed"></div>
+  <!-- 对局内聊天（差距 43）：行在 .ct-log，输入行只在 chatOpen 时出现（Enter 全体 / Y 队伍） -->
+  <div id="chatBox" class="hidden">
+    <div id="chatLog"></div>
+    <div id="chatIn"><span id="chatCh">全体</span><input id="chatSay" maxlength="120" autocomplete="off" spellcheck="false"></div>
+  </div>
   <div id="objective"></div>
   <div id="ammoBox">
     <div id="weaponName"></div>

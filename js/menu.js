@@ -53,7 +53,10 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 // （两者都要，只认一个会在某类输入法上漏掉）。抽成纯函数不是为了好看 —— 那两处都在 DOM
 // 事件回调里，node 侧够不到，而"少写这一句"的症状（把半成品拼音当成密码提交 / 当成消息发出去）
 // 只会表现为"玩家手快"，所以它必须能被判据直接走一遍。
-export const isImeKey = (e) => !!(e && (e.isComposing || e.keyCode === 229));
+// 定义搬到 js/net/chat.mjs（对局内的聊天输入也要同一把尺子，两个定义迟早分叉）；
+// 这里留再导出，老的判据入口（test/net-feel.mjs 从 menu 认它）不用跟着动。
+import { isImeKey, parseChatCommand, toggleMute, chatRowHtml } from './net/chat.mjs';
+export { isImeKey };
 
 // 暂停屏上"这一屏该说什么、该给哪些动作"。抽成纯函数有两个理由：
 //   ① 联机这条路上"暂停"这个词是**假**的（本地 sim 停了、服务端照跑，你的人还在场上挨打）——
@@ -598,7 +601,7 @@ export class Menu {
     return `<div class="panel chat-box">
       <div class="lb-hd"><span>${esc(label)}</span></div>
       <div id="${id}" class="chat-lines"></div>
-      <div class="chat-in"><input id="${inp}" maxlength="120" placeholder="说点什么…" autocomplete="off"><button class="btn small ghost" data-a="say">发送</button></div>
+      <div class="chat-in"><input id="${inp}" maxlength="120" placeholder="说点什么…（/mute 屏蔽 · /report 举报）" autocomplete="off"><button class="btn small ghost" data-a="say">发送</button></div>
     </div>`;
   }
   bindChat(root, ch) {
@@ -608,10 +611,27 @@ export class Menu {
     const btn = box.parentElement.querySelector('[data-a=say]');
     const fire = () => {
       const lb = this.game.lobby; if (!lb) return;
-      const v = String(inp.value || '');
-      if (!v.trim()) return;
-      lb.say(ch, v);
+      // 命令与发言走同一个框（差距 45）：/mute /unmute /muted 是本地的屏蔽名单，
+      // /report 要上行记档。判定在 js/net/chat.mjs —— 对局内的聊天框认的是同一套词。
+      const cmd = parseChatCommand(String(inp.value || ''));
       inp.value = '';
+      const g = this.game;
+      if (cmd.op === 'say') { if (cmd.text) lb.say(ch, cmd.text); return; }
+      if (cmd.op === 'mute' || cmd.op === 'unmute') {
+        g.profile.muted = toggleMute(g.profile.muted, cmd.name, cmd.op === 'mute');
+        if (g.saveProfile) g.saveProfile();
+        this.localChat(ch, cmd.op === 'mute'
+          ? `已屏蔽「${cmd.name}」，他的话不再显示（/unmute ${cmd.name} 可恢复）`
+          : `已解除对「${cmd.name}」的屏蔽`);
+      } else if (cmd.op === 'muted') {
+        const list = (g.profile && g.profile.muted) || [];
+        this.localChat(ch, list.length ? '当前屏蔽：' + list.join('、') : '当前没有屏蔽任何人');
+      } else if (cmd.op === 'report') {
+        if (cmd.name === lb.name) this.localChat(ch, '不能举报自己');
+        else { lb.send({ t: 'report', name: cmd.name, reason: cmd.reason }); this.localChat(ch, `正在举报「${cmd.name}」…`); }
+      } else {
+        this.localChat(ch, `不认得命令「${cmd.text}」——可用：/mute /unmute /muted /report`);
+      }
     };
     if (btn) btn.addEventListener('click', fire);
     // 回车发送、Esc 只关这个输入框 —— 菜单屏上的输入框拿到焦点时，那些按键
@@ -635,16 +655,29 @@ export class Menu {
     box.scrollTop = box.scrollHeight;
   }
   chatLine(x) {
-    if (x.sys) return `<div class="chat-line sys">${esc(x.text)}</div>`;
-    const mine = this.game.lobby && x.from && x.from === (this.game.lobby.state && this.game.lobby.state.me && this.game.lobby.state.me.name);
-    return `<div class="chat-line"><b class="${mine ? 'me' : ''}">${esc(x.from || x.name || '')}</b><span>${esc(x.text || '')}</span></div>`;
+    // 渲染（含时间戳与屏蔽过滤）在 js/net/chat.mjs:chatRowHtml —— 与对局 HUD 共用一份，
+    // 免得"大厅里有时间戳、对局里没有"这种只在两个界面之间才看得见的差异又长出来。
+    const lb = this.game.lobby;
+    const mine = !!(lb && x.from && x.from === (lb.state && lb.state.me && lb.state.me.name));
+    return chatRowHtml(x, { mine, muted: (this.game.profile && this.game.profile.muted) || [] });
   }
   pushChat(root, ch, row) {
     const box = root.querySelector(ch === 'lobby' ? '#lbChat' : '#rmChat');
     if (!box) return;
-    box.insertAdjacentHTML('beforeend', this.chatLine(row));
+    const html = this.chatLine(row);
+    if (!html) return;                      // 被屏蔽的人：一行都不画（过滤点在 chatRowHtml）
+    box.insertAdjacentHTML('beforeend', html);
     while (box.children.length > 40) box.removeChild(box.firstChild);
     box.scrollTop = box.scrollHeight;
+  }
+  // 本地回执（/mute /report 的结果）：只进自己这台机器的聊天条，不是发言、不上行。
+  // 进**缓冲**而不只是 DOM：hist 一到就整块重画（renderChat），只画 DOM 的话回执会被抹掉。
+  localChat(ch, text) {
+    const lb = this.game.lobby;
+    const row = { ch, sys: true, text, at: Date.now() };
+    const buf = ch === 'lobby' ? (lb && lb.chat) : (lb && lb.state && lb.state.chat);
+    if (buf) { buf.push(row); if (buf.length > 60) buf.shift(); }
+    this.pushChat(this.el, ch, row);
   }
   // 服务端那句拒绝画在**当前那一屏**上。它不翻译、不复述（和注册闸同一个规矩）：
   // "邀请码不对"和"服务器忙"如果被揉成同一句"失败了"，服主永远收不到真问题。
