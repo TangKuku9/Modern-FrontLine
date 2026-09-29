@@ -29,7 +29,10 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   const def = WEAPONS[weaponId];
   const M = def.model;
   const root = new THREE.Group();
-  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Vector3(0.03, 0.05, -0.05), optic: 'iron', reticle: null };
+  // eject 是**抛壳口**的锚点：弹壳从这里出来，不是从枪口后方 0.4 m 的固定点。
+  // 它必须是挂在枪上的 Object3D（跟 muzzle 一样），否则枪一动弹壳就落在旧位置。
+  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Object3D(), optic: 'iron', reticle: null };
+  root.add(info.eject);
   const low = !!opts.low;
 
   const furnBase = M.color === 'wood' ? mat('gunWood') : M.color === 'tan' ? mat('gunTan') : M.color === 'green' ? mat('gunGreen') : M.color === 'steel' ? mat('gunSteel') : mat('gunPoly');
@@ -59,6 +62,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     info.muzzle.position.set(0, 0.06, -0.8);
     info.sight.set(0, 0.14, 0.14);
     info.leftHand.set(0, -0.02, -0.2);
+    info.eject.position.set(0, 0.06, 0.28);   // 火箭筒不抛壳，锚点只求不落在筒内
     root.add(info.muzzle);
     return info;
   }
@@ -72,6 +76,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
       add(bgeo(0.004, 0.012, 0.01), metal, 0, 0.078, -0.23);
       info.muzzle.position.set(0, 0.06, -0.25);
       info.sight.set(0, 0.083, 0.02);
+      info.eject.position.set(0.034, 0.05, -0.02);   // 弹巢与底把之间的缝，装弹时才打开
       info.mag = add(bgeo(0.001, 0.001, 0.001), metal, 0, 0.05, -0.02);
     } else {
       add(bgeo(0.03, 0.032, 0.2), body, 0, 0.05, -0.07);
@@ -79,10 +84,16 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
       add(bgeo(0.03, 0.1, 0.045), furn, 0, -0.03, 0.03, 0.25);
       add(bgeo(0.005, 0.03, 0.04), metal, 0, 0.0, -0.035);
       add(bgeo(0.004, 0.01, 0.008), metal, 0, 0.071, -0.16);
-      add(bgeo(0.02, 0.01, 0.01), metal, 0, 0.071, 0.02);
+      // 照门改成"底座 + 两耳"的缺口式：原先那块 20×10 的实心板顶面正好压在瞄准线上
+      // （0.076 = info.sight.y），把准星整根挡在后面 —— ADS 看到的是一堵小墙而不是三点一线。
+      // 缺口 0.065…0.083，容得下整根准星（0.066…0.076）且瞄准线在当中。
+      add(bgeo(0.02, 0.006, 0.01), metal, 0, 0.062, 0.02);
+      add(bgeo(0.005, 0.018, 0.01), metal, -0.0075, 0.074, 0.02);
+      add(bgeo(0.005, 0.018, 0.01), metal, 0.0075, 0.074, 0.02);
       info.mag = add(bgeo(0.024, 0.09, 0.035), metal, 0, -0.03, 0.03, 0.25);
       info.muzzle.position.set(0, 0.05, -0.18);
       info.sight.set(0, 0.076, 0.03);
+      info.eject.position.set(0.022, 0.058, -0.06);   // 套筒抛壳窗
       if (att.mag) info.mag.scale.y = 1.6;
     }
     if (att.muzzle === 'suppressor') { add(cgeo(0.018, 0.018, 0.14), mat('gunPoly'), 0, 0.05, -0.25); info.muzzle.position.z -= 0.14; }
@@ -145,13 +156,23 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   else if (mz === 'flash') { add(cgeo(0.014, 0.018, 0.07), metal, 0, 0.035, muzzleZ - 0.035); muzzleZ -= 0.07; }
   else { add(cgeo(0.013, 0.013, 0.04), metal, 0, 0.035, muzzleZ - 0.02); muzzleZ -= 0.04; }
   info.muzzle.position.set(0, 0.035, muzzleZ);
+  // 抛壳口锚点：贴着那扇抛壳窗（gunmodel 上方 0.027, 0.035, -0.03）的外侧，
+  // 稍微外推以免弹壳生成时嵌在窗框里。low 简模没有窗，但锚点照样要给（第三人称也抛壳）。
+  info.eject.position.set(0.038, 0.042, -0.03);
   // 机械瞄具
   const optic = att.optic || (def.defaultOptic && !att.optic ? def.defaultOptic : null);
   const sightY = railY + 0.035;
   if (!optic) {
-    add(bgeo(0.004, 0.035, 0.006), metal, 0, railY + 0.02, hz1 + 0.02);
+    add(bgeo(0.004, 0.03, 0.006), metal, 0, railY + 0.019, hz1 + 0.02);
     add(bgeo(0.02, 0.012, 0.012), metal, 0, railY + 0.006, hz1 + 0.02);
-    add(bgeo(0.022, 0.022, 0.016), metal, 0, railY + 0.02, zRear - 0.02);
+    // 照门 = 底座 + 两耳，中间留 11mm 缺口。原先是一整块 22×22 的实心铁（顶面 railY+0.031），
+    // 正好横在瞄准线（railY+0.034）下面 3mm —— 从眼位看过去就是准星后面一堵矮墙。
+    // 缺口要容得下整根准星（柱顶到柱脚），并且瞄准线落在缺口当中：
+    // 缺口 railY+0.020…0.044，瞄准线 railY+0.034，上下各留 1cm 余量给摆动。
+    // 判据 test/viewmodel.mjs 的 S1：眼位→准星的光路不许被照门挡住（±8mm 三条）。
+    add(bgeo(0.022, 0.008, 0.016), metal, 0, railY + 0.016, zRear - 0.02);
+    add(bgeo(0.0055, 0.024, 0.016), metal, -0.00825, railY + 0.032, zRear - 0.02);
+    add(bgeo(0.0055, 0.024, 0.016), metal, 0.00825, railY + 0.032, zRear - 0.02);
     info.sight.set(0, railY + 0.034, zRear + 0.13);
   }
   // 瞄具
@@ -244,9 +265,11 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     const magM = weaponId === 'ak' ? mat('containerOrange') : mm;
     for (let i = 0; i < n; i++) {
       const a = i * 0.1 + 0.1;
-      add(bgeo(0.026, seg + 0.004, 0.06 - (M.mag === 'curved_small' ? 0.02 : 0)), magM === mm ? mm : mat('gunMetal'), 0, -i * seg * 0.98 - seg / 2, -i * i * 0.004 - i * 0.008, a, 0, 0, magG);
+      // 材质就传 magM：原来写的是 `magM === mm ? mm : mat('gunMetal')`，AK 那支恒为假，
+      // 于是上面那句橙色胶木意图一个像素都没生效，12 把枪的弹匣全是同一种深灰。
+      add(bgeo(0.026, seg + 0.004, 0.06 - (M.mag === 'curved_small' ? 0.02 : 0)), magM, 0, -i * seg * 0.98 - seg / 2, -i * i * 0.004 - i * 0.008, a, 0, 0, magG);
     }
-    if (att.mag === 'fast') for (let i = 0; i < n; i++) add(bgeo(0.026, seg + 0.004, 0.06), mm, 0.03, -i * seg * 0.98 - seg / 2, -i * i * 0.004 - i * 0.008, i * 0.1 + 0.1, 0, 0, magG);
+    if (att.mag === 'fast') for (let i = 0; i < n; i++) add(bgeo(0.026, seg + 0.004, 0.06), magM, 0.03, -i * seg * 0.98 - seg / 2, -i * i * 0.004 - i * 0.008, i * 0.1 + 0.1, 0, 0, magG);
   } else if (M.mag === 'box') {
     add(bgeo(0.1, 0.11, 0.12), mat('gunGreen'), -0.03, -0.07, 0, 0, 0, 0, magG);
     add(bgeo(0.03, 0.02, 0.1), mm, 0.02, 0.03, 0, 0, 0, 0, magG);
@@ -300,6 +323,11 @@ function addLaser(add, x, y, z) {
 }
 
 // 第一人称手臂
+//
+// 左臂是**可重摆的两骨链**，因为换弹时副手要离开护木去抓弹匣：手臂以前是枪组的
+// 刚性子件，弹匣在手里下坠、消失、再回来，而两只手纹丝不动（test/viewmodel.mjs 的 H1）。
+// 骨长（L1/L2）烤死在胶囊几何里不许变 —— 只摆位姿，所以永远合身。
+const _armV = new THREE.Vector3(), _armV2 = new THREE.Vector3();
 export function buildArms(gunInfo, sleeveMat) {
   const g = new THREE.Group();
   const glove = mat('glove');
@@ -313,7 +341,13 @@ export function buildArms(gunInfo, sleeveMat) {
     g.add(mesh);
     return mesh;
   };
-  // 右手（握把）
+  // 只改位姿，不改几何（骨长恒定）
+  const pose = (mesh, a, b) => {
+    const dir = _armV.subVectors(b, a);
+    mesh.position.copy(a).addScaledVector(dir, 0.5);
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+  };
+  // 右手（握把）—— 扣扳机的手不参与换弹，保持刚性
   const rh = new THREE.Vector3(0.0, -0.035, 0.05);
   const re = new THREE.Vector3(0.1, -0.16, 0.22);
   const rs = new THREE.Vector3(0.16, -0.3, 0.5);
@@ -325,10 +359,34 @@ export function buildArms(gunInfo, sleeveMat) {
   const lh = gunInfo.leftHand.clone().add(new THREE.Vector3(-0.012, -0.015, 0));
   const le = new THREE.Vector3(-0.14, -0.14, lh.z + 0.2);
   const ls = new THREE.Vector3(-0.22, -0.3, lh.z + 0.55);
-  limb(lh, le, 0.032, glove);
-  limb(le.clone().lerp(lh, 0.3), le, 0.042, sleeveMat);
-  limb(le, ls, 0.055, sleeveMat);
+  const lfore = limb(lh, le, 0.032, glove);
+  const lsleeve = limb(le.clone().lerp(lh, 0.3), le, 0.042, sleeveMat);
+  const lupper = limb(le, ls, 0.055, sleeveMat);
   const lhand = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.1), glove); lhand.position.copy(lh); lhand.rotation.z = 0.5; g.add(lhand);
   g.traverse(o => { if (o.isMesh) o.castShadow = false; });
-  return g;
+
+  const L1 = le.distanceTo(ls), L2 = lh.distanceTo(le);
+  // 肘往侧下方弯（pole），跟人手自然持枪一致
+  const pole = new THREE.Vector3(-0.7, -0.8, 0.1);
+  // 两骨 IK：给手的目标位置反解肘。目标超长就夹到够得着的最远处（不许把骨头拉长）。
+  const poseLeft = (target) => {
+    const d = _armV.subVectors(target, ls);
+    const want = d.length() || 1e-5;
+    const dist = Math.min((L1 + L2) * 0.995, Math.max(Math.abs(L1 - L2) + 0.02, want));
+    d.multiplyScalar(dist / want);
+    const u = _armV2.copy(d).normalize();
+    const a = (L1 * L1 - L2 * L2 + dist * dist) / (2 * dist);
+    const h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+    const p = pole.clone().addScaledVector(u, -pole.dot(u));
+    if (p.lengthSq() < 1e-8) p.set(0, -1, 0).addScaledVector(u, u.y);
+    p.normalize();
+    const elbow = ls.clone().addScaledVector(u, a).addScaledVector(p, h);
+    const hand = ls.clone().add(d);
+    pose(lupper, elbow, ls);
+    pose(lfore, hand, elbow);
+    pose(lsleeve, elbow.clone().lerp(hand, 0.3), elbow);
+    lhand.position.copy(hand);
+    return hand;
+  };
+  return { group: g, leftHome: lh.clone(), handMesh: lhand, poseLeft };
 }

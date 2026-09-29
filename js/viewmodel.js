@@ -10,6 +10,10 @@ import { mat } from './materials.js';
 import { clamp, damp, lerp } from './util.js';
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3();
+const _mw = new THREE.Vector3(), _shellP = new THREE.Vector3(), _hand = new THREE.Vector3(), _belt = new THREE.Vector3(), _magOff = new THREE.Vector3();
+// 副手抓弹匣的握点（弹匣自身坐标里往左前探一点）
+const MAG_GRAB_OFF = new THREE.Vector3(-0.03, 0.02, 0.02);
+const smooth01 = (x) => { const t = clamp(x, 0, 1); return t * t * (3 - 2 * t); };
 
 export class Viewmodel {
   constructor(game, owner, ws) {
@@ -25,10 +29,16 @@ export class Viewmodel {
     this.pivot.add(this.holder);
     this.seenVersion = -1;
     this.groups = [];
+    // 枪口闪光灯挂在 vmScene 上：世界那盏（effects.flashLight）加在 game.scene，
+    // 而枪模渲染在 vmScene —— 开火时枪身/手套一直是冷的，只有那张贴片在发光。
+    this.flashLamp = new THREE.PointLight(0xffb060, 0, 4, 2);
+    game.vmScene.add(this.flashLamp);
+    this.handDirty = false;   // 换弹结束后把副手放回护木一次
   }
   dispose() {
     this.ws.sink = null;
     this.game.vmScene.remove(this.pivot);
+    this.game.vmScene.remove(this.flashLamp);
     for (const s of this.groups) if (s && s.laserDot) this.game.scene.remove(s.laserDot);
     this.groups = [];
   }
@@ -39,17 +49,21 @@ export class Viewmodel {
     const sleeve = mat(this.game.playerSleeve || 'fab_ally');
     const arms = buildArms(info, sleeve);
     const g = new THREE.Group();
-    g.add(info.group); g.add(arms);
+    g.add(info.group); g.add(arms.group);
     g.traverse(o => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; } });
+    // 火光尺寸与持续时间按枪口装置走：消焰器要真的消焰 —— 原来只把点光源 4→1.5，
+    // 贴片尺寸和 35ms 的闪光时间一动不动，装了它照样一大团火（名实不符）。
+    const flashScale = stats.suppressed ? 0.08 : stats.flashHide ? 0.11 : 0.22;
+    const flashDur = stats.suppressed ? 0.018 : stats.flashHide ? 0.022 : 0.035;
     const flash = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.game.effects.texFlash, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: new THREE.Color(3, 2.2, 1.4) }));
-    flash.scale.setScalar(stats.suppressed ? 0.08 : 0.22); flash.visible = false;
+    flash.scale.setScalar(flashScale); flash.visible = false;
     info.muzzle.add(flash);
     let laserDot = null;
     if (stats.laser) {
       laserDot = new THREE.Mesh(new THREE.SphereGeometry(0.02, 8, 6), new THREE.MeshBasicMaterial({ color: new THREE.Color(8, 0.5, 0.5) }));
       this.game.scene.add(laserDot); laserDot.visible = false;
     }
-    return { info, group: g, flash, laserDot };
+    return { info, group: g, arms, flash, flashDur, laserDot };
   }
   syncLoadout() {
     if (this.ws.loadoutVersion === this.seenVersion) return;
@@ -87,13 +101,15 @@ export class Viewmodel {
     if (this.fx.length) {
       for (const e of this.fx) {
         if (e.kind === 'shot') {
-          this.flashT = 0.035;
-          const mw = this.muzzleWorld(new THREE.Vector3());
+          this.flashT = cur.flashDur;
+          const mw = this.muzzleWorld(_mw);
           if (!e.suppressed) game.effects.flashLight(mw, 0xffb060, e.flashHide ? 1.5 : 4, 0.05, 8);
           for (const p of e.tracers) game.effects.tracer(mw.clone().addScaledVector(e.fwd, 0.5), p, [1.4, 1.0, 0.55]);
           if (e.shell) {
+            // 弹壳从**抛壳窗**（info.eject）出来，不是"枪口后方 0.4 m"那个固定点 ——
+            // 枪越长偏得越多：L115A3 的弹壳原本会从护木/枪管那儿冒出来。
             const right = _v2.set(1, 0, 0).applyQuaternion(game.camera.quaternion);
-            game.effects.shell(mw.clone().addScaledVector(e.fwd, -0.4).addScaledVector(right, 0.05), right);
+            game.effects.shell(cur.info.eject.getWorldPosition(_shellP), right);
           }
           this.vmKick += 0.02 + e.recoilV * 0.012;
           this.vmRot += 0.02 + e.recoilV * 0.02;
@@ -118,6 +134,11 @@ export class Viewmodel {
     this.pivot.quaternion.copy(cam.quaternion);
     game.vmCamera.position.copy(cam.position);
     game.vmCamera.quaternion.copy(cam.quaternion);
+    // 火光要打亮自己的枪与手：世界那盏点光源挂在 game.scene，照不到 vmScene 里的枪模
+    this.flashLamp.position.copy(this.muzzleWorld(_mw));
+    this.flashLamp.intensity = this.flashT > 0
+      ? (st.suppressed ? 0.5 : st.flashHide ? 0.8 : 2.0) * clamp(this.flashT / cur.flashDur, 0, 1)
+      : 0;
     // 摆动：视线位移由权威侧按拍攒过来，这里一次取干，总量与帧率无关
     const aim = ws.aimAccum;
     this.sway.x = damp(this.sway.x, clamp(-aim.x * 0.0006, -0.05, 0.05), 8, dt);
@@ -145,9 +166,14 @@ export class Viewmodel {
     if (pl.sliding) { rz -= 0.3; }
     // 状态动画
     const k = ws.stateDur ? clamp(ws.stateT / ws.stateDur, 0, 1) : 1;
+    const arms = cur.arms;
     if (ws.state === 'reload') {
-      if (st.shellReload) { rz += 0.25; rx += 0.1 + Math.sin(k * Math.PI) * 0.08; pos.y -= 0.03; }
-      else {
+      if (st.shellReload) {
+        rz += 0.25; rx += 0.1 + Math.sin(k * Math.PI) * 0.08; pos.y -= 0.03;
+        // 逐发装填：副手每一发去装弹口递一发（k 每发走一轮，stateT 在 weapon-state.js:121 被清零）
+        _belt.set(0, -0.05, -0.02);
+        _hand.copy(arms.leftHome).lerp(_belt, k < 0.25 ? smooth01(k / 0.25) : k < 0.62 ? 1 : 1 - smooth01((k - 0.62) / 0.38));
+      } else {
         const e = Math.sin(k * Math.PI);
         rz += e * 0.55; rx += e * 0.25; pos.y -= e * 0.05; pos.x -= e * 0.03;
         if (cur.info.mag) {
@@ -156,11 +182,25 @@ export class Viewmodel {
           let off = 0;
           if (k > 0.2 && k < 0.62) off = Math.min(1, (k - 0.2) / 0.12);
           if (k >= 0.62 && k < 0.75) off = 1 - (k - 0.62) / 0.13;
-          m.position.copy(m.userData.base).add(new THREE.Vector3(0, -0.25 * off, 0.05 * off));
+          m.position.copy(m.userData.base).add(_magOff.set(0, -0.25 * off, 0.05 * off));
           m.visible = !(k > 0.33 && k < 0.5);
-        }
+          // 副手全程跟着弹匣：伸手抓住 → 押着它下来 → 去弹挂取新的 → 装到位 → 回护木。
+          // 原来手臂是枪组的刚性子件，弹匣在手里下坠、消失、再回来，两只手纹丝不动。
+          _hand.copy(m.position).add(MAG_GRAB_OFF);
+          if (k < 0.16) _hand.copy(arms.leftHome);
+          else if (k < 0.40) { /* 抓着弹匣一起走 */ }
+          else if (k < 0.52) _hand.lerp(_belt.set(0.04, -0.26, 0.12), smooth01((k - 0.40) / 0.12));
+          else if (k < 0.62) _hand.lerp(_belt.set(0.04, -0.26, 0.12), 1 - smooth01((k - 0.52) / 0.10));
+          else if (k < 0.80) { /* 押着弹匣装到位 */ }
+          else _hand.lerp(arms.leftHome, smooth01((k - 0.80) / 0.20));
+        } else _hand.copy(arms.leftHome);
       }
-    } else if (cur.info.mag && cur.info.mag.userData.base) { cur.info.mag.position.copy(cur.info.mag.userData.base); cur.info.mag.visible = true; }
+      arms.poseLeft(_hand);
+      this.handDirty = true;
+    } else if (this.handDirty) { arms.poseLeft(arms.leftHome); this.handDirty = false; }
+    if (ws.state !== 'reload' && cur.info.mag && cur.info.mag.userData.base) {
+      cur.info.mag.position.copy(cur.info.mag.userData.base); cur.info.mag.visible = true;
+    }
     if (ws.state === 'switch') { const e = 1 - k; pos.y -= e * 0.3; rx -= e * 0.6; }
     if (ws.state === 'melee') { const e = Math.sin(k * Math.PI); pos.z -= e * 0.15; pos.x -= e * 0.1; ry += e * 0.8; rz -= e * 0.4; }
     if (ws.state === 'throw' || ws.state === 'cook' || ws.state === 'use') {

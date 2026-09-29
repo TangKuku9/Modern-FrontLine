@@ -1,0 +1,296 @@
+// 枪械视觉的六条判据。这些都是"一眼能看出来"的东西，靠读代码盯不住：
+// 弹壳从哪儿冒出来、开火照不照得亮自己的枪、换弹时副手动不动、AK 弹匣是不是橙的、
+// 消焰器消不消焰、照门是缺口还是实心板。
+//
+// 每条判据都问**被画出来的那个量**（弹壳的世界坐标、灯的强度、手的网格位置、
+// 贴片的缩放），不是问实现里有没有某段代码 —— 后者是"规格抄本"，改动一换写法就假绿。
+// 反证臂同理：把改动前那条规则原样算一遍，判据必须能分出差别。
+import { chromium } from 'playwright';
+import { readFileSync } from 'node:fs';
+import { withServer } from './with-server.mjs';
+
+// GL 参数跟 test/optic.mjs 一致（angle + swiftshader）：要真出图，不能 stub 渲染，
+// 而 `--use-gl=swiftshader` 那套在这台机器上会在加载阶段丢 WebGL 上下文。
+const ARGS = ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--mute-audio',
+  '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--disable-background-timer-throttling'];
+async function launch() {
+  for (const [label, opts] of [['chrome', { channel: 'chrome', args: ARGS }], ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }]]) {
+    try { const b = await chromium.launch(opts); console.log(`  浏览器: ${label}`); return b; }
+    catch (e) { console.log(`  ${label} 起不来: ${e.message.split('\n')[0]}`); }
+  }
+  throw new Error('没有可用浏览器');
+}
+const browser = await launch();
+const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+const errs = [];
+page.on('pageerror', e => errs.push('[pageerror] ' + e.message));
+page.on('console', m => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) errs.push('[console.error] ' + m.text()); });
+await page.addInitScript(() => { HTMLCanvasElement.prototype.requestPointerLock = function () { return Promise.resolve(); } });
+const srv = await withServer();
+await page.goto(srv.base + '/index.html');
+await page.waitForFunction(() => window.game && window.game.state === 'menu', null, { timeout: 180000 });
+await page.evaluate(() => { window.game.renderer.setAnimationLoop(null); });
+
+// ---------- 阶段 A：几何与材质（不起局） ----------
+const geo = await page.evaluate(async () => {
+  const out = [];
+  const ok = (label, cond, extra = '') => out.push([!!cond, label + (extra ? '  ' + extra : '')]);
+  const THREE = await import('three');
+  const { buildGun } = await import('/js/gunmodel.js');
+  const mats = await import('/js/materials.js');
+  const ray = new THREE.Raycaster();
+  const axis = new THREE.Vector3(0, 0, -1);
+
+  // S1 机械瞄具：眼位要看得见准星，照门不许是一堵实心板。
+  // 探测线取瞄准线下方 2mm —— 准星柱顶正好压在瞄准线上，擦边射线打不中（那样量具永远绿）。
+  // 取探测线上**最远**一处几何当准星：瞄准线只有瞄具几何横穿（枪管/护木都在它下面），
+  // 而反证臂补的照门板离眼更近，取最近的话它会冒充准星，"照门挡住准星"就永远测不出来。
+  const probeSight = (info) => {
+    info.group.updateMatrixWorld(true);
+    ray.set(info.sight.clone().add(new THREE.Vector3(0, -0.002, 0)), axis);
+    const onAxis = ray.intersectObject(info.group, true).filter(h => h.distance > 1e-4);
+    const tip = onAxis[onAxis.length - 1];
+    if (!tip || tip.distance < 0.1) return null;
+    const blocked = [];
+    for (const dy of [-0.008, 0, 0.008]) {
+      const o = info.sight.clone().add(new THREE.Vector3(0, dy - 0.002, 0));
+      ray.set(o, tip.point.clone().sub(o).normalize());
+      const hits = ray.intersectObject(info.group, true).filter(h => h.distance > 1e-4 && h.distance < tip.distance - 0.002);
+      blocked.push(hits.length ? hits[0].point.z : null);
+    }
+    return { tip, blocked };
+  };
+  for (const id of ['m4', 'ak', 'sks', 'm1911']) {
+    const r = probeSight(buildGun(id, {}, 'none'));
+    ok(`S1 ${id} 探测线尽头是准星`, !!r, r ? `距眼 ${r.tip.distance.toFixed(3)} m` : '没找到准星');
+    if (!r) continue;
+    const bad = r.blocked.filter(z => z !== null);
+    ok(`S1 ${id} 眼位 ±8mm 都看得见准星`, bad.length === 0, bad.length ? `被 z=${bad.map(z => z.toFixed(3)).join(',')} 挡住` : '三条光路全通');
+  }
+  {
+    const info = buildGun('m4', {}, 'none');
+    const slab = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.022, 0.016), new THREE.MeshBasicMaterial());
+    slab.position.set(0, info.sight.y - 0.003, 0.05);   // 改动前那块实心照门的位置
+    info.group.add(slab);
+    const r = probeSight(info);
+    ok('S1⁻ 反证：照老写法补回实心照门要报红', !!r && r.blocked.some(z => z !== null), r ? `检出 ${r.blocked.filter(z => z !== null).length} 条光路被挡` : '没测到');
+  }
+
+  // S4 AK 弹匣是橙色胶木（那段意图写了一半被自己的三元式吃掉），别的枪仍是深灰
+  const magMat = (id) => { const m = buildGun(id, {}, 'none').mag; return m && m.children.length ? m.children[0].material : null; };
+  ok('S4 AK 弹匣用橙色胶木材质', magMat('ak') === mats.mat('containerOrange'), String(magMat('ak') && magMat('ak').color && magMat('ak').color.getHexString()));
+  ok('S4 M4 弹匣仍是深灰金属（不是"全体变橙"）', magMat('m4') === mats.mat('gunMetal'));
+  ok('S4 快拔副弹匣跟主弹匣同材质', (() => {
+    const m = buildGun('ak', { mag: 'fast' }, 'none').mag;
+    return m.children.length > 1 && m.children[0].material === m.children[m.children.length - 1].material && m.children[0].material === mats.mat('containerOrange');
+  })());
+
+  // S2 锚点本身：每把枪都得有一个挂在枪上的抛壳口
+  for (const id of ['m4', 'ak', 'm1911', 'revolver', 'rpg']) {
+    const info = buildGun(id, {}, 'none');
+    ok(`S2 ${id} 抛壳口锚点挂在枪上`, info.eject && info.eject.parent === info.group, info.eject ? `pos=${info.eject.position.toArray().map(v => v.toFixed(3)).join(',')}` : 'null');
+  }
+  return out;
+});
+
+// ---------- 阶段 B：跑局（抛壳位置 / 火光灯 / 换弹副手 / 消焰器） ----------
+const play = await page.evaluate(async () => {
+  const out = [];
+  const ok = (label, cond, extra = '') => out.push([!!cond, label + (extra ? '  ' + extra : '')]);
+  const THREE = await import('three');
+  const { computeStats } = await import('/js/data.js');
+  const g = window.game;
+  g.renderer.setAnimationLoop(null);
+  const realRender = g.composer.render.bind(g.composer);
+  g.composer.render = () => {};
+  const realClock = g.clock;
+  g.clock = { getDelta: () => 1 / 60 };
+  const frames = (n, inp) => { for (let i = 0; i < n; i++) { if (inp) inp(); g.frame(); } };
+  await g.startGame('mp', { mode: 'tdm', map: 'yard', diff: 1, allies: 2, enemies: 2, scoreLimit: 50, timeLimit: 10 });
+  const ws = g.player.ws, vm = ws.vm;
+  frames(40);          // setLoadout 会先进 switch（0.5s）：射击与换弹都只在 idle 开门
+  ok('起局后状态机回到 idle', ws.state === 'idle', 'state=' + ws.state);
+  const cur = vm.groups[ws.cur];
+
+  // S2 弹壳从抛壳窗出来。老规则是"枪口后方 0.4m"，枪越长偏得越多。
+  const shells = [];
+  const realShell = g.effects.shell;
+  g.effects.shell = (pos, dir) => { shells.push(pos.clone()); };
+  const v = () => new THREE.Vector3();
+  frames(3, () => { g.input.buttons = 1; });
+  g.input.buttons = 0; frames(3);
+  g.effects.shell = realShell;
+  const ejectWorld = cur.info.eject.getWorldPosition(v());
+  ok('S2 开火有弹壳', shells.length > 0, 'n=' + shells.length);
+  const worst = shells.reduce((a, p) => Math.max(a, p.distanceTo(ejectWorld)), 0);
+  ok('S2 弹壳落在抛壳窗旁边', shells.length > 0 && worst < 0.08, `最远 ${worst.toFixed(3)} m`);
+  const mw = vm.muzzleWorld(v());
+  const fwd = g.camera.getWorldDirection(v());
+  const right = v().set(1, 0, 0).applyQuaternion(g.camera.quaternion);
+  const oldRule = mw.clone().addScaledVector(fwd, -0.4).addScaledVector(right, 0.05);
+  ok('S2⁻ 反证：老规则（枪口后方 0.4m）离抛壳窗足够远，两把尺子分得清', oldRule.distanceTo(ejectWorld) > 0.25,
+    `老规则离抛壳窗 ${oldRule.distanceTo(ejectWorld).toFixed(3)} m`);
+
+  // S3 开火要照得亮自己的枪模（世界那盏点光源在 game.scene，照不到 vmScene）
+  frames(4);
+  ok('S3 平时火光灯是灭的', vm.flashLamp.intensity === 0, 'intensity=' + vm.flashLamp.intensity);
+  frames(2, () => { g.input.buttons = 1; });
+  const lit = vm.flashLamp.intensity;
+  ok('S3 开火时 vmScene 里有灯在照枪模', lit > 0 && vm.flashLamp.parent === g.vmScene, `intensity=${lit.toFixed(2)}`);
+  ok('S3 灯位贴着枪口', vm.flashLamp.position.distanceTo(vm.muzzleWorld(v())) < 0.02, `${vm.flashLamp.position.distanceTo(vm.muzzleWorld(v())).toFixed(4)} m`);
+  g.input.buttons = 0; frames(3);
+
+  // S5 消焰器名实相符：贴片比裸枪小、闪光比裸枪短
+  const mk = (att) => vm.build({ id: 'm4', att, camo: 'none', stats: computeStats('m4', att) });
+  const bare = mk({}), flashHider = mk({ muzzle: 'flash' }), sup = mk({ muzzle: 'suppressor' });
+  ok('S5 消焰器的火光贴片比裸枪小', flashHider.flash.scale.x < bare.flash.scale.x * 0.75,
+    `裸=${bare.flash.scale.x.toFixed(3)} 消焰=${flashHider.flash.scale.x.toFixed(3)}`);
+  ok('S5 消焰器的闪光比裸枪短', flashHider.flashDur < bare.flashDur * 0.8, `裸=${bare.flashDur} 消焰=${flashHider.flashDur}`);
+  ok('S5⁻ 反证：消音器比消焰器还小', sup.flash.scale.x <= flashHider.flash.scale.x, `消焰=${flashHider.flash.scale.x.toFixed(3)} 消音=${sup.flash.scale.x.toFixed(3)}`);
+
+  // H1 换弹时副手要动（原来手臂是枪组刚性子件，弹匣在手里下坠又回来，手纹丝不动）
+  ws.w.mag = Math.min(ws.w.mag, 3);
+  ws.startReload();
+  const arm = cur.arms;
+  const mag = cur.info.mag;
+  let away = 0, grab = 0, n = 0;
+  for (let i = 0; i < 300 && ws.state === 'reload'; i++) {
+    frames(1); n++;
+    const hand = arm.handMesh.position;
+    if (hand.distanceTo(arm.leftHome) > 0.06) away++;
+    if (mag && hand.distanceTo(mag.position) < 0.09) grab++;
+  }
+  frames(30);
+  ok('H1 换弹时副手离开护木', away > 15, `离位 ${away}/${n} 帧`);
+  ok('H1 副手抓到过弹匣', grab > 5, `贴住弹匣 ${grab}/${n} 帧`);
+  ok('H1 换弹结束副手回到护木', arm.handMesh.position.distanceTo(arm.leftHome) < 1e-3,
+    `Δ=${arm.handMesh.position.distanceTo(arm.leftHome).toFixed(4)}`);
+  ok('H1 换弹结算弹药', ws.state === 'idle' && ws.w.mag === ws.w.stats.mag, `state=${ws.state} mag=${ws.w.mag}`);
+
+  g.composer.render = realRender;
+  g.clock = realClock; realClock.getDelta();
+  return { out, shots: { bare: bare.flash.scale.x, hider: flashHider.flash.scale.x } };
+});
+
+// ---------- 阶段 C：截图（多角度给眼睛验收） ----------
+// 每块 evaluate 之间页面会收到 pointerlockchange → game.pause(true)（js/main.js:528），
+// 于是 g.frame() 整个不推进 —— 截图会拍到"冻结的最后一帧"，症状像功能没生效。
+// 所以每块第一件事都是把 paused 放倒。
+const WAKE = `function wake(){ const g = window.game; g.paused = false; const el = document.getElementById('clickToPlay'); if (el) el.classList.add('hidden'); }`;
+// 驱动帧的时候把 composer.render 打桩：frame() 每帧都会真渲染，而 swiftshader 下
+// 1280×720 + 泛光一帧就要好几秒 —— 60 帧堆在合成器队列里，紧接着的 page.screenshot 会超时。
+// 截图前才真渲染一帧。
+// 驱动帧的时候把 composer.render 打桩：frame() 每帧都会真渲染，而 swiftshader 下
+// 1280×720 + 泛光一帧就要好几秒。**必须 try/finally 还原**：驱动块里有 `return {...}`，
+// 那会直接跳出箭头函数 —— 第一版没兜住，于是 composer.render 从此一直是空操作，
+// 症状是"判据全绿、截图永远是加载那一帧、readPixels 全零、动画循环跑出 230fps"。
+const drive = (js) => page.evaluate(`(() => {
+  ${WAKE} wake();
+  const _g = window.game;
+  const real = _g.composer.render.bind(_g.composer);
+  _g.composer.render = () => {};
+  _g.clock = { getDelta: () => 1 / 60 };   // 固定步长：真时钟连打 60 帧几乎不走时间
+  try { ${js} } finally { _g.composer.render = real; }
+})()`);
+// 截图走"游戏自己的动画循环把帧呈现出来 → page.screenshot"（跟 test/viewmodel.mjs 一样）。
+// 踩过的两个坑：①手动调 composer.render 之后直接截图 —— 页面不在前台时合成器不呈现新帧，
+//   抓到的是**上一次**的旧画面；②为了冻住动画把 clock 换成 dt=0 —— 那样帧同样不被呈现。
+// 所以让真时钟跑、循环照常渲染，要拍哪个瞬间就把那个状态**每帧写回去**。
+const shoot = async (name, pin = '', opts = {}) => {
+  await page.evaluate(`(() => {
+    ${WAKE} wake();
+    const g = window.game, ws = g.player && g.player.ws, vm = ws && ws.vm;
+    g.renderer.setAnimationLoop(() => { g.frame(); ${pin} });
+  })()`);
+  // 先点一下页面再截（test/optic.mjs 的做法）：不点的话合成器不给新帧，截到的是**上一次**
+  // 呈现的旧画面 —— 判据全绿而截图对不上，这种红只能靠眼睛发现。
+  try { await page.mouse.click(640, 400); } catch { /* 指针锁恢复不了不影响截图 */ }
+  await page.waitForTimeout(1500);
+  const path = `test/gunv-${name}.png`;
+  await page.evaluate(`(() => {
+    document.getElementById('clickToPlay').classList.add('hidden');
+    ${opts.noHud ? "document.getElementById('hud').style.display = 'none';" : ''}
+    window.game.renderer.setAnimationLoop(null);
+    window.game.input.buttons = 0;
+  })()`);
+  await page.screenshot({ path, timeout: 120000 });
+  const probe = await page.evaluate(`(() => {
+    const g = window.game, gl = g.renderer.getContext();
+    g.composer.render();
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let s = 0; for (let i = 0; i < px.length; i += 4) s += px[i] + px[i + 1] + px[i + 2];
+    return {
+      renderMean: +(s / (px.length / 4) / 3).toFixed(1),   // 0 = 渲染链路又空转了（截图会是旧帧）
+      ctxLost: gl.isContextLost(), state: g.state, vmPass: g.vmPass.enabled,
+      hud: document.getElementById('hud').style.display || '(unset)',
+    };
+  })()`);
+  if (opts.noHud) await page.evaluate(() => { document.getElementById('hud').style.display = ''; });
+  console.log(`  [${name}] -> ${path}  ${JSON.stringify(probe)}`);
+};
+const FRAMES = `const frames = (n, inp) => { for (let i = 0; i < n; i++) { if (inp) inp(); window.game.frame(); } };`;
+const shotInfo = [];
+const r1 = await drive(`${FRAMES}
+  const g = window.game, ws = g.player.ws;
+  const t0 = g.tick;
+  ws.replaceSlot(0, { id: 'm4', att: {}, camo: 'none' }, 30, 150);
+  frames(60);                 // 过掉切枪，站定在持枪位
+  return { ticks: g.tick - t0, kids: ws.vm.holder.children.length, state: ws.state, y: +ws.vm.holder.position.y.toFixed(3) };
+`);
+shotInfo.push(['C1 持枪位截图前：模拟在推进、枪模挂上了 holder', r1.ticks > 30 && r1.kids > 0 && r1.state === 'idle', JSON.stringify(r1)]);
+await shoot('hip');
+const r2 = await drive(`${FRAMES}
+  const g = window.game, ws = g.player.ws;
+  frames(70, () => { g.input.buttons = 4; });   // 机械瞄具 ADS
+  g.input.buttons = 0;
+  return { ads: +ws.adsT.toFixed(2), visible: ws.vm.holder.visible };
+`);
+shotInfo.push(['C2 ADS 截图前：真的拉到满镜', r2.ads > 0.99 && r2.visible, JSON.stringify(r2)]);
+await shoot('iron-ads', `window.game.input.buttons = 4;`);
+const r3 = await drive(`${FRAMES}
+  const g = window.game, ws = g.player.ws, vm = ws.vm;
+  frames(20);
+  ws.w.mag = 3; ws.startReload();
+  frames(Math.round(ws.stateDur * 60 * 0.30));            // 弹匣已拔出、副手还抱着它
+  const arm = vm.groups[ws.cur].arms, mag = vm.groups[ws.cur].info.mag;
+  return { state: ws.state, k: +(ws.stateT / ws.stateDur).toFixed(2), handMag: +arm.handMesh.position.distanceTo(mag.position).toFixed(3) };
+`);
+shotInfo.push(['C3 换弹截图前：卡在换弹中段、副手贴着弹匣', r3.state === 'reload' && r3.handMag < 0.12, JSON.stringify(r3)]);
+await shoot('reload', `
+  const ws2 = window.game.player.ws;
+  // 钉死在 k=0.31：弹匣已拔出、副手正抱着它。写死 state/stateDur/stateT 三件套，
+  // 比"等它自己走到那一拍"稳（模拟每帧推 1/60，会把 k 越过那个窗口）。
+  ws2.state = 'reload'; ws2.stateDur = 2.1; ws2.stateT = 0.65;
+`);
+const r4 = await drive(`${FRAMES}
+  const g = window.game, ws = g.player.ws, vm = ws.vm;
+  for (let i = 0; i < 200 && ws.state !== 'idle'; i++) frames(5);
+  frames(6);
+  frames(1, () => { g.input.buttons = 1; });    // 打一发，火光还在
+  g.input.buttons = 0;
+  return { flash: +vm.flashT.toFixed(4), lamp: +vm.flashLamp.intensity.toFixed(2), visible: vm.groups[ws.cur].flash.visible };
+`);
+shotInfo.push(['C4 开火截图前：火光贴片与火光灯都还亮着', r4.flash > 0 && r4.lamp > 0 && r4.visible, JSON.stringify(r4)]);
+await shoot('flash', `window.game.input.buttons = 1;`);   // 压住扳机：火光每帧都在
+// C5 给"截图"这把尺子自己上保险：同一套机制连拍两张（开着/关掉视图模型），两张必须不一样。
+// 以前出过"判据全绿、截图里却没有枪"（截图抓的是上一次呈现的旧帧），那种红只能靠眼睛发现。
+// 注意①vmPass.enabled 每帧都会被 frame() 写回来（js/main.js:771），要在**每帧之后**关掉；
+// ②两张都关掉 HUD —— 否则计时器/击杀播报的差异会冒充"画面变了"，这把尺子就永远绿。
+await shoot('vm', `window.game.input.buttons = 4;`, { noHud: true });
+await shoot('novm', `window.game.input.buttons = 4; window.game.vmPass.enabled = false;`, { noHud: true });
+const same = (() => {
+  const a = readFileSync(`test/gunv-vm.png`), b = readFileSync(`test/gunv-novm.png`);
+  return a.length === b.length && Buffer.compare(a, b) === 0;
+})();
+shotInfo.push(['C5 关掉视图模型后截图真的变了（截图链路能分辨枪）', !same, same ? '两张图逐字节相同' : '两张图不同']);
+await browser.close();
+
+let green = errs.length === 0;
+for (const [flag, label] of geo) { green &&= flag; console.log(`  ${flag ? '✅' : '❌'} ${label}`); }
+for (const [flag, label] of play.out) { green &&= flag; console.log(`  ${flag ? '✅' : '❌'} ${label}`); }
+for (const [label, flag, extra] of shotInfo) { green &&= flag; console.log(`  ${flag ? '✅' : '❌'} ${label}  ${extra}`); }
+if (errs.length) console.log('  页面异常:\n    ' + errs.slice(0, 8).join('\n    '));
+console.log(`\n  结论：${green ? '绿' : '红'}`);
+srv.kill(); process.exit(green ? 0 : 1);
