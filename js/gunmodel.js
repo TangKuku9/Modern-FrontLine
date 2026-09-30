@@ -276,16 +276,27 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     add(bgeo(0.026, L, 0.065), M.color === 'tan' && M.mag === 'straight' ? mat('gunTan') : mm, 0, -L / 2, 0, 0.12, 0, 0, magG);
     if (att.mag === 'fast') add(bgeo(0.026, L, 0.065), mm, 0.03, -L / 2, 0, 0.12, 0, 0, magG);
   } else if (M.mag === 'curved' || M.mag === 'curved_small') {
-    const n = Math.round((M.mag === 'curved_small' ? 4 : 5) * ext);
-    const seg = 0.04;
+    // 香蕉弹匣沿弧线走链：每段中心 = 顶点沿**该段自己的朝向**下移半段高，走完整段
+    // 再加下一角的转量 —— 相邻两段的弦向恒等于两段转角的均值，侧视是连续的弧。
+    // 旧写法每段多转 0.1 rad、位置却按 i² 独立前探，转角与弦线对不上，侧视是锯齿
+    // 楼梯、底段翘近 30°；末端还是个平齐断口 —— 现在底板顺末段角度收尾（S11 及其反证臂）。
+    // 材质就传 magM：原来写的是 `magM === mm ? mm : mat('gunMetal')`，AK 那支恒为假，
+    // 于是橙色胶木意图一个像素都没生效，12 把枪的弹匣全是同一种深灰。
+    const small = M.mag === 'curved_small';
+    const n = Math.round((small ? 4 : 5) * ext);
+    const h = small ? 0.04 : 0.042, depth = small ? 0.04 : 0.06;
+    const a0 = small ? 0.04 : 0.06, da = small ? 0.05 : 0.07;
     const magM = weaponId === 'ak' ? mat('containerOrange') : mm;
-    for (let i = 0; i < n; i++) {
-      const a = i * 0.1 + 0.1;
-      // 材质就传 magM：原来写的是 `magM === mm ? mm : mat('gunMetal')`，AK 那支恒为假，
-      // 于是上面那句橙色胶木意图一个像素都没生效，12 把枪的弹匣全是同一种深灰。
-      add(bgeo(0.026, seg + 0.004, 0.06 - (M.mag === 'curved_small' ? 0.02 : 0)), magM, 0, -i * seg * 0.98 - seg / 2, -i * i * 0.004 - i * 0.008, a, 0, 0, magG);
-    }
-    if (att.mag === 'fast') for (let i = 0; i < n; i++) add(bgeo(0.026, seg + 0.004, 0.06), magM, 0.03, -i * seg * 0.98 - seg / 2, -i * i * 0.004 - i * 0.008, i * 0.1 + 0.1, 0, 0, magG);
+    const chain = (x0) => {
+      let a = a0, y = 0, z = 0;
+      for (let i = 0; i < n; i++) {
+        add(bgeo(0.026, h + 0.004, depth), magM, x0, y - Math.cos(a) * h / 2, z - Math.sin(a) * h / 2, a, 0, 0, magG);
+        y -= Math.cos(a) * h; z -= Math.sin(a) * h; a += da;
+      }
+      add(bgeo(0.034, 0.014, depth + 0.012), magM, x0, y - Math.cos(a - da) * 0.007, z - Math.sin(a - da) * 0.007, a - da, 0, 0, magG);
+    };
+    chain(0);
+    if (att.mag === 'fast') chain(0.03);
   } else if (M.mag === 'box') {
     add(bgeo(0.1, 0.11, 0.12), mat('gunGreen'), -0.03, -0.07, 0, 0, 0, 0, magG);
     add(bgeo(0.03, 0.02, 0.1), mm, 0.02, 0.03, 0, 0, 0, 0, magG);

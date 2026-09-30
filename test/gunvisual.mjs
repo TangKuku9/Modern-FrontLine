@@ -111,6 +111,25 @@ const geo = await page.evaluate(async () => {
     return m.children.length > 1 && m.children[0].material === m.children[m.children.length - 1].material && m.children[0].material === mats.mat('containerOrange');
   })());
 
+  // S11 弯弹匣（AK/MP5）是连续弧线不是楼梯：相邻两段的弦向角要等于两段转角的均值
+  // （链式生成的数学保证），底板顺末段角度收尾。反证臂把旧规则原样重算一遍 ——
+  // 旧写法每段独立多转 0.1 rad、位置按 i² 前探，同一把尺下最大偏差 ~0.29 rad。
+  const chordErr = (ms) => {
+    let worst = 0;
+    for (let i = 0; i + 1 < ms.length; i++) {
+      const dy = ms[i].position.y - ms[i + 1].position.y, dz = ms[i].position.z - ms[i + 1].position.z;
+      const segA = (ms[i].rotation.x + ms[i + 1].rotation.x) / 2;
+      worst = Math.max(worst, Math.abs(Math.atan2(dz, dy) - segA));
+    }
+    return worst;
+  };
+  const akMag = buildGun('ak', {}, 'none').mag.children.filter(o => o.isMesh).sort((a, b) => b.position.y - a.position.y);
+  ok('S11 AK 弹匣是连续弧线（弦向≈段向）', chordErr(akMag) < 0.06, `最大偏差 ${chordErr(akMag).toFixed(3)} rad`);
+  ok('S11 AK 弹匣有底板收尾', akMag.length === 6 && akMag[5].position.y < akMag[4].position.y, `段数=${akMag.length}`);
+  ok('S11⁻ 反证：旧楼梯规则在同一把尺下偏差大得多', chordErr([
+    ...Array.from({ length: 5 }, (_, i) => ({ position: { y: -i * 0.0392 - 0.02, z: -i * i * 0.004 - i * 0.008 }, rotation: { x: i * 0.1 + 0.1 } })),
+  ]) > 0.15, `旧规则 ${chordErr(Array.from({ length: 5 }, (_, i) => ({ position: { y: -i * 0.0392 - 0.02, z: -i * i * 0.004 - i * 0.008 }, rotation: { x: i * 0.1 + 0.1 } }))).toFixed(3)} rad`);
+
   // S2 锚点本身：每把枪都得有一个挂在枪上的抛壳口
   for (const id of ['m4', 'ak', 'm1911', 'revolver', 'rpg']) {
     const info = buildGun(id, {}, 'none');
