@@ -36,12 +36,15 @@ export class Bot {
     this.model.root.position.copy(this.pos);
     game.scene.add(this.model.root);
     if (o.tag) { this.tag = makeNameTag(this.name, o.tagColor || '#6cf'); this.model.root.add(this.tag); }
-    this.anim = { speed: 0, phase: Math.random() * 6, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0 };
+    this.anim = { speed: 0, phase: Math.random() * 6, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, slide: 0, sprint: 0 };
     this.mag = this.stats.mag;
     this.target = null; this.targetVisible = false; this.lastSeenPos = null; this.lastSeenT = -99; this.acquireT = 0;
     this.perceiveT = rng.next() * 0.2; this.fireT = 0; this.burstLeft = 0; this.reloadT = 0;
     this.path = null; this.pathT = -99; this.pathGoal = null; this.goal = null; this.goalT = 0;
     this.strafeDir = rng.next() < 0.5 ? -1 : 1; this.strafeT = 0; this.wantCrouch = false; this.crouchT = 0;
+    // 滑铲:战斗中换拍时概率触发,方向/时长/冷却三件套(移动接管在 update 里)
+    this.slideT = 0; this.slideCD = rand(3, 7); this.slideDir = new THREE.Vector3();
+    this.goalDist = 0; this.sprinting = false;
     this.stunT = 0; this.flashT = 0; this.revealT = 0; this.grenades = o.grenades ?? 1; this.grenadeCD = rand(4, 10);
     this.home = o.home ? o.home.clone() : this.pos.clone();
     this.leash = o.leash || 0;
@@ -204,6 +207,7 @@ export class Bot {
     const game = this.game;
     if (!goal) return out.set(0, 0, 0);
     const dGoal = Math.hypot(goal.x - this.pos.x, goal.z - this.pos.z);
+    this.goalDist = dGoal;   // 冲刺判据读这一格:要去的地方还远不远
     if (dGoal < 0.8) { this.path = null; return out.set(0, 0, 0); }
     // 直线可达直接走
     if (!this.path || !this.pathGoal || this.pathGoal.distanceTo(goal) > 2.5 || game.time - this.pathT > 4) this.requestPath(goal);
@@ -228,7 +232,7 @@ export class Bot {
     }
     this.perceiveT -= dt;
     if (this.perceiveT <= 0) { this.perceiveT = 0.15 + rng.next() * 0.08; this.perceive(); }
-    this.stunT -= dt; this.flashT -= dt; this.revealT -= dt; this.grenadeCD -= dt; this.reloadT -= dt;
+    this.stunT -= dt; this.flashT -= dt; this.revealT -= dt; this.grenadeCD -= dt; this.reloadT -= dt; this.slideCD -= dt;
     this.model.flash.visible = this.flashT > 0;
     A.recoil = damp(A.recoil, 0, 10, dt);
 
@@ -238,6 +242,12 @@ export class Bot {
     const t = this.target;
     const stunned = this.stunT > 0;
     let wantCrouch = false;
+    // 冲刺:没在交火、不是站桩/被闪、要去的地方还远(>10m)—— 就跑起来(玩家 7.1×mob)。
+    // 交火中永远不跑,侧移/蹲才是战斗步态;alerted 前的哨兵巡逻也不跑。goalDist 由
+    // steer() 顺路记下;冲刺姿态(A.sprint)与快照位(this.sprinting)在函数尾部喂出。
+    const sprinting = !this.targetVisible && !stunned && !this.static && this.slideT <= 0
+      && this.goalDist > 10 && !(this.role === 'guard' && !this.alerted);
+    if (sprinting) speed = 7.0 * this.stats.mobility;
 
     if (stunned) {
       desired.set(Math.sin(game.time * 2 + this.id) * 1.2, 0, Math.cos(game.time * 1.7 + this.id) * 1.2);
@@ -252,7 +262,8 @@ export class Bot {
       lookPitch = Math.atan2(dy, dist);
       // 移动：侧移 + 距离调整
       this.strafeT -= dt;
-      if (this.strafeT <= 0) { this.strafeT = rand(0.8, 2.2); this.strafeDir = rng.next() < 0.5 ? -1 : 1; this.wantCrouch = rng.next() < (this.stats.type === 'sniper' || this.stats.type === 'lmg' ? 0.6 : 0.3); }
+      const rerolled = this.strafeT <= 0;
+      if (rerolled) { this.strafeT = rand(0.8, 2.2); this.strafeDir = rng.next() < 0.5 ? -1 : 1; this.wantCrouch = rng.next() < (this.stats.type === 'sniper' || this.stats.type === 'lmg' ? 0.6 : 0.3); }
       wantCrouch = this.wantCrouch;
       if (!this.static) {
         const sx = Math.cos(lookYaw), sz = -Math.sin(lookYaw);
@@ -265,10 +276,22 @@ export class Bot {
         const probe = _c.copy(this.pos).addScaledVector(desired, 0.4);
         const [ix, iz] = game.world.cellOf(probe.x, probe.z);
         if (!game.world.walkable(ix, iz)) { this.strafeDir *= -1; desired.set(0, 0, 0); }
+        // 滑铲：换拍瞬间概率朝当前移动方向"扑"一段(玩家的滑铲在这里的低配版)——
+        // 方向锁进 slideDir、初速 8、指数衰减 1.8/s(与玩家同一档),贴地(本职:pos.y 恒 damp 到地面)。
+        // 只在战斗里、中近距离、且真的在移动时才扑;冷却防连环滑。蹲姿位顺带压低命中盒。
+        if (rerolled && this.slideT <= 0 && this.slideCD <= 0 && !stunned
+            && dist > 6 && dist < 25 && Math.hypot(this.vel.x, this.vel.z) > 1 && rng.next() < 0.35) {
+          this.slideT = 0.7; this.slideCD = rand(5, 9);
+          this.slideDir.copy(desired); this.slideDir.y = 0;
+          if (this.slideDir.lengthSq() < 0.01) this.slideDir.set(sx * this.strafeDir, 0, sz * this.strafeDir);
+          this.slideDir.normalize();
+          this.vel.x = this.slideDir.x * 8; this.vel.z = this.slideDir.z * 8;
+          this.wantCrouch = true; wantCrouch = true;
+        }
       }
       // 射击
       const facing = Math.abs(angleDiff(this.yaw, lookYaw)) < 0.25;
-      if (game.time > this.acquireT && facing && this.reloadT <= 0) this.tryFire(dt, t, dist);
+      if (game.time > this.acquireT && facing && this.reloadT <= 0 && this.slideT <= 0) this.tryFire(dt, t, dist);
       // 高度警觉提示。真人在权威端是**另一台机器上的浏览器**（与 combat.js:flashAt 同一个
       // 理由）：game.hud 在那台机器上够不着，所以 game.highAlert 由 NetRoom 提供、把
       // "谁在瞄你"编成事件发过去；浏览器侧没有这个钩子就照旧本地提示。
@@ -299,6 +322,9 @@ export class Bot {
     if (this.static) desired.set(0, 0, 0);
     // 限速
     const dl = Math.hypot(desired.x, desired.z);
+    // 冲刺补速:behave()/搜索里的字面速度(巡逻 1.6、跟随 5、冲锋 4.5)不随 sprinting 变,
+    // 这里沿原方向补到冲刺速度 —— 交火分支的 desired 不补(战斗不跑)
+    if (sprinting && dl > 0.01) desired.multiplyScalar(speed / dl);
     const maxS = (wantCrouch ? 2.0 : speed) * (stunned ? 0.4 : 1);
     if (dl > maxS) desired.multiplyScalar(maxS / dl);
     // 分离
@@ -308,8 +334,16 @@ export class Bot {
       if (d2 < 0.7 && d2 > 0.0001) { const d = Math.sqrt(d2); desired.x += dx / d * 1.5; desired.z += dz / d * 1.5; }
     }
     const k = 1 - Math.exp(-10 * dt);
-    this.vel.x += (desired.x - this.vel.x) * k;
-    this.vel.z += (desired.z - this.vel.z) * k;
+    if (this.slideT > 0) {
+      // 滑铲接管移动:期望速度一律不生效,方向锁死、只衰减 —— 否则 10/s 的转向阻尼
+      // 会把这一"扑"在两帧内拽回普通侧移,滑铲就只剩个姿势
+      this.slideT -= dt;
+      const dec = Math.exp(-1.8 * dt);
+      this.vel.x *= dec; this.vel.z *= dec;
+    } else {
+      this.vel.x += (desired.x - this.vel.x) * k;
+      this.vel.z += (desired.z - this.vel.z) * k;
+    }
     this.pos.x += this.vel.x * dt; this.pos.z += this.vel.z * dt;
     game.world.collide(this.pos, this.vel, this.radius, 1.7);
     const gh = game.world.groundHeight(this.pos.x, this.pos.z, this.pos.y, this.radius);
@@ -335,6 +369,9 @@ export class Bot {
     this.crouchT = damp(this.crouchT, wantCrouch ? 1 : 0, 8, dt);
     // 动画
     A.speed = spd; A.phase += dt * spd * 2.2; A.crouch = this.crouchT; A.pitch = this.pitch;
+    A.slide = damp(A.slide, this.slideT > 0 ? 1 : 0, 12, dt);     // 与 NetPlayer 的滑铲平滑同一档
+    this.sprinting = sprinting;
+    A.sprint = damp(A.sprint, sprinting ? 1 : 0, 10, dt);         // 冲刺姿态:前倾+枪口上抬(soldier.js 通道)
     animateSoldier(this.model, A, dt);
     this.model.root.position.copy(this.pos);
     this.model.root.rotation.y = this.yaw;

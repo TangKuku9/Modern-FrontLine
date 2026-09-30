@@ -288,6 +288,11 @@ export class Player {
       if (wasGround && this.vel.y <= 0 && this.pos.y - g < 0.5) { this.pos.y = g; this.vel.y = 0; }
       else this.onGround = false;
     }
+    // 离地即断滑铲。滑铲起点虽查了 onGround,但 crouch 分支跑在物理之前(那一拍 onGround
+    // 是上一帧的旧值),而且 slideT 只看时间不看脚下 —— 从檐口/陡坡滑出去就带着滑铲姿态
+    // 飞在空中。贴地小落差走上面的 stair snap(onGround 保持 true),滑铲不受影响;
+    // 只有真离地才断,断掉后落回普通空中操控。
+    if (this.sliding && !this.onGround) this.sliding = false;
     // 天花板
     const ceil = world.ceilingHeight(this.pos.x, this.pos.z, this.pos.y, this.radius);
     if (this.pos.y + h > ceil && this.vel.y > 0) { this.vel.y = 0; this.pos.y = ceil - h; }

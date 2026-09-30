@@ -260,9 +260,9 @@ export function animateSoldier(p, s, dt) {
     p.root.rotation.x = 0; p.root.rotation.z = 0;
     // 滑铲/举枪/冲刺/滞空是四个**只给模型**的姿态通道（0..1）。源头是权威状态位
     // （FLAG.Sliding / FLAG.Ads / FLAG.Sprint / FLAG.OnGround），由 NetPlayer 平滑后递进来；
-    // 本地 Bot 不产生它们（ai.js 里没有这些状态），缺省 0 ⇒ 模型与从前逐帧一致。
-    // 本机玩家是第一人称，滑铲/冲刺在单机里体现在相机上（js/player.js:331,357），
-    // 第三人称的姿态只在联机看别人时才有观众。
+    // 本地 Bot 产生其中冲刺/滑铲两位（js/ai.js），举枪与滞空不产，缺省 0。本机玩家是
+    // 第一人称，这些姿态在单机里体现在相机上（滑铲降 0.25 m、侧倾 0.06，js/player.js:331,357），
+    // 第三人称只有联机看别人、以及看 Bot 时才有观众。
     const sl = s.slide || 0, ad = s.ads || 0;
     const sp = s.sprint || 0, air = s.air || 0;
     // 同理要复位的还有:枪的倒地转角、趴倒垫高的髋 —— 都是死亡分支写过、活人分支曾放任不管的。

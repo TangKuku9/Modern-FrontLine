@@ -629,6 +629,11 @@ export class NetRoom {
     // 不给它的话，Bot 在你屏幕上是一边平移一边无声地让人掉血。
     if (bot.flashT > 0) flags |= FLAG.Firing;
     if (bot.mag < (bot.stats && bot.stats.mag || 30)) flags |= FLAG.Reloading;
+    if (bot.slideT > 0) flags |= FLAG.Sliding;   // Bot 滑铲也上快照:不然远端只看到他猛窜,没有姿势
+    if (bot.sprinting) flags |= FLAG.Sprint;     // 同理:冲刺位不上,远端的 Bot 永远是步行姿态
+    // Bot 恒贴地(没有跳跃)。这一位必须显式给:客户端的滞空姿态通道消费 OnGround,
+    // 缺位会被读成"永远在空中",整场 Bot 都悬着收腿。
+    flags |= FLAG.OnGround;
     return {
       id: bot.netId, x: bot.pos.x, y: bot.pos.y, z: bot.pos.z, yaw: bot.yaw, pitch: bot.pitch || 0,
       hp: bot.hp, flags, weapon: weaponIndex(bot.weaponId || 'm4'), mag: bot.mag || 0,
