@@ -11,6 +11,10 @@
 // 并且尽量落到 /healthz 的计数上 —— 那是运维唯一能看见它们的地方。
 import { withServer, freePort } from './with-server.mjs';
 import { request as httpRequest } from 'node:http';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import WebSocket from 'ws';
 
 let fails = 0, checks = 0;
@@ -311,12 +315,32 @@ try {
     chk(c3 && c3.status === undefined, 'C8 第 3 条连接还能开（上限本身不能把自己人挡在外面）');
     chk(c4 && c4.status === 429, 'C9 第 4 条被拒（429）—— 一个人开满连接就没人进得来，那是"他一个人能把你关门"',
       `status=${c4 && c4.status}`);
+    // C11 的那把尺子先立起来：**服务端自报**的在线连接数（/healthz 的 clients）。
+    // 为什么不用"关掉之后睡 300 ms 再看"：那是拿**客户端的钟**去等服务端把 close 事件跑完 ——
+    // 机器被拖热时（本机实测：全套件连跑时 Chrome 刚退、后台还在收尾）300 ms 不够，
+    // C11 当场红成"名额没还回来"，而服务端其实只是还没处理到那一拍。红的是量具，不是产品。
+    // 这一格和 `connsByIp` 的减一在**同一个** `ws.on('close')` 里（见 server/net-server.mjs 的
+    // 连接计数那段），所以"它降了"就等于"名额真的还回去了"。
+    const hz0 = await health();
+    chk(Number.isFinite(hz0.clients) && hz0.clients >= 3,
+      'C10a【先决】服务端自报的在线连接数真的到得了 3（C11 的尺子；这一格读不到的话那条就是空过）',
+      `clients=${hz0.clients}`);
     if (c3 && c3.ws) c3.ws.close();
-    await sleep(300);
+    let released = null;
+    for (let i = 0; i < 50; i++) {
+      const h = await health();
+      if (Number.isFinite(h.clients) && h.clients <= hz0.clients - 1) { released = h.clients; break; }
+      await sleep(100);
+    }
+    chk(released !== null, 'C10b【先决】关掉一条之后服务端自报的在线数确实降了（降不下来时下面那条无从谈起）',
+      `clients ${hz0.clients} → ${released}`);
     const hzq = await health();
     chk(hzq.gate.refusedConn >= 1, 'C10 连接配额被拒有计数', `refusedConn=${hzq.gate.refusedConn}`);
 
-    // 反证臂：关掉一条之后应该又能开一条（名额是**减回去**的，不是一次性烧掉的）
+    // 反证臂：关掉一条之后应该又能开一条（名额是**减回去**的，不是一次性烧掉的）。
+    // 走到这里的先决是 C10b —— "服务端自报的在线数已经降了"。两半都要有才叫"还回来了"：
+    // 只有 C10b 是"库把它从 clients 里摘了"，只有 C11 是"配额表也减了"（两处的减一在同一个
+    // close 里，所以这条能红的唯一形状是**有人改了配额表那一半**）。
     let c5 = null;
     try { c5 = await openWs(srv.ws, ck); } catch (e) { c5 = e; }
     chk(c5 && c5.status === undefined, 'C11 **反证臂**：关掉一条之后名额回来了（不然连接数是单调上涨的，越用越少）');
@@ -574,6 +598,26 @@ try {
         'H6 开发模式下没设 JOIN_CODE 也照常起，但日志必须写出"在用源码里的默认值"（以前这一格骗人）',
         (d.log.split('\n').find(l => /邀请码/.test(l)) || '').trim().slice(0, 130));
     } finally { d.kill(); }
+    // H7：生产 + 未设 ALLOW_ORIGIN ⇒ **照常起**（决策不变：确实有不需要来源检查的部署），
+    // 但日志必须打出一块说清后果的警告。它与 H1/H4 的分别正是"不掐服务"：
+    // 判据只要求"忘了设"与"我知道我在要什么"在日志里长得不一样。
+    // until=/启动完成/：那是启动日志的哨兵行，等它保证这块警告已经进管道（看到启动行就收工会漏尾行）。
+    const e = await bootRaw({ NODE_ENV: 'production', JOIN_CODE: INVITE, ACCOUNTS_DB: '' }, { until: /启动完成/ });
+    try {
+      chk(e.up && /启动完成/.test(e.log) && /不检查浏览器来源/.test(e.log) && /ALLOW_ORIGIN/.test(e.log),
+        'H7 生产模式忘了设 ALLOW_ORIGIN：照常起（不掐服务），但日志要自己说清后果',
+        (e.log.split('\n').find(l => /不检查浏览器来源/.test(l)) || '(日志里没有这一块)').trim().slice(0, 140));
+    } finally { e.kill(); }
+    // H8：**反证臂** —— 设了就**不许**再打这一块。少了它，H7 可以靠"无条件打一行"变绿，
+    // 而配好了的机器上还在喊狼来了，运维三天就学会无视它。
+    // `f.up` 也要一起量：起都没起来的时候"日志里没有那一块"是恒真的。
+    const f = await bootRaw({ NODE_ENV: 'production', JOIN_CODE: INVITE, ACCOUNTS_DB: '', ALLOW_ORIGIN: 'https://mw.example.com' },
+      { until: /启动完成/ });
+    try {
+      chk(f.up && /启动完成/.test(f.log) && !/不检查浏览器来源/.test(f.log) && /允许来源 https:\/\/mw\.example\.com/.test(f.log),
+        'H8 **反证臂**：设了 ALLOW_ORIGIN 就不再打那块警告（否则它是噪音，等于没打）',
+        `up=${f.up} ${(f.log.split('\n').find(l => /允许来源/.test(l)) || '').trim().slice(0, 100)}`);
+    } finally { f.kill(); }
   }
 
   // ══════════ I 联机大厅的房间列表与注册闸 ══════════
@@ -639,6 +683,125 @@ try {
           `${guest.status} ${guest.text.slice(0, 60)}`);
       } finally { s6.kill(); }
     } finally { s5.kill(); }
+  }
+
+  // ══════════ J 忘了密码：一次性恢复码的**接线** ══════════
+  // 与 test/accounts.mjs 的 K 段分工（那个文件开头写的就是这条分工）：
+  //   · K 段量规则：哈希形状、一次性、会话作废、限流、计时同量级；
+  //   · 这一段量接线：接口有没有把码发出来、HTTP 恢复能不能用、库是不是真的落盘、
+  //     以及服主手上那两条命令能不能对着一台**跑过的服**的库干活。
+  // 最后一条尤其要在这里量：恢复码存在的全部意义是"人和机器之间的最后一条路"，
+  // 而它是这个项目里唯一一条要跨三个进程（服务 / CLI / 审计口）才走得完的路。
+  console.log(sec('J 恢复码的接线与落盘'));
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'mf-recover-'));
+    const db = join(dir, 'accounts.db');
+    const P1 = 'reset-by-recovery-1', P2 = 'reset-by-recovery-2', P3 = 'reset-by-recovery-3';
+    let codes = null, afterRestart = null, beforeCli = null, cliCodes = [];
+    try {
+      const s7 = await withServer({ JOIN_CODE: INVITE, ACCOUNTS_DB: db });
+      try {
+        const rg = await json(s7.base + '/api/register', { name: '找回甲', password: PW, code: INVITE });
+        codes = (JSON.parse(rg.text) || {}).recovery;
+        chk(rg.status === 200 && Array.isArray(codes) && codes.length === 5,
+          'J1 注册那一条 HTTP 响应里带着 5 张恢复码（接口真的把它发出来了）',
+          `${rg.status} ${Array.isArray(codes) ? codes.length + ' 张' : rg.text.slice(0, 80)}`);
+        // 反证臂：原文不许落盘。扫的是**库文件本身**（含 WAL），不是某个 API 的返回值 ——
+        // "泄库的人拿到什么"只有这个扫法能回答。
+        const disk = [db, db + '-wal', db + '-shm'].filter(p => existsSync(p)).map(p => readFileSync(p).toString('latin1')).join('');
+        const leaked = (codes || []).filter(c => disk.includes(c) || disk.includes(c.replace(/-/g, '')));
+        chk(!!codes && leaked.length === 0, 'J2 **反证臂**：库文件（含 WAL）里搜不到任何一张码的原文',
+          `扫了 ${disk.length} 字节 · 漏了 ${leaked.length} 张`);
+
+        const rec = await json(s7.base + '/api/recover', { name: '找回甲', code: (codes || [])[0], password: P1 });
+        const rb = JSON.parse(rec.text) || {};
+        afterRestart = rb.recovery;
+        chk(rec.status === 200 && rb.ok === true && rb.loggedIn === true && Array.isArray(rb.recovery) && rb.recovery.length === 5,
+          'J3 POST /api/recover：呼号 + 一张码 + 新密码 ⇒ 200 + 会话 + 一叠新码', `${rec.status} ${rec.text.slice(0, 90)}`);
+        chk(/HttpOnly/i.test(String(rec.headers['set-cookie'] || '')),
+          'J4 恢复拿到的 cookie 和注册/登录同一套属性（HttpOnly）',
+          String(rec.headers['set-cookie'] || '').replace(/=[^;]+/, '=<令牌>'));
+        const ck = cookieOf(rec);
+        const me3 = await raw(s7.base + '/api/me', { headers: { cookie: ck } });
+        chk(JSON.parse(me3.text).name === '找回甲',
+          'J5 这条 cookie 立刻能用（恢复成功 = 一次登录，不用再去另一屏重打新密码）', me3.text.slice(0, 60));
+        const lg = await json(s7.base + '/api/login', { name: '找回甲', password: P1 });
+        chk(lg.status === 200, 'J6 新密码在**登录**接口上也能用（不是只有恢复那一条路认它）', `${lg.status} ${lg.text.slice(0, 60)}`);
+        const old = await json(s7.base + '/api/login', { name: '找回甲', password: PW });
+        chk(old.status === 401, 'J7 反证臂：旧密码登录 401（不是"两个都能用"）', `${old.status} ${old.text.slice(0, 60)}`);
+
+        // 枚举面：同一个接口，"没这个呼号"与"码不对"必须**逐字节同一句话**。
+        // 这里量的是 HTTP 那一层（状态码 + 文案），accounts.mjs 的 K18 量的是内层的错误码。
+        const ghost = await json(s7.base + '/api/recover', { name: '查无此人甲', code: (codes || [])[1], password: P1 });
+        const wrong = await json(s7.base + '/api/recover', { name: '找回甲', code: 'ZZZZ-ZZZZ-ZZZZ', password: P1 });
+        const gm = JSON.parse(ghost.text) || {}, wm = JSON.parse(wrong.text) || {};
+        chk(ghost.status === 401 && wrong.status === 401 && gm.message === wm.message && gm.error === 'bad_recovery',
+          'J8 **反证臂**：没这个呼号与码不对返回同一个状态码 + 同一句话（HTTP 这一层也不许当账号枚举器）',
+          `${ghost.status} ${gm.message} / ${wrong.status} ${wm.message}`);
+        const wrongMethod = await raw(s7.base + '/api/recover');
+        chk(wrongMethod.status === 405 && /POST/i.test(String(wrongMethod.headers.allow || '')),
+          'J9 /api/recover 只认 POST，且 405 里带着 allow（路由表真的登记了它）',
+          `${wrongMethod.status} allow=${wrongMethod.headers.allow}`);
+        const h1 = JSON.parse((await raw(s7.base + '/healthz')).text) || {};
+        chk(((h1.auth || {}).recover | 0) >= 1, 'J10 恢复次数落在 /healthz 上（运维要能看见"有人在撞找回"）',
+          `recover=${(h1.auth || {}).recover}`);
+        // 等批刷落地再杀进程：store 的用户改动是 250ms 批刷的，这里量的是**重启之后**的事，
+        // 而"改动还在内存里就被 kill 掉"会被读成"码没落盘"—— 那是量具的错，不是被量对象的错。
+        await sleep(600);
+      } finally { s7.kill(); }
+
+      // ── 停服 → 起服 → 用**上一轮**发的码 ──
+      const s8 = await withServer({ JOIN_CODE: INVITE, ACCOUNTS_DB: db });
+      try {
+        const rec2 = await json(s8.base + '/api/recover', { name: '找回甲', code: (afterRestart || [])[2], password: P2 });
+        beforeCli = (JSON.parse(rec2.text) || {}).recovery;
+        chk(rec2.status === 200 && JSON.parse(rec2.text).ok === true,
+          'J11 重启之后，**上一轮**发的那叠码还能用（码在库里，不是只在内存里）', `${rec2.status} ${rec2.text.slice(0, 80)}`);
+        await sleep(600);
+      } finally { s8.kill(); }
+
+      // ── 服主那条命令（对着**没在跑**的服务）──
+      // 用 spawnSync 而不是 withServer：这两条量的是**退出码**，而退出码只有在同一条管道里
+      // 等它退完才拿得到（withServer 在服务没起来时抛异常，退出码就丢了）。
+      const cliEnv = { ...process.env, ACCOUNTS_DB: '' };
+      const cli = spawnSync(process.execPath, ['server/recover.mjs', '--db=' + db, '--name=找回甲'], { encoding: 'utf8', env: cliEnv });
+      cliCodes = (cli.stdout || '').match(/[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}/g) || [];
+      chk(cli.status === 0 && cliCodes.length === 5,
+        'J12 服主 CLI 对已存在的呼号发出 5 张码并正常退出', `exit=${cli.status} 捕获 ${cliCodes.length} 张`);
+      const usage = spawnSync(process.execPath, ['server/recover.mjs'], { encoding: 'utf8', env: cliEnv });
+      chk(usage.status === 2 && /用法/.test(usage.stdout || ''),
+        'J13 不带参数 ⇒ 退出码 2 + 用法（不是静默成功、也不是崩）', `exit=${usage.status}`);
+      const noUser = spawnSync(process.execPath, ['server/recover.mjs', '--db=' + db, '--name=查无此人乙'], { encoding: 'utf8', env: cliEnv });
+      chk(noUser.status === 1 && /没有呼号/.test(noUser.stdout || ''),
+        'J14 没有这个呼号 ⇒ 退出码 1 + 一句人话', `exit=${noUser.status} ${(noUser.stdout || '').trim().slice(0, 50)}`);
+
+      const s9 = await withServer({ JOIN_CODE: INVITE, ACCOUNTS_DB: db });
+      try {
+        // 顺序有讲究：先问"补发之前那叠还活着吗"，再拿新码去重设。
+        // 反过来的话，重设成功自己也会换一整叠 —— 那这条判据就分不清旧码是被 CLI 作废的，
+        // 还是被这一次成功作废的（后者本来就该作废，于是它变成一条恒真绿灯）。
+        const stale = await json(s9.base + '/api/recover', { name: '找回甲', code: (beforeCli || [])[1], password: P3 });
+        chk(stale.status === 401,
+          'J15 **反证臂**：CLI 补发之后，补发之前那叠码立刻作废（否则"补发"只是让可用码变多）', `${stale.status}`);
+        const rec3 = await json(s9.base + '/api/recover', { name: '找回甲', code: cliCodes[0], password: P3 });
+        chk(rec3.status === 200 && JSON.parse(rec3.text).ok === true,
+          'J16 服主发出来的码能在**跑着的服务**上重设密码（两条命令 + 一条 HTTP，闭环）', `${rec3.status} ${rec3.text.slice(0, 80)}`);
+        await sleep(600);
+      } finally { s9.kill(); }
+
+      // ── 审计口：纠纷时"谁在什么时候给谁发过码"要查得到，而查得到的东西要能给外人看 ──
+      const dumpEv = spawnSync(process.execPath, ['server/audit-dump.mjs', '--db=' + db, '--ev=recover:cli_issued'], { encoding: 'utf8', env: cliEnv });
+      chk(dumpEv.status === 0 && /recover:cli_issued/.test(dumpEv.stdout || '') && /找回甲/.test(dumpEv.stdout || ''),
+        'J17 审计里查得到"服主给谁发过码"（audit-dump 认得这个事件，名字可读）',
+        (dumpEv.stdout || '').trim().split('\n').slice(-1)[0]);
+      const dumpAll = spawnSync(process.execPath, ['server/audit-dump.mjs', '--db=' + db, '--limit=500'], { encoding: 'utf8', env: cliEnv });
+      const allCodes = [].concat(codes || [], afterRestart || [], beforeCli || [], cliCodes || []);
+      chk(dumpAll.status === 0 && /recover:ok/.test(dumpAll.stdout || '') && allCodes.every(c => !(dumpAll.stdout || '').includes(c)),
+        'J18 **反证臂**：审计表每一格都翻过了，没有一张码的原文，而且成功那次确实落了账',
+        `查了 ${(dumpAll.stdout || '').trim().split('\n').length} 行`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 
 } catch (e) {

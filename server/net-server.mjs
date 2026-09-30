@@ -1102,4 +1102,21 @@ httpServer.listen(CFG.port, CFG.host, () => {
   console.log(`  账号 ${auth.store.constructor.name}${CFG.accountsDb ? ' @ ' + CFG.accountsDb : '（内存，重启就丢）'}` +
     `${CFG.accountsDbFromEnv ? '' : ' ← 未设 ACCOUNTS_DB'} · 邀请码 ${inviteDesc} · 进对局必须登录 ${CFG.requireAccount ? '是' : '否'}`);
   console.log(`  闸门 每 IP 连接 ${CFG.connsPerIp} · 每连接 ${CFG.wsMsgPerSec} 消息/秒 · 每人 ${CFG.roomsPerUser} 间房 · 代理层数 ${CFG.trustProxy}${CFG.trustProxy ? '' : '（忽略 X-Forwarded-For）'}`);
+  // 来源检查是**第三条**"部署上必须自己想一下"的配置，但它与前两条（JOIN_CODE / ACCOUNTS_DB）
+  // 不同：确实有不需要来源检查的部署（内网、纯客户端、只给一个站用的机器），所以它**不拒绝启动**。
+  // 代价是"忘了设"在日志里此前只表现为启动行里的 `允许来源 (不检查)` —— 与"我知道我在要什么"同貌，
+  // 而这一行的后果不小：WebSocket 握手不受 CORS 约束，不检查来源 = 任何网站都能借访客的浏览器
+  // 连上这台机（连带用掉他 cookie 里的会话）。所以生产模式下把它打成**多行 + 带后果**的警告块，
+  // 并且机器可查：`/healthz` 的 `gate.originCheck` 自报要与"陌生来源被 403"的实测一致
+  // （`server/deploy-probe.mjs` 两条判据互证，`test/hardening.mjs` H7/H8 量这一个块在不在）。
+  if (CFG.prod && CFG.origins.length === 0) {
+    console.log('  ⚠ 生产模式未设 ALLOW_ORIGIN：本实例**不检查浏览器来源**。');
+    console.log('    任何网站都能借访客的浏览器连上这台对局服务（WebSocket 握手不受 CORS 约束）。');
+    console.log('    不需要来源检查的部署（内网 / 只给一个站用）可以忽略这一块；');
+    console.log('    否则设 ALLOW_ORIGIN=https://your.domain（逗号分隔可多个），见 README《反向代理》。');
+  }
+  // 启动日志的最后一行做成**哨兵**：它之后不再有启动日志，所以"管道里的话到齐了没有"
+  // 有了一个可等的判据。要量"该打的那块警告有没有打"时，看到启动行就收工会漏掉尾行
+  // （listen 回调里这几行是同一个 tick 里 console.log 的，但逐行异步刷进管道）。
+  console.log('  启动完成（这一行之后不再有启动日志）');
 });

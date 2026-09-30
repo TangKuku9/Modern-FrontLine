@@ -11,7 +11,7 @@
 // 每一节都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。下面每条的措辞写的就是"这条红了说明什么坏了"。
 import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
-import { StreakBook, TickClock, MatchRules, killScore, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks } from '../js/match-rules.js';
+import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks } from '../js/match-rules.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
@@ -95,6 +95,31 @@ sec('A. 规则内核自证（StreakBook / TickClock / killScore）');
   ok('A22【反证】爆炸击杀不算远距离（哪怕打了 41 m）', s2.points === 100 && !s2.tags.includes('longshot'), `${s2.points} [${s2.tags}]`);
   const s3 = killScore({ dist: 41, chain: 3 });
   ok('A23 三连杀 + 远距离 = 100 + 50 + 3×50，且带 chain3 标记', s3.points === 300 && s3.tags.includes('chain3'), `${s3.points} [${s3.tags}]`);
+
+  // ── 奖章表：两端画的必须是同一份（单机 js/mp.js:playerKill / 联机 js/main.js:onNetKill）──
+  // 这一组量的是"逐条弹窗"这一件事：标签 → 一行字 + 这一条值多少分。判据不能只看
+  // "有文案"——那是恒真的（把分值改成 1 也照样有文案）。
+  const sc4 = killScore({ head: true, dist: 10, chain: 3, revenge: true });
+  ok('A24【先决】这一杀真的攒下了多条奖章（空表的"逐条都对"是句空话）',
+    sc4.tags.length === 3 && sc4.tags.includes('head') && sc4.tags.includes('revenge') && sc4.tags.includes('chain3'),
+    `[${sc4.tags}]`);
+  const md = killMedals(sc4.tags);
+  ok('A25 tags → 逐条奖章（顺序与 tags 一致，每条都有文案）',
+    md.length === 3 && md[0].label === '爆头' && md[1].label === '复仇' && md[2].label === '三杀', JSON.stringify(md));
+  // 命门：弹窗上那个数就是账上加的那个数。抄一份数字的症状是弹窗 "+50"、账上 +25，
+  // 两边都觉得自己对 —— 所以这里把"逐条加起来"和 killScore 的总分对死。
+  const sum = md.reduce((n, m) => n + m.points, 0) + KILL_POINTS.kill;
+  ok('A26 每条奖章的分值 = 账上真加的分（逐条加起来必须等于 killScore 的总分）',
+    md.find(m => m.tag === 'head').points === KILL_POINTS.head
+    && md.find(m => m.tag === 'revenge').points === KILL_POINTS.revenge
+    && md.find(m => m.tag === 'chain3').points === 3 * KILL_POINTS.chain
+    && sum === sc4.points, `逐条 ${sum} vs 账上 ${sc4.points}`);
+  // 反证臂：这条红了 = 不认识的标签被硬套成了某一行字（"以后加个新标签"就弹出莫名其妙的话），
+  // 或者空表/undefined 会把循环跑成抛异常（联机事件里 tags 缺一格就是这种情况）。
+  ok('A27【反证】不认识的标签丢掉、空表不出一行也不抛',
+    killMedals(['head', 'nuke', 'chain9']).map(m => m.tag).join(',') === 'head'
+    && killMedals([]).length === 0 && killMedals(undefined).length === 0,
+    JSON.stringify(killMedals(['nuke', 'chain9'])));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -21,7 +21,8 @@
 ## 0. 先把自己关在门外看一遍（改代码之后必跑）
 
 ```bash
-npm test          # 不含浏览器；rollback / net-journal / codec / lagcomp / mp-rules / accounts / hardening / net-probe / deploy-probe / xenv / fps / viewmodel
+npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / net-journal / codec / lagcomp / mp-rules / accounts / progress / hardening / room-flow / room-bots / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / heli-armor / optic / state-leak
+                  # 其中要一个真浏览器的那几份，名单见 README《验收》（从源码推的，别在这儿抄第二份）
 npm run test:all  # 再加两个真浏览器测试（net-play 对打、net-drop 掉线）
 ```
 
@@ -51,6 +52,28 @@ HOST=127.0.0.1 \
 - 邀请码那一行写着**值来自环境变量**，不是"在用源码里的默认值"
 - `/healthz` 的 `auth.store` 是 `SqliteStore`（不是 `MemoryStore`）
 - `/healthz` 的 `auth.inviteRequired` 是 `true`
+- `启动完成` 那一行（哨兵：它之后不再有启动日志，所以"日志到这儿就是全部配置了"）
+- 忘了设 `ALLOW_ORIGIN` 时，这里会多一块 `⚠ 生产模式未设 ALLOW_ORIGIN`。**它不掐服务**
+  （确实有不需要来源检查的部署），但那块警告说的是真话：不检查来源 = 任何网站都能借访客的
+  浏览器连上这台机。判据在 `test/hardening.mjs` 的 H7（未设要打）/ H8（设了不许打）。
+
+### 多实例：口径只有一句
+
+**一个进程 = 一个权威端 = 最多 `MAX_ROOMS` 间对局（等待态另给 2× 额度）+ `MAX_CLIENTS` 条连接。**
+所以 README《带宽与容量》那张表是**每进程**的数（16 → 256 人都在一台里压出来的），
+不是集群的数。进程内的房间列表（`/api/rooms` + 大厅推送）是真的；**跨进程没有房间目录**，
+`?room=` 找的是你连上的那一台里的房。
+
+现在能起的多实例形状是"**按 `MAP` / `SEED` 起多台，玩家用地址选图**"：
+
+```bash
+MAP=yard  SEED=20260925 … node server/net-server.mjs 8091
+MAP=depot SEED=7        … node server/net-server.mjs 8092   # 各自一份房间列表
+```
+
+两条**没有判据**、别当成已经验过的事：跨进程的房间目录与实例分派（要做就得先在进程外放一个
+目录），以及**多台进程共用同一个 `ACCOUNTS_DB` 文件**（现有账号判据全是单进程的；同库文件只在
+"杀一台再起一台"的顺序里用过，见 `test/hardening.mjs` 的 J 段）。
 
 红了怎么看：
 
@@ -153,10 +176,22 @@ node server/soak.mjs --url=http://127.0.0.1:8124 --ladder=1,2,4
 
 ---
 
-## 4. 容器那三步（⚠ **本机没有 docker，这一节是待做清单**）
+## 4. 容器那三步（⚠ **三条命令本机没跑过；配方本身已经量了**）
 
-本机没装 docker，所以下面这三步**没有在本机验证过**。谁在有 docker 的机器上跑完它，
+本机没装 docker，所以下面这三步**没有在本机跑过**。谁在有 docker 的机器上跑完它，
 把两段输出贴进这一节，这一节才算闭。
+
+不过"没有 docker 守护进程"不等于这一节整块只能靠散文 —— **不需要 docker 的那一半在
+`test/image.mjs` 里**（在 `npm test` 里跑，段号 A/B/C）：每条 `COPY` 的源都在仓库里、`CMD`
+指着真文件、镜像默认 `NODE_ENV=production`、`USER` 不是 root、`npm ci --omit=dev` 与
+`dependencies` 是同一份理解、运行时导入闭包（从 `server/net-server.mjs` 递归推的 32 个文件）
+与 `PUBLIC` 白名单一条都没被 `.dockerignore` 挡住、闭包里没有一处 import playwright，以及
+Dockerfile 里那句 HEALTHCHECK 的 payload 被抠出来**对一台真服跑**（退出码 0）**再对一个
+空端口跑**（退出码必须 1）。所以 4.1 红了，先看 `test/image.mjs` 是绿还是红 —— 它绿的话
+"配方"这一半已经排除掉了，红在构建多半是基础镜像/依赖层。
+**仍然只有真机读数才能知道的事**（别拿上面那段当它们已经验过）：镜像真的构建得出来、
+真的跑得起来、层体积、以及 4.4 那条 `SIGTERM`（Windows 上测不了，libuv 的 `child.kill()`
+是直接 TerminateProcess）。
 
 ```bash
 cp .env.example .env        # 改掉 JOIN_CODE 与域名；.env 不进镜像（.dockerignore 已挡）
@@ -168,7 +203,7 @@ docker run -d --name mw-room -p 8090:8090 --env-file .env -v mw-accounts:/data m
 
 | # | 命令 | 期望 | 红了怎么看 |
 |---|---|---|---|
-| 4.1 | `docker build -t mw-room .` | 构建成功 | `CMD`/`HEALTHCHECK` 依赖的两条**运行时**事实本机已验（启动 + `/healthz` 读数、`shutdown()` 走 SIGTERM），所以红在构建多半是基础镜像/依赖层，不是业务代码 |
+| 4.1 | `docker build -t mw-room .` | 构建成功 | 先跑 `node test/image.mjs`：它绿 ⇒ `COPY`/`CMD`/运行时闭包/白名单/HEALTHCHECK 这些"配方事实"都还在，红在构建多半是基础镜像或依赖层（网络、registry、`npm ci` 的锁文件），不是业务代码 |
 | 4.2 | `docker run … --env-file .env` | 日志里是**生产模式**、`SqliteStore`、邀请码来自环境变量 | **别省 `--env-file`**。省了就是走配置闸 → 直接退出码 1（这正是那个闸存在的意义） |
 | 4.3 | 不挂 `--env-file` 再 run 一次 | **退出码 1** + 两条出路 | 这是**期望的红**。真正的坑是"忘了设却启动成功了" |
 | 4.4 | `docker inspect -f '{{.State.ExitCode}}' mw-room`（先 `docker stop -t 10 mw-room`） | `0`，且 10 秒内退净 | 非 0 ⇒ `SIGTERM` 那段没走完。**`docker stop` 会送 SIGTERM 给 PID 1**，`Dockerfile` 的 `CMD` 是直接 `node …`（没有 shell 包一层），信号才送得到 |
@@ -192,7 +227,7 @@ docker run -d --name mw-room -p 8090:8090 --env-file .env -v mw-accounts:/data m
 - `per[]{hz, stepMs, behindMs, fails}` —— 扩容看的是"哪一间先吃紧"；
   `fails` 在"一个客户端的坏数据打死一屋子人"之前就会先动。
 
-另外两件与运维有关的事，都不在 healthz 上：
+另外几件与运维有关的事：
 
 - `gate.originCheck` —— 来源检查开没开的**自报**。remote-probe 会拿它和"陌生来源被 403"的
   实测互相印证；单独看它也行：生产上它是 `false` 就是"忘了设 ALLOW_ORIGIN"。
@@ -207,19 +242,57 @@ docker run -d --name mw-room -p 8090:8090 --env-file .env -v mw-accounts:/data m
 
   只读打开，不停服。审计是**直写**的（不走 250ms 批刷），进程被杀也不丢 —— 判据在
   `test/accounts.mjs` 的 J 段（J8：users 还在脏集合里时另一个连接已经读得到 audit 行）。
+- **账号找回**（玩家说"密码忘了、恢复码也丢了"）：给他补发一叠新码，念给本人。
+
+  ```bash
+  node server/recover.mjs --db=/data/accounts.db --name=某呼号          # 印出 5 张新码
+  node server/audit-dump.mjs --db=/data/accounts.db --ev=recover:cli_issued   # 谁什么时候补发过
+  ```
+
+  补发即作废他手里旧的那一叠；这个脚本**不能设密码、不能改呼号**（对得上人才能补发，
+  改密码仍然是本人的事）。它和 service 同时跑没问题（写 meta 抽屉，走同一套攒批刷盘）。
+  另外 `/healthz` 的 `auth.recover` 是"成功重设过几次" —— 它涨，说明这条路上真的有人在走；
+  它突然涨而你不知道是谁，就去翻上面的审计。判据在 `test/hardening.mjs` 的 J 段
+  （真 HTTP + 真库文件 + 真 CLI 三段闭环），另一条说明见 `docs/net-vs-local-gaps.md` 附十二。
 
 ---
 
 ## 6. 这份清单**不管**的事（都立着账，别当成已经做完）
 
-- 多实例编排：现在是一间一进程、外层大厅还没有；`?room=` 的语义要跟着变。
-- 战役经验不进账号；登录没有找回（忘了密码只能由服主改库）；限流按 IP（可伪装）。
+- 多实例编排：**一个进程 = 一个权威端**（第 1 节末尾写了口径与容量表是每进程的数）。
+  进程内的房间列表已做，**跨进程**的房间目录与实例分派没做；`?room=` 只在连上的那一台里找房。
+  另外"多台共用同一个 `ACCOUNTS_DB`"没有判据。
+- 战役经验不进账号（本地那一半永不上报，只影响自己显示）；限流按 IP（可伪装）。
+- ~~登录只有密码，没有找回~~ 已收口（2026-09-30）：注册与每次重设各发一叠 5 张一次性恢复码，
+  用掉任意一张即整叠作废并换发新的；重设成功 = 登录 + 作废该账号全部旧会话；服主侧补发口
+  `server/recover.mjs`（只能发码，不能设密码）+ 审计 `recover:cli_issued`。判据 `test/accounts.mjs`
+  的 K 段、`test/hardening.mjs` 的 J 段、`test/net-drop.mjs` 的 I 段；设计理由与两次"能不能红"
+  的实测见 `docs/net-vs-local-gaps.md` 附十二。没接邮箱/短信 —— 码丢了只能找服主，这是有意的一条。
 - ~~没有审计日志~~ 已收口（2026-09-26）：`audit` 表 + `server/audit-dump.mjs` 读取口，
   判据在 `test/accounts.mjs` 的 J 段。上面第 5 节写了用法。
 - ~~`ALLOW_ORIGIN` 留空没有闸~~ 半收口（2026-09-26）：**仍然不拒绝启动**（决策不变：
   确实有不需要来源检查的部署），但"忘了设"已经**机器可查** —— `/healthz` 的
   `gate.originCheck` 自报 + remote-probe 两条判据（自报与 403 实测一致；生产模式必须开）。
   开着来源检查的生产实例 34/34 绿；故意关掉的那台被当场点名红（两次实测都在）。
+  2026-09-30 又收了一层：生产模式下未设 `ALLOW_ORIGIN` 会在启动日志里打一块**多行 + 带后果**
+  的警告（`⚠ 生产模式未设 ALLOW_ORIGIN：本实例**不检查浏览器来源**。`），末尾用
+  `启动完成（这一行之后不再有启动日志）` 当哨兵，"该打的块有没有打全"因此可等可判。
+  判据 `test/hardening.mjs` 的 H7（未设 ⇒ 必须打）/ H8（设了 ⇒ 不许打），两条反证臂都实测过：
+  把条件改成 `if (false)` ⇒ 只有 H7 红；改成 `if (true)` ⇒ 只有 H8 红（源码还原 byte-identical）。
+- ~~容器那两条命令一律"未验证"~~ 半收口（2026-09-30）：不需要 docker 守护进程的那一半
+  现在有判据了 —— `test/image.mjs`（`npm test` 的 A/B/C 三段）量 `COPY` 源、`CMD` 指真文件、
+  镜像默认 `NODE_ENV=production`、非 root、`npm ci --omit=dev` 与 `dependencies` 一致、
+  运行时导入闭包（32 个文件）与 `PUBLIC` 白名单不被 `.dockerignore` 挡住（反证臂：把 `js/`
+  写进 ignore ⇒ B1/B2 当场红；把所有 ignore 清空 ⇒ B3 红）、闭包里没有 playwright，
+  并把那句 HEALTHCHECK 的 payload 抠出来对真服跑（0）对空端口跑（必须 1；把它写死成
+  `process.exit(0)` ⇒ C2 红，实测过）。**仍然只有真机读数才知道的**：真的 build、真的 run、
+  层体积、4.4 那条 `SIGTERM`（Windows 上测不了）。
 - ~~`carryMiss` 与"基态退回日记本"只打印不断言~~ 已收口（2026-09-26）：
   缺料逐笔归因 + 步数恒等式钉在 `test/reconcile-chain.mjs` 的 A2/A6，真浏览器那一半
   钉在 `test/net-play.mjs`（carry 步数一致性从打印升为判据）。
+
+---
+
+**第 9 轮结束时的遗留账**（"本机量不了"与"明说了没做"的那几条，含本清单 §4 那三条命令的读数还没补回来）
+汇总在 `docs/net-vs-local-gaps.md` 附十四：一张表写清每条现在什么状态、为什么停在这、下一轮第一步、
+今天能不能被机器看见；同一节末尾另有一份"别把这些当成遗留"的清单（有意为之的那些）。

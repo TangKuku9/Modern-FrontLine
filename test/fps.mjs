@@ -21,6 +21,9 @@ const ARGS = ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--ignore-g
 async function launch() {
   const tries = [
     ['chrome', { channel: 'chrome', args: ARGS }],
+    // 中间这一档是 `npx playwright install chromium` 装的那一份（不带 channel/executablePath），
+    // 也是**别人的机器**上唯一可能起得来的那一档 —— docs-guard 的 G 段拿它当判据。
+    ['playwright-chromium', { args: ARGS }],
     ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }],
   ];
   for (const [label, opts] of tries) {

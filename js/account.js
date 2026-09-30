@@ -117,4 +117,18 @@ export class Account {
     this.busy = true;
     try { await this._req('/api/logout', {}); } finally { this.user = null; this.busy = false; }
   }
+
+  // 忘了密码：呼号 + 一张一次性恢复码 + 新密码。
+  // 它**不接受旧密码**（要旧密码就不叫找回了），也不吃邀请码（那是给新账号的闸）。
+  // 成功之后服务端会当场作废这个账号的所有旧会话 —— 所以这里拿回来的新身份是**唯一**的
+  // 那一份，别的地方若还开着这个账号，那边下一次请求就会变成"没登录"。
+  async recover({ name, code, password }) {
+    this.busy = true; this.lastError = '';
+    try {
+      const r = await this._req('/api/recover', { name, code, password });
+      this.user = (r.ok && r.data.loggedIn && r.data.profile) ? r.data.profile : null;
+      if (!r.ok) this.lastError = r.message;
+      return r;
+    } finally { this.busy = false; }
+  }
 }

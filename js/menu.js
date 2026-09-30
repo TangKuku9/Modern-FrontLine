@@ -6,12 +6,13 @@ import { buildGun } from './gunmodel.js';
 import { createSoldierModel, animateSoldier } from './soldier.js';
 import { mat, camoSwatch } from './materials.js';
 import { damp, fmtTime } from './util.js';
+// 经验 → 等级这一条公式现在住在 js/progress.mjs（与"账号那一半 / 本地那一半"同一处：
+// 等级按两半之和算，档案卡那一行文案也在那儿）。在存档卡、结算面板、房间座位栏里
+// 各画一份的话，换算法就要改三处，而漏掉那处只会显示出一个偏低的等级，没人会报错。
+import { levelOf, totalXp, xpText, applyAccountXp } from './progress.mjs';
 
 const DIFF_NAMES = ['新兵', '正规军', '老兵'];
 const MAX_ATT = 5;
-// 经验 → 等级。这一条公式在存档卡、房间座位栏里各画一份的话，
-// 换算法就要改两处，而漏掉那处只会显示出一个偏低的等级，没人会报错。
-export const levelOf = (xp) => Math.min(55, Math.floor(Math.sqrt(Math.max(0, xp | 0) / 300)) + 1);
 
 // 联机能选的模式 = js/data.js 那张表上 net 为真的那几个（服务端判得出它们的胜负）。
 // 与 server/lobby.mjs:MODE_IDS 同源，两侧各筛各的话症状就是"界面上给了一格，点下去被拒"
@@ -91,6 +92,7 @@ export class Menu {
     // "上次选了什么"的记忆，真正的默认/清洗在服务端（lobby.cleanScore）。
     this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, minutes: 10, score: 50, name: '士兵', team: 'A', room: '', title: '' };
     this.campDiff = 1;
+    this.gateRecover = false;      // 闸的形态：false = 登录/注册，true = 用恢复码重设密码
     this.selClass = game.profile.selClass || 0;
     this.buildScene();
     this.el.addEventListener('pointerdown', () => game.audio.init());
@@ -239,14 +241,18 @@ export class Menu {
   on(root, sel, fn) { root.querySelectorAll(sel).forEach((el, i) => el.addEventListener('click', e => fn(el, e, i))); }
   hide() { this.el.innerHTML = ''; this.screen = ''; this.overlayOpen = false; }
   level() {
-    const xp = this.game.profile.xp || 0;
+    // **两半都算**：账号那份（服务端记的联机战绩）+ 本地那份（战役 / 单机 / 访客联机）。
+    // 只按账号那份算的话，本地挣的经验在界面上等于不存在 —— 那正是缺口的样子。
+    const xp = totalXp(this.game.profile);
     const lv = levelOf(xp);
     const a = Math.pow(lv - 1, 2) * 300, b = Math.pow(lv, 2) * 300;
     return { lv, frac: lv >= 55 ? 1 : (xp - a) / (b - a), xp };
   }
   playerCard() {
     const L = this.level();
-    return `<div class="player-card"><div class="lvl">${L.lv}</div><div><div style="font-weight:700;letter-spacing:2px">指挥官</div><div style="font-size:11px;color:#999">等级 ${L.lv} · ${L.xp} XP</div><div class="xpbar"><div style="width:${Math.round(L.frac * 100)}%"></div></div></div></div>`;
+    // 两半分开写在卡上：玩家看得见"本地这些没进账号"，而不是只看见一个总数。
+    const line = xpText(this.game.profile, !!(this.game.account && this.game.account.user));
+    return `<div class="player-card"><div class="lvl">${L.lv}</div><div><div style="font-weight:700;letter-spacing:2px">指挥官</div><div style="font-size:11px;color:#999">${line}</div><div class="xpbar"><div style="width:${Math.round(L.frac * 100)}%"></div></div></div></div>`;
   }
   showLoadingOverlay(text) {
     this.render(`<div style="margin:auto;text-align:center"><div class="logo"><div class="l1">现代战线</div><div class="l2">MODERN FRONTLINE</div></div><div class="load-bar" style="width:420px;margin:0 auto"><div style="height:100%;width:100%;background:var(--acc);animation:ldpulse 1s infinite"></div></div><div style="margin-top:14px;color:#999;letter-spacing:3px;font-size:13px">${esc(text)}</div></div><style>@keyframes ldpulse{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}</style>`, 'solid', 'loading');
@@ -411,6 +417,9 @@ export class Menu {
     if (A.statusKnown && (!A.requireAccount || A.loggedIn)) { this.showOnlineLobby(); return; }
     this.setCam('lobby');
     const L = this.lobby;
+    // 闸有两种形态：登录/注册（默认）与"用恢复码重设密码"（点「忘了密码？」切过来）。
+    // 形态存在 this 上而不是 DOM 上 —— 它的每一次切换都是重渲染（见下面 keepName）。
+    const rec = !!this.gateRecover;
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
     // 错误信息一律**原样显示服务端那一句**：这个模块不翻译、不复述。翻译的那一版会把
     // "邀请码不对"和"服务器忙"揉成同一句"登录失败"，服主永远收不到"我邀请码是多少"这个真问题。
@@ -421,47 +430,107 @@ export class Menu {
     const r = this.render(`
       <div class="gate-card">
         <div class="op">联网对战 · 账号</div>
-        <h1>登录 / 注册</h1>
-        <p>呼号全服唯一，战绩与经验保存在服务器。<br>登录后自动进入房间列表。</p>
+        <h1>${rec ? '用恢复码重设密码' : '登录 / 注册'}</h1>
+        <p>${rec
+          ? '填呼号、一张注册时抄下的恢复码、以及新密码。<br>成功之后旧会话全部失效，并会发一叠新的恢复码。'
+          : '呼号全服唯一，战绩与经验保存在服务器。<br>登录后自动进入房间列表。'}</p>
         <div class="opts">
           <div>呼号</div><input id="onName" maxlength="16" placeholder="2-16 个字符" value="${esc(L.name || '')}" style="${inp}">
-          <div>密码</div><input id="acctPw" type="password" maxlength="128" placeholder="至少 8 位" style="${inp}">
-          ${A.inviteRequired ? `<div>邀请码</div><input id="acctCode" placeholder="由服主提供" style="${inp}">` : ''}
-          <div></div><div style="display:flex;gap:8px"><button class="btn" data-a="login">登录</button><button class="btn ghost" data-a="reg">注册</button></div>
+          <div>${rec ? '新密码' : '密码'}</div><input id="acctPw" type="password" maxlength="128" placeholder="至少 8 位" style="${inp}">
+          ${rec
+            ? `<div>恢复码</div><input id="acctRecov" placeholder="XXXX-XXXX-XXXX" autocomplete="off" style="${inp}">`
+            : (A.inviteRequired ? `<div>邀请码</div><input id="acctCode" placeholder="由服主提供" style="${inp}">` : '')}
+          <div></div><div style="display:flex;gap:8px">${rec
+            ? `<button class="btn" data-a="docover">重设密码</button><button class="btn ghost" data-a="tologin">返回登录</button>`
+            : `<button class="btn" data-a="login">登录</button><button class="btn ghost" data-a="reg">注册</button>`}</div>
           <div class="note-wide" id="acctMsg">${esc(A.lastError || '')}</div>
+          ${rec ? '' : `<div class="note-wide"><button class="btn ghost small" data-a="forgot">忘了密码？</button> 用注册时抄下的恢复码重设</div>`}
           <div class="note-wide">${note}</div>
         </div>
         <div class="lobby-foot"><button class="btn ghost" data-a="back">返回主菜单</button></div>
       </div>`, 'solid', 'onlineGate');
     this.on(r, '[data-a=back]', () => this.showMain());
+    // 两种形态共用一个 render，所以"切形态"就是重渲染一次 —— 名字要先捞进 L.name，
+    // 否则点一下"忘了密码？"就把已经打好的呼号擦掉了（那看起来像页面抽风）。
+    const keepName = () => { const el = r.querySelector('#onName'); if (el && el.value.trim()) L.name = el.value.trim(); };
+    this.on(r, '[data-a=forgot]', () => { keepName(); this.gateRecover = true; this.showOnlineGate(); });
+    this.on(r, '[data-a=tologin]', () => { keepName(); this.gateRecover = false; this.showOnlineGate(); });
     const grab = () => ({
       name: String((r.querySelector('#onName') || {}).value || '').trim(),
       password: String((r.querySelector('#acctPw') || {}).value || ''),
-      code: String((r.querySelector('#acctCode') || {}).value || ''),
+      invite: String((r.querySelector('#acctCode') || {}).value || ''),
+      rc: String((r.querySelector('#acctRecov') || {}).value || ''),
     });
     const submit = async (kind) => {
       const f = grab();
       L.name = f.name || L.name;
-      this.acctMsg(r, (kind === 'reg' ? '正在注册…' : '正在登录…'));
+      this.acctMsg(r, kind === 'reg' ? '正在注册…' : (kind === 'recover' ? '正在重设…' : '正在登录…'));
       const r2 = kind === 'reg'
-        ? await A.register({ name: f.name, password: f.password, code: f.code })
-        : await A.login({ name: f.name, password: f.password });
+        ? await A.register({ name: f.name, password: f.password, code: f.invite })
+        : (kind === 'recover'
+          ? await A.recover({ name: f.name, code: f.rc, password: f.password })
+          : await A.login({ name: f.name, password: f.password }));
       if (!r2.ok) { this.acctMsg(r, r2.message || '失败了'); return; }
-      // 登录之后把服务端那份经验值同步到本地档案上（显示用）。
-      // 本地那份仍然可以被玩家改，但它现在只是**一个显示用的副本** ——
-      // 真正的数在服务端，下一次 /api/me 会把它盖回去。
-      if (A.user) { this.game.profile.xp = A.user.xp | 0; this.game.saveProfile(); }
+      // 登录之后把服务端那份经验值同步到本地档案上（显示用）—— **只写账号那一半**，
+      // 本地那份（战役 / 单机 / 访客联机）在这儿绝不参与（见 js/progress.mjs 开头）。
+      if (A.user) { applyAccountXp(this.game.profile, A.user.xp); this.game.saveProfile(); }
+      // 恢复码在这一条响应里，**之后再也要不回来**（服务端只留哈希），
+      // 所以进了大厅就把它们摆在最上面让人抄 —— 少这一步的症状是"码从来没被人看见过"。
+      const codes = r2.data && r2.data.recovery;
+      if (Array.isArray(codes) && codes.length) { this.showRecoveryCodes(codes, kind === 'recover'); return; }
       this.showOnlineLobby();        // 层级前进：闸过了就进大厅
     };
     this.on(r, '[data-a=login]', () => submit('login'));
     this.on(r, '[data-a=reg]', () => submit('reg'));
+    this.on(r, '[data-a=docover]', () => submit('recover'));
     const pw = r.querySelector('#acctPw');
+    const rcEl = r.querySelector('#acctRecov');
+    if (rcEl) rcEl.addEventListener('keydown', e => { if (!isImeKey(e) && e.key === 'Enter') submit('recover'); });
     if (pw) pw.addEventListener('keydown', e => {
       // 输入法保护（中文/日文）：选词时的回车是"上屏"，不是"提交"。少这一句的后果是
       // 密码框里那一串还没上屏的候选被当成密码提交，报一句"密码错误"而玩家完全不知道为什么。
       if (isImeKey(e)) return;
-      if (e.key === 'Enter') submit('login');
+      if (e.key === 'Enter') submit(rec ? 'recover' : 'login');
     });
+  }
+
+  // 注册成功 / 用恢复码重设成功之后：**把恢复码摆出来让人抄**。
+  // 为什么值得单独占一块而不是弹一条提示：这几张码是"忘了密码"的唯一出路，
+  // 而它们只在这一个响应里存在（服务端只留哈希，自己也还原不出来）。
+  // 一步放过去的话，绝大多数人会直接点掉 —— 然后在忘记密码的那一天才发现无处可去。
+  //
+  // 但它**不是另开一屏**，而是大厅顶端的一条横幅，理由是两个都立着的判据在这里会撞车：
+  // 「码只在这一条响应里，必须让人看见」（test/net-drop.mjs 的 I 段）与
+  // 「过闸就自动进大厅，下一步不该让玩家自己找」（同一份的层级②/③）。
+  // 另开一屏的实测症状：`注册之后**自动进大厅**` 当场红（screen 停在 recoveryCodes、
+  // 房表与建房按钮都不在），紧接着 `[data-a=logout]` 点不到 → 整段 CRASH。
+  // 放在**流内**（不是浮层）也是有意的：浮层会盖住大厅的按钮，
+  // 而"码摆在这儿"不该以"别的都点不动"为代价。
+  showRecoveryCodes(codes, afterRecover = false) {
+    this.showOnlineLobby();                        // 层级前进：闸过了就进大厅
+    this._recovPending = { codes, afterRecover };  // 大厅重渲染（进房再回来）也还在，直到点掉
+    this.mountRecoveryPanel();
+  }
+  // 把待抄的那一叠码挂到大厅顶端。单独一个方法是为了 `showOnlineLobby()` 每次渲染后
+  // 都能补挂一次 —— 进房再回大厅是重新渲染，横幅不该因此消失（那就是"码又没了"）。
+  mountRecoveryPanel() {
+    const p = this._recovPending;
+    if (!p) return;
+    const body = this.el.querySelector('.lobby-body');
+    if (!body || !body.parentElement) return;
+    const old = this.el.querySelector('.recov-banner');
+    if (old) old.remove();
+    const box = document.createElement('div');
+    box.className = 'panel recov-banner';
+    box.innerHTML = `
+      <div style="font-size:13px;color:var(--acc);letter-spacing:6px">${p.afterRecover ? '密码已重设' : '注册成功'} · 恢复码</div>
+      <div class="note-wide" style="margin:6px 0 10px">忘了密码时，在登录那一屏点「忘了密码？」，填呼号 + 其中<b>任意一张</b> + 新密码就能重设。<br>
+         它们<b>只显示这一次</b>，用掉任何一张，其余的一起作废（同时会发一叠新的）。</div>
+      <div id="recovList" style="user-select:text;font:14px/2 ui-monospace,Consolas,monospace;letter-spacing:2px">${p.codes.map(c => esc(c)).join('<br>')}</div>
+      <div class="note-wide" style="margin-top:8px">别截图发群里 —— 它和密码等价；忘了密码也丢了它，只能找服主。</div>
+      <div class="lobby-foot"><button class="btn" data-a="done">抄好了</button></div>`;
+    box.querySelector('[data-a=done]').addEventListener('click', () => { this._recovPending = null; box.remove(); });
+    body.parentElement.insertBefore(box, body);
   }
 
   // ── 联机第三层：大厅（一张实时的房间列表 + 全服频道）──
@@ -524,6 +593,7 @@ export class Menu {
     this.renderIdentity(r, L);
     this.renderRooms();
     this.renderChat(r, 'lobby');
+    this.mountRecoveryPanel();   // 刚注册/刚重设的人：那一叠码补挂在这一屏顶端
     // 连接是这条路的入口：进不来就把原因写在这一屏上（而不是把人踢回主菜单 ——
     // 他什么都不知道，只会以为"这按钮点了没用"）。
     this.game.onlineLobby().then(() => { this.syncLobbyName(); }).catch(e => this.lobbyNote(r, '连不上大厅：' + (e && e.message || e)));
@@ -606,6 +676,7 @@ export class Menu {
   leaveOnline() {
     const lb = this.game.lobby;
     if (lb) { lb.close(); this.game.lobby = null; }
+    this._recovPending = null;   // 离开这一层就丢弃：留着的话下次进大厅会摆出一叠早就作废的码
     this.showMain();
   }
 
@@ -785,6 +856,9 @@ export class Menu {
     if (mt) mt.textContent = `${map.name} · ${mode.name} · ${room.score || 50}${room.mode === 'dom' ? ' 分' : ' 杀'} · ${room.time || 10} 分 · ${room.players || seats.length}/${room.max || 16} 人`
       + (bots.length ? `（${bots.length} Bot）` : '') + ` · 房主 ${room.host || '—'}`;
     const per = Math.max(2, Math.floor((room.max || 16) / 2));
+    // 座位栏上的等级读的是**服务端发来**的 `s.xp`（账号那一半），不混本地那份：
+    // 这一屏看的是别人，别人机器上的战役经验我这儿不可能有，同一张表里两个来源就乱了。
+    // 所以这里的等级与档案卡（两半之和）在"本地也挣过"的人身上会差一级，这是有意的。
     const row = (s) => `<div class="seat ${s.ready ? 'rd' : ''} ${s.isHost ? 'host' : ''}">
       <span class="s-tag">${s.isHost ? '房主' : (s.ready ? '✔' : '·')}</span>
       <span class="s-name">${esc(s.name)}</span>
@@ -850,10 +924,14 @@ export class Menu {
         // Bot 难度。改一格**全体 Bot 一起变**（服务端那条注释写了为什么不做成逐个改），
         // 所以这一行只在房里真有 Bot 时才画 —— 空房子里摆一个 Bot 难度选择器，
         // 玩家会以为"选了就会自动加 Bot"。
-        + (bots.length ? row('Bot', 'rmBot', BOT_SKILLS, BOT_SKILL_NAMES, st.botSkill | 0) : '');
+        + (bots.length ? row('Bot', 'rmBot', BOT_SKILLS, BOT_SKILL_NAMES, st.botSkill | 0) : '')
+        // 补人（房主的开关）：开着的时候这一间永远是满的，人走了补 Bot、人来了 Bot 让位。
+        // 这一行**不管房里有没有 Bot 都要画** —— 难度那一行要等有 Bot 才画，补人这一行要是
+        // 也等，就没人能在这个房里造出第一个 Bot 来了（自己把自己锁在门外）。
+        + row('补人', 'rmFill', [0, 1], ['手动', '补满'], st.fill ? 1 : 0);
       cfg.querySelectorAll('.seg div[data-dis="0"]').forEach(d => d.addEventListener('click', () => {
         const sg = d.parentElement, v = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
-        const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : sg.id === 'rmScore' ? 'scoreLimit' : sg.id === 'rmBot' ? 'botSkill' : 'minutes';
+        const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : sg.id === 'rmScore' ? 'scoreLimit' : sg.id === 'rmBot' ? 'botSkill' : sg.id === 'rmFill' ? 'fill' : 'minutes';
         if (this.game.lobby) this.game.lobby.setCfg({ [key]: v });
       }));
     }
@@ -932,6 +1010,7 @@ export class Menu {
         // 关掉的代价只是回大厅时重连一次（onlineLobby 自己会重建）。
         if (this.game.lobby) { this.game.lobby.close(); this.game.lobby = null; }
         this.game._wantRoom = false;
+        this._recovPending = null;   // 登出即作废：那一叠码属于刚才那个身份
         await A.logout();
         this.showOnlineGate();   // 层级：身份没了就回闸 —— 大厅不给没身份的人看
       });

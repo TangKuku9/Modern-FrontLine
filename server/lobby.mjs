@@ -133,6 +133,9 @@ export class Lobby {
       starts: 0, notHost: 0, tooFew: 0, notReady: 0,
       seats: 0, leaves: 0, swept: 0,
       botAdd: 0, botDel: 0, botFull: 0,
+      // 补人这一路也要数得出来：自动补上了几个、让位给真人几个。没有这两个数的话
+      // "这间房怎么一直满的""我的 Bot 去哪了"都只能靠猜。
+      botAuto: 0, botGive: 0,
     };
   }
 
@@ -178,7 +181,7 @@ export class Lobby {
     // 而那种房间的开始按钮永远点不动，且不报错。
     const bots = room.bots ? [...room.bots.values()].map(b => ({ bid: b.bid, name: b.name, team: b.team, skill: b.skill })) : [];
     return { t: 'room', room: this.brief(room), me, seats, bots, botSkill: room.botSkill | 0,
-      canStart: g.ok, why: g.why, chat: room.chat.slice() };
+      fill: !!room.fill, canStart: g.ok, why: g.why, chat: room.chat.slice() };
   }
   pushRoom(room) {
     for (const s of room.seats.values()) {
@@ -218,7 +221,15 @@ export class Lobby {
       // 房主加的 Bot。**只在等待态可改**：开局那一刻这份名单被读进 sim，之后再动它
       // 就要往一个正在跑的世界里插人（快照里的实体表会长出来一格，而客户端的名册
       // 是在 welcome 里一次性给的）—— 那种"半路冒出一个人"的错最难查，所以直接不让它发生。
-      bots: new Map(), botSeq: 0, botSkill: 1 };
+      bots: new Map(), botSeq: 0, botSkill: 1,
+      // 自动补人（房主开关，默认关）。开着的时候这一间**永远是满的**：人一走就补一个 Bot、
+      // 人一来就让一个 Bot 站起来 —— 于是任何时刻按下开始都能打一场 16 人的仗，
+      // 而不是"凑齐两个人先打 1v1"。
+      // 为什么是开关而不是默认行为：一间房在列表上写着 16/16 时，别人会以为里面站满了人。
+      // 补出来的位置必须能被房主看见、能被关掉，否则那条读数就成了一句谎话。
+      // 只补 Bot 不给真人让位的话，这间房就是一间"看起来满、谁也进不来"的死房 ——
+      // 所以真人进场时 Bot 必须让位（见 _makeRoomForHuman）。
+      fill: false };
     this.rooms.set(id, room);
     return room;
   }
@@ -253,6 +264,52 @@ export class Lobby {
   }
   // 房主离开时必须有个接手的人，否则这间就再也开不了了（而"没人能开局"在界面上
   // 的表现只是"开始按钮是灰的"，谁都不会想到是房主跑了）。
+  // ── 自动补人（房主的开关） ──
+  // 造一个 Bot。手动加与自动补走**同一个**函数：各写一份的症状是"补出来的 Bot 没有
+  // 难度、或者名字和手动那个撞了"，而这两种都只会在对局里显形。
+  _addBot(room, team, skill) {
+    const bid = ++room.botSeq;
+    const bot = { bid, name: this._botName(room), team, skill };
+    room.bots.set(bid, bot);
+    return bot;
+  }
+  // 把这一间补到满。**不 push**：调用方（改设置 / 有人离开 / 一局打完）手里那一次
+  // 广播要连自己的改动一起发出去，多推一帧的症状是房间屏闪一下旧名单。
+  _fillBots(room) {
+    if (!room.fill || room.stage !== 'waiting') return 0;
+    let n = 0;
+    while (this._total(room) < MAX_SEATS) {
+      const team = this._botTeam(room, null);
+      if (!team) break;                       // 两队都满了（不可能，除非 MAX_SEATS 不是偶数）
+      this._addBot(room, team, room.botSkill | 0);
+      this.stat.botAuto++;
+      n++;
+    }
+    return n;
+  }
+  // 这一间还能不能再收一个**真人**。扑满的时候只有"补人开着且有 Bot 可让位"这一条路。
+  _canTakeHuman(room) {
+    if (room.stage !== 'waiting') return false;
+    if (this._freeTeam(room) !== null) return true;
+    return !!room.fill && room.bots.size > 0;
+  }
+  // 真人优先：满了就从**人少的那一队**撤一个 Bot 腾位置，返回撤掉的那个。
+  // 撤谁：**最后加的那个**（和手动"减一个"同一个直觉，也保证手动摆的那些先留下）。
+  // 放在 _place 之前调用：之后调用的话 _place 先撞上"满"那一格，人还是进不来 ——
+  // 而症状是"列表说还能进（补人的房永远显示满），点了却说满了"。
+  _makeRoomForHuman(room) {
+    if (!room.fill || room.stage !== 'waiting') return null;
+    if (this._freeTeam(room) !== null) return null;      // 还有空位，不用惊动任何人
+    const list = [...room.bots.values()];
+    if (!list.length) return null;
+    const a = this._teamCount(room, 'A'), b = this._teamCount(room, 'B');
+    // 撤人多的那一队的最后一个：撤完之后那一队仍有位置给新人，另一队不受影响。
+    const want = a > b ? 'A' : 'B';
+    const bot = [...list].reverse().find(x => x.team === want) || list[list.length - 1];
+    room.bots.delete(bot.bid);
+    this.stat.botGive++;
+    return bot;
+  }
   _handover(room) {
     if (room.seats.has(room.hostSid)) return;
     const next = room.seats.values().next().value;
@@ -304,20 +361,27 @@ export class Lobby {
     if (!room) { this.stat.badId++; return { ok: false, message: '那间房已经不在了' }; }
     if (room.stage !== 'waiting') { this.stat.playing++; return { ok: false, message: '那间房正在对局中，等它打完或在列表里另找一间' }; }
     const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks);
-    if (!this._place(room, seat)) { this.stat.full++; return { ok: false, message: '那间房已经满了（上限 ' + MAX_SEATS + ' 个位置，Bot 也占位置）' }; }
+    // 满了而补人开着：先让一个 Bot 站起来（真人优先），再放座位。
+    const yielded = this._makeRoomForHuman(room);
+    if (!this._place(room, seat)) {
+      // 腾了位置还放不进去（理论上到不了这里）：把让位的那个还回原位，别把名单改坏。
+      if (yielded) room.bots.set(yielded.bid, yielded);
+      this.stat.full++; return { ok: false, message: '那间房已经满了（上限 ' + MAX_SEATS + ' 个位置，Bot 也占位置）' };
+    }
     this.stat.join++;
-    this._sys(room, seat.name + ' 进来了');
+    this._sys(room, seat.name + ' 进来了' + (yielded ? `（${yielded.name} 让出位置）` : ''));
     this.pushRoom(room); this.pushLobby();
     return { ok: true, room, seat };
   }
 
   // 快速加入：塞进人最多的那间还开着门的房。刻意不是"随便找一间"——
   // 这一条存在的意义就是别让人各自开一间空房。
+  // "还开着门"的判据要用 _canTakeHuman：补人的房在列表上永远是 16/16，
+  // 按 _total < MAX_SEATS 筛的话，最需要人来（也最打得起）的那几间反而被跳过了。
   quickRoom(ws, msg = {}) {
     let best = null;
     for (const r of this.rooms.values()) {
-      if (r.stage !== 'waiting' || this._total(r) >= MAX_SEATS) continue;
-      if (this._freeTeam(r) === null) continue;
+      if (!this._canTakeHuman(r)) continue;
       if (!best || r.seats.size > best.seats.size) best = r;
     }
     return best ? this.joinRoom(ws, { ...msg, room: best.id }) : this.createRoom(ws, msg);
@@ -334,6 +398,8 @@ export class Lobby {
     if (!room.seats.size) { this.rooms.delete(room.id); this.pushLobby(); return; }
     this._handover(room);
     this._sys(room, seat.name + ' 离开了');
+    // 补人开着：人走了就把位置补回来（不然房主回来一看是 15/16，还得手动加一个）。
+    this._fillBots(room);
     this.touch(room);
     this.pushRoom(room); this.pushLobby();
   }
@@ -391,6 +457,15 @@ export class Lobby {
       room.botSkill = Number(msg.botSkill);
       for (const b of room.bots.values()) b.skill = room.botSkill;
     }
+    // 自动补人：开 = 立刻补满（房主按下去就该看见名单满了，而不是"等下一个人才生效"）；
+    // 关 = 场上的 Bot 留着不动，只是不再补 —— "关掉"被理解成"把补出来的全删了"的话，
+    // 房主手动摆的那几个也会跟着消失。
+    if (msg.fill != null) {
+      room.fill = msg.fill === true || msg.fill === 1 || msg.fill === '1';
+      const n = this._fillBots(room);
+      if (room.fill) this._sys(room, n ? `自动补人开启（补上 ${n} 个 Bot）` : '自动补人开启');
+      else this._sys(room, '自动补人关闭');
+    }
     this.touch(room);
     this.pushRoom(room); this.pushLobby();
   }
@@ -428,18 +503,21 @@ export class Lobby {
     const team = this._botTeam(room, msg.team);
     if (!team) {
       this.stat.botFull++;
-      this.send(ws, JSON.stringify({ t: 'err', msg: team === null && (msg.team === 'A' || msg.team === 'B')
+      // 补人开着的时候"满了"是**设计**，不是意外 —— 不解释一句的话，房主会以为按钮坏了
+      // （他每点一下都看到"这间房已经满了"，而满正是他自己开的那一档）。
+      const tail = room.fill
+        ? `这间房已经满了（上限 ${MAX_SEATS} 个位置）—— 自动补人正把它补满，先关掉补人或者减一个 Bot`
+        : `这间房已经满了（上限 ${MAX_SEATS} 个位置）`;
+      this.send(ws, JSON.stringify({ t: 'err', msg: (msg.team === 'A' || msg.team === 'B') && team === null && this._teamCount(room, msg.team) >= MAX_PER_TEAM
         ? `${msg.team} 队已经站满了（每队 ${MAX_PER_TEAM} 个）`
-        : `这间房已经满了（上限 ${MAX_SEATS} 个位置）` }));
+        : tail }));
       return;
     }
     // 难度：**没带就用房间那一格**。写成 `(msg.skill | 0)` 那种夹取值是错的 ——
     // undefined | 0 正好等于 0（新兵），于是"什么都没选"被当成"选了最简单的那一档"，
     // 而房间里那一格明明写着正规军。这条是被判据抓出来的（I 段第一条 Bot 的 skill 是 0）。
     const skill = BOT_SKILLS.includes(msg.skill) ? msg.skill : (room.botSkill | 0);
-    const bid = ++room.botSeq;
-    const bot = { bid, name: this._botName(room), team, skill };
-    room.bots.set(bid, bot);
+    const bot = this._addBot(room, team, skill);
     this.stat.botAdd++;
     this._sys(room, `${seat.name} 加了一个 Bot（${bot.name}）`);
     this.touch(room);
@@ -461,6 +539,12 @@ export class Lobby {
     if (!bot) return;
     room.bots.delete(bot.bid);
     this.stat.botDel++;
+    // 手动减一个 = 房主要自己调这张名单了，于是**顺手关掉补人**。不关的话减掉的那一个
+    // 下一帧就被补回来：房主看到的是"点了减，名单纹丝不动"，而他会以为按钮坏了。
+    if (room.fill) {
+      room.fill = false;
+      this._sys(room, '自动补人已关闭（房主手动减了一个 Bot）');
+    }
     this._sys(room, `${seat.name} 移除了 Bot（${bot.name}）`);
     this.touch(room);
     this.pushRoom(room); this.pushLobby();
@@ -513,6 +597,7 @@ export class Lobby {
     room.stage = 'waiting';
     for (const s of room.seats.values()) s.ready = s.sid === room.hostSid;
     this._sys(room, '对局结束，回到房间');
+    this._fillBots(room);            // 下一局也照样是满的（有人在这一局里退了的话）
     this.touch(room);
     this.pushRoom(room); this.pushLobby();
   }

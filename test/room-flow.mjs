@@ -391,6 +391,114 @@ try {
   q.close();
   srv4.kill();
 
+  console.log('\n── L：自动补人（补满 / 真人优先 / 关掉的三种方式）──');
+  // 缺口原文是"Bot 不自动补人"：人不够时只能房主一个个点，而且**真人来了没人让位** ——
+  // 一间被 Bot 填满的房在列表上写着 16/16，谁也进不来，那就成了一间死房。
+  // 所以这一节量三件事：① 补满是真的（先决：开之前名单是空的）；② 真人优先（判別臂：
+  // 人进来总数不变而 Bot 少一个、人走了 Bot 补回来）；③ 三种"不再补"（反证臂：
+  // 对局中改不动、关掉之后不补、手动减一个自动关）。
+  const srvF = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '', MATCH_SECONDS: '5', MATCH_RETURN_MS: '0' });
+  const fa = client(srvF.ws, '补甲'), fb = client(srvF.ws, '补乙');
+  await fa.opened; await fb.opened;
+  fa.send({ t: 'lobby' }); fb.send({ t: 'lobby' });
+  await fa.until(j => j.t === 'lobby'); await fb.until(j => j.t === 'lobby');
+  fa.send({ t: 'createRoom', room: 'fill', name: '补甲', title: '补人房' });
+  const fl0 = await fa.until(j => j.t === 'room' && j.room && j.room.id === 'fill', 6000);
+  ok('【先决】刚建好的房没补人、名单是空的（不然下面"补满"量的是一条默认就有的东西）',
+    !!fl0 && (fl0.bots || []).length === 0 && fl0.fill === false,
+    JSON.stringify({ bots: fl0 && (fl0.bots || []).length, fill: fl0 && fl0.fill }));
+  const auto0 = (await health(srvF.base)).lobby.botAuto | 0;
+
+  // ── ① 打开：当场补满 ──
+  fa.send({ t: 'roomCfg', fill: true });
+  const fl1 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
+  ok('打开自动补人：这一间当场补到 16（1 人 + 15 Bot），不用等下一个人才生效',
+    !!fl1 && fl1.fill === true && fl1.bots.length === 15,
+    JSON.stringify({ fill: fl1 && fl1.fill, bots: fl1 && fl1.bots.length }));
+  ok('补满之后房主一个人就能开局（这正是"自动补人"这一项存在的理由）',
+    !!fl1 && fl1.canStart === true, JSON.stringify(fl1 && { canStart: fl1.canStart, why: fl1.why }));
+  ok('补位置这件事在 /healthz 上数得出来（自动加了 15 个）',
+    ((await health(srvF.base)).lobby.botAuto | 0) - auto0 === 15,
+    `botAuto ${auto0} → ${(await health(srvF.base)).lobby.botAuto}`);
+  // 全塞进一个队的症状是"16 人房，一边 15 个 Bot、一边 1 个人"，而界面上只写着 16/16。
+  const sides = fl1 ? fl1.bots.reduce((m, b) => (m[b.team] = (m[b.team] || 0) + 1, m), {}) : {};
+  ok('补出来的 Bot 两队分摊（A/B 相差不超过 1，不是全塞一队）',
+    Math.abs((sides.A || 0) - (sides.B || 0)) <= 1 && (sides.A || 0) + (sides.B || 0) === 15, JSON.stringify(sides));
+  const rowF = (await apiRooms(srvF.base)).find(x => x.id === 'fill') || {};
+  ok('列表上这一格写着 16/16 且带 Bot 数（别人按它挑房，得看得见这是补出来的）',
+    rowF.players === 16 && rowF.bots === 15, JSON.stringify({ players: rowF.players, bots: rowF.bots }));
+
+  // ── ② 真人优先：满的房里也进得来，且总数不变 ──
+  const give0 = (await health(srvF.base)).lobby.botGive | 0;
+  fb.send({ t: 'joinRoom', room: 'fill', name: '补乙' });
+  const fl2 = await fb.until(j => j.t === 'room' && j.me, 6000);
+  const f2a = await fa.until(j => j.t === 'room' && j.seats && j.seats.length === 2, 6000);
+  ok('补满的房里真人照样进得来（真人优先 —— 不然这间就是一间谁也进不去的死房）',
+    !!fl2 && !!f2a, JSON.stringify({ 乙: fl2 && fl2.me && fl2.me.name, 甲看到座位: f2a && f2a.seats.length }));
+  ok('进来一个人、让位一个 Bot：总数仍是 16，Bot 少一个、真人多一个',
+    !!f2a && f2a.seats.length === 2 && f2a.bots.length === 14,
+    JSON.stringify({ seats: f2a && f2a.seats.length, bots: f2a && f2a.bots.length }));
+  ok('让位在 /healthz 上数得出来（不然"我的 Bot 怎么少了一个"只能靠猜）',
+    ((await health(srvF.base)).lobby.botGive | 0) - give0 === 1,
+    `botGive ${give0} → ${(await health(srvF.base)).lobby.botGive}`);
+  // 反证臂：这条红了 = 让位是一次性的（每来一个人这间就少一格），而这间房在列表上
+  // 会慢慢从 16/16 掉下去 —— 与"补人"这个名字说的正好相反，且没有任何一处报错。
+  fb.close();
+  const fl3 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
+  ok('【反证】那个人走了之后位置补回来（让位不是一次性的减法）',
+    !!fl3 && fl3.bots.length === 15 && fl3.seats.length === 1,
+    JSON.stringify({ seats: fl3 && fl3.seats.length, bots: fl3 && fl3.bots.length }));
+
+  // ── ③ 三种"不再补" ──
+  // ③a 关掉：场上的 Bot 留着，只是不再补。判別臂：减掉一个之后**停在 15**。
+  fa.send({ t: 'roomCfg', fill: false });
+  const fl4 = await fa.until(j => j.t === 'room' && j.fill === false, 6000);
+  ok('关掉补人：场上的 Bot 留着不动（关 = 把补出来的全删了的话，房主手动摆的也没了）',
+    !!fl4 && fl4.bots.length === 15, JSON.stringify({ fill: fl4 && fl4.fill, bots: fl4 && fl4.bots.length }));
+  const del0 = (await health(srvF.base)).lobby.botDel | 0;
+  fa.send({ t: 'botDel' });
+  await fa.until(j => j.t === 'room' && (j.bots || []).length === 14, 6000);
+  await sleep(500);
+  ok('【判別臂】关掉之后不再补：减了一个就停在 14（补人还开着的话这里会自己涨回 15）',
+    ((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots === 14
+    && ((await health(srvF.base)).lobby.botDel | 0) - del0 === 1,
+    `bots=${((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots}`);
+
+  // ③b 手动减一个 = 顺手关掉补人（减了立刻补回来的话，房主看到的是"点了减，名单纹丝不动"）。
+  fa.send({ t: 'roomCfg', fill: true });
+  const fl5 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
+  ok('【先决】重新打开补人又补满（不然下面"手动减一个"量的不是开着的那一档）',
+    !!fl5 && fl5.fill === true && fl5.bots.length === 15, JSON.stringify({ fill: fl5 && fl5.fill, bots: fl5 && fl5.bots.length }));
+  fa.send({ t: 'botDel' });
+  const fl6 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 14, 6000);
+  ok('手动减一个 Bot：补人**自己关掉**（并说一声），不是把减掉的那个立刻补回来',
+    !!fl6 && fl6.fill === false && fl6.bots.length === 14, JSON.stringify({ fill: fl6 && fl6.fill, bots: fl6 && fl6.bots.length }));
+  await sleep(500);
+  ok('【判別臂】关掉之后名单停在 14（没有"减了又补"那种死循环）',
+    ((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots === 14);
+
+  // ③c 对局中改不动。这一格读的是**打完回房间那一帧**：中途那句 roomCfg 被丢掉的话，
+  //     fill 到那时候仍然是 true（liveEnded 那条路照旧按补人把房间留着）。
+  fa.send({ t: 'roomCfg', fill: true });
+  await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
+  fa.frames.length = 0;
+  fa.send({ t: 'start' });
+  const flW = await fa.until(j => j.t === 'welcome', 15000);
+  const flBots = ((flW && flW.others) || []).filter(o => o.bot).length;
+  ok('补出来的 15 个 Bot 随开局一起进对局（补人不是只补在名单上）',
+    !!flW && flBots === 15, `others 里 ${flBots} 个 Bot`);
+  fa.send({ t: 'roomCfg', fill: false });
+  fa.send({ t: 'roomCfg', mode: 'ffa' });
+  const overF = await fa.until(j => j.t === 'ev' && (j.ev || []).some(e => e.e === 'matchOver'), 25000);
+  const backF = await fa.until(j => j.t === 'room' && j.room && j.room.state === 'waiting', 25000);
+  ok('【反证】对局中改设置一句都不作数：回来时 fill 还是 true、模式还是 tdm',
+    !!overF && !!backF && backF.fill === true && backF.room.mode === 'tdm',
+    JSON.stringify(backF && { fill: backF.fill, mode: backF.room.mode }));
+  ok('打完回房间照旧是满的（下一局还是随时能开，不用房主再点一遍）',
+    !!backF && backF.bots.length === 15, JSON.stringify(backF && backF.bots.length));
+  fa.close();
+  srvF.kill();
+
   console.log('\n── H：连杀选单走完整条链（选 → 座位 → 开局 → 各回各的回显）──');
   const srv5 = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
   const u = client(srv5.ws, '选甲'), v = client(srv5.ws, '选乙'), w = client(srv5.ws, '选丙');

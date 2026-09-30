@@ -23,7 +23,17 @@ let n = 0, bad = 0;
 const ok = (label, cond, extra = '') => { n++; if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${label}${extra ? '  | ' + extra : ''}`); };
 
 async function launch() {
-  for (const [label, opts] of [['chrome', { channel: 'chrome', args: ARGS }], ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }]]) {
+  // 三档依次试：系统 Chrome → **Playwright 自带的那一份**（不带 channel/executablePath，
+  // 所以 `npx playwright install chromium` 装的就是它）→ 这台开发机上实际存在的那一份 1234
+  // （Playwright 1.63 默认要 1243，机器上只有 1234）。中间这一档是**别人的机器能跑起来**的前提：
+  // 少了它，README 里那句"没有 Chrome 的机器先 npx playwright install chromium"就是假的
+  // （`test/docs-guard.mjs` 的 G 段拿这一档当判据，8 份浏览器判据逐个核）。
+  const tries = [
+    ['chrome', { channel: 'chrome', args: ARGS }],
+    ['playwright-chromium', { args: ARGS }],
+    ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }],
+  ];
+  for (const [label, opts] of tries) {
     try { return await chromium.launch(opts); } catch { /* 换下一个 */ }
   }
   throw new Error('没有可用浏览器');
@@ -84,7 +94,11 @@ async function boot(browser, tag) {
 }
 
 // 只想跑某一段的时候：node test/net-drop.mjs D —— 一次全跑要五分钟，迭代等不起。
-const only = (process.argv[2] || 'ABCDEF').toUpperCase();
+// 默认跑的是 A–F 加上 H（房间屏上"补人"那一格，十几秒、不拉对局）与 I
+// （账号闸上的"忘了密码？"，只点按钮、不进对局）。
+// G（加 Bot 打一局）留在默认之外：它要开一局真的对局，一次全跑更慢 ——
+// 想验它就显式写 node test/net-drop.mjs G。
+const only = (process.argv[2] || 'ABCDEFHI').toUpperCase();
 const skip = t => !only.includes(t);
 
 const realErrs = (logs) => logs.filter(l => !/favicon|WebGL|AudioContext|pointer lock|ERR_NETWORK|ERR_INTERNET|Failed to load/i.test(l));
@@ -606,6 +620,194 @@ try {
     await a.bringToFront();
     await a.screenshot({ path: 'test/lobby-match-bots.png' });
     ok('页面没有真错误', realErrs(A.logs).length === 0, A.logs.slice(0, 2).join(' ⏐ '));
+    srv.kill();
+  }
+  if (!skip('H')) {
+    console.log('\n── H：房间屏上的"补人"那一格（点了就补满，一个人也能开） ──');
+    // 与上一节正好相反的一条：Bot **难度**那一行要有 Bot 才画，而"补人"这一行在空房里
+    // 也必须画出来 —— 也等有 Bot 才画的话，房主永远造不出第一个 Bot：他把自己锁在门外了。
+    // 所以这一节第一条（先决）不是形式主义，它是这一格唯一的死法。
+    // 服务端那一半（谁让位、三种关法、数得出来的计数）在 room-flow 的 L 段。
+    await closeOpened();
+    const srv = await withServer(GUEST);
+    const A = await newPage(browser, srv, 'fill-a', null, '', { width: 1280, height: 720 });
+    const a = A.page;
+    const wait = async (page, fn, ms = 30000) => {
+      const t0 = Date.now();
+      for (;;) {
+        const v = await page.evaluate(fn).catch(() => null);
+        if (v) return v;
+        if (Date.now() - t0 > ms) return null;
+        await sleep(250);
+      }
+    };
+    for (let i = 0; i < 200; i++) { if (await a.evaluate(() => !!document.querySelector('[data-a=online]'))) break; await sleep(250); }
+    await a.bringToFront();
+    await a.click('[data-a=online]');
+    await wait(a, () => (window.game.menu || {}).screen === 'online' && !!document.querySelector('[data-a=create]'));
+    await a.fill('#onName', '补人甲');
+    await a.click('[data-a=create]');
+    await wait(a, () => (window.game.menu || {}).screen === 'onlineRoom' && !!document.querySelector('[data-a=start]'));
+
+    const fill0 = await a.evaluate(() => {
+      const el = document.querySelector('#rmFill');
+      return el ? { txt: el.textContent, sel: (el.querySelector('.sel') || {}).textContent, bots: (window.game.lobby.state.bots || []).length } : null;
+    });
+    ok('【先决】空房里也有"补人"那一行、且停"手动"（有 Bot 才画的话，房主永远造不出第一个 Bot）',
+      !!fill0 && fill0.sel === '手动' && fill0.bots === 0, JSON.stringify(fill0));
+    ok('难度那一行此时**不该**在（两行的条件相反，摆在一起才看得出来不是随手画的）',
+      await a.evaluate(() => !document.querySelector('#rmBot')));
+
+    await a.click('#rmFill div[data-v="1"]');
+    const filled = await wait(a, () => {
+      const all = [...document.querySelectorAll('#seatA .seat[data-bid], #seatB .seat[data-bid]')];
+      return all.length === 15 ? { rows: all.length, bots: all.filter(el => (el.querySelector('.s-tag') || {}).textContent === 'Bot').length } : null;
+    });
+    ok('点"补满"：座位栏当场补出 15 行 Bot（1 人 + 15 = 16，服务端那个上限）',
+      !!filled && filled.bots === 15, JSON.stringify(filled));
+    ok('补满之后开始按钮就亮了（一个人也能开一局，这正是这一格存在的理由）',
+      await a.evaluate(() => document.querySelector('[data-a=start]').disabled === false
+        && (document.querySelector('#rmFill .sel') || {}).textContent === '补满'
+        && window.game.lobby.state.fill === true),
+      JSON.stringify(await a.evaluate(() => ({ d: document.querySelector('[data-a=start]').disabled, sel: (document.querySelector('#rmFill .sel') || {}).textContent }))));
+    await a.screenshot({ path: 'test/lobby-room-fill.png' });
+
+    await a.click('#rmFill div[data-v="0"]');
+    const kept = await wait(a, () => {
+      const all = [...document.querySelectorAll('#seatA .seat[data-bid], #seatB .seat[data-bid]')];
+      return (all.length === 15 && window.game.lobby.state.fill === false) ? { rows: all.length, sel: (document.querySelector('#rmFill .sel') || {}).textContent } : null;
+    });
+    ok('再点"手动"：这一格回到手动、服务端那格也变 false，场上的 15 行**留着**（关 = 不再补，不是把补出来的删掉）',
+      !!kept && kept.sel === '手动', JSON.stringify(kept));
+    ok('页面没有真错误', realErrs(A.logs).length === 0, A.logs.slice(0, 2).join(' ⏐ '));
+    srv.kill();
+  }
+  if (!skip('I')) {
+    console.log('\n── I：账号闸上的「忘了密码？」（恢复码横幅） ──');
+    // 这一段量的是**客户端那一半**：闸的两种形态、切形态时名字不许被擦、码只在
+    // 注册/重设那两条响应里出现一次、抄错时空格与 0/O 1/l 的分辨。
+    // 服务端那一半（哈希、一次性、会话作废、限流、CLI、审计）在 test/hardening.mjs 的 J 段
+    // 和 test/accounts.mjs 的 K 段；**这一段一条都不重复**，它只回答"人去点的时候看到了什么"。
+    // 分工写在两边，是因为这一屏是那个功能的全部可见面：服务端做得再对，
+    // 只要码没被摆到人眼前，这个功能就等于不存在。
+    await closeOpened();
+    const INV = 'DROP-INVITE', PW1 = 'first-password-ok', PW2 = 'second-password-ok';
+    const srv = await withServer({ JOIN_CODE: INV, REQUIRE_ACCOUNT: '1' });
+    const waitIn = async (page, fn, ms = 30000) => {
+      const t0 = Date.now();
+      for (;;) {
+        const v = await page.evaluate(fn).catch(() => null);
+        if (v) return v;
+        if (Date.now() - t0 > ms) return null;
+        await sleep(250);
+      }
+    };
+    // 每张码都是 XXXX-XXXX-XXXX，且字母表里没有 I L O U（抄错的三个字都被换掉了）
+    const codeShape = c => /^[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){2}$/.test(c);
+    const toGate = async (page) => {
+      for (let i = 0; i < 200; i++) { if (await page.evaluate(() => !!document.querySelector('[data-a=online]'))) break; await sleep(250); }
+      await page.bringToFront();
+      await page.click('[data-a=online]');
+      return waitIn(page, () => (window.game.menu || {}).screen === 'onlineGate' && !!document.querySelector('[data-a=forgot]'));
+    };
+
+    const A = await newPage(browser, srv, 'rec-a', null, '', { width: 1280, height: 720 });
+    const a = A.page;
+    ok('【先决】要账号的服上，从主菜单点进联机先落到账号闸（登录/注册两种按钮都在）',
+      !!(await toGate(a)) && await a.evaluate(() => !!document.querySelector('[data-a=reg]') && !!document.querySelector('#acctCode')));
+
+    await a.fill('#onName', '忘了甲');
+    await a.click('[data-a=forgot]');
+    const rf = await waitIn(a, () => {
+      const el = document.querySelector('#acctRecov');
+      return el ? { name: (document.querySelector('#onName') || {}).value, head: (document.querySelector('h1') || {}).textContent,
+        invite: !!document.querySelector('#acctCode'), docover: !!document.querySelector('[data-a=docover]') } : null;
+    });
+    ok('点「忘了密码？」当场换成恢复表单：多出恢复码那一格、邀请码那一格消失、按钮换成"重设密码"',
+      !!rf && /恢复码/.test(rf.head) && rf.invite === false && rf.docover === true, JSON.stringify(rf));
+    ok('【反证】切形态时已经打好的呼号留着（被擦掉的话看起来像页面抽风）',
+      !!rf && rf.name === '忘了甲', JSON.stringify(rf && rf.name));
+    await a.click('[data-a=tologin]');
+    const bk = await waitIn(a, () => {
+      const el = document.querySelector('[data-a=reg]');
+      return el ? { name: (document.querySelector('#onName') || {}).value, recov: !!document.querySelector('#acctRecov') } : null;
+    });
+    ok('再点「返回登录」切回来，名字**还在**、恢复码那一格收回去（切两次都不许擦）',
+      !!bk && bk.name === '忘了甲' && bk.recov === false, JSON.stringify(bk));
+
+    await a.fill('#acctPw', PW1);
+    await a.fill('#acctCode', INV);
+    await a.click('[data-a=reg]');
+    const codesA = await waitIn(a, () => { const el = document.querySelector('#recovList'); return el ? el.innerText.split(/\s+/).filter(Boolean) : null; });
+    ok('注册之后**先**把 5 张恢复码摆在大厅顶端（码只在这一次响应里，直接过去的话没人看见过这几张码）',
+      !!codesA && codesA.length === 5 && codesA.every(codeShape), JSON.stringify(codesA));
+    ok('这块横幅写着"只显示这一次"并劝人别截图（不写的话玩家会以为以后还能查到）',
+      /只显示这一次/.test(await a.evaluate(() => document.body.innerText)) && /别截图/.test(await a.evaluate(() => document.body.innerText)));
+    await a.bringToFront();
+    await a.screenshot({ path: 'test/account-recovery-codes.png' });
+    await a.click('[data-a=done]');
+    const inLobby = await waitIn(a, () => (!!document.querySelector('[data-a=create]') ? { s: (window.game.menu || {}).screen, logged: !!(window.game.account || {}).loggedIn } : null));
+    ok('点"抄好了"收掉横幅，人还在大厅里（而且这一页确实登录了，闸那一步没有被跳过）',
+      !!inLobby && inLobby.logged === true, JSON.stringify(inLobby));
+    ok('页面没有真错误', realErrs(A.logs).length === 0, A.logs.slice(0, 2).join(' ⏐ '));
+
+    // ── 另一个客户端（干净存档）：走"忘了密码？"真重设一次 ──
+    const B = await newPage(browser, srv, 'rec-b', null, '', { width: 1280, height: 720 });
+    const b = B.page;
+    await toGate(b);
+    await b.click('[data-a=forgot]');
+    await waitIn(b, () => !!document.querySelector('#acctRecov'));
+    await b.fill('#onName', '忘了甲');
+    await b.fill('#acctPw', PW2);
+    await b.fill('#acctRecov', 'ZZZZ-ZZZZ-ZZZZ');
+    await b.click('[data-a=docover]');
+    const msg = await waitIn(b, () => {
+      const t = ((document.querySelector('#acctMsg') || {}).textContent || '').trim();
+      return t && t !== '正在重设…' ? t : null;
+    });
+    ok('码不对时把服务端那一句原样显示在表单里（不翻译、不吞成"失败了"）',
+      msg === '呼号或恢复码不对', JSON.stringify(msg));
+    // 故意抄得走形：小写 + 前后空格 + 把 0 抄成 o、1 抄成 l。
+    // 这一条是**客户端与规范化函数合起来**才过得去的：填进去的是人的手，不是规范化的码。
+    const messy = ' ' + codesA[3].toLowerCase().replace(/0/g, 'o').replace(/1/g, 'l') + ' ';
+    await b.fill('#acctRecov', messy);
+    await b.click('[data-a=docover]');
+    const codesB = await waitIn(b, () => { const el = document.querySelector('#recovList'); return el ? el.innerText.split(/\s+/).filter(Boolean) : null; });
+    ok('真码（故意抄成小写 + 0→o / 1→l）能重设：当场换出新的一叠 5 张',
+      !!codesB && codesB.length === 5 && codesB.every(codeShape), JSON.stringify(codesB));
+    ok('【反证】新的一叠和老的那一叠**没有一张重合**（换了一整叠，不是把旧的又显示一遍）',
+      !!codesB && !!codesA && codesA.every(c => !codesB.includes(c)),
+      JSON.stringify({ old: codesA, now: codesB }));
+    ok('这一屏的抬头写的是"密码已重设"（和"注册成功"那一屏分得开）',
+      /密码已重设/.test(await b.evaluate(() => document.body.innerText)));
+    await b.click('[data-a=done]');
+    ok('重设完也直接进大厅（重设成功 = 一次登录）',
+      !!(await waitIn(b, () => (!!document.querySelector('[data-a=create]') ? true : null))));
+    ok('页面没有真错误', realErrs(B.logs).length === 0, B.logs.slice(0, 2).join(' ⏐ '));
+
+    // ── 第三个客户端：旧密码必须登不上，新密码登上但**不再摆码** ──
+    // "登不上"这一条是这一段的命门：不量它的话，"重设"可能只是**多了一个能用的密码**，
+    // 而那样等于把找回变成了"多配一把钥匙"（被人捡到码之后，原主连改密码都赶不走他）。
+    const C = await newPage(browser, srv, 'rec-c', null, '', { width: 1280, height: 720 });
+    const c = C.page;
+    await toGate(c);
+    await c.fill('#onName', '忘了甲');
+    await c.fill('#acctPw', PW1);
+    await c.click('[data-a=login]');
+    const oldMsg = await waitIn(c, () => {
+      const t = ((document.querySelector('#acctMsg') || {}).textContent || '').trim();
+      return t && t !== '正在登录…' ? t : null;
+    });
+    ok('【反证】用**旧**密码登录拿到"呼号或密码不对"，而且人还留在闸上（不是两个密码都能用）',
+      oldMsg === '呼号或密码不对' && await c.evaluate(() => (window.game.menu || {}).screen === 'onlineGate'),
+      JSON.stringify(oldMsg));
+    await c.fill('#acctPw', PW2);
+    await c.click('[data-a=login]');
+    const okIn = await waitIn(c, () => (!!document.querySelector('[data-a=create]') ? { recovered: !!document.querySelector('#recovList') } : null));
+    ok('用**新**密码登录直接进大厅，且**不再**摆一次恢复码（码只在那两条响应里存在，登录响应里不该有）',
+      !!okIn && okIn.recovered === false, JSON.stringify(okIn));
+    ok('页面没有真错误', realErrs(C.logs).length === 0, C.logs.slice(0, 2).join(' ⏐ '));
+    await closeOpened();
     srv.kill();
   }
 

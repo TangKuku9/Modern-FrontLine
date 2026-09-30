@@ -99,13 +99,42 @@ for (let i = 0; i < 60; i++) {
   send(B, encodeInput({ tick, mdx: 0, mdy: 0, keys: 0, buttons: 0, seq: i }));
   await sleep(16);
 }
+// ── 按 tick 对齐地比两个人的读数 ──
+// 这条判据原来拿"A 手里最新那一包"减"B 手里最新那一包"（< 0.06 m）。两根时间轴根本不对齐：
+// 20Hz 下行，两人的最后一包可以差半包（50 ms），而 A 正以 ~5 m/s 走 —— 半包就是 0.12 m。
+// 于是它红的是"哪一包先到"，跟机器负载有关（在 `npm run test:all` 里红过一次，单独跑连绿三次），
+// 不是"下行内容对不对"。现在改成**同一 tick 逐位比**：先各记一份 tick → 快照的索引，
+// 取两人都有的最新那一拍（就地取，趁 A 还在动），再比那一拍里 A 的坐标 ——
+// 与到达顺序无关，而且比原来严了五个数量级（1e-6 对 0.06 m）：真客户端看到的是同一份下行字节。
+const byTickA = new Map(A.snaps.map(s => [s.tick, s]));
+const byTickB = new Map(B.snaps.map(s => [s.tick, s]));
+let commonTick = null;
+for (const t of byTickB.keys()) if (byTickA.has(t) && (commonTick === null || t > commonTick)) commonTick = t;
+const eaTick = commonTick === null ? null : byTickA.get(commonTick).entities.find(e => e.id === A.cid);
+const ebTick = commonTick === null ? null : byTickB.get(commonTick).entities.find(e => e.id === A.cid);
+// 判别臂的料：这一拍 A 自己相对上一包走了多少。它保证"尺度"在 —— A 在动的时候错一包要差出
+// 量级，否则下面那条"逐位相同"就是恒真判据（站着不动时随便哪两包都对得上）。
+const prevTick = commonTick === null ? null : [...byTickA.keys()].filter(t => t < commonTick)
+  .sort((x, y) => y - x).find(t => byTickA.get(t).entities.some(e => e.id === A.cid));
+const eaPrev = prevTick == null ? null : byTickA.get(prevTick).entities.find(e => e.id === A.cid);
+
 await sleep(200);
 const nowA = A.last.entities.find(e => e.id === A.cid);
 const seenA = B.last.entities.find(e => e.id === A.cid);
 const moved = Math.hypot(nowA.x - baseA.x, nowA.z - baseA.z);
+const seenMoved = Math.hypot(seenA.x - baseA.x, seenA.z - baseA.z);
 ok('服务端按输入推进了 A（自己看到）', moved > 1.0, `位移 ${moved.toFixed(2)} m`);
-ok('B 也看到 A 动了同一个位置', Math.hypot(seenA.x - nowA.x, seenA.z - nowA.z) < 0.06,
-  `A=${nowA.x.toFixed(2)},${nowA.z.toFixed(2)} B眼里=${seenA.x.toFixed(2)},${seenA.z.toFixed(2)}`);
+// 远端那份坐标确实跟着走了。这条只要求"看到动了"，不要求与 A 的读数逐位相等 ——
+// 两个读数各自停在不同的包上，等价关系由下面按 tick 对齐的那条负责。
+ok('B 也看到 A 动了', seenMoved > 1.0, `B 眼里位移 ${seenMoved.toFixed(2)} m`);
+const dSame = (eaTick && ebTick) ? Math.hypot(ebTick.x - eaTick.x, ebTick.z - eaTick.z) : NaN;
+ok('先决：两人手里有同一 tick 的快照（不对齐这条就是空转）', Number.isFinite(dSame),
+  `共同 tick=${commonTick} · A ${byTickA.size} 包 / B ${byTickB.size} 包`);
+ok('同一个 tick 上，B 眼里的 A 与 A 眼里的 A 是同一份坐标', dSame < 1e-6,
+  `tick=${commonTick} A=${eaTick?.x.toFixed(4)},${eaTick?.z.toFixed(4)} B=${ebTick?.x.toFixed(4)},${ebTick?.z.toFixed(4)} Δ=${dSame}`);
+const stepMove = (eaPrev && eaTick) ? Math.hypot(eaTick.x - eaPrev.x, eaTick.z - eaPrev.z) : NaN;
+ok('判别臂：这一拍 A 真的在动（错一包就出量级，判据不是恒真）', stepMove > 0.05,
+  `tick=${commonTick} 相对上一包 ${stepMove.toFixed(3)} m（旧写法的容差是 0.06 m）`);
 const b0 = B.snaps[1].entities.find(e => e.id === B.cid);
 const b1 = B.last.entities.find(e => e.id === B.cid);
 ok('没发按键的 B 留在原地', Math.hypot(b1.x - b0.x, b1.z - b0.z) < 0.02,

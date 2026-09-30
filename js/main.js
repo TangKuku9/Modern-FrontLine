@@ -18,12 +18,13 @@ import { Menu } from './menu.js';
 import { MPMatch } from './mp.js';
 import { Campaign } from './campaign.js';
 import { Player } from './player.js';
-import { onKillPerks, pickupsExpire, pickupAction } from './match-rules.js';
+import { onKillPerks, killMedals, pickupsExpire, pickupAction } from './match-rules.js';
 import { NetClient } from './net/client.mjs';
 import { LobbyClient } from './net/lobby.mjs';
 import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS, MP_MODES } from './data.js';
 import { repairClass } from './loadout.mjs';
+import { applyAccountXp } from './progress.mjs';
 import { damp } from './util.js';
 import { Account } from './account.js';
 import { unpackInput } from './quant.js';
@@ -74,7 +75,7 @@ const MAX_STEPS_PER_FRAME = 8;     // 单帧最多补几步，超出就丢时间
 class Game {
   constructor() {
     this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true, fixedStep: true, fpsCap: 0 }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
-    this.profile = Object.assign({ xp: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null, muted: [] }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
+    this.profile = Object.assign({ xp: 0, xpLocal: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null, muted: [] }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
     if (!this.profile.classes || this.profile.classes.length < 5) this.profile.classes = JSON.parse(JSON.stringify(DEFAULT_CLASSES));
     // 存档里读出来的东西要过一遍表：mf_profile 是玩家能自己编辑的文件，一个不存在的枪 id
     // 会让菜单在 new Menu → buildScene → buildGun 里抛，整个页面停在"初始化失败"。
@@ -197,9 +198,11 @@ class Game {
     if (!this.account) return Promise.resolve();
     if (this._acctSync && this.account.statusKnown) return this._acctSync;
     this._acctSync = this.account.status().then(() => this.account.me()).then(() => {
-      // 登录之后把服务端那份经验值同步到本地档案上（显示用）。本地那份仍然可以被玩家改，
-      // 但它现在只是**一个显示用的副本** —— 真正的数在服务端，下一次 me() 会把它盖回去。
-      if (this.account.user) { this.profile.xp = this.account.user.xp | 0; this.saveProfile(); }
+      // 登录之后把服务端那份经验值同步到本地档案上（显示用）。
+      // **只写账号那一半**：本地那份（战役 / 单机 / 访客联机）不参与，谁都盖不掉 ——
+      // 这条以前是 `profile.xp = user.xp`，把两半挤在一个字段里，于是玩家打完一整场战役
+      // 再回主菜单，那一笔就没了（见 js/progress.mjs 开头）。
+      if (this.account.user) { applyAccountXp(this.profile, this.account.user.xp); this.saveProfile(); }
     }).catch(() => { /* 连不上服务器不是启动错误：单机照玩，下一次进联网还会再问 */ });
     return this._acctSync;
   }
@@ -375,6 +378,10 @@ class Game {
     this.hud.killfeed(killer, victim, escHtml(ev.weapon), ev.head);
     if (killer.isPlayer) {
       this.hud.popup(`${ev.pts ? '+' + ev.pts + '  ' : ''}击杀 ${escHtml(ev.victim)}`, '#d4f24a');
+      // 逐条奖章：事件里的 tags 就是服务端 killScore 算出来的那几条，文案与分值问
+      // js/match-rules.js:killMedals —— 与单机 js/mp.js:playerKill 共用同一张表。
+      // 以前联机只有上面那一行总分，爆头/近战/远距离/复仇/连杀在屏幕上一条都没有。
+      for (const m of killMedals(ev.tags)) this.hud.popup(`${m.label} +${m.points}`, '', true);
       this.audio.hit(true, !!ev.head);
       // 拾荒者 / 速愈在**我这台机器的**状态机上再跑一遍同一份规则（js/match-rules.js:
       // onKillPerks）：服务端那份管权威血量与弹药，这份管屏幕上的计数 —— 缺了它的症状是

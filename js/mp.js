@@ -7,7 +7,8 @@ import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, comput
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
-import { StreakBook, MatchRules, WP_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick } from './match-rules.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick } from './match-rules.js';
+import { addLocalXp } from './progress.mjs';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
 // 这是"联机的 Bot 和单机的 Bot 手感一样"唯一的一处定义。抄一份的话，两边的 Bot
@@ -210,20 +211,21 @@ export class MPMatch {
     pl.stats.kills++; pl.stats.streak++;
     const n = this.rules.killChain();
     // 分值来自 js/match-rules.js:killScore（联机权威端问的是同一句）。
-    // 规则只说"这一下挣了什么"，文案留在这里 —— 联机不发这些弹窗，它靠事件。
+    // 逐条奖章那几行问 killMedals（**联机画的是同一张表**，见 js/main.js:onNetKill）。
     const sc = killScore({
       head: !!head, melee: !!(info && info.melee), explosive: !!(info && info.explosive),
       dist: victim.pos.distanceTo(pl.pos), chain: n, revenge: pl.lastAttacker === victim,
     });
     if (pl.lastAttacker === victim) pl.lastAttacker = null;
     if (head) pl.stats.headshots++;
-    const CHAIN_NAME = ['', '', '双杀', '三杀', '四杀', '暴走', '无人可挡'];
     game.hud.popup(`+${KILL_POINTS.kill} 击杀`, '#fff');
-    if (sc.tags.includes('head')) game.hud.popup(`爆头 +${KILL_POINTS.head}`, '', true);
-    if (sc.tags.includes('melee')) game.hud.popup('近战击杀', '', true);
-    if (sc.tags.includes('longshot')) game.hud.popup(`远距离击杀 +${KILL_POINTS.longshot}`, '', true);
-    if (n >= 2) { const nm = CHAIN_NAME[Math.min(n, 6)]; game.hud.popup(nm + ` +${n * KILL_POINTS.chain}`, '', true); game.audio.say(nm); }
-    if (sc.tags.includes('revenge')) game.hud.popup(`复仇 +${KILL_POINTS.revenge}`, '', true);
+    // 一条奖章一行字。以前这里是五条手写 if，近战那条还漏了分值 —— 于是"同样一条奖章
+    // 在单机写着 +50、在联机什么都没有"这种差别没人看得出来。表只有一份之后，
+    // 两端同一批 tags 出来的就是同一行字。
+    for (const m of killMedals(sc.tags)) {
+      game.hud.popup(`${m.label} +${m.points}`, '', true);
+      if (m.tag.startsWith('chain')) game.audio.say(m.label);
+    }
     if (pl.stats.streak % 5 === 0) game.hud.popup(`连杀 ×${pl.stats.streak}`, '', true);
     pl.stats.score += sc.points;
     // 拾荒者 / 速愈：规则在 js/match-rules.js:onKillPerks —— 联机权威端与客户端镜像
@@ -479,7 +481,9 @@ export class MPMatch {
     const r = this.ranking();
     const place = r.findIndex(x => x.e.isPlayer) + 1;
     const xp = pl.stats.score + (win === 'win' ? 500 : 150);
-    game.profile.xp += xp; game.saveProfile();
+    // 单机对局这一笔同样是**本地经验**：它没有服务端裁决可依，所以不进账号（js/progress.mjs）。
+    // 同一件事的另一半在 js/net/client.mjs：联机那一局登录玩家记账号那份、访客记本地那份。
+    addLocalXp(game.profile, xp); game.saveProfile();
     game.audio.say(win === 'win' ? '胜利' : win === 'draw' ? '平局' : '失败');
     game.hud.announce(win === 'win' ? '胜利' : win === 'draw' ? '平局' : '失败', '', 3);
     setTimeout(() => {

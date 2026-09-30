@@ -5,6 +5,7 @@ import { Bot } from './ai.js';
 import { buildHeli } from './mp.js';
 import { mat } from './materials.js';
 import { fmtTime, rand, pick, rng } from './util.js';
+import { addLocalXp } from './progress.mjs';
 
 const V = (x, z, y = 0) => new THREE.Vector3(x, y, z);
 
@@ -335,7 +336,9 @@ export class Campaign {
     const t = game.time;
     const best = game.profile.campaignBest;
     if (!best || t < best) { game.profile.campaignBest = t; }
-    game.profile.xp += 1500 + pl.stats.kills * 50; game.saveProfile();
+    // 这一笔是**本地经验**，不进账号：服务端没法验证一场单机战役（见 js/progress.mjs 开头）。
+    // 以前它加在 `profile.xp` 上，于是下一次账号同步把整场战役抹平。
+    addLocalXp(game.profile, 1500 + pl.stats.kills * 50); game.saveProfile();
     setTimeout(() => {
       if (document.pointerLockElement) document.exitPointerLock();
       game.menu.showResults({

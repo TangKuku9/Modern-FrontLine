@@ -24,7 +24,17 @@ const ok = (label, cond, extra = '') => { checks.push([!!cond, label, extra]); c
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function launch() {
-  for (const [label, opts] of [['chrome', { channel: 'chrome', args: ARGS }], ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }]]) {
+  // 三档依次试：系统 Chrome → **Playwright 自带的那一份**（不带 channel/executablePath，
+  // 所以 `npx playwright install chromium` 装的就是它）→ 这台开发机上实际存在的那一份 1234
+  // （Playwright 1.63 默认要 1243，机器上只有 1234）。中间这一档是**别人的机器能跑起来**的前提：
+  // 少了它，README 里那句"没有 Chrome 的机器先 npx playwright install chromium"就是假的
+  // （`test/docs-guard.mjs` 的 G 段拿这一档当判据，8 份浏览器判据逐个核）。
+  const tries = [
+    ['chrome', { channel: 'chrome', args: ARGS }],
+    ['playwright-chromium', { args: ARGS }],
+    ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }],
+  ];
+  for (const [label, opts] of tries) {
     try { const b = await chromium.launch(opts); console.log(`  浏览器: ${label}`); return b; }
     catch (e) { console.log(`  ${label} 起不来: ` + e.message.split('\n')[0]); }
   }
@@ -99,19 +109,30 @@ try {
   const snaps = async (p) => p.page.evaluate(() => window.game.net.snaps);
   const [nsa, nsb] = [await snaps(A), await snaps(B)];
   ok('双方都收到了下行快照', nsa > 2 && nsb > 2, `甲 ${nsa} 包 / 乙 ${nsb} 包`);
-  // 量具自身的先决断言：客户端节拍不够 55Hz 时，服务端就得替它空跑几拍，
+  // 量具自身的先决断言：客户端节拍跟不上时，服务端就得替它空跑几拍，
   // 下面"预测偏差在厘米级"那条量的就不再是预测而是渲染器产能 —— 那种红是假红。
+  // 比的是**消费比**（我这边推进的拍 ÷ 服务端推进的拍），不是墙钟 Hz：
+  // 这个门槛原来写成 `hz >= 50`，而同一台机器上本机节拍随负载在 49~66 之间晃 ——
+  // 门槛正好卡在分布边缘，于是它自己成了假红（`test:all` 里红过一次：甲 49Hz，而那一轮
+  // 838 个稳态样本、Δ=0、空跑残差 0 超尺子，全是绿的）。服务端和浏览器在同一台机器上，
+  // 负载一起来两个数一起降，比值不动；真该拦的是"客户端比服务端慢一半以上"那种。
+  // 分母要单独断言：两边都停住时比值是 0/0，说不出话（服务端拍号是 16 位，差值做环绕）。
   const rate = async (p, tag) => {
     await focus(p);
-    const t0 = await p.page.evaluate(() => window.game.tick);
+    const r0 = await p.page.evaluate(() => ({ t: window.game.tick, s: window.game.net.serverTick | 0 }));
     await sleep(1000);
-    const t1 = await p.page.evaluate(() => window.game.tick);
-    const hz = t1 - t0;
-    console.log(`  ${tag} 模拟节拍 ${hz} Hz · 快照 ${(await p.page.evaluate(() => window.game.net.snaps))} 包`);
-    return hz;
+    const r1 = await p.page.evaluate(() => ({ t: window.game.tick, s: window.game.net.serverTick | 0 }));
+    const hz = r1.t - r0.t, srv = (r1.s - r0.s) & 0xffff;
+    const ratio = srv > 0 ? hz / srv : 0;
+    console.log(`  ${tag} 模拟节拍 ${hz} Hz · 服务端拍 ${srv} 拍/秒 · 消费比 ${ratio.toFixed(2)} · 快照 ${(await p.page.evaluate(() => window.game.net.snaps))} 包`);
+    return { hz, srv, ratio };
   };
-  const hzA = await rate(A, '甲'), hzB = await rate(B, '乙');
-  ok('两个窗口的模拟节拍够快（≥50Hz），后面的厘米级容差才有意义', hzA >= 50 && hzB >= 50, `甲 ${hzA}Hz / 乙 ${hzB}Hz`);
+  const rA = await rate(A, '甲'), rB = await rate(B, '乙');
+  ok('先决：服务端那一秒真的在推进（不然"消费比"的分母是空的）',
+    rA.srv >= 30 && rB.srv >= 30, `甲 ${rA.srv} 拍 / 乙 ${rB.srv} 拍`);
+  ok('判别臂：两个窗口都没比服务端慢一半以上（后面的厘米级容差才有意义）',
+    rA.ratio >= 0.5 && rB.ratio >= 0.5,
+    `甲 ${rA.hz}Hz/${rA.srv}拍=${rA.ratio.toFixed(2)} · 乙 ${rB.hz}Hz/${rB.srv}拍=${rB.ratio.toFixed(2)}`);
   const seenOther = await B.page.evaluate(cid => !!(window.game.net.roster.get(cid) || window.game.net.remotes.get(cid)), sa.cid);
   ok('乙的 roster 里认得甲', seenOther);
 
@@ -291,10 +312,73 @@ try {
   });
   ok('乙那边给甲建了远端实体', !!viewed, why);
   if (viewed) {
-    const dRaw = Math.hypot(viewed.raw[0] - walk.x1, viewed.raw[1] - walk.z1);
     const dRen = Math.hypot(viewed.rendered[0] - walk.x1, viewed.rendered[1] - walk.z1);
-    ok('两份下行对同一个人的读数一致（同一次广播）', dRaw < 0.15, `原始记录差 ${dRaw.toFixed(3)} m`);
     ok('乙眼里甲的渲染位置落在插值延迟内', dRen < 0.8, `渲染位置差 ${dRen.toFixed(3)} m（延迟 0.10s × 4.7 m/s ≈ 0.47 m）`);
+  }
+
+  // ---- 两份下行比的是不是同一份字节：**按 tick 对齐** ----
+  // 这一条原来写成 `viewed.raw − walk.x1 < 0.15`：两个读数各自停在"自己最后收到的那一包"上，
+  // 甲又在动（4.7 m/s，20Hz 一包 ≈ 0.12 m）。于是它量的是"谁先收到"：错一包差 0.12 m 还行，
+  // 错两包 0.24 m 就红 —— 在 `npm run test:all` 里红过一次，单独跑是绿的（同一台机器上
+  // 还跑着 360tray / 输入法看门狗那些东西，谁先被调度到不由这条判据定）。
+  // 现在两边**同时**读（Promise.all 并发下发），要求读到**同一个 tick** 才比，容差收到 1e-6：
+  // 同一个 tick 的那一份下行是同一批字节，逐位相同才是它该有的样子。
+  // 判别臂负责证明这个尺度还活着：甲在动的窗口里，相邻两包必须差出量级。
+  {
+    // 取样**在页面里**做，两个页面同时跑（Promise.all 各发一个 evaluate，各自跑自己的 700ms）：
+    //  - 按键和 walk 段一样在同一个 evaluate 里按，走的是同一条"页面自己读输入"的路；
+    //  - 采样在页面里每 20ms 一次，踩得到 20Hz 的包，不受 CDP 往返抖动影响。
+    // 之前那版是在 Node 侧反复 evaluate 取样：判别臂量到"相邻两包位移 0.000m"，而**本地预测位移
+    // 0.233m** —— 也就是甲自己在走、服务端那份却在原地，一包一拍都没换。那是量具在抢页面主线程
+    // （50ms 的往返把下行处理挤到后面），不是下行有问题；红的是量具。
+    // 往**回**走（KeyS）：刚走过的那一秒已经用 walk.dist > 2.0 证明那个方向是通的，继续往前有
+    // 撞进墙里的风险。判别臂的明细里单列了"本地预测位移"，真撞墙时一眼能分出来。
+    const driveS = (ms) => A.page.evaluate(async (ms) => {
+      const g = window.game, out = [], t0 = performance.now();
+      g.input.keys.KeyS = true;
+      const st = () => (g.paused ? 'P' : '') + (g.player && !g.player.alive ? 'D' : '')
+        + (g.hud && g.hud.chatActive ? 'C' : '') + (g.net.lost ? 'L' : '');
+      while (performance.now() - t0 < ms) {
+        const s = g.net.lastSnap, e = g.net.mySnapshot, p = g.player;
+        if (s && e && p) out.push({ tick: s.tick, x: e.x, z: e.z, px: p.pos.x, pz: p.pos.z, st: st() || '-' });
+        await new Promise(r => setTimeout(r, 20));
+      }
+      g.input.keys.KeyS = false;
+      return out;
+    }, ms);
+    const watchB = (ms) => B.page.evaluate(async (ms) => {
+      const g = window.game, out = [], t0 = performance.now();
+      const cid = [...g.net.remotes.keys()][0];
+      while (performance.now() - t0 < ms) {
+        const s = g.net.lastSnap, e = s ? s.entities.find(x => x.id === cid) : null;
+        if (s && e) out.push({ tick: s.tick, x: e.x, z: e.z });
+        await new Promise(r => setTimeout(r, 20));
+      }
+      return out;
+    }, ms);
+    await focus(A);
+    const [sa, sb] = await Promise.all([driveS(700), watchB(700)]);
+    // 判别臂：甲在动的窗口里，**同一份下行的相邻两包**必须差出量级（4.7 m/s × 1/20s ≈ 0.12m）。
+    let step = 0, prev = null, poseStep = 0, prevP = null;
+    for (const s of sa) {
+      if (prev && s.tick !== prev.tick) step = Math.max(step, Math.hypot(s.x - prev.x, s.z - prev.z));
+      if (prevP) poseStep = Math.max(poseStep, Math.hypot(s.px - prevP.px, s.pz - prevP.pz));
+      prev = s; prevP = s;
+    }
+    // 同一个 tick：甲那份的最后值，和乙那份里**同一个 tick** 的那一条
+    let pa = null, pb = null;
+    for (let i = sa.length - 1; i >= 0 && !pa; i--) {
+      const hit = sb.find(b => b.tick === sa[i].tick);
+      if (hit) { pa = sa[i]; pb = hit; }
+    }
+    const dRaw = pa ? Math.hypot(pb.x - pa.x, pb.z - pa.z) : NaN;
+    const aTicks = new Set(sa.map(s => s.tick)).size, bTicks = new Set(sb.map(s => s.tick)).size;
+    ok('先决：两边读到的是同一个 tick（不对齐就是在比两包）', !!pa,
+      `共同 tick=${pa ? pa.tick : '无'}（甲 ${sa.length} 次取样/${aTicks} 个 tick · 乙 ${sb.length} 次/${bTicks} 个 tick）`);
+    ok('同一个 tick 上，两份下行对甲的读数逐位相同', !!pa && dRaw < 1e-6,
+      `tick=${pa ? pa.tick : '-'} A=${pa ? `${pa.x.toFixed(4)},${pa.z.toFixed(4)}` : '-'} B=${pb ? `${pb.x.toFixed(4)},${pb.z.toFixed(4)}` : '-'} Δ=${dRaw}`);
+    ok('判别臂：甲在动（相邻两包差出量级 ⇒ "逐位相同"不是恒真）', step > 0.05,
+      `相邻两包最大位移 ${step.toFixed(3)} m（旧写法容差 0.15 m）· 本地预测位移 ${poseStep.toFixed(3)} m · 状态 ${sa.length ? sa[sa.length - 1].st : '无取样'}`);
   }
 
   // ---- 命中：乙追着甲打，甲的血必须由服务端掉下来 ----
@@ -453,6 +537,51 @@ try {
     `「${infoText}」`);
   ok('死亡画面在被打死的当下真的显示过（3 秒重生时才收起来）', !!(uiA.dead || uiB.dead),
     `甲 dead=${uiA.dead} · 乙 dead=${uiB.dead}（观察器全程盯着，不是末值）`);
+
+  // ---- 击杀奖章：那几条"为什么这一杀值 250"要能画到屏幕上 ----
+  // 以前联机屏幕上只有一行"+250 击杀"，爆头/近战/远距离/复仇/连杀一条都看不出来，
+  // 而账上加的偏偏就是那些 50/100。半条链在服务端（事件里带 tags，见 test/room-bots.mjs
+  // 的 J 段），半条在浏览器（拿 tags 画成行）—— 这里量的是后一半，而且是**真页面里的真
+  // onNetKill**：它正是 js/net/client.mjs 收到 kill 事件时调的那个函数。
+  console.log('\n── 击杀奖章 ──');
+  const kev = await A.page.evaluate(() => window.game.net.events.filter(e => e.e === 'kill')
+    .map(e => ({ victim: e.victim, pts: e.pts, tags: e.tags, hasTags: Array.isArray(e.tags) })));
+  console.log(`  甲收到的击杀事件：${JSON.stringify(kev)}`);
+  ok('【先决】甲这一把真的收到了击杀事件（一条都没有时"每条都带 tags"是句空话）',
+    kev.length >= 1, `${kev.length} 条`);
+  ok('这一把真打出来的每条击杀事件都带 tags 数组（服务端算的那几条真的走到浏览器了）',
+    kev.every(e => e.hasTags), JSON.stringify(kev.map(e => e.tags)));
+
+  // 事件形状照抄服务端（server/room.mjs:drainKillFeed）：killer/victim/weapon/head/pts/tags。
+  // 靶子名字是编的（这一把里那两条真事件的 tags 恰好是空的：近距离、没爆头、没连杀 ——
+  // 平杀本来就不该有奖章），所以这里只借真函数的**入口**，量它把 tags 画成了什么。
+  const MEDAL = () => {
+    const g = window.game, box = document.getElementById('popups');
+    const rows = () => [...box.querySelectorAll('.pop')].map(e => ({ m: e.classList.contains('medal'), t: e.textContent }));
+    box.innerHTML = '';
+    g.onNetKill({ e: 'kill', killer: g.player.name, victim: '靶子一号', weapon: 'ak', head: true, pts: 300, tags: ['head', 'chain4'] });
+    const withTags = rows();
+    box.innerHTML = '';
+    // 判别臂：同一条路，但这一杀没挣到任何奖章
+    g.onNetKill({ e: 'kill', killer: g.player.name, victim: '靶子二号', weapon: 'ak', head: false, pts: 100, tags: [] });
+    const noTags = rows();
+    box.innerHTML = '';
+    return { withTags, noTags };
+  };
+  const md = await A.page.evaluate(MEDAL);
+  console.log(`  甲 HUD（带奖章那一杀）：${JSON.stringify(md.withTags.map(r => (r.m ? '★' : '') + r.t))}`);
+  console.log(`  甲 HUD（平杀那一杀）：${JSON.stringify(md.noTags.map(r => (r.m ? '★' : '') + r.t))}`);
+  ok('带奖章的那一杀画出了逐条行（爆头 / 四杀各一行，文案与单机同一张表）',
+    md.withTags.filter(r => r.m).map(r => r.t).join(' / ') === '爆头 +50 / 四杀 +200',
+    JSON.stringify(md.withTags.filter(r => r.m).map(r => r.t)));
+  ok('【先决】总分那一行还在（奖章是**加**上去的，不是把原来那行换掉）',
+    md.withTags.some(r => !r.m && r.t.includes('击杀')), JSON.stringify(md.withTags.map(r => r.t)));
+  // 反证臂：这条红了 = 奖章是无条件画的（每个击杀都挂几行，或者空 tags 也画一行）。
+  // 只数"奖章行"而不数"总行数"：onKillPerks 的文案（拾荒者/速愈）与这一节无关。
+  ok('【反证】没挣到奖章的那一杀一行奖章都不画（只有总分那一行）',
+    md.noTags.every(r => !r.m) && md.noTags.some(r => r.t.includes('击杀')),
+    JSON.stringify(md.noTags.map(r => (r.m ? '★' : '') + r.t)));
+
 
   await sleep(4500);
   const after = async (p) => p.page.evaluate(() => {

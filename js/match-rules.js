@@ -228,7 +228,9 @@ export const KILL_POINTS = {
 export const LONGSHOT_DIST = 40;
 
 // tags 是**语义**（'head' / 'melee' / 'longshot' / 'revenge' / 'chain4'），不是文案：
-// 联机不发奖章弹窗、单机发，那是表现层的差别，不是规则的差别。
+// 两端各自画成什么字是表现层的差别，不是规则的差别。**两边都画**（单机 mp.js:playerKill、
+// 联机 main.js:onNetKill）—— 这条曾经写的是"联机不发奖章弹窗"，那不是设计而是缺口：
+// 同样是爆头，单机屏幕上多一行、联机什么都不说。
 export function killScore(o) {
   let points = KILL_POINTS.kill;
   const tags = [];
@@ -238,6 +240,30 @@ export function killScore(o) {
   if (o.revenge) { points += KILL_POINTS.revenge; tags.push('revenge'); }
   if ((o.chain | 0) >= 2) { points += o.chain * KILL_POINTS.chain; tags.push('chain' + Math.min(o.chain, 6)); }
   return { points, tags };
+}
+
+// 奖章的**文案与分值**：语义标签 → 一行字 + 这一条值多少分。
+// 放在规则内核里是因为它要被画**两次**：单机 js/mp.js:playerKill 画它，联机
+// js/main.js:onNetKill 画同一批（服务端把 killScore 算出的 tags 随 kill 事件发下去）。
+// 分值从 KILL_POINTS 现取，不另抄一份数字 —— 抄一份的症状是弹窗写着 "+50"、账上加的是
+// 25，而两边都觉得自己对（文案归表现层，但"这一条值多少"是规则）。
+export const MEDAL_LABEL = {
+  head: '爆头', melee: '近战击杀', longshot: '远距离击杀', revenge: '复仇',
+  chain2: '双杀', chain3: '三杀', chain4: '四杀', chain5: '暴走', chain6: '无人可挡',
+};
+
+// tags → 逐条奖章 [{tag, label, points}]。**不认识的标签直接丢掉**，不拿"击杀"糊过去：
+// 以后 killScore 加了新标签而这个表没跟上时，症状是"少一条弹窗"，不是"弹出一句莫名其妙的话"。
+export function killMedals(tags) {
+  const out = [];
+  for (const t of tags || []) {
+    const label = MEDAL_LABEL[t];
+    if (!label) continue;
+    // 连杀的第 n 条按 n × 单条分算（与 killScore 里 `o.chain * KILL_POINTS.chain` 同一句）。
+    const n = t.startsWith('chain') ? (parseInt(t.slice(5), 10) || 0) : 0;
+    out.push({ tag: t, label, points: n ? n * KILL_POINTS.chain : (KILL_POINTS[t] | 0) });
+  }
+  return out;
 }
 
 // ---------- 击杀时生效的 Perk（拾荒者 / 速愈） ----------

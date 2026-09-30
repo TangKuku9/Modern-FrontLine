@@ -20,6 +20,7 @@ import {
   Accounts, RateLimiter,
   SCRYPT, hashPassword, verifyPassword, tokenHash,
   validName, normalizeName, nameKey, validPassword, PASSWORD_MAX,
+  RECOVERY_COUNT, newRecoveryCode, normalizeRecoveryCode, recoveryMetaKey,
 } from '../server/accounts.mjs';
 import { MemoryStore, SqliteStore } from '../server/store.mjs';
 
@@ -504,6 +505,165 @@ console.log(sec('J 审计日志'));
         'J9 反证臂的反向：重开库之后审计还在（它记的就是"进程死了之后"的事）', JSON.stringify(again[0] || null));
     } finally { cleanup(); }
   }
+}
+
+// ══════════ K 一次性恢复码 ══════════
+console.log(sec('K 一次性恢复码（忘了密码的唯一出路）'));
+{
+  clock = 1_700_000_000_000;
+
+  // ── 先决臂：码本身的形状 ──
+  // 这一组不是"功能对不对"，而是保证下面所有判据量的是**同一件东西**：
+  // 长度/字母表变了而下面还按老的写法拼字符串的话，那些判据会以一种莫名其妙的方式红。
+  const uniq = new Set();
+  for (let i = 0; i < 200; i++) uniq.add(newRecoveryCode());
+  chk(uniq.size === 200, 'K1 先决：newRecoveryCode 每次都不一样（200 次取 200 个）', `${uniq.size}/200`);
+  const sample = [...uniq][0];
+  chk(/^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/.test(sample),
+    'K2 先决：形状是 XXXX-XXXX-XXXX，字母表里没有 I L O U（那是给人念的）', sample);
+  chk(normalizeRecoveryCode(sample.toLowerCase().replace(/-/g, ' ')) === sample.replace(/-/g, ''),
+    'K3 小写 + 空格 + 连字符都随手写，归一化之后一样');
+  chk(normalizeRecoveryCode('O0I1L') === '', 'K4 长度不对 ⇒ 返回空串（由调用方当作"码不对"，不另说一句话）');
+  chk(normalizeRecoveryCode('UUUU-UUUU-UUUU') === '', 'K5 字母表外的字符**不猜**（U 直接判错）');
+  chk(normalizeRecoveryCode(sample.replace(/0/g, 'O').replace(/1/g, 'I')) === sample.replace(/-/g, ''),
+    'K6 O→0 且 I/L→1（这两个字符在等宽字体里长得一样，不该让玩家去分辨）');
+
+  const { store, acc } = mk();
+  const reg = await acc.register({ name: 'KK', password: PW, code: 'SESAME', ip: '10.5.0.1' });
+  chk(reg.ok && Array.isArray(reg.recovery) && reg.recovery.length === RECOVERY_COUNT,
+    `K7 注册成功那一条响应里带着 ${RECOVERY_COUNT} 张码（**只在这一刻**）`,
+    reg.ok ? `${reg.recovery.length} 张` : reg.error);
+
+  // ── 反证臂：原文不落库 ──
+  // 把"泄库的人拿到的东西"整个串起来搜这几张码。谁哪天顺手把 codes 存成原文，
+  // 这一条立刻红 —— 而它红的意义正是这个模块存在的意义。
+  const dump = JSON.stringify([...store.users]) + JSON.stringify([...store.meta]);
+  const leaked = reg.recovery.filter(c => dump.includes(c) || dump.includes(c.replace(/-/g, '')));
+  chk(leaked.length === 0, 'K8 库里搜不到任何一张码的原文（存的是 scrypt 记录）', `漏了 ${leaked.length} 张`);
+  const meta = JSON.parse(store.getMeta(recoveryMetaKey(nameKey('KK'))) || 'null');
+  chk(meta && meta.codes.length === RECOVERY_COUNT && meta.codes.every(c => c.algo === 'scrypt' && c.salt && c.hash),
+    'K9 抽屉里存的是 algo/salt/hash（和密码同一套记录形状，不是快哈希）');
+
+  // ── 判别臂：用一张码重设密码 ──
+  tick(400_000);
+  const NEWPW = 'a-brand-new-password';
+  const used = reg.recovery[2];
+  const r1 = await acc.recover({ name: 'KK', code: used, password: NEWPW, ip: '10.5.0.2' });
+  chk(r1.ok, 'K10 呼号 + 其中一张码 + 新密码 ⇒ 重设成功', r1.error || '');
+  chk(r1.ok && r1.recovery.length === RECOVERY_COUNT && !r1.recovery.includes(used),
+    'K11 成功时**换一整叠新码**（用掉的那张不在新的里面）');
+  const li = await acc.login({ name: 'KK', password: NEWPW, ip: '10.5.0.3' });
+  const lo = await acc.login({ name: 'KK', password: PW, ip: '10.5.0.4' });
+  chk(li.ok, 'K12 新密码能登录');
+  chk(lo.error === 'bad_credentials', 'K13 旧密码登录失败（不是"两个都能用"）', lo.error);
+
+  // ── 一次性 ──
+  tick(400_000);
+  const again = await acc.recover({ name: 'KK', code: used, password: 'another-password-1', ip: '10.5.0.5' });
+  chk(again.error === 'bad_recovery', 'K14 刚用过的那张码立刻失效（一次性，不是"还能再用"）', again.error);
+  const old2 = await acc.recover({ name: 'KK', code: reg.recovery[0], password: 'another-password-2', ip: '10.5.0.6' });
+  chk(old2.error === 'bad_recovery', 'K15 同一叠里**没用过的**那些也一起作废（换一整叠的含义）', old2.error);
+
+  // ── 反证臂：会话跟着密码一起作废 ──
+  // 重设密码的动机通常正是"这号可能已经被人进去了"。旧会话留着 = 把进来的人留在屋里。
+  tick(400_000);
+  const before = store.countSessions();
+  const live = r1.token;
+  const r2 = await acc.recover({ name: 'KK', code: r1.recovery[1], password: 'yet-another-pw-9', ip: '10.5.0.7' });
+  chk(r2.ok && (await acc.whoami(live)) === null && (await acc.whoami(li.token)) === null,
+    'K16 重设成功之后，之前发出去的会话（含注册/登录发的）全部不认了',
+    `重设前会话 ${before} · 重设后 ${store.countSessions()}`);
+
+  // ── 归一化在**真流程**里也成立（不只是那个纯函数） ──
+  tick(400_000);
+  const messy = r2.recovery[3];
+  const messyIn = ' ' + messy.toLowerCase().replace(/0/g, 'o').replace(/1/g, 'l') + ' ';
+  const r3 = await acc.recover({ name: 'KK', code: messyIn, password: 'messy-but-fine-1', ip: '10.5.0.8' });
+  chk(r3.ok, 'K17 手抄走形（小写 / 多空格 / 0→o、1→l）照样能用', r3.error || messyIn);
+
+  // ── 反证臂：码不对与"没这个呼号"必须长得一样 ──
+  tick(400_000);
+  const noUser = await acc.recover({ name: 'NobodyHere', code: reg.recovery[0], password: 'whatever-pw-12', ip: '10.5.1.1' });
+  const badCode = await acc.recover({ name: 'KK', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'whatever-pw-12', ip: '10.5.1.2' });
+  chk(noUser.error === 'bad_recovery' && badCode.error === badCode.error && noUser.error === badCode.error,
+    'K18 "没这个呼号" 与 "码不对" 返回**同一个错误码**（这个接口不许当账号枚举器）',
+    `${noUser.error} / ${badCode.error}`);
+  // 老账号（注册时还没有恢复码这回事）走同一条路：抽屉里没有东西 ⇒ 也是 bad_recovery。
+  // 这一条是给"老库升级"留的：不能出现"你这个呼号没有恢复码"这种一眼看穿存在性的说法。
+  // 这里**换一个账号**来做（KOld）：KK 的抽屉里此刻正放着一叠活着的码，
+  // 拿它演"老账号"会把 K21/K22 一起带红 —— 而那两条量的是完全另一件事。
+  tick(400_000);
+  await acc.register({ name: 'KOld', password: PW, code: 'SESAME', ip: '10.5.3.1' });
+  store.setMeta(recoveryMetaKey(nameKey('KOld')), 'null');               // 演：库里根本没有这一格
+  const noCodes = await acc.recover({ name: 'KOld', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'whatever-pw-12', ip: '10.5.1.3' });
+  chk(noCodes.error === 'bad_recovery', 'K19 抽屉是空的（老账号）也走同一句话，不额外提示"你没有恢复码"', noCodes.error);
+  store.setMeta(recoveryMetaKey(nameKey('KOld')), 'not json at all');    // 演：这一格被写坏了
+  const broken = await acc.recover({ name: 'KOld', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'whatever-pw-12', ip: '10.5.1.4' });
+  chk(broken.error === 'bad_recovery', 'K20 抽屉里的东西坏了 ⇒ 当作"码不对"，不是崩（也不给出方向）', broken.error);
+
+  // ── 新密码不合格时**不许消费掉那张码** ──
+  // 顺序反了（先作废码再校验新密码）的症状非常具体：玩家打错一次新密码的长度，
+  // 手里那张抄好的码就没了 —— 而他完全看不出发生了什么。
+  tick(400_000);
+  const live0 = r3.recovery[0];
+  const short = await acc.recover({ name: 'KK', code: live0, password: 'short', ip: '10.5.2.1' });
+  chk(short.error === 'bad_password', 'K21 新密码太短 ⇒ 拒，且错误码与注册那边一致', short.error);
+  const retry = await acc.recover({ name: 'KK', code: live0, password: 'a-perfectly-fine-pw', ip: '10.5.2.2' });
+  chk(retry.ok, 'K22 反证臂：被 K21 拒过之后，同一张码还能用（失败不消费码）', retry.error || '');
+
+  // ── 限流：与登录共用一张表，两个维度都要在 ──
+  tick(400_000);
+  const { acc: lim } = mk({ loginMax: 2 });
+  await lim.register({ name: 'LIM', password: PW, code: 'SESAME', ip: '10.6.0.1' });
+  const a1 = await lim.recover({ name: 'LIM', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'pw-long-enough-1', ip: '10.6.0.2' });
+  const a2 = await lim.recover({ name: 'LIM', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'pw-long-enough-1', ip: '10.6.0.2' });
+  const a3 = await lim.recover({ name: 'LIM', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'pw-long-enough-1', ip: '10.6.0.2' });
+  chk(a1.error === 'bad_recovery' && a2.error === 'bad_recovery' && a3.error === 'too_many',
+    'K23 恢复接口也吃登录那张限流表（第 3 次直接 too_many）', [a1, a2, a3].map(x => x.error).join(','));
+  const a4 = await lim.recover({ name: 'LIM', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'pw-long-enough-1', ip: '10.6.9.9' });
+  chk(a4.error === 'too_many', 'K24 反证臂：换个 IP 也没用 —— 按**呼号**那一维同时也在限（否则换 IP 就能把额度翻倍）', a4.error);
+  const a5 = await lim.recover({ name: 'OTHER', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'pw-long-enough-1', ip: '10.6.9.8' });
+  chk(a5.error === 'bad_recovery', 'K25 换呼号 + 换 IP 就能过（限的是调用者，不是把所有人一起拉黑）', a5.error);
+
+  // ── 计时同量级：这一条**必须用生产参数**才量得出来 ──
+  // 低配 scrypt 一次 1~2ms，5 次也就几毫秒，比值在噪声里乱跳 —— 那是恒真绿灯。
+  // 用生产参数（一次 ~100ms）时两边各 5 次 ≈ 0.5s，差一个数量级一眼可见。
+  clock = 1_700_000_000_000;
+  const { acc: slow } = mk({ scrypt: SCRYPT });
+  const sreg = await slow.register({ name: 'SlowOne', password: PW, code: 'SESAME', ip: '10.7.0.1' });
+  const med = async (fn) => { const s = []; for (let i = 0; i < 3; i++) { tick(); const t = performance.now(); await fn(); s.push(performance.now() - t); } s.sort((a, b) => a - b); return s[1]; };
+  const tExist = await med(() => slow.recover({ name: 'SlowOne', code: 'ZZZZ-ZZZZ-ZZZZ', password: 'pw-long-enough-1', ip: '10.7.1.1' }));
+  const tGhost = await med(() => slow.recover({ name: 'NoSuchOne', code: sreg.recovery[0], password: 'pw-long-enough-1', ip: '10.7.1.2' }));
+  const kMin = Math.min(tExist, tGhost);
+  // 先决臂：两边都必须**真的跑了 5 次哈希**（>100ms）。少了这一条，未来的快速失败
+  // 会让比值仍然是 1（两边都是 0ms），于是这一条变成恒真绿灯。
+  chk(kMin > 100, 'K26 先决：两条路径真的各跑了 5 次生产参数哈希（不是"都快"才比值接近 1）',
+    `存在 ${tExist.toFixed(0)} ms · 不存在 ${tGhost.toFixed(0)} ms`);
+  chk(Math.max(tExist, tGhost) / kMin < 2.5,
+    'K27 计时反证臂：呼号不存在时也跑满 5 次假哈希 —— 否则响应时间本身就是账号枚举器',
+    `比 ${(Math.max(tExist, tGhost) / kMin).toFixed(2)}×`);
+  chk(sreg.recovery.length === RECOVERY_COUNT, 'K28 先决：上面那个账号确实有码（否则 K26 量的是"两个都没有码"）');
+
+  // ── 服主 CLI 那条路 ──
+  clock = 1_700_000_000_000;
+  const { store: st2, acc: cli } = mk();
+  const missing = await cli.issueRecovery({ name: 'GhostName', ip: 'cli:test' });
+  chk(missing.error === 'no_user', 'K29 CLI：没有这个呼号就明说 no_user（这是**服主**看的输出，不是玩家看的接口）', missing.error);
+  const creg = await cli.register({ name: 'CliUser', password: PW, code: 'SESAME', ip: '10.8.0.1' });
+  const issued = await cli.issueRecovery({ name: 'CliUser', ip: 'cli:test' });
+  chk(issued.ok && issued.recovery.length === RECOVERY_COUNT, 'K30 CLI 能给已存在的呼号发一叠新码');
+  const auditEvs = st2.getAudit(20).map(r => r.ev);
+  chk(auditEvs.includes('recover:cli_issued') && auditEvs.includes('recover:cli_no_user'),
+    'K31 CLI 的两次调用都在审计里留了痕（服主能做的不是"悄悄改密码"，而是"发码"）', auditEvs.slice(0, 3).join(','));
+  tick(400_000);
+  const stale = await cli.recover({ name: 'CliUser', code: creg.recovery[0], password: 'new-pw-from-cli-1', ip: '10.8.0.2' });
+  chk(stale.error === 'bad_recovery', 'K32 反证臂：CLI 发码之后，注册时那叠旧码作废（否则"补发"只是让码变多）', stale.error);
+  const fresh = await cli.recover({ name: 'CliUser', code: issued.recovery[0], password: 'new-pw-from-cli-1', ip: '10.8.0.3' });
+  chk(fresh.ok, 'K33 CLI 发出来的码真的能重设密码（它就是那条路的全部意义）', fresh.error || '');
+  const auditRows = st2.getAudit(30);
+  chk(auditRows.some(r => r.ev === 'recover:ok') && !JSON.stringify(auditRows).includes(issued.recovery[0]),
+    'K34 成功那次也落了审计，而且审计里**没有**码本身',
+    auditRows.filter(r => r.ev.startsWith('recover')).map(r => r.ev).join(','));
 }
 
 console.log('');

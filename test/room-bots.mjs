@@ -15,6 +15,7 @@
 // 坏掉时必须变红**的那一次。
 import { NetRoom, DT } from '../server/room.mjs';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
+import { killMedals, LONGSHOT_DIST } from '../js/match-rules.js';
 import * as THREE from 'three';
 
 const checks = [];
@@ -177,6 +178,101 @@ ok('I1 房间会把警戒扩散给同组的 Bot（n = 这次扩到几个人）',
 // 反证臂：同一个组第二次报警不再重复扩散（那会把 alertSpread 变成"喊了多少次"）
 ok('I2【反证】同一个组第二次报警不重复扩散（first=false，n 仍为 2 但不重复计数）',
   room.alertGroup('g', A.pl.pos).first === false);
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('J. 击杀奖章随 kill 事件下发（联机屏幕上也该有爆头/双杀/复仇那几行）');
+// ═══════════════════════════════════════════════════════════════════════════
+// 缺口：事件里以前只有 pts 一个总数，于是联机屏幕上永远只有"+250 击杀"一行 ——
+// 爆头、近战、远距离、复仇、连杀一条都看不出来，而账上加的偏偏就是那些 50/100。
+// 文案与分值表在 js/match-rules.js:killMedals（单机 js/mp.js:playerKill 画的是
+// 同一张，那张表自己在 test/mp-rules.mjs 的 A24-A27 里被量过）。
+// 这一节量的是**连接处**：权威端算出来的 tags 有没有真的走到事件里、分对不对。
+//
+// 连杀窗口是**全房滚动**的（MatchRules.killChain，4 秒），所以每条场景开跑前先清空它：
+// 这一节问的是"这一杀的 tags 里有什么"，不是"今晚连杀排到第几"。清空之后 killChain()
+// 照样会把当前这一拍记进去（返回 1），所以"第一杀不许带连杀标签"依然是一条真判据。
+const soloChain = () => { room.rules.lastKillTicks.length = 0; };
+const killsOf = (name) => room.events.filter(e => e.e === 'kill' && e.victim === name);
+const botNamed = (n) => (room.game.bots || []).find(b => b.name === n);
+// 开打之前要**摆距离**：killScore 的远距离那条线是 40 m，而这张图上的 Bot 正好都站在
+// 40 m 开外 —— 不摆的话，"近距离爆头值 150"读到的是 200，红的是判据而不是被测对象。
+// （这不是假设：J2 第一次跑就读到 pts=200 / tags=[head,longshot]。）
+const put = (killer, victim, m) => { killer.pos.set(0, 0, 0); victim.pos.set(0, 0, -m); };
+
+room.events.length = 0;
+soloChain();
+ok('J1【先决】连杀窗口清空了（不清的话"第二杀带 chain2"可能本该是 chain4 的后半截）',
+  room.rules.lastKillTicks.length === 0);
+
+// ① 近距离爆头：tags 里要有 head，且分值 100 + 50
+const vJ = botNamed('野马');
+put(A.pl, vJ, 3);
+ok('J1b【先决】这一杀是近距离（< 40 m）—— 不然"只有爆头这一条"就不成立',
+  A.pl.pos.distanceTo(vJ.pos) < LONGSHOT_DIST, `${A.pl.pos.distanceTo(vJ.pos).toFixed(1)} m`);
+room.game.onKill(A.pl, vJ, 'ak', true, {});
+stepN(room, 1);
+const ev1 = killsOf(vJ.name).pop();
+ok('J2 爆头那一杀的 kill 事件带上了 tags，里面有 head 没有别的（不是只发一个总分）',
+  !!ev1 && Array.isArray(ev1.tags) && ev1.tags.join(',') === 'head' && ev1.pts === 150,
+  JSON.stringify(ev1 && { pts: ev1.pts, tags: ev1.tags }));
+ok('J3 这一批 tags 画出来就是 HUD 上那一行（与单机同一张表）',
+  !!ev1 && killMedals(ev1.tags).map(m => m.label + ' +' + m.points).join(' / ') === '爆头 +50',
+  ev1 ? killMedals(ev1.tags).map(m => m.label + ' +' + m.points).join(' / ') : '没有事件');
+// 反证臂：这条红了 = 第一杀被算成连杀（killChain 返回 1 也贴 chain1），屏幕上会凭空
+// 多一行"双杀" —— 而它的分值也是凭空多的 50。
+ok('J4【反证】第一杀不带连杀标签（chain1 不是"双杀"）',
+  !!ev1 && !ev1.tags.some(t => t.startsWith('chain')), JSON.stringify(ev1 && ev1.tags));
+
+// ② 同一拍里的第二杀 = 双杀（走的是权威端那一句 killChain()，不是这里补的）
+const vJ2 = botNamed('黑曼巴');
+ok('J5a【先决】这一节要用的三个 Bot 都还在场上（名字写错了的话下面每条都会读到 undefined）',
+  !!vJ && !!vJ2 && vJ !== vJ2, `${vJ && vJ.name} / ${vJ2 && vJ2.name}`);
+put(B.pl, vJ2, 3);
+room.game.onKill(B.pl, vJ2, 'm4', false, {});
+stepN(room, 1);
+const ev2 = killsOf(vJ2.name).pop();
+ok('J5 紧接着的第二杀带 chain2，分值 100 + 2×50（连杀那一条也是账上真加了的）',
+  !!ev2 && ev2.tags.join(',') === 'chain2' && ev2.pts === 200, JSON.stringify(ev2 && { pts: ev2.pts, tags: ev2.tags }));
+
+// ③ 远距离：40 m 那条线在**权威端这条路上**也要成立（纯函数那半边在 mp-rules 的 A22/A23）
+const vJ3 = botNamed('雷霆');
+put(A.pl, vJ3, LONGSHOT_DIST + 10);
+ok('J5b【先决】这一杀是远距离（> 40 m），而且靶子还在场上',
+  !!vJ3 && A.pl.pos.distanceTo(vJ3.pos) > LONGSHOT_DIST, `${vJ3 ? A.pl.pos.distanceTo(vJ3.pos).toFixed(1) + ' m' : '靶子不见了'}`);
+soloChain();
+room.game.onKill(A.pl, vJ3, 'ak', false, {});
+stepN(room, 1);
+const ev2b = killsOf(vJ3.name).pop();
+ok('J5c 远距离那一杀带 longshot（同样的枪、同样没爆头，就因为它站得远）',
+  !!ev2b && ev2b.tags.join(',') === 'longshot' && ev2b.pts === 150, JSON.stringify(ev2b && { pts: ev2b.pts, tags: ev2b.tags }));
+
+// ④ 复仇：'上一个打我的人'。这一格由 takeDamage 记（js/player.js:132），服务端跑的是
+// 同一份 combat.js —— 所以这里走真伤害那条路，不直接改字段（改了就是自问自答）。
+soloChain();
+put(A.pl, vJ, 3);
+const hpJ = A.pl.hp;
+A.pl.takeDamage(5, { attacker: vJ, weapon: 'ak', dir: new THREE.Vector3(0, 0, 1) });
+ok('J6【先决】甲刚挨了野马一下（不复位这一格，"复仇"那一条无从谈起）',
+  A.pl.lastAttacker === vJ && A.pl.hp === hpJ - 5, `hp ${hpJ} → ${A.pl.hp}`);
+room.game.onKill(A.pl, vJ, 'ak', false, {});
+stepN(room, 1);
+const ev3 = killsOf(vJ.name).pop();
+ok('J7 打死"刚才打我的人"带 revenge，分值 100 + 50（与单机 js/mp.js:216 同一句）',
+  !!ev3 && ev3.tags.includes('revenge') && ev3.pts === 150, JSON.stringify(ev3 && { pts: ev3.pts, tags: ev3.tags }));
+// 反证臂：这条红了 = 记完没清（单机 mp.js:218 清了），于是同一个对手被你杀第二次
+// 仍然算复仇 —— 两边就此分家，而这件事没有任何一处会报错。
+ok('J8【反证】记完就清：甲身上那一格不再是野马',
+  A.pl.lastAttacker === null, String(A.pl.lastAttacker && A.pl.lastAttacker.name));
+soloChain();
+room.game.onKill(A.pl, vJ, 'ak', false, {});
+stepN(room, 1);
+const ev4 = killsOf(vJ.name).pop();
+ok('J9【反证】再杀一次同一人不算复仇：pts 回到 100、tags 是空表（没有凭空多出来的奖章）',
+  !!ev4 && ev4.pts === 100 && ev4.tags.length === 0 && !ev4.tags.includes('revenge'),
+  JSON.stringify(ev4 && { pts: ev4.pts, tags: ev4.tags }));
+ok('J10 这一节每一条 kill 事件都带 tags 数组（缺字段时客户端会画出一行 undefined）',
+  [ev1, ev2, ev2b, ev3, ev4].every(e => !!e && Array.isArray(e.tags)),
+  [ev1, ev2, ev2b, ev3, ev4].map(e => JSON.stringify(e && e.tags)).join(' '));
 
 const bad = checks.filter(c => !c[0]).length;
 for (const [pass, label] of checks) console.log(`  ${pass ? '✅' : '❌'} ${label}`);

@@ -683,12 +683,26 @@ export class NetRoom {
     const vc = victim ? this.byPlayer.get(victim) : null;
     if (vc) { vc.deaths++; vc.book.onDeath(); this.pushStreakCharge(vc); }
     let pts = 0;
+    // 这一杀挣了哪几条奖章（'head' / 'melee' / 'longshot' / 'revenge' / 'chain3'…），
+    // 由 killScore 算出来、随 kill 事件一起下发（drainKillFeed）。客户端拿它画逐条弹窗
+    // —— 文案与分值在 js/match-rules.js:killMedals（与单机同一张表）。
+    // 以前这里只有 pts 一个总数：联机屏幕上于是只有"+250 击杀"一行，爆头、连杀、
+    // 复仇全都看不出来，而账上加的偏偏就是那 50/100/50。
+    let tags = [];
     if (killer && killer !== victim) {
       // 团队分：只有 tdm 按击杀加分，占领模式靠占点（与单机 MPMatch 的规则一致）
       if (!R.ffa && R.mode === 'tdm') R.addScore(killer.team, 1);
       const dist = (killer.pos && victim.pos) ? killer.pos.distanceTo(victim.pos) : 0;
-      const sc = killScore({ head: !!head, melee: !!(info && info.melee), explosive: !!(info && info.explosive), dist, chain: R.killChain(), revenge: false });
+      // 复仇：'上一个打我的人'（pl.lastAttacker，js/player.js:132 在 takeDamage 里记的，
+      // 服务端跑同一份 combat.js ⇒ 这一格真的有值）。单机那条路写的是
+      // `pl.lastAttacker === victim`（js/mp.js:216），这里是同一句的权威端写法。
+      const revenge = !!(killer.lastAttacker && killer.lastAttacker === victim);
+      const sc = killScore({ head: !!head, melee: !!(info && info.melee), explosive: !!(info && info.explosive), dist, chain: R.killChain(), revenge });
       pts = sc.points;
+      tags = sc.tags.slice();
+      // 记完就清（与单机 mp.js:218 同一步）：不清的话，同一个对手在你身上再挨一枪之前
+      // 被你杀第二次还会算一次复仇 —— 单机不会，两边就此分家。
+      if (revenge) killer.lastAttacker = null;
       if (kc) {
         kc.kills++; kc.score += sc.points;
         // 自由混战的赢家是名次里的人（规则内核只认队伍）：杀到目标数在这儿收，
@@ -750,7 +764,7 @@ export class NetRoom {
         x: drop.pos.x, y: drop.pos.y, z: drop.pos.z, mag: drop.mag, reserve: drop.reserve,
       });
     }
-    this.killExtra.push({ killer: killer && killer.name, victim: victim && victim.name, pts });
+    this.killExtra.push({ killer: killer && killer.name, victim: victim && victim.name, pts, tags });
     if (this.killExtra.length > 16) this.killExtra.splice(0, this.killExtra.length - 16);
   }
 
@@ -976,11 +990,11 @@ export class NetRoom {
       if (e.e === 'kill') {
         const victim = [...this.clients.values()].find(c => c.pl.name === e.victim);
         if (victim) { victim.dead = true; victim.respawnT = RESPAWN_DELAY; }
-        // 得分随行（上面 killExtra 那一段）。取不到就写 0，而不是猜一个数 ——
-        // 播报里那个 "+N" 是要显示给人看的，宁可没有也不能错。
+        // 得分与奖章随行（上面 killExtra 那一段）。取不到就写 0 / 空表，而不是猜一个数 ——
+        // 播报里那个 "+N" 与那几行奖章是要显示给人看的，宁可没有也不能错。
         const i = this.killExtra.findIndex(k => k.victim === e.victim && k.killer === e.killer);
         const extra = i >= 0 ? this.killExtra.splice(i, 1)[0] : null;
-        this.events.push({ e: 'kill', killer: e.killer, victim: e.victim, weapon: e.weapon, head: e.head, pts: extra ? extra.pts : 0 });
+        this.events.push({ e: 'kill', killer: e.killer, victim: e.victim, weapon: e.weapon, head: e.head, pts: extra ? extra.pts : 0, tags: extra ? extra.tags : [] });
       }
     }
     ev.length = 0;

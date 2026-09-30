@@ -14,7 +14,17 @@ import { withServer } from './with-server.mjs';
 
 const ARGS = ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'];
 async function launch() {
-  for (const [label, opts] of [['chrome', { channel: 'chrome', args: ARGS }], ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }]]) {
+  // 三档依次试：系统 Chrome → **Playwright 自带的那一份**（不带 channel/executablePath，
+  // 所以 `npx playwright install chromium` 装的就是它）→ 这台开发机上实际存在的那一份 1234
+  // （Playwright 1.63 默认要 1243，机器上只有 1234）。中间这一档是**别人的机器能跑起来**的前提：
+  // 少了它，README 里那句"没有 Chrome 的机器先 npx playwright install chromium"就是假的
+  // （`test/docs-guard.mjs` 的 G 段拿这一档当判据，8 份浏览器判据逐个核）。
+  const tries = [
+    ['chrome', { channel: 'chrome', args: ARGS }],
+    ['playwright-chromium', { args: ARGS }],
+    ['chromium-1234', { executablePath: 'C:/Users/pyc/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe', args: ARGS }],
+  ];
+  for (const [label, opts] of tries) {
     try { const b = await chromium.launch(opts); console.log(`  浏览器: ${label}`); return b; }
     catch (e) { console.log(`  ${label} 起不来: ${e.message.split('\n')[0]}`); }
   }

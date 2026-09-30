@@ -43,6 +43,10 @@ const ERRORS = {
   bad_invite: [403, '邀请码不对'],
   name_taken: [409, '这个呼号已经有人用了'],
   bad_credentials: [401, '呼号或密码不对'],
+  // 与 bad_credentials 同一个理由，而且是同一个坑的第二个出口：这句话必须同时覆盖
+  // "这个呼号不存在"、"他没有恢复码"、"码抄错了"三种情况。分开写的话，恢复接口会变成
+  // 一个**比登录更好用的账号枚举器**（它连密码都不需要）。
+  bad_recovery: [401, '呼号或恢复码不对'],
   too_many: [429, '操作太频繁了，等一下再试'],
   busy: [503, '服务器忙，稍后再试'],
   hashing_failed: [500, '服务端出了点问题'],
@@ -149,7 +153,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
     loginLimiter: new RateLimiter({ windowMs: 300_000, max: (cfg.loginPer5Min | 0) || 12, baseMs: 1000, maxBackoffMs: 900_000 }),
   });
   apiStat = {
-    reg: 0, login: 0, logout: 0, me: 0, rejected: 0, tooLarge: 0, badMethod: 0,
+    reg: 0, login: 0, recover: 0, logout: 0, me: 0, rejected: 0, tooLarge: 0, badMethod: 0,
     tooMany: 0, busy: 0, notFound: 0,
   };
   const secure = cfg.cookieSecure != null ? cfg.cookieSecure : !!cfg.prod;
@@ -196,6 +200,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
       '/api/rooms': 'GET',       // 只读：联机大厅的房间列表（要账号的服上未注册不开放）
       '/api/register': 'POST',
       '/api/login': 'POST',
+      '/api/recover': 'POST',    // 忘了密码：呼号 + 一次性恢复码 + 新密码
       '/api/logout': 'POST',
     };
     const want = ROUTES[path];
@@ -306,16 +311,21 @@ export async function createAuth({ cfg = {}, store } = {}) {
         send(res, status, { ok: false, error: r.error, message });
       }
     };
-    const pass = (r, extraHeaders = {}) => {
+    // extra 只用来带**一次性**的东西（恢复码原文）。它故意不塞进 profile 那个形状里：
+    // profile 会被客户端存进 localStorage、会进截图、会进日志，
+    // 而恢复码的整个设计前提是"原文只在发出去的那一刻存在"。
+    const pass = (r, extraHeaders = {}, extra = null) => {
       // loggedIn 与 /api/me 保持同一个形状：客户端只需要认这一格，不必为三条路径各写一套判断。
-      send(res, 200, { ok: true, loggedIn: true, name: r.name, profile: r.profile }, extraHeaders);
+      send(res, 200, { ok: true, loggedIn: true, name: r.name, profile: r.profile, ...(extra || {}) }, extraHeaders);
     };
 
     if (path === '/api/register') {
       const r = await accounts.register({ name: body.name, password: body.password, code: body.code, ip });
       if (!r.ok) return fail(r), true;
       stat.reg++;
-      pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) });
+      // 恢复码**就在这一条响应里**，之后再也要不回来（服务端只有哈希）。
+      pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) },
+        r.recovery ? { recovery: r.recovery } : null);
       return true;
     }
 
@@ -324,6 +334,21 @@ export async function createAuth({ cfg = {}, store } = {}) {
       if (!r.ok) return fail(r), true;
       stat.login++;
       pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) });
+      return true;
+    }
+
+    if (path === '/api/recover') {
+      // 忘了密码那条路：呼号 + 一张一次性恢复码 + 新密码。
+      // 它**不要邀请码**（邀请码是给"新账号"的闸，而这里是已经存在的账号），
+      // 也不要旧密码 —— 要旧密码就不叫找回了。
+      // 反过来说，这条路只能靠"恢复码"这一个秘密把住门：
+      // 所以它在 accounts.mjs 那边共用登录的限流表、共用同一句错误文案。
+      const r = await accounts.recover({ name: body.name, code: body.code, password: body.password, ip });
+      if (!r.ok) return fail(r), true;
+      stat.recover++;
+      // 成功 = 登录成功（顺带把旧会话全部作废、并换一整叠新码，理由见 accounts.mjs）。
+      pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) },
+        r.recovery ? { recovery: r.recovery } : null);
       return true;
     }
 
@@ -337,7 +362,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
       return true;
     }
 
-    // 走到这里说明路由表里有这条路径、方法也对 —— 而那四条已经全部在上面处理掉了。
+    // 走到这里说明路由表里有这条路径、方法也对 —— 而它们已经全部在上面处理掉了。
     // 留一个显式的兜底而不是静默 return true：以后往 ROUTES 里加一条却忘了写分支时，
     // 症状会是"接口存在但什么都不发生"（客户端一直等），而这里会当场说清楚。
     stat.notFound++;

@@ -12,6 +12,7 @@ import { uavFromFlags } from '../match-rules.js';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { clamp } from '../util.js';
+import { addAccountXp, addLocalXp } from '../progress.mjs';
 import { Sentry, Heli, flagMesh } from '../mp.js';
 import { Projectile } from '../combat.js';
 
@@ -1208,7 +1209,14 @@ export class NetClient {
     const k = st.k | 0, d = st.d | 0, s = Math.round(st.s || 0);
     const shots = (pl && pl.stats && pl.stats.shots) | 0, hits = (pl && pl.stats && pl.stats.hits) | 0;
     const xp = s + (win === 'win' ? 500 : 150);
-    g.profile.xp += xp; g.saveProfile();
+    // 这一笔落在哪一半，取决于**这局有没有服务端档案**：
+    //   登录玩家：服务端自己也会记同一笔，本地只是先按同一条式子显示出来，下一次
+    //             /api/me 用服务端的数确认（所以走账号那一半）。
+    //   访客：    没有档案可写，这一笔只能记在本地那份上 —— 而且**不能记在账号那一半**，
+    //             因为访客哪天注册了，账号同步会把那一半整个盖掉，他打过的联机局就没了
+    //             （这正是"战役经验值被账号覆盖"的同一个坑，见 js/progress.mjs）。
+    if (g.account && g.account.user) addAccountXp(g.profile, xp); else addLocalXp(g.profile, xp);
+    g.saveProfile();
     const meRow = (this.board && this.board.rows || []).find(r => r.cid === this.cid);
     setTimeout(() => {
       // 这一局可能已经先走完了：MATCH_RETURN_MS=0 的服上"回房间"发生在 1 秒内，
