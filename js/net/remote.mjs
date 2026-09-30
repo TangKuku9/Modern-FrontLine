@@ -310,27 +310,30 @@ export class NetPlayer {
 
     // —— 脚步声 ——
     // 和本机玩家一样按**走过的距离**记（js/player.js），不是按时间：按时间的话慢走和
-    // 冲刺一样密。走同一条 audio.step(pos, surface, vol)，所以听声辨位在联机里与单机同响度。
+    // 冲刺一样密。走同一条 audio.step(pos, surface, vol)。vol 比本机脚步高整档：
+    // 本机的脚步自己听是"背景"，别人的脚步是**敌情** —— 它要穿过空间衰减（audio.step
+    // 里 reach 0.55 那一档）之后仍然可闻，逼近的人才藏不住。
     if (this.alive && this.onGround && !this.sliding && spd > 0.3) {
       this.stepDist += Math.hypot(this.pos.x - px, this.pos.z - pz);
       if (this.stepDist > (this.sprinting ? 2.0 : 1.6)) {
         this.stepDist = 0;
         const surf = (this.game.world && this.game.world.def && this.game.world.def.surface) || 'dirt';
-        this.game.audio.step(this.pos, surf, this.crouchT > 0.5 ? 0.07 : this.sprinting ? 0.22 : 0.14);
+        this.game.audio.step(this.pos, surf, this.crouchT > 0.5 ? 0.1 : this.sprinting ? 0.38 : 0.24);
       }
     } else if (!this.alive) this.stepDist = 0;
 
     // —— 换弹 ——
     // 快照给的是**过程位**（Reloading 是一个持续状态，不是边缘），所以取两个跳变点各响一声，
-    // 正好对上本机那条链的三段音（weapon-state.js 的 out / in）。
+    // 正好对上本机那条链的三段音（weapon-state.js 的 out / in）。带 this.pos：别人的
+    // 换弹要有距离与声像 —— 不带的话那串"咔哒"会以满音量从正中来，分不清是谁在换。
     const rl = this.alive && !!(s.flags & FLAG.Reloading);
-    if (rl !== this.reloading) { this.game.audio.reload(rl ? 'out' : 'in'); this.reloading = rl; }
+    if (rl !== this.reloading) { this.game.audio.reload(rl ? 'out' : 'in', this.pos); this.reloading = rl; }
     // mag 的消费点：霰弹枪是**一发一发**装的，单机那边每入膛一发响一声（weapon-state.js
     // 的 audio.reload('shell')），而 Reloading 位只有"开始/结束"两个跳变 —— m870 的装弹声
     // 在联机里因此整段只剩两声。mag 每 +1 就是一发入膛，正好把中间那几声补回来。
     const prevMag = this.lastMag;
     this.lastMag = s.mag;
-    if (rl && st.shellReload && prevMag !== undefined && s.mag > prevMag) this.game.audio.reload('shell');
+    if (rl && st.shellReload && prevMag !== undefined && s.mag > prevMag) this.game.audio.reload('shell', this.pos);
   }
   swapWeapon(wid) {
     this.weaponId = wid;

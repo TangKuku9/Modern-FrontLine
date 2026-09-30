@@ -333,8 +333,8 @@ export class Menu {
               <div class="tm-only">队友数量</div><div class="tm-only">${seg('allies', [3, 5], ['3', '5'])}</div>
               <div>敌人数量</div>${seg('enemies', [4, 6, 8], ['4', '6', '8'])}
               <div>时间限制</div>${seg('time', [5, 10, 15], ['5 分钟', '10 分钟', '15 分钟'])}
-              <div>胜利目标</div>${seg('score', MP_SCORES, MP_SCORES.map(v => this.scoreLabel(v, L.mode)), L.score)}
-              <div id="limitTxt" style="color:#777;font-size:12px"></div>
+              <div>胜利目标</div>${seg('score', MP_SCORES, MP_SCORES.map(String), L.score)}
+              <div id="limitTxt" class="note-wide" style="color:#777"></div>
             </div></div>
             <div class="panel">
               <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">当前配装</div>
@@ -349,14 +349,15 @@ export class Menu {
         </div>
       </div>`, 'solid', 'lobby');
     const upd = () => {
-      // 目标那格的标签随模式换语义（击杀数 / 占领分数），换模式要重画一遍 ——
-      // 只换文案不改选择，玩家选的数在两种模式之间保留。
+      // 目标那格只写数字（"150 杀"这种双字后缀 ×6 会把它顶出 460 px 的面板 —— 量过，
+      // 需要 ~380 px、只有 ~300 px）；"是杀还是分"的语义由下面那行说明文字说，
+      // 换模式时它跟着重写。选择本身在两种模式之间保留。
       const segEl = r.querySelector('.seg[data-k=score]');
       if (segEl) segEl.querySelectorAll('div').forEach((d, i) => {
-        d.textContent = this.scoreLabel(MP_SCORES[i], L.mode);
+        d.textContent = MP_SCORES[i];
         d.classList.toggle('sel', MP_SCORES[i] == L.score);
       });
-      r.querySelector('#limitTxt').textContent = '或时间结束时领先';
+      r.querySelector('#limitTxt').textContent = `先达到 ${L.score}${L.mode === 'dom' ? ' 分' : ' 击杀'}获胜，或时间结束时领先`;
       r.querySelectorAll('.tm-only').forEach(e => e.style.opacity = L.mode === 'ffa' ? 0.3 : 1);
     };
     upd();
@@ -370,9 +371,9 @@ export class Menu {
       setTimeout(() => this.game.startGame('mp', { mode: L.mode, map: L.map, diff: L.diff, allies: L.mode === 'ffa' ? 0 : L.allies, enemies: L.enemies, scoreLimit: L.score, timeLimit: L.time }), 600);
     });
   }
-  // 胜利目标那格的标签。tdm/ffa 的目标是"率先达到的击杀数"（一杀一分），dom 是占领
-  // 分数 —— 同一个数在两种模式下说的是两件事，标签得跟着说清楚。三种模式共用一张
-  // MP_SCORES：两个默认（25/50/200）都在表里，服务端按同一张表验。
+  // 胜利目标那格的标签（**只有联机建房屏在用** —— 它那一行独占约 660 px 面板宽，
+  // 带后缀放得下；房间屏与单机屏是窄栏，只写数字，语义由行标签与说明文字说）。
+  // tdm/ffa 的目标是"率先达到的击杀数"（一杀一分），dom 是占领分数。
   scoreLabel(v, mode) { return v + (mode === 'dom' ? ' 分' : ' 杀'); }
   // ── 联机的层级：主菜单 →（闸：注册/登录）→ 房间列表大厅 → 对局 ──
   // 层级是**屏与屏的先后**，不是同一屏上锁几个按钮：注册是前置条件，房间列表是正事，
@@ -842,8 +843,10 @@ export class Menu {
           ? row('模式', 'rmMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), room.mode)
           : `<div class="cfg-row"><span>模式</span><div class="cfg-one" id="rmMode">${esc(mode.name)}</div></div>`)
         + row('时长', 'rmMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), room.time || 10)
-        // 胜利目标。同一个数随模式换语义（击杀数/占领分数），标签跟着 room.mode 走。
-        + row('目标', 'rmScore', MP_SCORES, MP_SCORES.map(v => this.scoreLabel(v, room.mode)), room.score || 50)
+        // 胜利目标。六个候选值的这一行是 300 px 窄栏里最挤的一行 —— "150 杀"这种双字
+        // 后缀会把它顶出面板边框（nowrap 不许折行，flex 也不许缩过内容宽）。所以这一行
+        // 只写数字："是击杀还是占领分"由行标签与上面那行 meta（"150 杀 · …"）说。
+        + row('目标', 'rmScore', MP_SCORES, MP_SCORES.map(String), room.score || 50)
         // Bot 难度。改一格**全体 Bot 一起变**（服务端那条注释写了为什么不做成逐个改），
         // 所以这一行只在房里真有 Bot 时才画 —— 空房子里摆一个 Bot 难度选择器，
         // 玩家会以为"选了就会自动加 Bot"。

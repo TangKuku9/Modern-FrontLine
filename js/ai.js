@@ -338,8 +338,9 @@ export class Bot {
     animateSoldier(this.model, A, dt);
     this.model.root.position.copy(this.pos);
     this.model.root.rotation.y = this.yaw;
-    // 脚步声
-    if (spd > 3 && Math.random() < dt * 3) game.audio.step(this.pos, game.world.def.surface || 'dirt', 0.25);
+    // 脚步声。与远端真人同一档（0.35 + audio.step 的传远衰减）：Bot 的逼近也是敌情，
+    // 通用曲线下 20 m 外那 0.25 等于不存在。
+    if (spd > 3 && Math.random() < dt * 3) game.audio.step(this.pos, game.world.def.surface || 'dirt', 0.35);
   }
 
   behave(dt, desired) {
@@ -385,7 +386,8 @@ export class Bot {
   reload() {
     this.reloadT = this.stats.reload * 1.1;
     this.mag = this.stats.mag;
-    this.game.audio.reload('out');
+    // 带 this.pos：Bot 换弹也是"旁边有人没子弹了"的情报，声像与距离都要有。
+    this.game.audio.reload('out', this.pos);
   }
 
   tryFire(dt, target, dist) {
