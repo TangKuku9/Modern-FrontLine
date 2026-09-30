@@ -263,8 +263,10 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   if (M.grip === 'sniper') info.grip = add(bgeo(0.03, 0.09, 0.045), gripM, 0, -0.035, 0.07, 0.35);
   else info.grip = add(bgeo(0.028, 0.095, 0.04), gripM, 0, -0.04, 0.035, 0.3);
   add(bgeo(0.006, 0.006, 0.07), metal, 0, -0.032, -0.005); // 扳机护圈
-  // 弹匣
-  const magG = new THREE.Group(); magG.position.set(0, -0.01, -0.035); root.add(magG);
+  // 弹匣。井位按枪给（model.magZ）：老版本所有长枪共用一个固定井位 −0.035，而扳机
+  // 护圈横在 −0.04…+0.03 —— 直匣旋转后的尾角、PKM 方匣、AK 弯匣的顶段全都顶进护圈
+  // 甚至咬住握把前缘。现在 AR 系贴着护圈前缘，AK/PKM 前面留出特征间隙（S12 及反证臂）。
+  const magG = new THREE.Group(); magG.position.set(0, -0.01, M.magZ ?? -0.035); root.add(magG);
   info.mag = magG;
   const ext = att.mag === 'ext' ? 1.45 : 1;
   const mm = mat('gunMetal');
@@ -273,8 +275,16 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     add(bgeo(0.028, 0.06, 0.05), mm, 0, -0.03, 0, 0, 0, 0, magG);
   } else if (M.mag === 'straight' || M.mag === 'pistol_long') {
     const L = (M.mag === 'pistol_long' ? 0.15 : 0.17) * ext;
-    add(bgeo(0.026, L, 0.065), M.color === 'tan' && M.mag === 'straight' ? mat('gunTan') : mm, 0, -L / 2, 0, 0.12, 0, 0, magG);
-    if (att.mag === 'fast') add(bgeo(0.026, L, 0.065), mm, 0.03, -L / 2, 0, 0.12, 0, 0, magG);
+    if (M.mag === 'pistol_long') {
+      // Vector：弹匣插在**握把里**，沿握把轴线（同一 0.3 rad 后掠）往下延续，插入口
+      // 藏在握把中段 —— 不是在扳机前面另开一个井（magZ 因此给的是 +0.035，握把那格）。
+      const r = 0.3, k = 0.02 + L / 2;   // k：从握把中心沿轴下行到弹匣中心的距离
+      add(bgeo(0.026, L, 0.065), mm, 0, -0.03 - Math.cos(r) * k, -Math.sin(r) * k, r, 0, 0, magG);
+      if (att.mag === 'fast') add(bgeo(0.026, L, 0.065), mm, 0.03, -0.03 - Math.cos(r) * k, -Math.sin(r) * k, r, 0, 0, magG);
+    } else {
+      add(bgeo(0.026, L, 0.065), M.color === 'tan' && M.mag === 'straight' ? mat('gunTan') : mm, 0, -L / 2, 0, 0.12, 0, 0, magG);
+      if (att.mag === 'fast') add(bgeo(0.026, L, 0.065), mm, 0.03, -L / 2, 0, 0.12, 0, 0, magG);
+    }
   } else if (M.mag === 'curved' || M.mag === 'curved_small') {
     // 香蕉弹匣沿弧线走链：每段中心 = 顶点沿**该段自己的朝向**下移半段高，走完整段
     // 再加下一角的转量 —— 相邻两段的弦向恒等于两段转角的均值，侧视是连续的弧。

@@ -130,6 +130,28 @@ const geo = await page.evaluate(async () => {
     ...Array.from({ length: 5 }, (_, i) => ({ position: { y: -i * 0.0392 - 0.02, z: -i * i * 0.004 - i * 0.008 }, rotation: { x: i * 0.1 + 0.1 } })),
   ]) > 0.15, `旧规则 ${chordErr(Array.from({ length: 5 }, (_, i) => ({ position: { y: -i * 0.0392 - 0.02, z: -i * i * 0.004 - i * 0.008 }, rotation: { x: i * 0.1 + 0.1 } }))).toFixed(3)} rad`);
 
+  // S12 弹匣井让开扳机护圈：老井位（所有长枪固定 −0.035）会让直匣的旋转尾角、PKM
+  // 方匣、SKS 固定匣顶进护圈（−0.04…+0.03）甚至咬住握把前缘。判据读弹匣组的包围盒
+  // （枪本地坐标）：尾部不许越过护圈前缘 −0.04；AK"弹匣井与护圈之间留一段距离"
+  // 是它的经典特征，单独钉 3cm。反证臂把老井位平移回 AK 上重算，必须违规。
+  const GUARD_FRONT = -0.04;
+  const magBox = (id) => {
+    const info = buildGun(id, {}, 'none');
+    info.group.updateMatrixWorld(true);
+    return new THREE.Box3().setFromObject(info.mag);
+  };
+  for (const id of ['m4', 'scar', 'mp5', 'sks', 'l115']) {
+    const b = magBox(id);
+    ok(`S12 ${id} 弹匣在护圈前面`, b.max.z <= GUARD_FRONT + 0.005, `尾部 ${b.max.z.toFixed(3)} ≤ ${GUARD_FRONT}`);
+  }
+  for (const id of ['ak', 'pkm']) {
+    const b = magBox(id);
+    ok(`S12 ${id} 弹匣与护圈留有间隙`, b.max.z <= GUARD_FRONT - 0.03, `尾部 ${b.max.z.toFixed(3)}，间隙 ${(GUARD_FRONT - b.max.z).toFixed(3)} m`);
+  }
+  ok('S12 vector 弹匣插在握把里（不在扳机前另开井）', magBox('vector').getCenter(new THREE.Vector3()).z > 0);
+  const akOld = magBox('ak').translate(new THREE.Vector3(0, 0, -0.035 - -0.115));
+  ok('S12⁻ 反证：老井位下 AK 弹匣顶进护圈', akOld.max.z > GUARD_FRONT + 0.005, `老井位尾部 ${akOld.max.z.toFixed(3)}`);
+
   // S2 锚点本身：每把枪都得有一个挂在枪上的抛壳口
   for (const id of ['m4', 'ak', 'm1911', 'revolver', 'rpg']) {
     const info = buildGun(id, {}, 'none');
