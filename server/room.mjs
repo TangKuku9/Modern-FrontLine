@@ -310,6 +310,13 @@ export class NetRoom {
 
   step() {
     if (!this.started) return;
+    // ── 结算停摆 ── matchOver 下发之后，这一局在规则上已经结束；但房间要等
+    // MATCH_RETURN_MS 才把人送回房间（resultDrain 在循环外面），这段窗口里 sim 若照旧
+    // 推进，结算画面背后就还在开火、还在击杀、比分还在涨 —— 而玩家什么都改变不了。
+    // 所以整局冻结：世界（Bot/投掷物/伤害/重生）一拍都不再走。快照却还得发 ——
+    // 客户端的看门狗按"多久没收到快照"判下行断了，断流的话玩家看到的是
+    // "连接丢失"而不是结算，所以这里只推拍号、不推世界。
+    if (this.matchOverSent) { this.tick++; return; }
     // 规则时钟先走一格：UAV/白磷弹的剩余时间、以及**按拍排程**的空袭投弹都在这一步。
     // 放在 game.step **之前**是为了让"这一拍排出来的炸弹"被这一拍的 projectiles.update
     // 推进 —— 排在世界前进之后的话，每颗弹都会晚一拍照面出现。
@@ -661,6 +668,10 @@ export class NetRoom {
   // 击杀的规则侧：分数、连杀充能、首杀。表现走事件。
   // 这是 MPMatch.onKill 的**规则那一半**；分值问的是 js/match-rules.js:killScore。
   onKill(killer, victim, weapon, head, info) {
+    // 结算之后的击杀一律不认（与单机 MPMatch 的 over 闸同一句语义）。撞线的那一杀
+    // 在 endMatch 之前已经记完了账，这里拦的是**蜂鸣之后**的：同一拍里跟着死掉的第二个、
+    // 以及 settle 窗口里任何一条还活着的伤害路径。
+    if (this.matchOverSent) return;
     const R = this.rules;
     R.kills++;
     const kc = killer ? this.byPlayer.get(killer) : null;
@@ -748,6 +759,9 @@ export class NetRoom {
       this.events.push({ e: 'matchStats', cid: c.cid, k: c.kills, d: c.deaths, a: c.assists | 0, s: Math.round(c.score) });
     }
     this.events.push({ e: 'matchOver', winner });
+    // 随手补一份**终局记分板**：平时它每 120 拍一班，撞线的那一杀往往落在两班之间 ——
+    // 不补的话，结算面板上记分板的击杀列会比 matchStats 少最后一杀（相差的正是那一句）。
+    this.pushBoard();
     // ── 战绩**不在这里落库**，只把名单和数字挂到队列上 ──
     // 这里跑在 60 拍/秒的权威循环里。写账号这一步以后完全可能（也理应）变成一次
     // 真的磁盘/网络调用 —— 那时这一行就会吃掉每一拍。所以规则是：
@@ -838,7 +852,8 @@ export class NetRoom {
   // 而不是靠客户端自觉 —— 那种自觉在协议上不存在。
   requestRespawn(cid) {
     const c = this.clients.get(cid);
-    if (!c || c.pl.alive || c.respawnT > 0.12) return false;
+    // 结算停摆之后没有"下一条件"可部署：这一局的名单已经封盘（endMatch 落库的就是它）。
+    if (!c || this.matchOverSent || c.pl.alive || c.respawnT > 0.12) return false;
     c.respawnT = 0;
     return true;
   }
@@ -856,6 +871,9 @@ export class NetRoom {
   // 两边各判一次的话，"什么时候算就绪"就有了两个真相。
   callStreak(c, i, target = null) {
     const S = this.streak;
+    // 结算停摆之后呼叫一律不认：集束空袭按拍排程（时钟已停）投不下来，UAV 计时也不再走
+    // —— 收下只会让"就绪槽"凭空消耗掉，玩家在下一局里莫名其妙少一个奖励。
+    if (this.matchOverSent) return null;
     S.calls++;
     // 集束空袭必须带落点（走选点确认那条窄帧）。没带 / 落点不合法就拒，而且**槽不消耗** ——
     // 消耗发生在下面 book.take 里，这条提前返回保证"取消与乱按都扣不掉槽"（与单机同语义：

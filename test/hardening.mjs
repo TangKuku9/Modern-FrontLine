@@ -86,7 +86,7 @@ function childEnv(env) {
   for (const k of Object.keys(env)) if (env[k] === undefined) delete e[k];
   return e;
 }
-async function bootRaw(env, { ms = 20000 } = {}) {
+async function bootRaw(env, { ms = 20000, until = null } = {}) {
   const { spawn } = await import('node:child_process');
   // 端口用 with-server.mjs 那个"问内核要一个空闲端口"的办法，不自己随机：随机撞上别人占用的端口时，
   // 进程会因为**别的**原因起不来，而 H5/H6 量的是"它该起来" —— 那种红查起来完全不讲道理。
@@ -100,8 +100,13 @@ async function bootRaw(env, { ms = 20000 } = {}) {
   s.stderr.on('data', d => { log += d; });
   s.on('exit', c => { exitCode = c; });
   const t0 = Date.now();
-  // 等两件事之一：它报出启动行（起来了），或者它自己退了（被配置闸拦住了）
+  // 等两件事之一：它报出启动行（起来了），或者它自己退了（被配置闸拦住了）。
+  // `until` 是"启动行**之后**还要等的那一行"：listen 回调里的那几行 console.log 是
+  // 逐行异步刷进管道的，看到启动行就收工的话，后面几行（H6 要量的"邀请码…"）可能
+  // 还在路上 —— 全套件跑热时它真的被抹红过一次。给了 until 就等它到齐，
+  // 同一个耐心上限管着，到齐立刻走；没给（H1-H5 只看退出码/启动行）行为不变。
   while (Date.now() - t0 < ms && exitCode === null && !log.includes('权威对局服务')) await sleep(50);
+  while (until && Date.now() - t0 < ms && exitCode === null && !until.test(log)) await sleep(50);
   const up = log.includes('权威对局服务');
   if (!up) { const t = Date.now(); while (exitCode === null && Date.now() - t < 3000) await sleep(50); }
   return { up, code: exitCode, port, base: `http://127.0.0.1:${port}`, log, kill: () => { try { s.kill(); } catch { /* 已经退了 */ } } };
@@ -562,7 +567,8 @@ try {
     } finally { c.kill(); }
     // H6：开发模式不该被部署配置拦住 —— 但**日志必须自己说出来**用的是源码里的默认值。
     // 这一条是整段的"被测对象"：以前它打印的是"已设"，和真的设好了的一模一样。
-    const d = await bootRaw({ JOIN_CODE: undefined });
+    // until=/邀请码/：那行日志比启动行晚一个 stdout 块，不等它到齐这条就在赌运气。
+    const d = await bootRaw({ JOIN_CODE: undefined }, { until: /邀请码/ });
     try {
       chk(d.up && /源码里的默认值/.test(d.log),
         'H6 开发模式下没设 JOIN_CODE 也照常起，但日志必须写出"在用源码里的默认值"（以前这一格骗人）',

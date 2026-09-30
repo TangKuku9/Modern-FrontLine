@@ -17,7 +17,8 @@
 // ── 权限在这里，不在界面上 ──
 // 谁能开局、开局要满足什么条件、聊天能发多快，全部在服务端判一遍。客户端把"开始"
 // 按钮置灰只是体验；改得动的东西不算权限（和 /api/rooms 的 401、WS 握手的 401 同源）。
-import { MP_MAPS, MP_MODES, MP_MINUTES, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
+import { MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
+import { DEFAULT_SCORE_LIMIT } from '../js/match-rules.js';
 
 // 一间的上限。和 net-server:pickRoom 里那个"人最多且没满"的 16 是同一个数 ——
 // 两处各写一份的话，改一处的症状是"列表说还能进、进去说满了"。
@@ -56,6 +57,11 @@ const modeGate = (v) => (v == null || v === '' || MODE_IDS.has(v))
 export const MINUTES = MP_MINUTES;
 const MIN_SET = new Set(MINUTES);
 const cleanMinutes = (v) => { const n = Number(v); return MIN_SET.has(n) ? n : 10; };
+// 胜利目标那格与时长同一套规矩：不认的值**退回该模式的默认**（DEFAULT_SCORE_LIMIT），
+// 而不是退回一个写死的数 —— 三种模式的目标语义不同（击杀数 / 占领分数）。
+// 静默换值的症状与时长那条一样：房间标题上写的数从此是假的。
+const SCORE_SET = new Set(MP_SCORES);
+const cleanScore = (v, mode) => { const n = Number(v); return SCORE_SET.has(n) ? n : DEFAULT_SCORE_LIMIT(mode); };
 
 let NEXT_SID = 1;
 // 一条连接的座位号在**进大厅那一刻**就发下去，不等它进哪间房。座位的键是它，
@@ -144,6 +150,7 @@ export class Lobby {
     return {
       id: room.id, title: room.title || room.id, map: room.mapId, mode: room.mode,
       players: room.seats.size + bots, max: MAX_SEATS, bots, ready: ready + bots, time: room.minutes,
+      score: room.scoreLimit,
       state: room.stage === 'playing' ? 'playing' : 'waiting',
       host: (room.seats.get(room.hostSid) || {}).name || '',
     };
@@ -205,8 +212,8 @@ export class Lobby {
   // 而后者已经被 connsPerIp 那道闸管住了（见 net-server 的 verifyClient）。
   _hostKey(ws, msg = {}) { return msg.account || ('conn:' + sidOf(ws)); }
   _owned(key) { let n = 0; for (const r of this.rooms.values()) if (r.hostKey === key) n++; return n; }
-  _mkRoom(id, title, mapId, mode, minutes) {
-    const room = { id, title, hostSid: null, mapId, mode, minutes, stage: 'waiting',
+  _mkRoom(id, title, mapId, mode, minutes, scoreLimit) {
+    const room = { id, title, hostSid: null, mapId, mode, minutes, scoreLimit, stage: 'waiting',
       seats: new Map(), chat: [], lastActive: Date.now(),
       // 房主加的 Bot。**只在等待态可改**：开局那一刻这份名单被读进 sim，之后再动它
       // 就要往一个正在跑的世界里插人（快照里的实体表会长出来一格，而客户端的名册
@@ -277,8 +284,9 @@ export class Lobby {
     }
     const bad = modeGate(msg.mode);
     if (bad) { this.stat.badMode++; return { ok: false, message: bad }; }
+    const mode = MODE_IDS.has(msg.mode) ? msg.mode : 'tdm';
     const room = this._mkRoom(id, flat(msg.title, 24), MAP_IDS.has(msg.map) ? msg.map : 'yard',
-      MODE_IDS.has(msg.mode) ? msg.mode : 'tdm', cleanMinutes(msg.minutes));
+      mode, cleanMinutes(msg.minutes), cleanScore(msg.scoreLimit, mode));
     room.hostKey = hostKey;
     const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks);
     seat.ready = true;                      // 房主不用点准备：他按下开始就是他的准备
@@ -375,6 +383,8 @@ export class Lobby {
     if (MAP_IDS.has(msg.map)) room.mapId = msg.map;
     if (MODE_IDS.has(msg.mode)) room.mode = msg.mode;
     if (MIN_SET.has(Number(msg.minutes))) room.minutes = Number(msg.minutes);
+    // 胜利目标。没带这格（老客户端 / 只改别的设置）就保持原值 —— 与地图/模式那两格同一句。
+    if (msg.scoreLimit != null) room.scoreLimit = cleanScore(msg.scoreLimit, room.mode);
     // Bot 难度改一个就**全体一起改**：房间屏上那一格只有一个选择器，而"后来加的 Bot 更凶"
     // 这种半新半旧的状态没有任何界面能表达出来，玩家只会觉得"这几个 Bot 手感不一样"。
     if (BOT_SKILLS.includes(Number(msg.botSkill))) {

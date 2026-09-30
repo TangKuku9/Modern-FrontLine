@@ -754,6 +754,65 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
   JSON.stringify(oBoard.flags));
 
 // ═══════════════════════════════════════════════════════════════════════════
+sec('P. 结算停摆：matchOver 之后这一局不再有战斗');
+// ═══════════════════════════════════════════════════════════════════════════
+// 症状：结算画面都出来了，对局里还在对战和开火击杀。房间要等 MATCH_RETURN_MS 才收，
+// 那段窗口里 sim 若照旧推进，比分/击杀/击杀播报全都还在动 —— 而玩家什么都改变不了。
+// 判据分三半：击杀闸（蜂鸣后的杀不认）、世界闸（输入还在收、人不再动）、快照闸
+// （下行不断流 —— 结算期间断流会被客户端当成"连接丢失"盖在结算面板上）。
+{
+  const roomP = new NetRoom({ id: 'rules-p', mapId: 'yard', seed: 20260926 });
+  await roomP.start();
+  const PA = roomP.addClient({ name: '甲', team: 'A' });
+  const PB = roomP.addClient({ name: '乙', team: 'B' });
+  roomP.endMatch('A');
+  ok('P1 先决：endMatch 已置 matchOverSent，matchOver 已入队',
+    roomP.matchOverSent && roomP.events.some(e => e.e === 'matchOver'));
+
+  // ① 击杀闸。撞线的那一杀在 endMatch 之前已记完账，这里拦的是**蜂鸣之后**的：
+  // 同一拍里跟着死掉的第二个人、以及 settle 窗口里任何一条还活着的伤害路径。
+  const killsA = PA.kills, deathsB = PB.deaths, scoreA = roomP.rules.scores.A;
+  const evCount = roomP.events.length;
+  roomP.onKill(PA.pl, PB.pl, 'm4', true, {});
+  ok('P2 结算后 onKill 一律不认（击杀/死亡/比分都不动 —— 结算画面后面不再涨杀）',
+    PA.kills === killsA && PB.deaths === deathsB && roomP.rules.scores.A === scoreA,
+    `A=${PA.kills}/${roomP.rules.scores.A} B死=${PB.deaths}`);
+  ok('P3 结算后 onKill 不再编任何事件（连杀充能/掉落/播报全都不该有）',
+    roomP.events.length === evCount, `${evCount} → ${roomP.events.length}`);
+
+  // ② 世界闸。给甲一份"什么都按住"的输入，几十拍之后人必须还在原地 ——
+  // 不然就是 sim 还在跑，Bot/投掷物/伤害全都在走。
+  // 反证臂：这条红了 = 停摆只停了计分，没停世界。
+  roomP.applyInput(PA.cid, { tick: 1, mdx: 0, mdy: 0, keys: 0xffff, buttons: 0xffff, view: 0, seq: 1, streak: -1 });
+  const p0 = PA.pl.pos.clone();
+  for (let i = 0; i < 30; i++) roomP.step();
+  ok('P4 世界停摆：输入还在收、人却一步没动（开火/换弹/跳跃也全都不生效）',
+    PA.pl.pos.distanceTo(p0) < 1e-9, `moved=${PA.pl.pos.distanceTo(p0).toFixed(4)}`);
+
+  // ③ 快照闸。tick 一拍一拍地涨 —— net-server 的广播按它排班，停了就是 2.5 秒断流。
+  const t0 = roomP.tick;
+  roomP.step(); roomP.step(); roomP.step();
+  ok('P5 快照拍号继续走（结算期间下行不断流，看门狗不会把结算盖成"连接丢失"）',
+    roomP.tick === t0 + 3, `${t0} → ${roomP.tick}`);
+
+  // ④ 窄帧闸。死亡画面那两条窄路在结算后都必须是死的：重生没有"下一条件"，
+  // 连杀呼叫收下了也只是让槽凭空消耗掉。P6 把乙摆成"躺着"再验 —— 不然活着的人
+  // 本来就会被拒，这条分不清是哪道闸在挡。
+  PB.pl.alive = false; PB.respawnT = 0;
+  ok('P6 结算后 requestRespawn 被拒（躺着也不许重生 —— 这一局的名单已经封盘）',
+    roomP.requestRespawn(PB.cid) === false);
+  ok('P7 结算后 requestStreak 被拒（槽不被凭空消耗，呼叫计数也不涨）',
+    roomP.requestStreak(PA.cid, 0) === null && PA.book.slots.every(s => !s.used) && roomP.streak.calls === 0);
+
+  // ⑤ 终局记分板随 matchOver 补发。平时它 120 拍一班，撞线那一杀常落在两班之间 ——
+  // 不补的话，结算面板上记分板的击杀列会比 matchStats 少最后一杀。
+  const pBoard = roomP.events.filter(e => e.e === 'board').pop();
+  ok('P8 终局记分板随 matchOver 补发（面板上的击杀列不少最后一杀）',
+    !!pBoard && pBoard.rows.length === 2, JSON.stringify(pBoard && pBoard.rows.map(r => `${r.name}:${r.k}`)));
+  void PB;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 const pass = checks.filter(c => c[0]).length;
 console.log('');
 for (const [good, label] of checks) console.log(`  ${good ? '✅' : '❌'} ${label}`);

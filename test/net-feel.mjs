@@ -40,7 +40,7 @@ const angDiff = (a, b) => { let d = (b - a) % TWO_PI; if (d > Math.PI) d -= TWO_
 // 记录"表现层到底调了什么"。刻意不用真 Effects/Audio：那一层要 WebGL 与 AudioContext，
 // 而这里要断言的是**调用次数与参数**，不是听感。
 function makeGame() {
-  const log = { shot: 0, step: 0, reload: [], tracer: 0, flashLight: 0, ring: [], hurt: 0, markers: null, smoke: 0 };
+  const log = { shot: 0, step: 0, reload: [], tracer: 0, flashLight: 0, muzzle: 0, ring: [], hurt: 0, markers: null, smoke: 0 };
   const game = {
     time: 0, scene: new THREE.Scene(), entities: [], projectiles: [],
     world: { def: { surface: 'dirt' }, lineBlocked: () => false },
@@ -61,6 +61,9 @@ function makeGame() {
     },
     effects: {
       tracer: () => { log.tracer++; }, flashLight: () => { log.flashLight++; }, flashbang: () => {}, explosion: () => {}, blood: () => {}, impact: () => {},
+      // 枪口烟/火星（remote.mjs 的 Firing 位那一段，消音器压住时不调）。按次计数：
+      // 它和曳光/枪口光吃同一格账（fireCool 记账之后各画各的），C3 顺带量它。
+      muzzle: () => { log.muzzle++; },
       // 直升机冒烟（Heli.update 的 hp < 70% 那一段）按次计数 —— 它是"损伤状态看得见"的证据
       smoke: { emit: () => { log.smoke++; } }, add: { emit: () => {} },
     },
@@ -170,9 +173,9 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     Math.abs(g.log.shot - want) <= 1, `响 ${g.log.shot} 声 · 期望 ${want}（rpm ${rpm}）`);
   ok('C2 反证臂：144Hz 那一路会给几十倍（说明这条判据量的是记账，不是"有没有响"）',
     g.log.shot < perFrame / 4, `${g.log.shot} vs 逐帧 ${perFrame}`);
-  ok('C3 曳光与枪口光跟着同一格账（不是一个响一个不响）',
-    g.log.tracer === g.log.shot && g.log.flashLight <= g.log.shot,
-    `曳光 ${g.log.tracer} · 枪口光 ${g.log.flashLight} · 枪声 ${g.log.shot}`);
+  ok('C3 曳光/枪口光/枪口烟跟着同一格账（不是一个响一个不响）',
+    g.log.tracer === g.log.shot && g.log.flashLight <= g.log.shot && g.log.muzzle === g.log.tracer,
+    `曳光 ${g.log.tracer} · 枪口光 ${g.log.flashLight} · 枪口烟 ${g.log.muzzle} · 枪声 ${g.log.shot}`);
   // 松开扳机之后不许再响：先推一包**没有 Firing 位**的快照，再跑 30 帧。
   // （这一步是必需的 —— 不推的话那一格里 Firing 还亮着，而外推分支会原样沿用它，
   //   于是"还在响"其实是对的行为，判据自己错了。第一版就是这么假红的。）

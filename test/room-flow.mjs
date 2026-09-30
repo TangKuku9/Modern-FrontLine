@@ -203,13 +203,18 @@ try {
   const g1 = client(srv2.ws, '庚'), g2 = client(srv2.ws, '辛');
   await g1.opened; await g2.opened;
   g1.send({ t: 'lobby' }); g2.send({ t: 'lobby' });
-  g1.send({ t: 'createRoom', room: 'oner', name: '庚1', title: '回房测试' });
+  g1.send({ t: 'createRoom', room: 'oner', name: '庚1', title: '回房测试', scoreLimit: 100 });
   await g1.until(j => j.t === 'room');
   g2.send({ t: 'joinRoom', room: 'oner', name: '辛2' });
   await g2.until(j => j.t === 'room' && j.seats && j.seats.length === 2);
   g2.send({ t: 'ready', on: true });
   g1.send({ t: 'start' });
-  ok('第二台服务上也能开局', !!(await g1.until(j => j.t === 'welcome', 15000)));
+  const wlive = await g1.until(j => j.t === 'welcome', 15000);
+  ok('第二台服务上也能开局', !!wlive);
+  // 胜利目标要打穿整条链（座位 → beginLive 的 cfg → MatchRules → welcome 下发）才算数：
+  // 断在哪一环，局里的"先到 100 杀"就悄悄变回默认 50，而没有任何一处报错。
+  ok('welcome 带着房间选的胜利目标（房主选的 100 到了局里还是 100）',
+    !!wlive && wlive.scoreLimit === 100, JSON.stringify(wlive && wlive.scoreLimit));
   g1.frames.length = 0; g2.frames.length = 0;
   const over = await g1.until(j => j.t === 'ev' && (j.ev || []).some(e => e.e === 'matchOver'), 25000);
   ok('时间到点就判结束（分数没到上限的一局以前永远打不完）', !!over, JSON.stringify(over && over.ev && over.ev.filter(e => e.e === 'matchOver')));
@@ -263,6 +268,14 @@ try {
   ok('拒完之后这间还是自由混战（没有偷偷换玩法）', rowH.mode === 'ffa', JSON.stringify(rowH));
   const bm1 = (await health(srv3.base)).lobby.badMode | 0;
   ok('两种拒绝都在 /healthz 上数得出来（静默失效要显形）', bm1 - bm0 === 2, `${bm0} → ${bm1}`);
+  // ── 胜利目标那格：与时长同一套规矩（认表内的值、不认的退回该模式默认）──
+  h.send({ t: 'roomCfg', scoreLimit: 100 });
+  const okS = await h.until(j => j.t === 'room' && j.room && j.room.score === 100, 6000);
+  ok('房主把胜利目标改成 100：接得下（ffa 里就是"先到 100 杀"）', !!okS, JSON.stringify(okS && okS.room.score));
+  h.send({ t: 'roomCfg', scoreLimit: 12345 });
+  const dftS = await h.until(j => j.t === 'room' && j.room && j.room.score === 25, 6000);
+  ok('不认的目标值退回**该模式**默认（ffa → 25），不是原样收下也不是写死的 50',
+    !!dftS, JSON.stringify(dftS && dftS.room.score));
   h.close();
   srv3.kill();
 

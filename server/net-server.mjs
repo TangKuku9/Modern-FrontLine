@@ -513,6 +513,9 @@ function welcomeFrame(room, c) {
     // 模式由服务端说：记分板怎么排（ffa 单表按名次）、小地图给谁画蓝点、结算写"第 N 名"
     // 还是比分 —— 这些分叉全看它。客户端自己猜（比如按房间名）会在直连那条路上猜错。
     mode: room.rules.mode,
+    // 胜利目标同样由服务端说（房里选的那一格经 lobby 清洗后的权威值）。客户端开局播报
+    // "率先达到 N 次击杀"读的就是它 —— 自己另算默认的话，房主选的 100 到了局里就成了 50。
+    scoreLimit: room.rules.scoreLimit,
     // 你的呼号由**服务端**告诉你，而不是你告诉服务端。客户端拿到之后把它盖到本地那份上 ——
     // 不盖的话 HUD 上会一直显示 URL 里那个名字，而记分板上是另一个，玩家会以为串号了。
     name: c.name,
@@ -714,8 +717,8 @@ async function beginLive(wroom) {
   try {
     live = await getRoom(wroom.id, host && host.account ? { key: host.account } : null, {
     mapId: wroom.mapId, mode: wroom.mode, fromLobby: true,
-    // 时长是房里选的那一格（分钟）。CFG.matchSeconds 是本地/判据用的强制覆盖，见它那条注释。
-    cfg: { mode: wroom.mode, timeLimit: CFG.matchSeconds ? CFG.matchSeconds / 60 : wroom.minutes },
+    // 时长与胜利目标都是房里选的那一格。CFG.matchSeconds 是本地/判据用的强制覆盖，见它那条注释。
+    cfg: { mode: wroom.mode, timeLimit: CFG.matchSeconds ? CFG.matchSeconds / 60 : wroom.minutes, scoreLimit: wroom.scoreLimit },
   });
   } catch (e) { return { ok: false, message: String(e && e.message || e) }; }
   live.title = wroom.title;

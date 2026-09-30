@@ -123,12 +123,17 @@ export class StreakBook {
 //
 // 全对局一份：队伍分数、UAV/白磷弹的剩余拍、按拍排程器、结束判定、世界标志。
 // 连杀槽不在这里 —— 那是每人一份的（见 StreakBook），谁持有它由上层决定。
+
+// 各模式的**默认**胜利目标。房间层（server/lobby.mjs）在房主没选/选了不认的值时也问
+// 这一句 —— 默认只此一份，抄一份的话"没选目标的开房"与"选了目标的开房"会打出两种胜负。
+export const DEFAULT_SCORE_LIMIT = (mode) => mode === 'dom' ? 200 : mode === 'ffa' ? 25 : 50;
+
 export class MatchRules {
   constructor(cfg = {}) {
     const mode = cfg.mode || 'tdm';
     this.ffa = mode === 'ffa';
     this.mode = mode;
-    this.scoreLimit = cfg.scoreLimit || (mode === 'dom' ? 200 : mode === 'ffa' ? 25 : 50);
+    this.scoreLimit = cfg.scoreLimit || DEFAULT_SCORE_LIMIT(mode);
     this.timeLimit = cfg.timeLimit || 10;         // 分钟
     this.scores = { A: 0, B: 0 };
     this.uav = new Map();                          // team -> 剩余拍

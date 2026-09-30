@@ -22,14 +22,19 @@ import { onKillPerks, pickupsExpire, pickupAction } from './match-rules.js';
 import { NetClient } from './net/client.mjs';
 import { LobbyClient } from './net/lobby.mjs';
 import { buildGun } from './gunmodel.js';
-import { DEFAULT_CLASSES, DEFAULT_STREAKS } from './data.js';
+import { DEFAULT_CLASSES, DEFAULT_STREAKS, MP_MODES } from './data.js';
 import { repairClass } from './loadout.mjs';
 import { damp } from './util.js';
 import { Account } from './account.js';
+import { unpackInput } from './quant.js';
 
 // 拼进 innerHTML 的**服务端字符串**（呼号、离开提示）一律先剥掉角括号。
 // 被攻破的服务器不该能往这台页面上塞脚本，而 HUD 那几处（announce/killfeed）走的就是 innerHTML。
 const escHtml = (s) => String(s == null ? '' : s).replace(/[<>]/g, '');
+
+// 结算停摆时替换用的输入：unpackInput(0,0) 就是"什么都没按"的那一份（与服务端解包
+// 空输入是同一个构造器，逐字段同形）。共享一个对象而不是每拍 new：消费方只读。
+const ENDING_INPUT = unpackInput(0, 0);
 
 const GradeShader = {
   uniforms: { tDiffuse: { value: null }, time: { value: 0 }, nvg: { value: 0 }, thermal: { value: 0 }, hurt: { value: 0 }, vig: { value: 0.35 }, wp: { value: 0 }, res: { value: new THREE.Vector2(1, 1) } },
@@ -238,6 +243,12 @@ class Game {
     this.deathKiller = null; this.scopeState = null;
     document.getElementById('deathScreen').classList.add('hidden');   // 见 startGame 里的注释
     this.hud.show(true);
+    // 开局播报（与单机 MPMatch.start 那一句同形状）：模式与胜利目标。房里选的设置
+    // 只活在房间屏上的话，进了局谁也不记得这一局打到多少算赢 —— 目标数由服务端
+    // 在 welcome 里说（room.rules.scoreLimit），这里不自己另算一份默认。
+    const md = MP_MODES.find(m => m.id === welcome.mode) || { name: welcome.mode || '对局' };
+    const lim = welcome.scoreLimit || (welcome.mode === 'dom' ? 200 : welcome.mode === 'ffa' ? 25 : 50);
+    this.hud.announce(md.name, `率先达到 ${lim}${welcome.mode === 'dom' ? ' 分' : ' 次击杀'}`, 4);
     this.renderer.compile(this.scene, this.camera);
     this.menu.hide();
     document.getElementById('clickToPlay').classList.remove('hidden');
@@ -412,8 +423,9 @@ class Game {
   netRespawnTick() {
     const el = document.getElementById('respawnText');
     if (!el) return;
+    // 结算停摆之后不再请求重生：这一局的名单已经封盘，服务端（matchOverSent 闸）也不会认。
     let text = '';
-    if (this.dead) {
+    if (this.dead && !this.ending) {
       const delay = (this.net && this.net.welcome && this.net.welcome.respawnDelay) || 3;
       const left = delay - (performance.now() / 1000 - (this.deathAt || 0));
       if (left > 0) { text = `${Math.ceil(left)} 秒后重新部署…`; this._respawnAsked = false; }
@@ -785,6 +797,12 @@ class Game {
     this.composer.render(rdt);
   }
   update(dt, inp) {
+    // ── 结算停摆 ── 胜负已出（game.ending 由单机 MPMatch.end 与联机的 matchOver 事件置上）
+    // 之后，本局不该再有战斗：这一拍的输入整份换成"什么都没按"（人站住、枪停火、雷与
+    // 连杀都叫不动），Bot 与投掷物也不再推进 —— 结算画面背后是一个冻住的世界，而不是
+    // 一局没人管得住的混战。单机与联机共用这一个闸：联机的权威端在 matchOverSent 之后
+    // 同样停摆（server/room.mjs:step），两边说的是同一件事。
+    if (this.ending) inp = ENDING_INPUT;
     // 联机：每一拍的输入都要连同"这一拍开始前的自身状态"记进日记本，
     // 服务端回多少 tick 回来，客户端就能退回去重放多少拍。见 net/client.mjs:reconcile
     if (this.net && this.player) this.net.recordInput(this.tick, inp);
@@ -814,11 +832,15 @@ class Game {
       this.setThermal(this.scopeState === 'thermal');
       this.grade.uniforms.hurt.value = pl.alive ? Math.max(0, 1 - pl.hp / pl.maxHp - 0.2) : 0.8;
     }
-    for (const b of this.bots) b.update(dt);
-    for (const p of this.projectiles) p.update(dt);
-    if (this.projectiles.some(p => !p.alive)) this.projectiles = this.projectiles.filter(p => p.alive);
-    // 拾取
-    this.updatePickups(dt, inp);
+    // 结算停摆的后半句：Bot/投掷物/拾取不再推进（世界冻住），但 mode.update 照走 ——
+    // 联机的 NetClient.update 要靠它把服务端推送的规则读数（连杀槽/比分条）刷在屏幕上。
+    if (!this.ending) {
+      for (const b of this.bots) b.update(dt);
+      for (const p of this.projectiles) p.update(dt);
+      if (this.projectiles.some(p => !p.alive)) this.projectiles = this.projectiles.filter(p => p.alive);
+      // 拾取
+      this.updatePickups(dt, inp);
+    }
     if (this.mode) this.mode.update(dt, inp);
     this.world.update(dt, this.time, this.camera.position);
     this.effects.update(dt, this.camera.position);

@@ -1,7 +1,7 @@
 // 菜单系统：主菜单、战役简报、多人大厅、配装、枪匠、设置、暂停、结算
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
+import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
 import { buildGun } from './gunmodel.js';
 import { createSoldierModel, animateSoldier } from './soldier.js';
 import { mat, camoSwatch } from './materials.js';
@@ -86,7 +86,10 @@ export class Menu {
     this.camTarget = { pos: new THREE.Vector3(-0.3, 1.45, 4.2), look: new THREE.Vector3(0.6, 1.15, 0) };
     this.camLook = this.camTarget.look.clone();
     this.gunRotY = -Math.PI / 2; this.gunRotX = 0; this.gunSpin = true;
-    this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, minutes: 10, name: '士兵', team: 'A', room: '', title: '' };
+    // score 是胜利目标那格（MP_SCORES 的一个值），单人对战与联机建房共用这一份偏好。
+    // 默认 50：与 js/match-rules.js 的 DEFAULT_SCORE_LIMIT('tdm') 同值 —— 但它只是
+    // "上次选了什么"的记忆，真正的默认/清洗在服务端（lobby.cleanScore）。
+    this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, minutes: 10, score: 50, name: '士兵', team: 'A', room: '', title: '' };
     this.campDiff = 1;
     this.selClass = game.profile.selClass || 0;
     this.buildScene();
@@ -330,7 +333,8 @@ export class Menu {
               <div class="tm-only">队友数量</div><div class="tm-only">${seg('allies', [3, 5], ['3', '5'])}</div>
               <div>敌人数量</div>${seg('enemies', [4, 6, 8], ['4', '6', '8'])}
               <div>时间限制</div>${seg('time', [5, 10, 15], ['5 分钟', '10 分钟', '15 分钟'])}
-              <div>胜利条件</div><div id="limitTxt" style="color:var(--acc)"></div>
+              <div>胜利目标</div>${seg('score', MP_SCORES, MP_SCORES.map(v => this.scoreLabel(v, L.mode)), L.score)}
+              <div id="limitTxt" style="color:#777;font-size:12px"></div>
             </div></div>
             <div class="panel">
               <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">当前配装</div>
@@ -345,8 +349,14 @@ export class Menu {
         </div>
       </div>`, 'solid', 'lobby');
     const upd = () => {
-      const lim = L.mode === 'dom' ? '先达到 200 分' : L.mode === 'ffa' ? '先达到 25 击杀' : '先达到 50 击杀';
-      r.querySelector('#limitTxt').textContent = `${lim}，或时间结束时领先`;
+      // 目标那格的标签随模式换语义（击杀数 / 占领分数），换模式要重画一遍 ——
+      // 只换文案不改选择，玩家选的数在两种模式之间保留。
+      const segEl = r.querySelector('.seg[data-k=score]');
+      if (segEl) segEl.querySelectorAll('div').forEach((d, i) => {
+        d.textContent = this.scoreLabel(MP_SCORES[i], L.mode);
+        d.classList.toggle('sel', MP_SCORES[i] == L.score);
+      });
+      r.querySelector('#limitTxt').textContent = '或时间结束时领先';
       r.querySelectorAll('.tm-only').forEach(e => e.style.opacity = L.mode === 'ffa' ? 0.3 : 1);
     };
     upd();
@@ -356,11 +366,14 @@ export class Menu {
     this.on(r, '[data-a=back]', () => this.showMain());
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('lobby'));
     this.on(r, '[data-a=go]', () => {
-      const scoreLimit = L.mode === 'dom' ? 200 : L.mode === 'ffa' ? 25 : 50;
       this.showLoadingOverlay('正在匹配对局…');
-      setTimeout(() => this.game.startGame('mp', { mode: L.mode, map: L.map, diff: L.diff, allies: L.mode === 'ffa' ? 0 : L.allies, enemies: L.enemies, scoreLimit, timeLimit: L.time }), 600);
+      setTimeout(() => this.game.startGame('mp', { mode: L.mode, map: L.map, diff: L.diff, allies: L.mode === 'ffa' ? 0 : L.allies, enemies: L.enemies, scoreLimit: L.score, timeLimit: L.time }), 600);
     });
   }
+  // 胜利目标那格的标签。tdm/ffa 的目标是"率先达到的击杀数"（一杀一分），dom 是占领
+  // 分数 —— 同一个数在两种模式下说的是两件事，标签得跟着说清楚。三种模式共用一张
+  // MP_SCORES：两个默认（25/50/200）都在表里，服务端按同一张表验。
+  scoreLabel(v, mode) { return v + (mode === 'dom' ? ' 分' : ' 杀'); }
   // ── 联机的层级：主菜单 →（闸：注册/登录）→ 房间列表大厅 → 对局 ──
   // 层级是**屏与屏的先后**，不是同一屏上锁几个按钮：注册是前置条件，房间列表是正事，
   // 摆在同一屏上两个焦点互相稀释（"一堆按钮 + 三个输入框"，不知道该先干什么），
@@ -479,6 +492,7 @@ export class Menu {
               <div>地图</div>${seg('segMap', MP_MAPS.map(m => m.id), MP_MAPS.map(m => m.name), L.map)}
               <div>模式</div>${seg('segMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), this.onlineMode())}
               <div>时长</div>${seg('segMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), L.minutes)}
+              <div>目标</div>${seg('segScore', MP_SCORES, MP_SCORES.map(v => this.scoreLabel(v, this.onlineMode())), L.score)}
               <div class="note-wide" id="lbErr"></div>
             </div></div>
           </div>
@@ -497,7 +511,7 @@ export class Menu {
         </div>
       </div>`, 'solid', 'online');
     r.querySelectorAll('.seg').forEach(sg => sg.querySelectorAll('div').forEach(d => d.addEventListener('click', () => {
-      const key = sg.id === 'segMap' ? 'map' : sg.id === 'segMode' ? 'mode' : 'minutes';
+      const key = sg.id === 'segMap' ? 'map' : sg.id === 'segMode' ? 'mode' : sg.id === 'segScore' ? 'score' : 'minutes';
       L[key] = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
       sg.querySelectorAll('div').forEach(x => x.classList.toggle('sel', x === d));
     })));
@@ -530,13 +544,13 @@ export class Menu {
     this.syncLobbyName();
     const safe = title.replace(/[^A-Za-z0-9_.-]/g, '');
     const room = (safe && safe === title) ? title.slice(0, 32) : ('r' + Date.now().toString(36).slice(-6));
-    lb.createRoom({ room, title, map: L.map, mode: this.onlineMode(), minutes: L.minutes });
+    lb.createRoom({ room, title, map: L.map, mode: this.onlineMode(), minutes: L.minutes, scoreLimit: L.score });
     this.game.showRoomSoon();
   }
   onlineQuick() {
     const lb = this.game.lobby; if (!lb) return;
     this.syncLobbyName();
-    lb.quickRoom({ title: '', map: this.lobby.map, mode: this.onlineMode(), minutes: this.lobby.minutes });
+    lb.quickRoom({ title: '', map: this.lobby.map, mode: this.onlineMode(), minutes: this.lobby.minutes, scoreLimit: this.lobby.score });
     this.game.showRoomSoon();
   }
   onlineJoin(room, title) {
@@ -767,7 +781,7 @@ export class Menu {
     const mt = this.el.querySelector('#rmMeta');
     // Bot 占位置，所以人数那一格要把它们算进去；另写一个"N Bot"，否则一间 1 人 + 7 Bot
     // 的房在标题上写着 8 人，点进去只看见一个人 —— 那看起来像列表算错了。
-    if (mt) mt.textContent = `${map.name} · ${mode.name} · ${room.time || 10} 分 · ${room.players || seats.length}/${room.max || 16} 人`
+    if (mt) mt.textContent = `${map.name} · ${mode.name} · ${room.score || 50}${room.mode === 'dom' ? ' 分' : ' 杀'} · ${room.time || 10} 分 · ${room.players || seats.length}/${room.max || 16} 人`
       + (bots.length ? `（${bots.length} Bot）` : '') + ` · 房主 ${room.host || '—'}`;
     const per = Math.max(2, Math.floor((room.max || 16) / 2));
     const row = (s) => `<div class="seat ${s.ready ? 'rd' : ''} ${s.isHost ? 'host' : ''}">
@@ -828,13 +842,15 @@ export class Menu {
           ? row('模式', 'rmMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), room.mode)
           : `<div class="cfg-row"><span>模式</span><div class="cfg-one" id="rmMode">${esc(mode.name)}</div></div>`)
         + row('时长', 'rmMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), room.time || 10)
+        // 胜利目标。同一个数随模式换语义（击杀数/占领分数），标签跟着 room.mode 走。
+        + row('目标', 'rmScore', MP_SCORES, MP_SCORES.map(v => this.scoreLabel(v, room.mode)), room.score || 50)
         // Bot 难度。改一格**全体 Bot 一起变**（服务端那条注释写了为什么不做成逐个改），
         // 所以这一行只在房里真有 Bot 时才画 —— 空房子里摆一个 Bot 难度选择器，
         // 玩家会以为"选了就会自动加 Bot"。
         + (bots.length ? row('Bot', 'rmBot', BOT_SKILLS, BOT_SKILL_NAMES, st.botSkill | 0) : '');
       cfg.querySelectorAll('.seg div[data-dis="0"]').forEach(d => d.addEventListener('click', () => {
         const sg = d.parentElement, v = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
-        const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : sg.id === 'rmBot' ? 'botSkill' : 'minutes';
+        const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : sg.id === 'rmScore' ? 'scoreLimit' : sg.id === 'rmBot' ? 'botSkill' : 'minutes';
         if (this.game.lobby) this.game.lobby.setCfg({ [key]: v });
       }));
     }
