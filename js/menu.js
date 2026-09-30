@@ -1143,6 +1143,7 @@ export class Menu {
       <div class="settings">
         <div class="hdr" style="margin-bottom:20px">设置<small>画面 · 操作 · 音频</small></div>
         <div class="set-row"><span>画面质量</span><div class="seg" data-q="1">${['low', 'medium', 'high'].map((q, i) => `<div data-v="${q}" class="${S.quality === q ? 'sel' : ''}">${['低', '中', '高'][i]}</div>`).join('')}</div></div>
+        <div class="set-row"><span>帧率上限</span><div class="seg" data-cap="1">${[['0', '不锁'], ['144', '144'], ['120', '120'], ['60', '60'], ['30', '30']].map(([v, n]) => `<div data-v="${v}" class="${(S.fpsCap | 0) === +v ? 'sel' : ''}">${n}</div>`).join('')}</div></div>
         ${rng('fov', '视野 (FOV)', 65, 100, 1, fmts.fov)}
         ${rng('sens', '鼠标灵敏度', 0.2, 3, 0.05, fmts.sens)}
         ${rng('adsSens', '开镜灵敏度倍率', 0.3, 1.5, 0.05, fmts.adsSens)}
@@ -1178,6 +1179,12 @@ export class Menu {
     r.querySelectorAll('.seg[data-q] div').forEach(d => d.addEventListener('click', () => {
       S.quality = d.dataset.v; r.querySelectorAll('.seg[data-q] div').forEach(x => x.classList.toggle('sel', x === d));
       this.game.saveSettings(); this.game.applyQuality();
+    }));
+    // 帧率上限:即时生效(frame() 每帧读设置),0=不锁。只跳帧不 sleep —— 跳掉的帧
+    // 其 dt 会攒着补给下一个放行帧,所以模拟仍按真实墙钟推进,锁帧不改变对局结果。
+    r.querySelectorAll('.seg[data-cap] div').forEach(d => d.addEventListener('click', () => {
+      S.fpsCap = +d.dataset.v; r.querySelectorAll('.seg[data-cap] div').forEach(x => x.classList.toggle('sel', x === d));
+      this.game.saveSettings();
     }));
     this.on(r, '[data-a=back]', () => { if (inGame) this.showPause(); else this.showMain(); });
     this.on(r, '[data-a=resetp]', () => { if (confirm('确定要重置所有配装与经验值吗？')) { localStorage.removeItem('mf_profile'); location.reload(); } });

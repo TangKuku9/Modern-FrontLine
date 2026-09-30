@@ -73,7 +73,7 @@ const MAX_STEPS_PER_FRAME = 8;     // 单帧最多补几步，超出就丢时间
 
 class Game {
   constructor() {
-    this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true, fixedStep: true }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
+    this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true, fixedStep: true, fpsCap: 0 }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
     this.profile = Object.assign({ xp: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null, muted: [] }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
     if (!this.profile.classes || this.profile.classes.length < 5) this.profile.classes = JSON.parse(JSON.stringify(DEFAULT_CLASSES));
     // 存档里读出来的东西要过一遍表：mf_profile 是玩家能自己编辑的文件，一个不存在的枪 id
@@ -86,6 +86,10 @@ class Game {
     this.tick = 0;
     this.acc = 0;
     this.frameTicks = 0;
+    // 帧计数:frames = 进了 frame() 的次数(墙钟节拍),renders = 真正画了的次数,
+    // skipped = 帧率上限挡掉的次数。三个数分开记,是因为锁帧只该改 renders ——
+    // frames 和模拟都照旧。
+    this.frames = 0; this.renders = 0; this.skipped = 0;
     this.netDebug = /[?&]netdebug=1/.test(location.search);
     this.online = /[?&]online=1/.test(location.search);
     // 账号：只用来决定菜单显示什么。**它不是权限** —— 判定在服务端每一次请求里重做，
@@ -95,7 +99,7 @@ class Game {
     this.mat = mat;
     this.input = { keys: {}, pressed: {}, mdx: 0, mdy: 0, buttons: 0, wheel: 0 };
   }
-  updateNetDebug(raw) {
+  updateNetDebug(raw, wall) {
     let el = document.getElementById('netDebug');
     if (!el) {
       el = document.createElement('div');
@@ -103,10 +107,15 @@ class Game {
       el.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:9999;font:12px/1.5 ui-monospace,Consolas,monospace;color:#d4f24a;background:rgba(0,0,0,.55);padding:6px 8px;white-space:pre;pointer-events:none';
       document.body.appendChild(el);
     }
+    // 两个平均都要取**墙钟差**。改造前这里吃的是 raw:锁帧把 raw 掺进了攒下的
+    // _capPend,而这一行只在放行帧上跑,平均出来的就是"放行帧的间隔" ——
+    // 锁 30 时会报 30,但它量不出"显示器给的节拍到底多快、被挡掉多少"。
     this._ndAcc = (this._ndAcc || 0) * 0.9 + raw * 0.1;
+    this._ndWall = (this._ndWall || 0) * 0.9 + (wall ?? raw) * 0.1;
     el.textContent =
       `${this.settings.fixedStep ? 'FIXED 1/60' : 'VARIABLE'}  tick ${this.tick}  simT ${this.time.toFixed(2)}s\n` +
-      `fps ${(1 / Math.max(1e-4, this._ndFps)).toFixed(0).padStart(4)}   ticks/frame ${this.frameTicks}   leftover ${(this.acc * 1000).toFixed(1)}ms`;
+      `fps ${(1 / Math.max(1e-4, this._ndWall)).toFixed(0).padStart(4)}   ticks/frame ${this.frameTicks}   leftover ${(this.acc * 1000).toFixed(1)}ms` +
+      (this.skipped ? `\ncap ${this.settings.fpsCap}   skipped ${this.skipped}` : '');
     this._ndFps = (this._ndFps || 0) * 0.9 + raw * 0.1;
   }
   saveProfile() { localStorage.setItem('mf_profile', JSON.stringify(this.profile)); }
@@ -751,7 +760,34 @@ class Game {
   // 且余弹数随帧率变（DPS 随帧率变）；固定 1/60 后所有帧率逐位相同。
   // 服务端只按固定步长跑，客户端预测要走同一条离散化，否则两边永远对不上。
   frame() {
-    const raw = Math.min(0.25, this.clock.getDelta());   // 0.25 上限防"死亡螺旋"
+    let raw = Math.min(0.25, this.clock.getDelta());   // 0.25 上限防"死亡螺旋"
+    // 这一帧的**真实墙钟差**。raw 马上要被加法和 cap 改写，而 FPS 要报的是墙钟 ——
+    // rdt 那份被截到 0.05，低帧率时会谎报成 20 FPS 封顶，所以两者都不能拿。
+    const wall = raw;
+    this.frames++;
+    // 帧率上限(设置里 0=不锁):只跳帧不 sleep。锁出来的上限对**模拟**零影响 ——
+    // 模拟是 60Hz 固定步长,与渲染解耦;但 getDelta 已经把跳过帧的 dt 消费掉了,
+    // 不攒着补给放行帧的话,锁 60 会把模拟的墙钟预算也一起砍掉(整局变慢动作)。
+    // 节拍锚(_capNext)只在**放行**时推进:跳过的帧不动它 —— 每帧都加的话,帧间隔
+    // 比节拍长(本机卡)时锚点永远跑在前面,一帧都放不出去。容差 1.5ms 吸收 rAF
+    // 抖动,锁 60 时差 0.1ms 的那拍也放行,否则节奏抖成 30/120 交替。
+    const cap = this.settings.fpsCap | 0;
+    if (cap > 0) {
+      const now = performance.now();
+      if (!this._capNext) this._capNext = now;
+      // 跳过帧**不消费输入**:攒下的鼠标位移会整份交给下一个放行帧,与"两次 tick
+      // 之间攒下的位移整份交给下一个 tick"是同一条规矩(mouseDelta 是累积量,不是
+      // 每帧速率)。暂停期的排空也照旧成立 —— 解除暂停前必然至少放行过一帧,
+      // 那一帧走的就是下面 paused 分支里的 snapshotInput()。
+      if (now + 1.5 < this._capNext) { this._capPend = (this._capPend || 0) + raw; this.skipped++; return; }
+      this._capNext = Math.max(this._capNext, now - 50) + 1000 / cap;
+      raw = Math.min(0.25, raw + (this._capPend || 0)); this._capPend = 0;
+    } else { this._capNext = 0; this._capPend = 0; }
+    this.renders++;
+    // FPS 计量在**放行帧**上(跳帧不进来),所以这个读数就是锁出来的实际帧率本身;
+    // 喂的是 wall 而不是上面的 raw:raw 在放行帧上带着攒下的 _capPend,两者之和
+    // 平均下来同样是墙钟,但走 wall 时"锁 30 的读数"不依赖累加期的边界。
+    this.hud.meterFrame(wall);
     // 渲染侧仍拿改造前那份取值（原来整个循环就用 min(0.05, delta)），
     // 不让模拟步长偷偷改掉 composer/菜单动画的时间基准
     const rdt = Math.min(0.05, raw);
@@ -793,7 +829,7 @@ class Game {
     // RESPAWN_DELAY 也是墙钟），而暂停时 sim 是停的、服务端的秒表却不停。
     if (this.net && this.state === 'play') this.netRespawnTick();
     this.netLostUi();
-    if (this.netDebug) this.updateNetDebug(raw);
+    if (this.netDebug) this.updateNetDebug(raw, wall);
     this.grade.uniforms.time.value = performance.now() * 0.001;
     this.composer.render(rdt);
   }

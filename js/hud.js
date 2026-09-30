@@ -215,11 +215,16 @@ export class HUD {
     }).join('') + `<div class="stk"><span>连杀</span><span class="k">${kills}</span></div>`;
   }
 
+  // FPS 的**计量**在渲染帧上(main.js 每个放行帧调一次 meterFrame,帧率上限挡掉的
+  // 帧不进来);update() 跑在 60Hz 模拟拍上,在这里计量量到的是拍频 —— 固定步长下
+  // 恒 60,显示器 144Hz 也显示 60。拍频与帧率是两个数,右下角要报的是后者。
+  // dt 取的是那一帧的**墙钟差**,所以锁 60 时读数就是 60,而不是被 raw 的截断带偏。
+  meterFrame(dt) { this.fpsAcc += dt; this.fpsN++; }
+
   update(dt) {
     const game = this.game, pl = game.player;
     if (!pl) return;
-    // FPS
-    this.fpsAcc += dt; this.fpsN++;
+    // FPS:计量见 meterFrame,这里只每 0.5s 刷一次读数
     if (this.fpsAcc > 0.5) { $('fps').textContent = game.settings.showFps ? Math.round(this.fpsN / this.fpsAcc) + ' FPS' : ''; this.fpsAcc = 0; this.fpsN = 0; }
     const ws = pl.ws, w = ws.w;
     // 准星
