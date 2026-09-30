@@ -127,10 +127,11 @@ export class Effects {
     slot.max = intensity; slot.t = dur; slot.dur = dur;
   }
 
-  muzzle(pos, dir, big = 1, light = true) {
+  // spark 只管火星的强弱（贴片/灯由调用方自己定档）：消焰器消焰不消烟，火星单独收档
+  muzzle(pos, dir, big = 1, light = true, spark = 1) {
     for (let i = 0; i < 3; i++) {
       const s = rand(2, 5) * 0.4;
-      this.add.emit({ x: pos.x + dir.x * i * 0.05, y: pos.y + dir.y * i * 0.05, z: pos.z + dir.z * i * 0.05, vx: dir.x * s, vy: dir.y * s, vz: dir.z * s, life: 0.05, s0: 0.25 * big, s1: 0.4 * big, c0: [4, 2.6, 1.2], a0: 1 });
+      this.add.emit({ x: pos.x + dir.x * i * 0.05, y: pos.y + dir.y * i * 0.05, z: pos.z + dir.z * i * 0.05, vx: dir.x * s, vy: dir.y * s, vz: dir.z * s, life: 0.05, s0: 0.2 * big * spark, s1: 0.3 * big * spark, c0: [2.6, 1.8, 0.95], a0: 1 });
     }
     this.smoke.emit({ x: pos.x, y: pos.y, z: pos.z, vx: dir.x * 1.5 + rand(-0.2, 0.2), vy: 0.4, vz: dir.z * 1.5, life: 0.8, s0: 0.1, s1: 0.6, c0: [0.7, 0.7, 0.7], a0: 0.12 * big, drag: 2 });
     if (light) this.flashLight(pos, 0xffb060, 3 * big, 0.05, 8);

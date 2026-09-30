@@ -53,13 +53,15 @@ export class Viewmodel {
     const g = new THREE.Group();
     g.add(info.group); g.add(arms.group);
     g.traverse(o => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; } });
-    // 火光尺寸与持续时间按枪口装置走：消焰器要真的消焰 —— 原来只把点光源 4→1.5，
-    // 贴片尺寸和 35ms 的闪光时间一动不动，装了它照样一大团火（名实不符）。
-    // 基准还按枪型分级：以前全枪一个 0.22，手枪和轻机枪一样大。
+    // 火光尺寸与持续时间按枪口装置走。整体压一档：贴片是 HDR 加色，旧颜色(3,2.2,1.4)
+    // 远超 bloom 阈值(0.92)，开镜时枪口又正贴在准星下方，一团泛光直接糊住瞄点。
+    // 消焰器这次要真的消焰：贴片缩到三成、透明度砍近半，灯与火星同步压小（见 update
+    // 的 shot 事件处理）；消音器仍然比它更狠。基准按枪型分级：手枪最小、霰弹枪最大。
     const base = FLASH_BY_TYPE[stats.type] ?? 0.21;
-    const flashScale = (stats.suppressed ? 0.36 : stats.flashHide ? 0.5 : 1) * base;
-    const flashDur = (stats.suppressed ? 0.5 : stats.flashHide ? 0.62 : 1) * 0.035;
-    const flash = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.game.effects.texFlash, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: new THREE.Color(3, 2.2, 1.4) }));
+    const flashScale = (stats.suppressed ? 0.26 : stats.flashHide ? 0.3 : 0.8) * base;
+    const flashOpacity = stats.suppressed ? 0.35 : stats.flashHide ? 0.45 : 0.85;
+    const flashDur = (stats.suppressed ? 0.5 : stats.flashHide ? 0.55 : 1) * 0.035;
+    const flash = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.game.effects.texFlash, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, color: new THREE.Color(2.0, 1.4, 0.9), opacity: flashOpacity }));
     flash.scale.setScalar(flashScale); flash.visible = false;
     info.muzzle.add(flash);
     let laserDot = null;
@@ -69,7 +71,7 @@ export class Viewmodel {
     }
     // 分件动作的基准位：套筒/拉机柄/泵动护木都从原位往后/往前推
     for (const p of [info.slide, info.bolt, info.pump]) if (p && !p.userData.base) p.userData.base = p.position.clone();
-    return { info, group: g, arms, flash, flashDur, laserDot, act: 0, cylStep: 0 };
+    return { info, group: g, arms, flash, flashScale, flashDur, laserDot, act: 0, cylStep: 0 };
   }
   syncLoadout() {
     if (this.ws.loadoutVersion === this.seenVersion) return;
@@ -109,10 +111,11 @@ export class Viewmodel {
         if (e.kind === 'shot') {
           this.flashT = cur.flashDur;
           const mw = this.muzzleWorld(_mw);
-          if (!e.suppressed) game.effects.flashLight(mw, 0xffb060, e.flashHide ? 1.5 : 4, 0.05, 8);
+          if (!e.suppressed) game.effects.flashLight(mw, 0xffb060, e.flashHide ? 0.5 : 2.5, 0.05, 8);
           // 枪口烟与火星：以前只有一张贴片 + 一次闪光（effects.muzzle 那套只有哨戒机枪在用），
           // 打起来是"一闪而过"。消音器把烟一并压掉（这才是"看不出谁在开枪"）。灯自己已经加过。
-          if (!e.suppressed) game.effects.muzzle(mw, e.fwd, st.type === 'shotgun' || st.type === 'lmg' ? 1.3 : st.type === 'pistol' ? 0.7 : 1, false);
+          // 消焰器只消焰不消烟：火星单独收档（spark 参数），烟保持原样。
+          if (!e.suppressed) game.effects.muzzle(mw, e.fwd, st.type === 'shotgun' || st.type === 'lmg' ? 1.3 : st.type === 'pistol' ? 0.7 : 1, false, e.flashHide ? 0.35 : 1);
           for (const p of e.tracers) game.effects.tracer(mw.clone().addScaledVector(e.fwd, 0.5), p, [1.4, 1.0, 0.55]);
           if (e.shell) {
             // 弹壳从**抛壳窗**（info.eject）出来，不是"枪口后方 0.4 m"那个固定点 ——
@@ -139,7 +142,11 @@ export class Viewmodel {
     cur.act = damp(cur.act, 0, 14, dt);
     this.flashT -= dt;
     cur.flash.visible = this.flashT > 0;
-    if (cur.flash.visible) cur.flash.material.rotation = Math.random() * 6;
+    if (cur.flash.visible) {
+      cur.flash.material.rotation = Math.random() * 6;
+      // 开镜时枪口就贴在准星正下方，贴片一大就把瞄点整个糊住 —— 开镜把火光再收四成
+      cur.flash.scale.setScalar(cur.flashScale * (1 - 0.4 * smooth01(ws.adsT)));
+    }
 
     const pl = this.owner, cam = game.camera;
     this.pivot.position.copy(cam.position);
@@ -149,7 +156,7 @@ export class Viewmodel {
     // 火光要打亮自己的枪与手：世界那盏点光源挂在 game.scene，照不到 vmScene 里的枪模
     this.flashLamp.position.copy(this.muzzleWorld(_mw));
     this.flashLamp.intensity = this.flashT > 0
-      ? (st.suppressed ? 0.5 : st.flashHide ? 0.8 : 2.0) * clamp(this.flashT / cur.flashDur, 0, 1)
+      ? (st.suppressed ? 0.3 : st.flashHide ? 0.35 : 1.3) * clamp(this.flashT / cur.flashDur, 0, 1)
       : 0;
     // 摆动：视线位移由权威侧按拍攒过来，这里一次取干，总量与帧率无关
     const aim = ws.aimAccum;

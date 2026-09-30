@@ -133,6 +133,10 @@ const play = await page.evaluate(async () => {
   g.clock = { getDelta: () => 1 / 60 };
   const frames = (n, inp) => { for (let i = 0; i < n; i++) { if (inp) inp(); g.frame(); } };
   await g.startGame('mp', { mode: 'tdm', map: 'yard', diff: 1, allies: 2, enemies: 2, scoreLimit: 50, timeLimit: 10 });
+  // 对面是活 bots：玩家一旦被打死 vm.update 就停跑，syncLoadout 挂起，后面所有
+  // replaceSlot 都建不出新枪模（S9 的 info.cylinder 会是 null）。判据量的是枪模，
+  // 不是存活，按探针惯例上无敌把 bot 火力从变量里剔掉。
+  g.player.maxHp = 1e9; g.player.hp = 1e9;
   const ws = g.player.ws, vm = ws.vm;
   frames(40);          // setLoadout 会先进 switch（0.5s）：射击与换弹都只在 idle 开门
   ok('起局后状态机回到 idle', ws.state === 'idle', 'state=' + ws.state);
@@ -204,13 +208,29 @@ const play = await page.evaluate(async () => {
   ok('S3 灯位贴着枪口', vm.flashLamp.position.distanceTo(vm.muzzleWorld(v())) < 0.02, `${vm.flashLamp.position.distanceTo(vm.muzzleWorld(v())).toFixed(4)} m`);
   g.input.buttons = 0; frames(3);
 
-  // S5 消焰器名实相符：贴片比裸枪小、闪光比裸枪短
+  // S5 消焰器名实相符：贴片比裸枪小、闪光比裸枪短。2026-09-30 强化后钉得更紧：
+  // 旧档（0.5×）装了照样一大团火，现在缩到三成、透明度也砍近半。
   const mk = (att) => vm.build({ id: 'm4', att, camo: 'none', stats: computeStats('m4', att) });
   const bare = mk({}), flashHider = mk({ muzzle: 'flash' }), sup = mk({ muzzle: 'suppressor' });
-  ok('S5 消焰器的火光贴片比裸枪小', flashHider.flash.scale.x < bare.flash.scale.x * 0.75,
+  ok('S5 消焰器的火光贴片比裸枪小', flashHider.flash.scale.x < bare.flash.scale.x * 0.5,
     `裸=${bare.flash.scale.x.toFixed(3)} 消焰=${flashHider.flash.scale.x.toFixed(3)}`);
+  ok('S5 消焰器的火光比裸枪淡', flashHider.flash.material.opacity < bare.flash.material.opacity * 0.6,
+    `裸=${bare.flash.material.opacity} 消焰=${flashHider.flash.material.opacity}`);
   ok('S5 消焰器的闪光比裸枪短', flashHider.flashDur < bare.flashDur * 0.8, `裸=${bare.flashDur} 消焰=${flashHider.flashDur}`);
   ok('S5⁻ 反证：消音器比消焰器还小', sup.flash.scale.x <= flashHider.flash.scale.x, `消焰=${flashHider.flash.scale.x.toFixed(3)} 消音=${sup.flash.scale.x.toFixed(3)}`);
+
+  // S5b 开镜收火光：贴片挂在枪口上，开镜时枪口正贴准星下方，不收就糊住瞄点。
+  // 先开镜到位再开火 —— 边开镜边开火的话 adsT 还没起来，量出来的是"没收到"。
+  ws.cool = 0; ws.cycleT = 0;
+  const builtScale = cur.flash.scale.x;
+  frames(70, () => { g.input.buttons = 4; });
+  const mag0 = ws.w.mag;
+  frames(2, () => { g.input.buttons = 5; });   // 1|4：边瞄边打
+  g.input.buttons = 0;
+  const adsScale = cur.flash.scale.x;
+  ok('S5b 开镜时火光贴片收小（不糊准星）', mag0 - ws.w.mag > 0 && adsScale < builtScale * 0.7 && adsScale > 0,
+    `腰射=${builtScale.toFixed(3)} 开镜=${adsScale.toFixed(3)} 开了${mag0 - ws.w.mag}枪`);
+  frames(5);
 
   // S8 火光按枪型分级 + 枪口烟。烟只数**枪口 0.6m 内**的粒子，而且抬头打天 ——
   // 否则弹着点的尘土也算进"枪口烟"，那把尺子会把没烟的枪也量成有烟。
