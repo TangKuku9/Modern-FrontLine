@@ -8,7 +8,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
 import { initTextures, mat } from './materials.js';
 import { setTextureSize } from './textures.js';
-import { setFlashTexture } from './soldier.js';
+import { setFlashTexture, setSoldierEye } from './soldier.js';
 import { World } from './world.js';
 import { MAPS } from './maps.js';
 import { Effects } from './effects.js';
@@ -755,6 +755,7 @@ class Game {
     // 渲染侧仍拿改造前那份取值（原来整个循环就用 min(0.05, delta)），
     // 不让模拟步长偷偷改掉 composer/菜单动画的时间基准
     const rdt = Math.min(0.05, raw);
+    setSoldierEye(this.camera.position);   // 士兵距离细节档的观察点(每帧一次,soldier 内部自己裁)
     if (this.state === 'play') {
       if (!this.paused) {
         if (this.settings.fixedStep === false) {

@@ -65,7 +65,7 @@ export class NetPlayer {
     this.model.root.position.copy(this.pos);
     game.scene.add(this.model.root);
     this.tag = null; this.buildTag();
-    this.anim = { speed: 0, phase: 0, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0 };
+    this.anim = { speed: 0, phase: 0, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0, sprint: 0, air: 0 };
     // —— 表现层账本（见文件头）——
     this.fireCool = 0;                              // 下一发枪声还要等多久
     this.stepDist = 0;                              // 从上一声脚步起走了多少米
@@ -248,7 +248,12 @@ export class NetPlayer {
     // 模型正面在 -Z（眼睛 z=-0.161、枪 z=-0.3、背包 z=+0.2），而 forward = (-sin yaw, 0, -cos yaw)
     // 与第一人称相机 rotation.y = yaw 是同一套 —— 所以这里**不能**再 +π：三个约定里只有这一处
     // 是异类，症状是"别人朝你跑，你看到的是背对着你倒着跑"。
-    m.rotation.y = this.yaw;
+    // 转向按最短弧平滑（angleDiff 走短边，16/s）：快照 20Hz，大角度回头是阶跃，
+    // 直接赋值模型会瞬转半圈。只平滑**模型**；开火弹道方向（下面 tracer/dir）仍用权威
+    // this.yaw，不吃平滑延迟 —— 裁决在服务端，这里只是让观众看得自然。
+    if (this.yawSm === undefined) this.yawSm = this.yaw;
+    this.yawSm += angleDiff(this.yawSm, this.yaw) * Math.min(1, dt * 16);
+    m.rotation.y = this.yawSm;
     const spd = Math.hypot(this.vel.x, this.vel.z);
     const a = this.anim;
     a.crouch = this.crouchT;
@@ -268,6 +273,9 @@ export class NetPlayer {
     // 以前只存不用：对方据枪瞄你和腰射在画面上一模一样，滑铲的人立着滑。
     a.ads = lerp(a.ads, (s.flags & FLAG.Ads) ? 1 : 0, Math.min(1, dt * 12));
     a.slide = lerp(a.slide, this.sliding ? 1 : 0, Math.min(1, dt * 12));
+    // 冲刺 / 滞空同理：位在快照里存了很久（this.sprinting / this.onGround），模型端一直没消费。
+    a.sprint = lerp(a.sprint, this.sprinting ? 1 : 0, Math.min(1, dt * 10));
+    a.air = lerp(a.air, this.onGround ? 0 : 1, Math.min(1, dt * 10));
     animateSoldier(this.model, a, dt);
 
     // 受击抖动：模型沿弹道方向被推一下，幅度线性衰减。纯表现，不改 pos（pos 是权威的）。
@@ -342,6 +350,7 @@ export class NetPlayer {
     applyFlashTex(this.model);
     this.model.root.position.copy(this.pos);
     this.model.root.rotation.y = this.yaw;      // 同 update：不加 π
+    this.yawSm = this.yaw;                      // 换枪重建了模型,平滑值从当前朝向重新起步
     this.game.scene.add(this.model.root);
     this.tag = null; this.buildTag();
     this._fadeMats = null;

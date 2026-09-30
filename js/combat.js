@@ -22,10 +22,13 @@ const _n = new THREE.Vector3();
 // （见 server/lagcomp.mjs:PoseRing）—— 命中盒依赖什么，缓冲里就该存什么，多存是浪费，
 // 少存就是"回溯过去的盒子"和"当时的盒子"不是同一个，而那种错只会表现为偶尔打不中。
 export function hitTestPlayer(x, y, z, eye, o, d, maxT) {
+  // 与外观贴合:头球 0.145 ≈ 盔体 0.135 + 1cm 容差(旧 0.16 比盔大一圈,贴着盔边擦过也算爆头);
+  // 躯干半宽 0.30 盖住肩球 0.285(旧 0.28,打肩球边缘不判中)。改这里同时影响本机/远端/
+  // 服务端回溯三路裁决与 test/lagcomp.mjs 的判据线。
   const hy = y + eye + 0.02;
-  let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x, hy, z, 0.16);
+  let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x, hy, z, 0.145);
   if (t >= 0 && t < maxT) return { t, part: 'head' };
-  const b = { x0: x - 0.28, x1: x + 0.28, y0: y, y1: y + eye - 0.12, z0: z - 0.28, z1: z + 0.28 };
+  const b = { x0: x - 0.30, x1: x + 0.30, y0: y, y1: y + eye - 0.12, z0: z - 0.30, z1: z + 0.30 };
   t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, maxT);
   if (t >= 0) { const hy2 = o.y + d.y * t; return { t, part: hy2 < y + eye * 0.5 ? 'legs' : 'body' }; }
   return null;
