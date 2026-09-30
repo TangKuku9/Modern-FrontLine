@@ -93,19 +93,46 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
 {
   const g = makeGame();
   const r = mkRemote(g);
-  r.push(snap({ yaw: 1.0, pitch: 0.3 }), 0);
-  r.push(snap({ yaw: 1.0, pitch: 0.3 }), 0.05);
-  r.update(1 / 60, 0.05 + INTERP_DELAY);
-  ok('A1 模型朝向 = 权威 yaw（不加 π）', Math.abs(r.model.root.rotation.y - 1.0) < 1e-9,
-    `rotation.y=${r.model.root.rotation.y.toFixed(4)}（旧写法会给 ${(1.0 + Math.PI).toFixed(4)}）`);
-  ok('A2 姿态俯仰 = 权威 pitch（不加负号）', Math.abs(r.anim.pitch - 0.3) < 1e-9,
+  // 时间轴**显式**给：update(dt) 不传 now 时默认 performance.now()/1000，那一刻机器
+  // 起来多久就成了渲染落点。0.10 那一包刚推进去时若默认 now 只有 0.03 上下，target
+  // = now − INTERP_DELAY 会落到**前两包之间**，量出来的不是刚喂进去的那一包。基准取
+  // 1.0（远离 0，也远离 performance.now() 的典型量级），每一拍的 now 都从它算。
+  const T0 = 1.0;
+  r.push(snap({ yaw: 1.0, pitch: 0.3 }), T0);
+  r.push(snap({ yaw: 1.0, pitch: 0.3 }), T0 + 0.05);
+  r.update(1 / 60, T0 + 0.05 + INTERP_DELAY);
+  // 判据读**权威值**（this.yaw / this.pitch），不读 model.rotation.y：那一格是 yawSm 经过
+  // 16/s 平滑之后的产物，一帧只走 26.7%，读它就是在考"平滑跑到第几帧了"而不是考符号
+  // —— 反过来说，符号要是真写反了，model.rotation.y 也认不出来（1.0 与 4.1416 都在
+  // yawSm 从 0 往上爬的同一条路上）。平滑那一格由下面 A3a/A3b/A3c 三条单独钉。
+  ok('A1 权威 yaw 落进 this.yaw（不加 π）', Math.abs(r.yaw - 1.0) < 1e-9,
+    `this.yaw=${r.yaw.toFixed(4)}（旧写法会给 ${(1.0 + Math.PI).toFixed(4)}）`);
+  ok('A2 权威 pitch 落进 anim.pitch（不加负号）', Math.abs(r.anim.pitch - 0.3) < 1e-9,
     `anim.pitch=${r.anim.pitch.toFixed(4)}（旧写法会给 ${(-0.3).toFixed(4)}）`);
   // 反证臂：上一行不是"反正都等于 0"的恒绿 —— 两个符号都要能被看见
-  r.push(snap({ yaw: -1.4, pitch: -0.6 }), 0.10);
-  r.update(1 / 60, 0.10 + INTERP_DELAY);
+  r.push(snap({ yaw: -1.4, pitch: -0.6 }), T0 + 0.10);
+  r.update(1 / 60, T0 + 0.10 + INTERP_DELAY);
   ok('A3 反证臂：换一个符号相反的读数，两条都跟着翻（不是恒 0 的绿灯）',
-    Math.abs(r.model.root.rotation.y + 1.4) < 1e-9 && Math.abs(r.anim.pitch + 0.6) < 1e-9,
-    `yaw→${r.model.root.rotation.y.toFixed(4)} · pitch→${r.anim.pitch.toFixed(4)}`);
+    Math.abs(r.yaw + 1.4) < 1e-9 && Math.abs(r.anim.pitch + 0.6) < 1e-9,
+    `this.yaw→${r.yaw.toFixed(4)} · anim.pitch→${r.anim.pitch.toFixed(4)}`);
+  // 平滑的**瞬态**：权威值刚从 +1.0 翻到 -1.4，转向按 16/s 平滑，一帧只走 26.7%，
+  // 所以这一拍不能跳到目标上（跳到目标 = 平滑根本不存在 = 大角度回头时模型瞬转半圈）。
+  // 改这一带最容易顺手写成 `this.yawSm = this.yaw`，那条只有这一格抓得住。
+  ok('A3a 反证臂：权威值大角度翻号时**不**瞬转（16/s 平滑真的在起作用）',
+    Math.abs(r.yawSm - r.yaw) > 0.5 && Math.abs(r.yawSm - 1.0) < Math.abs(r.yawSm - r.yaw),
+    `yawSm=${r.yawSm.toFixed(4)} · 还在 +1.0 这一侧，离目标 ${Math.abs(r.yawSm - r.yaw).toFixed(4)}`);
+  // 平滑那一格另立两条，都拿**有效值**（r.yaw）当参照而不是拿字面量 -1.4：加符号很容易
+  // 顺手改成 `m.rotation.y = -this.yawSm` —— 那会让上面两条照样全绿（它们读的是权威值），
+  // 而模型真的背过去。所以这里把平滑跑到收敛（渲染时刻逐帧往前推，yaw 每帧都取权威的
+  // -1.4），既要求落点**收敛到**权威值（不是停在中间值、也不是收敛到 -yaw），也要求写进
+  // 模型的那一格确实等于收敛值。
+  for (let i = 0; i < 40; i++) r.update(1 / 60, T0 + 0.10 + INTERP_DELAY + i / 60);
+  ok('A3b 转向平滑收敛到权威 yaw（不是停在中间值，也不是收敛到 -yaw）',
+    Math.abs(r.yawSm - r.yaw) < 1e-3,
+    `yawSm→${r.yawSm.toFixed(5)} vs 权威 ${r.yaw.toFixed(5)}（写反 → +1.4；只跑一帧 → 约 -0.47）`);
+  ok('A3c 模型朝向 = 收敛后的平滑值（`m.rotation.y = -yawSm` 这类反号会被这条抓住）',
+    Math.abs(r.model.root.rotation.y - r.yawSm) < 1e-9 && Math.abs(r.model.root.rotation.y - r.yaw) < 1e-3,
+    `model.rotation.y=${r.model.root.rotation.y.toFixed(5)} · yawSm=${r.yawSm.toFixed(5)}`);
   // 换枪这条路上同一处符号：swapWeapon 也要跟着改（漏一处的症状是"切枪那一下背过去"）
   r.swapWeapon('ak');
   ok('A4 换枪重建的模型也按同一个符号摆（swapWeapon 那条路不漏）', Math.abs(r.model.root.rotation.y + 1.4) < 1e-9,
