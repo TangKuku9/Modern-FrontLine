@@ -248,20 +248,52 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     if (!small) add(bgeo(0.024, 0.004, 0.05), mat('gunSteel'), 0.038, 0.045, hz1 + 0.05);
     addLaser(add, 0.038, 0.03, hz1 + 0.019);
   }
-  // 下挂
-  if (att.under === 'vgrip') add(bgeo(0.03, 0.09, 0.03), mat('gunPoly'), 0, -0.035, hz0 - hand * 0.55);
-  else if (att.under === 'agrip') add(bgeo(0.03, 0.035, 0.08), mat('gunPoly'), 0, -0.01, hz0 - hand * 0.5, -0.4);
-  else if (att.under === 'bipod') {
+  // 下挂。所有下挂件骑的**下挂导轨**：护木底面那根金属条。老版本没有它，握把座只
+  // 嵌进护木底 6mm，从射手视角看就是悬在护木底下（用户否决的第一条）。木护木底面
+  // 高 5mm（handH 0.05），轨位跟着抬。
+  if (att.under) {
+    const hbY = M.color === 'wood' ? 0.005 : 0;
+    info.underRail = add(bgeo(0.026, 0.01, hand * 0.5), metal, 0, hbY - 0.003, hz0 - hand * 0.5);
+  }
+  if (att.under === 'vgrip') {
+    // 垂直前握把：导轨座（嵌进护木底 15mm）+ 两段收锥握身 + 外撇底板 + 三道指槽
+    // （low 档不出）。分段间距两两搭接，不许出现断口。
+    const zV = hz0 - hand * 0.55;
+    const vg = new THREE.Group(); vg.position.set(0, -0.026, zV); root.add(vg);
+    info.foreGrip = vg;
+    add(bgeo(0.034, 0.016, 0.05), mat('gunPoly'), 0, 0.033, 0, 0, 0, 0, vg);   // 导轨座
+    add(bgeo(0.026, 0.04, 0.034), mat('gunPoly'), 0, 0.008, 0, 0, 0, 0, vg);   // 握身上段
+    add(bgeo(0.024, 0.036, 0.03), mat('gunPoly'), 0, -0.028, 0, 0, 0, 0, vg);  // 握身下段（收锥）
+    add(bgeo(0.032, 0.014, 0.042), mat('gunPoly'), 0, -0.05, 0, 0, 0, 0, vg);  // 外撇底板
+    if (!low) for (let i = 0; i < 3; i++) add(bgeo(0.018, 0.005, 0.008), mat('gunPoly'), 0, 0.004 - i * 0.012, -0.019, 0, 0, 0, vg);
+  } else if (att.under === 'agrip') {
+    // 直角前握把：导轨座 + 楔形主体 + 下缘鳍。
+    const zA = hz0 - hand * 0.5;
+    const ag = new THREE.Group(); ag.position.set(0, -0.002, zA); root.add(ag);
+    info.foreGrip = ag;
+    add(bgeo(0.036, 0.016, 0.055), mat('gunPoly'), 0, 0.008, 0, 0, 0, 0, ag);         // 导轨座
+    add(bgeo(0.026, 0.03, 0.075), mat('gunPoly'), 0, -0.016, -0.006, -0.4, 0, 0, ag); // 楔形主体
+    add(bgeo(0.02, 0.012, 0.06), mat('gunPoly'), 0, -0.034, -0.012, -0.4, 0, 0, ag);  // 下缘鳍
+  } else if (att.under === 'bipod') {
     add(bgeo(0.035, 0.02, 0.03), metal, 0, -0.005, hz1 + 0.03);
     add(cgeo(0.006, 0.006, 0.16), metal, -0.012, -0.015, hz1 + 0.1, -0.12);
     add(cgeo(0.006, 0.006, 0.16), metal, 0.012, -0.015, hz1 + 0.1, -0.12);
   }
   if (att.under) info.leftHand.set(0, -0.06, hz0 - hand * 0.55);
-  // 握把
-  // 握把也吃迷彩，否则迷彩只糊了护木和枪托，握把留一块原色。三种胶带各是各的材质。
+  // 握把（后握把）。分段：嵌进机匣的宽肩、掌心鼓段、收腰下段、外撇底板，掌心段前面
+  // 三道指槽（low 档不出 —— 第三人称隔远了低于一像素）。**倾角是这一版的重点修正**：
+  // 手枪握把要底端朝后（枪托方向）倾，旋转取负 0.3 —— 旧块的正 0.3 是底端朝前的
+  // 前倾，单块时代不明显，一分段就一眼假（用户否决的第二条）。外廓与右手盒
+  // （buildArms 固定位）兼容；info.grip 仍指掌心段主体网格（S10 读它的材质判胶带）。
   const gripM = camoMaterial(camo, att.rear === 'rubber' ? mat('rubber') : att.rear === 'grain' ? mat('gripGrain') : att.rear === 'stip' ? mat('gripStip') : furnBase === mat('gunWood') ? mat('gunPoly') : furnBase);
-  if (M.grip === 'sniper') info.grip = add(bgeo(0.03, 0.09, 0.045), gripM, 0, -0.035, 0.07, 0.35);
-  else info.grip = add(bgeo(0.028, 0.095, 0.04), gripM, 0, -0.04, 0.035, 0.3);
+  const gripZ = M.grip === 'sniper' ? { y: -0.035, z: 0.07, r: -0.35, w: 0.03, d: 0.045 } : { y: -0.04, z: 0.035, r: -0.3, w: 0.028, d: 0.04 };
+  const gr = new THREE.Group(); gr.position.set(0, gripZ.y, gripZ.z); gr.rotation.x = gripZ.r; root.add(gr);
+  info.gripGroup = gr;
+  add(bgeo(gripZ.w + 0.004, 0.028, gripZ.d + 0.004), gripM, 0, 0.034, 0.002, 0, 0, 0, gr);   // 肩：宽顶嵌进机匣
+  info.grip = add(bgeo(gripZ.w, 0.04, gripZ.d), gripM, 0, 0.002, 0, 0, 0, 0, gr);            // 掌心鼓段（主体）
+  add(bgeo(gripZ.w - 0.003, 0.03, gripZ.d - 0.006), gripM, 0, -0.032, 0, 0, 0, 0, gr);       // 收腰下段
+  add(bgeo(gripZ.w + 0.002, 0.012, gripZ.d + 0.004), gripM, 0, -0.052, 0.001, 0, 0, 0, gr);  // 底板
+  if (!low) for (let i = 0; i < 3; i++) add(bgeo(gripZ.w - 0.004, 0.006, 0.008), gripM, 0, 0.014 - i * 0.014, -gripZ.d / 2 - 0.002, 0, 0, 0, gr); // 指槽
   add(bgeo(0.006, 0.006, 0.07), metal, 0, -0.032, -0.005); // 扳机护圈
   // 弹匣。井位按枪给（model.magZ）：老版本所有长枪共用一个固定井位 −0.035，而扳机
   // 护圈横在 −0.04…+0.03 —— 直匣旋转后的尾角、PKM 方匣、AK 弯匣的顶段全都顶进护圈

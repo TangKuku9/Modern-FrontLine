@@ -152,6 +152,39 @@ const geo = await page.evaluate(async () => {
   const akOld = magBox('ak').translate(new THREE.Vector3(0, 0, -0.035 - -0.115));
   ok('S12⁻ 反证：老井位下 AK 弹匣顶进护圈', akOld.max.z > GUARD_FRONT + 0.005, `老井位尾部 ${akOld.max.z.toFixed(3)}`);
 
+  // S13 握把：分段 + 后倾角 + 前握把衔接。两条反证臂各对准一个被否决的旧版：
+  // ①旧块前倾 +0.3（底端朝枪口）→ 同一把尺下 rake 为负；②旧前握把座嵌深 6mm →
+  // 过不了 8mm 线。指槽是第一人称档细节，low 下段数要掉回去。
+  const { WEAPONS } = await import('/js/data.js');
+  const segs = (id, att, low) => buildGun(id, att, 'none', { low }).gripGroup.children.map(o => o.geometry.parameters.width);
+  const m4segs = segs('m4', {}, false);
+  ok('S13 后握把分段且宽度有变化（不是等宽光板）', m4segs.length >= 5 && new Set(m4segs).size > 1,
+    `段数=${m4segs.length} 宽度种数=${new Set(m4segs).size}`);
+  ok('S13 后握把指槽只在第一人称档（low 剔掉）', segs('m4', {}, true).length === 4, `low 段数=${segs('m4', {}, true).length}`);
+  const rakeOf = (id) => {
+    const info = buildGun(id, {}, 'none');
+    info.group.updateMatrixWorld(true);   // 枪不转，gun-local 即 world，z 就是前后轴
+    const cs = info.gripGroup.children;
+    const top = cs.reduce((a, b) => (a.position.y > b.position.y ? a : b));
+    const bot = cs.reduce((a, b) => (a.position.y < b.position.y ? a : b));
+    return bot.getWorldPosition(new THREE.Vector3()).z - top.getWorldPosition(new THREE.Vector3()).z;
+  };
+  ok('S13 后握把底端朝后倾（手枪握把的正确方向）', rakeOf('m4') >= 0.02, `底板比肩靠后 ${rakeOf('m4').toFixed(3)} m`);
+  ok('S13 狙击握把同样后倾', rakeOf('l115') >= 0.02, `${rakeOf('l115').toFixed(3)} m`);
+  ok('S13⁻ 反证：被否决的前倾 +0.3 在同一把尺下为负', -0.086 * Math.sin(0.3) < 0, `旧规则 ${(-0.086 * Math.sin(0.3)).toFixed(3)} m`);
+  const embedOf = (id) => {
+    const info = buildGun(id, { under: 'vgrip' }, 'none');
+    info.group.updateMatrixWorld(true);
+    return new THREE.Box3().setFromObject(info.foreGrip).max.y - (WEAPONS[id].model.color === 'wood' ? 0.005 : 0);
+  };
+  ok('S13 垂直前握把嵌进护木底（不悬空）', embedOf('m4') >= 0.008 && embedOf('ak') >= 0.008,
+    `m4 嵌 ${embedOf('m4').toFixed(3)} / ak 嵌 ${embedOf('ak').toFixed(3)} m`);
+  ok('S13⁻ 反证：被否决版的 6mm 浅嵌不达标', -0.035 + 0.034 + 0.007 < 0.008, `旧座顶 ${(-0.035 + 0.034 + 0.007).toFixed(3)} m`);
+  const vsegs = buildGun('m4', { under: 'vgrip' }, 'none').foreGrip.children.map(o => o.geometry.parameters.width);
+  ok('S13 垂直前握带有导轨座与收锥', vsegs.length >= 5 && new Set(vsegs).size > 1,
+    `段数=${vsegs.length} 宽度种数=${new Set(vsegs).size}`);
+  ok('S13 直角前握带有导轨座与下缘鳍', buildGun('m4', { under: 'agrip' }, 'none').foreGrip.children.length >= 3);
+
   // S2 锚点本身：每把枪都得有一个挂在枪上的抛壳口
   for (const id of ['m4', 'ak', 'm1911', 'revolver', 'rpg']) {
     const info = buildGun(id, {}, 'none');
