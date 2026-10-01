@@ -79,6 +79,9 @@ export class NetClient {
     // 见 recordInput 开头那段）。选点结束后必须清（useStreak / updateTargeting 两条路都清），
     // 残留的 true 会让"后来才照到地面"的那一拍凭空确认一次空袭。
     this.confirmShot = false;
+    // 确认之后压到松手为止的旗子（recordInput 消费）。见 recordInput 开头那段：
+    // 为什么是输入形状而不是一句 cool。
+    this.suppressFireUntilRelease = false;
   }
 
   connect() {
@@ -170,6 +173,11 @@ export class NetClient {
       // 名字不在二进制快照里（变长字段会毁掉定长包），靠 welcome + join 事件带。
       // 技能表与套件表（配件/迷彩）同理 —— 它们跟着装备走，装备的真相在服务端。
       for (const o of j.others || []) this.roster.set(o.id, { name: o.name, team: o.team, perks: o.perks || [], kits: o.kits || null });
+      // 中途进房 / 重连的既成事实（在场哨戒机、直升机、地上的枪、半路的雷）。
+      // welcome 到达时地图多半还没加载完（startOnline 先连后 loadMap），所以先存着，
+      // frameUpdate 里见到 game.world 再补种 —— spawn 那三个函数自己也有 world 闸，
+      // 但闸的直接返回会把这份清单**静默丢掉**，与"迟到的事件"不可同日而语。
+      this.pendingWorld = j.world || null;
       this.snapGap = 0;         // 看门狗的基线：从进场这一刻开始数"多久没收到快照"
       this.settleJoin(null, j);
     } else if (j.t === 'ev') {
@@ -250,14 +258,17 @@ export class NetClient {
   // 每个模拟 tick 调一次：记历史 + 排队上行
   recordInput(tick, inp) {
     this.localTick = tick;
-    // 选点流程吞火。game.update 的顺序是 recordInput → pl.update（本地预测）→ mode.update
-    // （updateTargeting 消费确认），所以只有在这里动手，才能对"本地预测"与"上行"同时生效：
-    // 确认落点的那一下左键不许是一枪 —— 不吞的话本地预测真开一发（pl.update 在前），
-    // 上行也带着开火位（服务端照单全收），两边各打一发各抬一次枪口。点空了（没照到地面）
-    // 也一样吞：选点中的左键要么确认、要么什么都不是，不该漏成一发真子弹。
-    // 点过哪一下存进 confirmShot，同拍后段的 updateTargeting 消费。
-    if (this.targeting) {
-      if (inp.firePressed) this.confirmShot = true;
+    // 选点流程吞火 + 确认后压到松手。game.update 的顺序是 recordInput → pl.update（本地
+    // 预测）→ mode.update（updateTargeting 消费确认），所以只有在这里动手，才能对"本地
+    // 预测"与"上行"同时生效。**压制必须做成输入形状**（存进日记本的全是 fire=false）而
+    // 不是"确认时设一句 ws.cool=0.3"：cool 是在 sim 之外赋的值，回滚重放不跑 mode.update，
+    // 重放时间轴里 cool 从基态的旧值出发 —— "确认后按住的那几拍 fire=true"会在每一次
+    // 重放里真开一枪（扣弹匣、不计 shots），本地从此每确认一次就比权威少一发，而且
+    // 不会自愈。压制到**松手**为止（而不是到某个秒数）：松手那一拍 fire 本来就是 false，
+    // 旗子就地清掉；松手后的补枪是全新的一次按下，两端同一拍同一裁决。
+    if (this.targeting || this.suppressFireUntilRelease) {
+      if (this.targeting && inp.firePressed) this.confirmShot = true;
+      if (!inp.fire) this.suppressFireUntilRelease = false;
       inp.firePressed = false; inp.fire = false;
     }
     const t16 = tick & 0xffff;
@@ -890,6 +901,14 @@ export class NetClient {
         this.game.hud.popup(ev.text, ev.color || '#fff', true);
       } else if (ev.e === 'proj') {
         this.spawnProjectile(ev);
+      } else if (ev.e === 'wpFires') {
+        // 白磷的 12 处火点：权威端的 effects 是桩，这些火只在事件里存在 —— 不接的话
+        // 联机里白磷"只掉血不发光"。表现副本只发光不伤害（灼烧走 wpTicks 那条权威账，
+        // 与单机同一条式子）。服务端是按拍错开点的，这里一把全点：0.25 s/处的视觉
+        // 差别没人看得出来，为它做一条定时器账不值。
+        if (this.game.world) for (const s of (ev.spots || [])) {
+          this.game.effects.addFireSource(new THREE.Vector3(s[0], s[1], s[2]), 1.5, 8);
+        }
       } else if (ev.e === 'pickup') {
         this.spawnGroundPickup(ev);
       } else if (ev.e === 'pickupGone') {
@@ -1079,7 +1098,11 @@ export class NetClient {
       this.ws.send(JSON.stringify({ t: 'streak', slot: t.slot, x: +hit.point.x.toFixed(2), z: +hit.point.z.toFixed(2) }));
       this.targeting = null; game.hud.prompt(null);
       game.audio.say('集束空袭已确认');
-      game.player.ws.cool = 0.3;          // 确认这一下不许顺手开一枪（与单机同句）
+      // 确认后压到松手为止（输入形状，见 recordInput 开头那段）。**不要**在这里写
+      // `ws.cool = 0.3`：那是 sim 之外的状态，回滚重放看不见它，会在"确认后按住"的
+      // 每一次重放里造出一发幻影弹（本地凭空比权威少一发，永不自愈）。
+      // 单机 mp.js 的 cool=0.3 保持原样 —— 单机没有重放，不存在这个分叉面。
+      this.suppressFireUntilRelease = true;
     } else if (inp.adsPressed) { this.targeting = null; game.hud.prompt(null); }
   }
 
@@ -1184,6 +1207,14 @@ export class NetClient {
   // 每渲染帧一次：驱动远端实体的插值
   frameUpdate(dt) {
     const now = performance.now() / 1000;
+    // welcome 带来的既成事实清单：地图一就绪就补种（welcome 与 spawn 三函数同形，
+    // 见 NetRoom.liveWorld）。清在补种之后 —— 不清的话回房间再开下一局会带进旧世界。
+    if (this.pendingWorld && this.game.world) {
+      const w = this.pendingWorld; this.pendingWorld = null;
+      for (const t of w.turrets || []) this.spawnTurret(t);
+      for (const p of w.pickups || []) this.spawnGroundPickup(p);
+      for (const p of w.projs || []) this.spawnProjectile(p);
+    }
     // 半开连接：TCP 还在、对端已经不发包了（换网络、进程被 OOM 杀掉、LB 空闲回收）。
     // 浏览器不会为这种情况触发 onclose，只能自己数"多久没收到快照"：
     // 正常 20Hz 下行，2.5 秒 = 连丢 50 包，那不是抖，那是没了。
@@ -1333,6 +1364,8 @@ export class NetClient {
       }
     }
     this.projs.clear();
+    this.pendingWorld = null;               // 没补种完的清单不许带进下一局
+    this.suppressFireUntilRelease = false;  // 压制旗子同理
     if (this.game) this.game.remotePlayers = [];
     // keepSocket 是给"打完回房间"那条路用的：那条连接是大厅的，关掉它等于把人踢出房间。
     // （clearWorld → mode.dispose 走的是默认分支，legacy 的 ?online=1 那条路行为不变。）

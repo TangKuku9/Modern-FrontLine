@@ -345,6 +345,9 @@ export class NetPlayer {
   }
   swapWeapon(wid) {
     this.weaponId = wid;
+    // 上一把枪的弹匣读数不许跨枪比较：新枪第一包 mag 若恰好比旧枪的最后一包大 1，
+    // 会替霰弹枪多响一声装填。置空让它从"没有上一格"重新开始。
+    this.lastMag = undefined;
     this.game.scene.remove(this.model.root);
     this.model = this.buildModel();          // 配件/迷彩按 kits 表走（差距 29）
     applyFlashTex(this.model);

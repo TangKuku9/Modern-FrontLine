@@ -23,7 +23,8 @@ import { NetPlayer, LEAVE_FADE, INTERP_DELAY } from '../js/net/remote.mjs';
 import { createSoldierModel, animateSoldier } from '../js/soldier.js';
 import { flashAt, Projectile, explode } from '../js/combat.js';
 import { NetClient } from '../js/net/client.mjs';
-import { NetRoom } from '../server/room.mjs';
+import { NetRoom, RESPAWN_DELAY } from '../server/room.mjs';
+import { Sentry } from '../js/mp.js';
 import { HeadlessGame, preloadMaterials } from '../server/headless-game.mjs';
 import { pauseActions, isImeKey } from '../js/menu.js';
 import { parseChatCommand, toggleMute, isMuted, chatRowHtml, chatTime } from '../js/net/chat.mjs';
@@ -456,9 +457,19 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     `buttons=${pe && pe.buttons} confirmShot=${c2.confirmShot}`);
   c2.updateTargeting(inp1);
   const sf = sent.map(s => JSON.parse(s)).find(f => f.t === 'streak');
-  ok('JZ5 同拍消费：确认照常发出 {t:"streak"} 窄帧、本地压枪 cool=0.3、选点退出、点击残留清零',
-    !!sf && sf.slot === 0 && g2.player.ws.cool === 0.3 && c2.targeting === null && c2.confirmShot === false,
+  ok('JZ5 同拍消费：确认照常发出 {t:"streak"} 窄帧、压制切到"直到松手"、选点退出、点击残留清零',
+    !!sf && sf.slot === 0 && c2.suppressFireUntilRelease === true && c2.targeting === null && c2.confirmShot === false,
     JSON.stringify(sf || null));
+  // 确认后按住扳机：那些拍在输入形状里就是 fire=false（重放时间轴与原始预测同源，
+  // 不会再有"重放里的幻影弹"）；松手那一拍旗子就地清掉，补枪是全新的一次按下。
+  const held = { fire: true, firePressed: false, mdx: 0, mdy: 0, streak: -1 };
+  c2.recordInput(12, held);
+  ok('JZ7 确认后按住扳机：开火位在输入形状里就不存在（上行与日记本同源，重放无幻影弹）',
+    !(c2.pending[c2.pending.length - 1].buttons & 1) && held.fire === false
+      && c2.suppressFireUntilRelease === true);
+  c2.recordInput(13, { fire: false, firePressed: false, mdx: 0, mdy: 0, streak: -1 });
+  ok('JZ8 松手解压：补枪是全新的一次按下（不压到某个秒数 —— 秒数在重放里对不齐）',
+    c2.suppressFireUntilRelease === false);
   // 反证臂：点空（这一拍没照到地面）就丢 —— 不许顺延到"后来才照到"的那一拍凭空确认。
   c2.targeting = { slot: 0 };
   g2.world.raycast = () => null;
@@ -467,6 +478,89 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   ok('JZ6 反证臂：点空的确认就地作废（选点还开着、没有请求发出去、残留不留给下一拍）',
     c2.targeting !== null && sent.length === 1 && c2.confirmShot === false,
     `sent=${sent.length} targeting=${!!c2.targeting}`);
+}
+
+// ───────── JR. 中途进房看得到既成世界（差距 12 的"迟到的人"变体 · 2026-10-01）─────────
+// 快速加入与掉线重连都是往**正在跑**的对局里进人。以前 welcome 只装人：在场的哨戒机、
+// 直升机、地上的枪、半路的雷，在新来的人的屏幕上统统不存在 —— 然后他被看不见的东西打死。
+{
+  // —— 服务端那一半：liveWorld 的单元（形状必须与 turret/pickup/proj 出生事件逐字同形）——
+  const gW = makeGame();
+  gW.world.groundHeight = () => 0;
+  const sentry = new Sentry(gW, new THREE.Vector3(3, 0, 4), { team: 'A', yaw: 0.5, isPlayer: true }, { dumb: true, duration: 40 });
+  sentry.netId = 31; sentry.t = 17.3;                 // 剩余寿命
+  const heli = { isHeli: true, alive: true, netId: 32, team: 'B', ang: 2.2, t: 9.5, height: 24, radius: 30, hp: 88.4, maxHp: 300 };
+  const drop = { netId: 33, weaponId: 'ak', att: { muzzle: 'suppressor' }, pos: new THREE.Vector3(5, 0.1, 6), mag: 12, reserve: 90 };
+  const fly = { alive: true, netId: 34, type: 'frag', owner: {}, pos: new THREE.Vector3(1, 2, 3), vel: new THREE.Vector3(0, -4, 0), fuse: 1.7 };
+  const room = Object.create(NetRoom.prototype);
+  room.active = [sentry, heli]; room.byPlayer = new Map();
+  const owner7 = {};
+  room.byPlayer.set(owner7, { cid: 77 });
+  fly.owner = owner7;
+  room.game = { pickups: [drop, { noNetId: true }], projectiles: [fly, { alive: false, netId: 99 }] };
+  // 修前的 room.mjs 没有这个入口 —— 直接 call 会把整份判据炸掉，而"抛异常"不是判决。
+  // 缺入口就点名红（清单为空），让红落在读数上而不是堆栈上。
+  const hasLive = typeof NetRoom.prototype.liveWorld === 'function';
+  const w = hasLive ? NetRoom.prototype.liveWorld.call(room) : { turrets: [], pickups: [], projs: [] };
+  const t1 = w.turrets.find(t => t.netId === 31), t2 = w.turrets.find(t => t.netId === 32);
+  const p1 = w.pickups[0], f1 = w.projs[0];
+  ok('JR1 liveWorld：在场实体进清单，形状与出生事件同形（dur 给剩余寿命）',
+    hasLive && t1 && t1.kind === 'sentry' && Math.abs(t1.dur - 17.3) < 1e-9 && t1.team === 'A'
+    && t2 && t2.kind === 'heli' && t2.ang === 2.2 && t2.hp === 88 && t2.maxHp === 300
+    && p1 && p1.weapon === 'ak' && p1.mag === 12
+    && f1 && f1.kind === 'frag' && f1.self === false && f1.cid === 77 && Math.abs(f1.fuse - 1.7) < 1e-6,
+    hasLive ? JSON.stringify({ t1, t2, p1, f1 }) : 'liveWorld 未定义（修前形状）');
+  ok('JR1【反证】没编号/已死的进不了清单（僵尸行只会让客户端建出幽灵）',
+    hasLive && w.pickups.length === 1 && w.projs.length === 1,
+    hasLive ? '' : 'liveWorld 未定义（修前形状）');
+
+  // —— 客户端那一半：welcome.world 先存、地图就绪后补种 ——
+  const g2 = makeGame();
+  g2.world.groundHeight = () => 0;
+  g2.pickups = [];                     // makeGame 没有这一格：spawnGroundPickup 要往里放
+  g2.spawnPickup = (id, att, pos, mag, reserve) => { const p = { weaponId: id, att, pos, mag, reserve }; g2.pickups.push(p); return p; };
+  g2.effects.addFireSource = () => {};
+  const c3 = new NetClient(g2, { url: 'ws://127.0.0.1:1/ws', name: '我', team: 'A' });
+  c3.cid = 7;
+  c3.onControl({ t: 'welcome', cid: 7, name: '我', team: 'A', streaks: [], others: [], world: {
+    turrets: [{ e: 'turret', netId: 41, kind: 'sentry', team: 'A', x: 1, y: 0, z: 2, yaw: 0, dur: 30 }],
+    pickups: [{ e: 'pickup', id: 42, weapon: 'm1911', att: {}, x: 3, y: 0, z: 4, mag: 7, reserve: 35 }],
+    projs: [{ e: 'proj', netId: 43, kind: 'frag', cid: 9, self: false, x: 5, y: 1.5, z: 6, vx: 0, vy: -3, vz: 0, fuse: 2.5, team: 'B' }],
+  } });
+  ok('JR2 welcome 到达时地图还没好 ⇒ 只存不种（种早了会被 spawn 闸静默丢掉）',
+    !!c3.pendingWorld && g2.entities.length === 0);
+  g2.world = { groundHeight: () => 0, root: new THREE.Scene(), def: { surface: 'dirt' }, lineBlocked: () => false };
+  c3.frameUpdate(0.016);
+  ok('JR3 地图就绪后补种：在场哨戒机 / 地上的枪 / 半路的雷各建各的表现副本',
+    c3.turrets.get(41) && c3.turrets.get(41).dumb === true
+    && c3.pickups.get(42) && c3.pickups.get(42).mag === 7
+    && c3.projs.get(43) && c3.projs.get(43).dumb === true,
+    `turrets=${c3.turrets.size} pickups=${c3.pickups.size} projs=${c3.projs.size}`);
+  ok('JR3【反证】补种完清单必须清空（回房间再开下一局不许带进旧世界）', c3.pendingWorld === null);
+  c3.dispose();
+  ok('JR4 dispose 把没种完的清单一并清掉（对局中途退出不留尾巴）', c3.pendingWorld === null);
+  c3.onEvents({ ev: [] });
+  const fires = [];
+  g2.effects.addFireSource = (pos, r, dur) => fires.push([pos.x, pos.y, pos.z, r, dur]);
+  c3.onEvents({ ev: [{ e: 'wpFires', team: 'A', spots: [[1, 0, 2], [3, 0, 4]] }] });
+  ok('JR5 wpFires 接到表现侧：白磷的火点在客户端点得着（只发光，不裁伤害）',
+    fires.length === 2 && fires[0][0] === 1 && fires[1][2] === 4 && fires[0][3] === 1.5 && fires[0][4] === 8,
+    JSON.stringify(fires));
+
+  // —— 重名认尸：kill 事件按名字找人时，死者才是 !alive 的那个 ——
+  const r2 = Object.create(NetRoom.prototype);
+  const aliveTwin = { pl: { name: '重名', alive: true }, dead: false, respawnT: 0 };
+  const deadTwin = { pl: { name: '重名', alive: false }, dead: false, respawnT: 0 };
+  r2.clients = new Map([[1, aliveTwin], [2, deadTwin]]);
+  r2.events = []; r2.killExtra = [];
+  r2.game = { events: [{ e: 'kill', killer: 'x', victim: '重名' }] };
+  NetRoom.prototype.drainKillFeed.call(r2);
+  ok('JR6 重名同房：重生计时落到真正死了的那位头上（以前按名字取第一个，活着的背 3 秒黑锅、死者白拿立即重生）',
+    deadTwin.respawnT === RESPAWN_DELAY && deadTwin.dead === true && !aliveTwin.dead && aliveTwin.respawnT === 0,
+    `死者 respawnT=${deadTwin.respawnT} · 活者 respawnT=${aliveTwin.respawnT}`);
+  // 反证臂要用旧写法能红：按旧条件（只比名字、不看死活）在同一现场选出来的正是活着的那个
+  const oldPick = [...r2.clients.values()].find(c => c.pl.name === '重名');
+  ok('JR6【反证】旧写法在这一现场选的是活着的同名者（绿灯不是恒真）', oldPick === aliveTwin);
 }
 
 // ───────────────────────── K. 服务端那两扇门（差距 5 / 34）─────────────────────────

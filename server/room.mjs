@@ -197,6 +197,38 @@ export class NetRoom {
     });
   }
 
+  // 场上**已经存在**的世界实体清单 —— welcome 帧带给"中途进房 / 掉线重连"的人。
+  // 以前 welcome 只装人（others），而快速加入（pickRoom auto 挑人最多的活房）与重连
+  // 都是往正在跑的对局里进人：一架正在扫射的武装直升机、一把地上的枪、半路的一颗雷，
+  // 在他的屏幕上统统不存在 —— 然后他被看不见的东西打死。这是差距 12（投掷物隐形）的
+  // "迟到的人"变体：事件只对**之后**发生的事广播，进场之前的既成事实没人补发。
+  // 三张表的形状与 turret / pickup / proj 三种出生事件**逐字同形** —— 客户端复用同一条
+  // spawn 路径（spawnTurret / spawnGroundPickup / spawnProjectile），不另写第二个构造者。
+  // dur 给**剩余**寿命（a.t 是倒数）；projs 的 self 恒为假 —— 重连的人对场上那颗雷
+  // 没有任何本地预测（他上一条命的那颗随页面一起没了），这份回放就是他唯一的一双眼。
+  liveWorld() {
+    const g = this.game;
+    if (!g) return null;
+    const cidOf = (o) => { const c = o ? this.byPlayer.get(o) : null; return c ? c.cid : null; };
+    return {
+      turrets: this.active.filter(a => a.alive && a.netId != null).map(a => a.isTurret
+        ? { e: 'turret', netId: a.netId, kind: 'sentry', team: a.team,
+            x: a.pos.x, y: a.pos.y, z: a.pos.z, yaw: a.yaw, dur: Math.max(0.5, a.t) }
+        : { e: 'turret', netId: a.netId, kind: 'heli', team: a.team, ang: a.ang,
+            dur: Math.max(0.5, a.t), height: a.height, radius: a.radius,
+            hp: Math.round(a.hp), maxHp: Math.round(a.maxHp) }),
+      pickups: (g.pickups || []).filter(p => p.netId != null).map(p => ({
+        e: 'pickup', id: p.netId, weapon: p.weaponId, att: p.att || {},
+        x: p.pos.x, y: p.pos.y, z: p.pos.z, mag: p.mag, reserve: p.reserve,
+      })),
+      projs: (g.projectiles || []).filter(p => p.alive && p.netId != null).map(p => ({
+        e: 'proj', netId: p.netId, kind: p.type, cid: cidOf(p.owner), self: false,
+        x: p.pos.x, y: p.pos.y, z: p.pos.z, vx: p.vel.x, vy: p.vel.y, vz: p.vel.z,
+        fuse: Math.max(0, Math.round((p.fuse || 0) * 100) / 100), team: (p.owner && p.owner.team) || null,
+      })),
+    };
+  }
+
   spawnPoint(team) {
     const w = this.game.world;
     // 自由混战没有"自己人的出生点"：所有人都从两边的点里挑（与单机 mp.js:121 同句）。
@@ -889,12 +921,12 @@ export class NetRoom {
   requestStreak(cid, slot, target) {
     const c = this.clients.get(cid);
     if (!c || !c.pl.alive) return null;
-    // 确认落点的那一下不该是一枪。客户端在 recordInput 里把选点期间的开火位整个吞掉了
-    // （连本地预测一起拦），但"确认之后按住扳机不放"的那些拍还在上来 —— 这边不设同一道
-    // cool 的话，权威端在确认后立刻恢复开火，而客户端的预测被自己的 cool 拦到 0.3 s 后，
-    // 两边差出一个点射的后坐与弹药。与单机 mp.js:updateTargeting 同一句、与客户端
-    // updateTargeting 的 cool 各管一边。
-    c.pl.ws.cool = Math.max(c.pl.ws.cool, 0.3);
+    // 确认落点的那一下不该是一枪 —— 这件事**已经在输入形状里办完了**：客户端
+    // recordInput 把选点期间与"确认后到松手为止"的开火位整个吞掉（见 js/net/client.mjs
+    // 同名注释），权威端收到的那些拍本来就是 fire=false。这里**不要**再设一句
+    // `ws.cool = 0.3`（单机 mp.js 那句的同形）：cool 会把确认后 0.3 秒内的**合法补枪**
+    // 也拦成"客户端预测开了、权威端不开"—— 每次恰好多出一发要靠快照拽回的偏差，
+    // 正是这一轮要消灭的"两端各说各话"。
     return this.callStreak(c, slot, target);
   }
 
@@ -952,7 +984,15 @@ export class NetRoom {
     } else if (s.id === 'wp') {
       this.rules.wpTicks = WP_SECONDS * 60;
       this.wpOwner = pl;                       // 持续灼烧要认"谁放的这一片火"
-      phosphorusSweep(game, this.rules.clock, pl, this.enemiesOf(pl.team));
+      // 白磷的 12 处火点在**此刻**就已抽好（phosphorusSweep 只把"什么时候点"交给排程器）。
+      // 服务端的 effects 是桩 ⇒ 这些火在权威世界里只是 fires 表里的一行，谁也看不见；
+      // 单机有真粒子，联机里却是"只掉血不发光"。把火点随事件发出去，客户端各点各的
+      // （表现副本，伤害照旧走 wpTicks 那条权威账）。
+      const spots = phosphorusSweep(game, this.rules.clock, pl, this.enemiesOf(pl.team));
+      this.events.push({
+        e: 'wpFires', team: pl.team,
+        spots: spots.map(p => [+p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2)]),
+      });
       this.events.push({ e: 'announce', team: pl.team, to: 'own', text: '白磷弹投放' });
       this.events.push({ e: 'announce', team: pl.team, to: 'foes', text: '白磷弹来袭，离开火区' });
     } else if (s.id === 'sentry') {
@@ -1000,7 +1040,12 @@ export class NetRoom {
     if (!ev.length) return;
     for (const e of ev) {
       if (e.e === 'kill') {
-        const victim = [...this.clients.values()].find(c => c.pl.name === e.victim);
+        // sim 的 kill 事件只带**名字**（定长快照装不下 id，事件也没带对象引用）。重名
+        // 的两个真人同房是允许的（访客自报呼号没有唯一性约束），只按名字找会把重生
+        // 计时安到活着的那个同名者头上，而真正死了的那位 respawnT 还是 0 —— 下一拍
+        // 就被复活，白拿 3 秒。幸存的判据现成就有：**死者才是 !alive 的那个**。
+        const victim = [...this.clients.values()].find(c => c.pl.name === e.victim && !c.pl.alive)
+          || [...this.clients.values()].find(c => c.pl.name === e.victim);
         if (victim) { victim.dead = true; victim.respawnT = RESPAWN_DELAY; }
         // 得分与奖章随行（上面 killExtra 那一段）。取不到就写 0 / 空表，而不是猜一个数 ——
         // 播报里那个 "+N" 与那几行奖章是要显示给人看的，宁可没有也不能错。

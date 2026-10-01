@@ -355,6 +355,8 @@ export function clusterStrike(game, clock, pos, owner, ang) {
 // 火的**位置**也在这里抽好，理由同上。
 // 注意伤害是在**这一拍**结清的，而"持续灼烧"由调用方按 wpTicks 在 update 里每拍结算 ——
 // 后者读的是规则内核里的那个计时器，不是这里。
+// 返回 12 处火的位置表：联机的权威端拿它编 wpFires 事件（服务端的 effects 是桩，
+// 不发事件的话联机里白磷只掉血不发光）；单机忽略返回值（火本来就在本机看得见）。
 export function phosphorusSweep(game, clock, owner, targets, spread = 12, staggerTicks = 15) {
   for (const e of targets) {
     e.takeDamage(55, { attacker: owner, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) });
@@ -373,4 +375,5 @@ export function phosphorusSweep(game, clock, owner, targets, spread = 12, stagge
       game.effects.addFireSource(p.clone().setY(0.1), 1.5, 8);
     });
   }
+  return spots;
 }

@@ -63,6 +63,12 @@ export const CFG = {
   maxClients: int(process.env.MAX_CLIENTS, 128),       // 每进程真人连接上限
   maxPayload: int(process.env.MAX_PAYLOAD, 64 * 1024), // 单帧字节上限：正常一帧 ≤ 13×60 = 780 B
   roomIdleMs: int(process.env.ROOM_IDLE_MS, 60000),    // 空房间多久收掉
+  // 单条连接的下行积压上限（字节）。ws.send 只是往内核缓冲排队，TCP 零窗（手机切后台、
+  // 断网挂起）时它会无限攒：一份快照 ~0.5 KB × 20 Hz ≈ 每小时 40 MB，全在进程内存里。
+  // 客户端那头 2.5 秒没快照就自判失联了，这条连接事实上已死；快照是**可替换的**（下一拍
+  // 就有新的），所以积压超限跳过二进制快照 —— 事件很小且不可再生，照发。默认 256 KB
+  // ≈ 良好链路上十几秒的量，正常抖动永远够不着。
+  wsBacklogBytes: int(process.env.WS_BACKLOG_BYTES, 262144),
   // 一局打完到"自动回到房间"之间留几秒（设 0 = 当场回）。记分板要给人看一眼，
   // 但也不能让人站在一个还在空跑的 sim 里出不去 —— 见 returnRoom。
   matchReturnMs: (() => { const n = Number(process.env.MATCH_RETURN_MS); return Number.isFinite(n) && n >= 0 ? n : 8000; })(),
@@ -612,6 +618,12 @@ function welcomeFrame(room, c) {
     // bot:true 那一格只给界面看（座位栏上要能区分），判定不读它。
     // kits：每人（含 Bot）手上那把枪的配件/迷彩，远端模型按它建（差距 29）——
     // 与 join 事件、respawn 的 loadout 回声走的是同一张表（js/loadout.mjs:kitsOf）。
+    // ── 场上已有的世界实体（哨戒机枪 / 武装直升机 / 地上的枪 / 半路的投掷物）──
+    // 快速加入（pickRoom auto 挑人最多的活房）与掉线重连都是往**正在跑**的对局里进人；
+    // 以前 welcome 只装人，这些既成事实在新来的人的屏幕上不存在 —— 然后他被一架自己
+    // 看不见的直升机打死。形状与 turret/pickup/proj 三种出生事件逐字同形，客户端复用
+    // 同一条 spawn 路径（见 js/net/client.mjs 的 pendingWorld）。刚开局那一次它全是空表。
+    world: room.liveWorld ? room.liveWorld() : null,
     others: [...room.clients.values()].filter(x => x.cid !== c.cid).map(x => ({
       id: x.cid, name: x.name, team: x.team, perks: (x.loadout && x.loadout.perks) || [], kits: kitsOf(x.loadout),
     }))
@@ -878,6 +890,15 @@ function broadcast(room) {
   for (const c of room.clients.values()) {
     const ws = c.ws;
     if (!ws || ws.readyState !== 1) continue;
+    // 背压闸：积压超限的连接跳过这份快照（可替换），不许让一条卡死的连接把进程内存
+    // 慢慢吃穿。跳过要留下**一次**痕迹（边沿记，不刷屏）—— 否则"有人一直收不到快照"
+    // 这种事只能靠内存曲线倒推。
+    if (ws.bufferedAmount > CFG.wsBacklogBytes) {
+      if (!room.__netStall) { room.__netStall = true; console.log(`[room ${room.id}] cid ${c.cid} 下行积压 ${ws.bufferedAmount} B，跳过快照（TCP 零窗？）`); }
+      room.__netDrops = (room.__netDrops || 0) + 1;
+      continue;
+    }
+    room.__netStall = false;
     // 事件先于快照发：重生事件会让客户端把这次位置跳变当"服务端整体重置"处理。
     // 反过来的话，那一包快照会先被当成一次普通校正，量出 29 m 的"预测偏差"，
     // 还会拿死亡前的日记本去回滚 —— 表现就是重生后被拽回死点一下。

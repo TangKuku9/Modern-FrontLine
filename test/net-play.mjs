@@ -844,20 +844,23 @@ try {
   await sleep(250);
   await A.page.evaluate(() => { if (window.game.player) window.game.player.pitch = -0.45; });
   await sleep(300);                                          // 等 ack 走过，重放不会把俯仰拽回去
-  const preShot = await A.page.evaluate(() => ({ mag: window.game.player.ws.w.mag, shots: window.game.player.stats.shots }));
+  const preShot = await A.page.evaluate(() => ({ mag: window.game.player.ws.w.mag, shots: window.game.player.stats.shots, starved: window.game.net.starved | 0, wid: window.game.player.ws.w.id, smag: window.game.net.mySnapshot && window.game.net.mySnapshot.mag, swid: window.game.net.srvWeapon, rep: window.game.net.lastRep | 0 }));
   await A.page.mouse.down({ button: 'left' }); await sleep(80); await A.page.mouse.up({ button: 'left' });
   await sleep(450);
   const hzC2 = await (await fetch(srv.base + '/healthz')).json();
   const callsC2 = ((((hzC2.per || []).find(r => r.id === ROOM)) || {}).streak || {}).calls | 0;
   ok('左键确认：选点流程把 {t:"streak"} 发到了服务端（正好 +1；+2 = 按键字节没被拦住的双发）',
     !(await A.page.evaluate(() => window.game.net.targeting)) && callsC2 === calls0 + 1, `calls ${calls0} → ${callsC2}`);
-  // 确认那一下左键不是一发子弹：选点吞火（recordInput 对本地预测与上行同时清掉开火位）。
-  // 修复前这一下会本地真开一枪（pl.update 跑在 mode.update 之前，cool=0.3 拦不住同一拍）、
-  // 上行还带着开火位让权威端再开一枪 —— 各打一发各抬一次枪口。
-  const postShot = await A.page.evaluate(() => ({ mag: window.game.player.ws.w.mag, shots: window.game.player.stats.shots }));
-  ok('确认落点的那一下左键不走火（选点吞火：本地预测与上行都没有这一枪）',
-    postShot.shots === preShot.shots && postShot.mag === preShot.mag,
-    `shots ${preShot.shots} → ${postShot.shots} · mag ${preShot.mag} → ${postShot.mag}`);
+  // 确认那一下左键不是一发子弹，而且确认后按住也不许在重放里长出幻影弹：
+  // "选点吞火 + 压到松手"是**输入形状**（存进日记本的全是 fire=false），所以这一窗口里
+  // 本地与权威的弹匣必须一动不动 —— 上一版修复用一句 sim 之外的 ws.cool=0.3 压枪，
+  // 被这条臂当场抓出过幻影弹（重放时间轴里 cool 缺席 → 每确认一次本地凭空少一发，
+  // 权威 mag 不动、本地 mag 永久 -1）。shots 只数预测开火、mag 两端同源，双信号都要平。
+  const postShot = await A.page.evaluate(() => ({ mag: window.game.player.ws.w.mag, shots: window.game.player.stats.shots, wid: window.game.player.ws.w.id, smag: window.game.net.mySnapshot && window.game.net.mySnapshot.mag, swid: window.game.net.srvWeapon }));
+  ok('确认落点的那一下左键不走火，确认后按住也不长幻影弹（本地与权威弹匣都不动）',
+    postShot.shots === preShot.shots && postShot.mag === preShot.mag
+    && preShot.wid === postShot.wid && preShot.wid === preShot.swid && postShot.wid === postShot.swid,
+    `shots ${preShot.shots} → ${postShot.shots} · 本地 mag ${preShot.mag} → ${postShot.mag} · 权威 mag ${preShot.smag} → ${postShot.smag} · 枪 ${preShot.wid}/${preShot.swid} → ${postShot.wid}/${postShot.swid}`);
 
   // ---- 结算面板：胜 / 平两格与胜负分（数的来源在 mp-rules K，这里量面板本身）----
   // 事件从**协议入口**喂（onControl，net-drop 用的同一个口）：真对局要打满击杀目标或
