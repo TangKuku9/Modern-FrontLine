@@ -666,6 +666,52 @@ console.log(sec('K 一次性恢复码（忘了密码的唯一出路）'));
     auditRows.filter(r => r.ev.startsWith('recover')).map(r => r.ev).join(','));
 }
 
+// ══════════ L 并发同一呼号（第 10 轮：探针 server/multi-account-probe.mjs 实测出来的进程内 TOCTOU）══════════
+// register / login / recover 三个口都是"读一把 → await 真哈希（百毫秒级）→ 写回"的形状。
+// 同一呼号的两个请求在 await 处交错，旧写法会**都**读到旧账、**都**写回：并发同名注册
+// 两个都成功（一行库，后写的哈希悄悄顶掉先写的，输家拿到一个永远登不进的号）；两张不同
+// 的码并发重设**都**成功（"用掉一张整叠作废"破成两张都能用）。修法是每呼号串行
+// （accounts.mjs 的 _keyChain）；跨进程的同形缺口是另一条账，由探针钉着，这里不量。
+{
+  const { acc } = mk();
+  // L1 并发同名注册：恰好一个成功。两个都成功 = 两份密码有一份被悄悄顶掉，
+  // 而"注册成功"的两个人里有一个拿着一个登不进的号 —— 全程没有任何报错。
+  const rs = await Promise.all([
+    acc.register({ name: '同呼号', password: PW, code: 'SESAME', ip: '10.1.0.1' }),
+    acc.register({ name: '同呼号', password: 'another-long-password', code: 'SESAME', ip: '10.1.0.2' }),
+  ]);
+  const winIdx = rs.findIndex(r => r.ok);
+  chk(rs.filter(r => r.ok).length === 1, 'L1 同名并发注册恰好一个成功（旧写法这一格红：两个都 ok）',
+    rs.map(r => r.ok ? 'ok' : r.error).join(' / '));
+  const pwWin = winIdx === 0 ? PW : 'another-long-password';
+  const pwLose = winIdx === 0 ? 'another-long-password' : PW;
+  const lg = await acc.login({ name: '同呼号', password: pwWin, ip: '10.1.0.3' });
+  chk(lg.ok, 'L2 赢家自己的密码登得进（库里的哈希与赢家一致）', lg.error || '');
+  const lgBad = await acc.login({ name: '同呼号', password: pwLose, ip: '10.1.0.4' });
+  chk(!lgBad.ok, 'L2【反证】输家的密码登不进 —— 旧写法"两个都成功"必然留一个登不进的号', lgBad.error || '');
+
+  // L3 两张不同的码并发重设：恰好一张成功，输家听到的是同一句 bad_recovery。
+  const reg3 = await acc.register({ name: '码双花', password: PW, code: 'SESAME', ip: '10.2.0.1' });
+  const [r1, r2] = await Promise.all([
+    acc.recover({ name: '码双花', code: reg3.recovery[0], password: 'new-pw-one-1', ip: '10.2.0.2' }),
+    acc.recover({ name: '码双花', code: reg3.recovery[1], password: 'new-pw-two-2', ip: '10.2.0.3' }),
+  ]);
+  chk([r1, r2].filter(r => r.ok).length === 1, 'L3 两张不同的码并发重设恰好一张成功（旧写法这一格红：两张各换一叠，先响应那人手里的新叠被后写的顶掉）',
+    [r1, r2].map(r => r.ok ? 'ok' : r.error).join(' / '));
+  // L4 双花尘埃落定后，活下来的那叠完整可用：轮换没有因为并发丢一半。
+  const winRec = r1.ok ? r1.recovery : r2.recovery;
+  tick(400_000);
+  const reuse = await acc.recover({ name: '码双花', code: winRec[0], password: 'new-pw-three-3', ip: '10.2.0.4' });
+  chk(reuse.ok, 'L4 赢家换出来的那叠完整可用（并发没有把轮换丢一半）', reuse.error || '');
+  // L5 反证臂：锁是每呼号一把，不是全局闸 —— 不同呼号照常并发走完，互不挡道。
+  const [d1, d2] = await Promise.all([
+    acc.register({ name: '各走各的一', password: PW, code: 'SESAME', ip: '10.3.0.1' }),
+    acc.register({ name: '各走各的二', password: PW, code: 'SESAME', ip: '10.3.0.2' }),
+  ]);
+  chk(d1.ok && d2.ok, 'L5【反证】不同呼号不被锁串住（锁错成全局闸的话，并发就在这里互相误伤）',
+    `${d1.ok ? 'ok' : d1.error}/${d2.ok ? 'ok' : d2.error}`);
+}
+
 console.log('');
 if (fails) { console.log(`RED  ${checks - fails}/${checks} 通过，${fails} 条失败`); process.exit(1); }
 console.log(`GREEN  账号与防护：${checks}/${checks} 通过`);

@@ -27,6 +27,7 @@ import { NetRoom, DT, SNAP_EVERY, RESPAWN_DELAY } from './room.mjs';
 import { Lobby, MAX_SEATS, CHAT_LEN, flat } from './lobby.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
+import { RoomDirectory } from './room-dir.mjs';
 import { normalizeName, validName, NAME_RULE_TEXT } from './accounts.mjs';
 import { kitsOf } from '../js/loadout.mjs';
 import { emoteByWord } from '../js/net/chat.mjs';
@@ -109,6 +110,17 @@ export const CFG = {
   // ③ 每个账号能同时拥有的房间数。房间 id 由客户端随便写 ⇒ 换着 id 建房就能把
   //    MAX_ROOMS 占满。房间是有主人的（谁第一个建的算谁的）。
   roomsPerUser: int(process.env.ROOMS_PER_USER, 2),
+
+  // ── 跨进程房间目录（可选，缺省整个功能关闭）──
+  // 设了 ROOMS_DB，这台就把自己的房间行"自报"进这个共享文件，大厅里也看得见别台的房
+  // （形状见 server/room-dir.mjs 文件头：自报 + 心跳 + TTL，没有协调者）。
+  // 不设 = 单进程部署，行为与从前完全相同。PUBLIC_URL 是"别台的客户端该怎么连我"——
+  // 反代 / 跨机器部署必须显式给；同机多端口的部署默认按绑定地址推。
+  roomDb: process.env.ROOMS_DB || '',
+  publicUrl: process.env.PUBLIC_URL || '',
+  roomBeatMs: int(process.env.ROOMS_BEAT_MS, 2000),          // 心跳/发布周期
+  roomTtlMs: int(process.env.ROOMS_TTL_MS, 8000),            // 心跳断了多久算死（部署上要 > 2×beat）
+  ticketTtlMs: int(process.env.ROOMS_TICKET_TTL_MS, 30000),  // 跨台入场券有效期（一次性）
 };
 
 // ── 生产模式的"配置闸"：**"忘了设"不许长得和"设好了"一模一样** ──
@@ -256,9 +268,21 @@ function roomList() {
   // 分两处各列一遍的症状就是 net-drop E 段一直盯着的那件事（画一张假列表也能"看起来有房间"）。
   // 已经开始的以 live 那一份为准（人数是活的），所以放在后面且按 id 去重。
   for (const w of lobby.list()) if (!seen.has(w.id)) out.push(w);
+  // 别台的行（房间目录开着时）：带 remote:true 与那台的 url —— 客户端拿 url 换 ws 地址
+  // 直连过去。同一 id 本台也有时本台优先（玩家看见的那一行连的必然是他看见的 url，
+  // 所以重号不会错进；这里去重只是不让一张列表出现两行同名）。
+  for (const w of (dir ? dir.list() : [])) if (!seen.has(w.id)) { seen.add(w.id); out.push(w); }
   return out;
 }
 auth.ctx.listRooms = roomList;
+
+// ws 握手 URL 上的 ?ticket=…（跨台入场券，见下面 verifyClient 的消费点）。
+// 放 query 是刻意的：verifyClient 在任何游戏帧之前就得拿到它 —— 拒绝必须发生在
+// "占住一个连接名额"之前，放到首帧里就等于先放人进门再查票。
+function ticketOf(req) {
+  try { return new URL(req.url, 'http://local').searchParams.get('ticket') || ''; }
+  catch { return ''; }
+}
 
 // 每 IP 的连接数，和四个"拒绝"计数。
 // 计数要落在生产面上（/healthz 的 gate{}）：限流生效的样子和"服务挂了"在玩家侧完全一样，
@@ -329,6 +353,9 @@ async function serveStatic(req, res) {
       // 在玩家侧都只是"这游戏坏了"，而原因（不是房主 / 有人没准备 / 刷屏被限流 / 房号撞了）
       // 各不相同，不数出来就只能靠猜。
       lobby: lobby.stats(),
+      // 房间目录的自报（没开就是 null）：运维要能一眼看出"这台在不在目录里、对外地址是什么"。
+      // 地址错了的部署症状是"列表里有别台的房、点进去连不上"—— 从这一格先看 url 对不对。
+      roomDir: dir ? { url: dir.url, rooms: dir.ownCount() } : null,
     });
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(body) });
     res.end(body);
@@ -392,7 +419,15 @@ const wss = new WebSocketServer({
     // 先占住名额、先进房间，而"拒绝"就退化成了一句服务端自己听的广播。
     sessionOf(req, auth.accounts)
       .then(u => {
-        if (!u) { gate.noAuth++; return done(false, 401, 'login required'); }
+        if (!u) {
+          // 本进程不认识这个会话 —— cookie 可能是**别台**发的（目录部署里玩家从 A 台的页面
+          // 连到 B 台）。他握手 URL 上若带一张未消费的跨台入场券，现在消费它：原子删，
+          // 只有第一条出示的连接拿得到身份；身份只带 key/呼号/XP，与一次成功登录等价。
+          const got = dir ? dir.consumeTicket(ticketOf(req)) : null;
+          if (got) { req.__user = got; return done(true); }
+          gate.noAuth++;
+          return done(false, 401, 'login required');
+        }
         req.__user = u;
         done(true);
       })
@@ -429,7 +464,45 @@ const lobby = new Lobby({
   saveChat: (rows) => {
     try { auth.store.setMeta('chatLobby', JSON.stringify(rows.slice(-50))); } catch { /* store.stat.errors 留字据 */ }
   },
+  // 跨进程房间目录（开着才有内容）：推给大厅的清单里带上别台的行（带 remote:true + url）。
+  // 大厅 ws 帧与 /api/rooms 必须是同一份名单 —— 分两处的症状与 roomList 注释里那件事同形。
+  remoteRooms: () => (dir ? dir.list() : []),
+  // 本台名单一变（建房/进人/离开/开局……最终都会走 pushLobby）就自报一次目录。
+  // 目录那边的 diff 决定"有没有真的变"；这里不做节流 —— publishAll 里 diff 完不改就不写。
+  onChange: () => { publishRooms(); },
 });
+
+// ── 跨进程房间目录（可选）──
+// 没设 ROOMS_DB 时 dir 为 null，下面每一处对它的引用都退化成"什么都不做"：
+// 单进程部署的行为与从前逐字节相同，已有判据不因它多出一毫秒。
+const dir = CFG.roomDb ? new RoomDirectory({
+  file: CFG.roomDb,
+  url: CFG.publicUrl || `http://${CFG.host === '0.0.0.0' ? '127.0.0.1' : CFG.host}:${CFG.port}`,
+  ttlMs: CFG.roomTtlMs,
+  ticketTtlMs: CFG.ticketTtlMs,
+}) : null;
+
+// 本台的行 → 目录。有增删改时把新名单（含远端行）推给本台大厅里的连接 ——
+// 否则"我在 A 台建的房，B 台的玩家两秒后才知道"会变成"永远要等他自己刷新"。
+function publishRooms() {
+  if (!dir) return false;
+  const changed = dir.publishAll(roomList().filter(w => !w.remote));
+  if (changed) lobby.pushLobby();
+  return changed;
+}
+if (dir) {
+  const dirBeat = setInterval(() => {
+    // 顺序：先扫别人的死行、再自报（续自己的心跳）、最后看**远端那半**有没有变 ——
+    // 本台的变由 pushLobby 的 onChange 钩子即时上报，这里补的是"别台的变"要落进本台清单。
+    dir.sweep();
+    const own = publishRooms();
+    const sig = JSON.stringify(dir.list());
+    if (own || sig !== (dirBeat.__sig || '')) { dirBeat.__sig = sig; lobby.pushLobby(); }
+  }, CFG.roomBeatMs);
+  dirBeat.unref?.();
+}
+// 目录实例交给 http-api（/api/dispatch 发票时要用它验证目标在不在目录里）。
+auth.ctx.dir = dir;
 
 function ownedRooms(userKey) {
   let n = 0;
@@ -1072,6 +1145,9 @@ async function shutdown(sig) {
   // 落库要在拆连接之前收尾：close() 会把脏数据推下去、并 checkpoint 一次 WAL。
   // 不做的话"正常关服"和"被 kill -9"一样丢最近那一批写入 —— 那"最多丢 250ms"就成了空话。
   try { auth.close(); } catch (e) { console.error('[auth] 关库出错：' + (e && e.message || e)); }
+  // 房间目录同理：正常下线**拔掉自己的行**（别台立刻看不见这台），不等 TTL。
+  // 崩溃才会走 TTL 那条路 —— 那正是 TTL 存在的理由。
+  if (dir) { try { dir.close(); } catch (e) { console.error('[room-dir] 拔行出错：' + (e && e.message || e)); } }
   for (const ws of wss.clients) {
     try { ws.send(JSON.stringify({ t: 'note', msg: '服务器维护中，请刷新重连' })); ws.close(1001, 'bye'); } catch { /* 已经在关了 */ }
   }
@@ -1102,6 +1178,10 @@ httpServer.listen(CFG.port, CFG.host, () => {
   console.log(`  账号 ${auth.store.constructor.name}${CFG.accountsDb ? ' @ ' + CFG.accountsDb : '（内存，重启就丢）'}` +
     `${CFG.accountsDbFromEnv ? '' : ' ← 未设 ACCOUNTS_DB'} · 邀请码 ${inviteDesc} · 进对局必须登录 ${CFG.requireAccount ? '是' : '否'}`);
   console.log(`  闸门 每 IP 连接 ${CFG.connsPerIp} · 每连接 ${CFG.wsMsgPerSec} 消息/秒 · 每人 ${CFG.roomsPerUser} 间房 · 代理层数 ${CFG.trustProxy}${CFG.trustProxy ? '' : '（忽略 X-Forwarded-For）'}`);
+  if (dir) {
+    console.log(`  房间目录 ROOMS_DB=${CFG.roomDb} · 本台对外 ${dir.url} · 心跳 ${CFG.roomBeatMs}ms · TTL ${CFG.roomTtlMs}ms · 跨台门票 ${CFG.ticketTtlMs}ms`);
+    if (!CFG.publicUrl) console.log('    （未设 PUBLIC_URL，按绑定地址推 —— 反代或跨机器部署必须显式设，否则别台拿到的地址连不回来）');
+  }
   // 来源检查是**第三条**"部署上必须自己想一下"的配置，但它与前两条（JOIN_CODE / ACCOUNTS_DB）
   // 不同：确实有不需要来源检查的部署（内网、纯客户端、只给一个站用的机器），所以它**不拒绝启动**。
   // 代价是"忘了设"在日志里此前只表现为启动行里的 `允许来源 (不检查)` —— 与"我知道我在要什么"同貌，

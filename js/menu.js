@@ -621,13 +621,48 @@ export class Menu {
   onlineQuick() {
     const lb = this.game.lobby; if (!lb) return;
     this.syncLobbyName();
+    // 快速加入的偏好顺序：本台有可进的等待房 → 交给服务端的 quick（它挑本台的）；
+    // 本台没有而目录里登记了别台的房 → 跨台加入；都没有 → 本台新建（原行为）。
+    // 让服务端先挑本台是刻意的：少一次换台的连接抖动，玩家对"我在哪台"也少一次困惑。
+    const localJoinable = (lb.rooms || []).some(x => !x.remote && x.state === 'waiting' && x.players < x.max);
+    if (!localJoinable) {
+      const row = (lb.rooms || []).find(x => x.remote && x.url && x.state === 'waiting' && x.players < x.max);
+      if (row) { this.remoteJoin(row); return; }
+    }
     lb.quickRoom({ title: '', map: this.lobby.map, mode: this.onlineMode(), minutes: this.lobby.minutes, scoreLimit: this.lobby.score });
     this.game.showRoomSoon();
   }
   onlineJoin(room, title) {
     const lb = this.game.lobby; if (!lb) return;
     this.syncLobbyName();
+    // 远端行（房间目录里别台的房）：走跨台那条路 —— row.url 告诉我们该连哪台。
+    const row = (lb.rooms || []).find(x => x.id === room);
+    if (row && row.remote && row.url) { this.remoteJoin(row); return; }
     lb.joinRoom(room);
+    this.game.showRoomSoon();
+  }
+  // 跨台加入：换台 = 换一条连接（大厅 → 房间 → 对局 都在同一条 ws 上，这是
+  // js/net/lobby.mjs 写定的前提，换台就必须换连接，旧连接上的座位/房间状态随之作废）。
+  // 要账号的服先向**本台**要一张跨台入场票（本台验过会话，目标台不认识本台的 cookie ——
+  // 账号账本进程私有）；访客服不设闸，直接连。
+  async remoteJoin(row) {
+    const A = this.game.account;
+    let q = '';
+    if (A.requireAccount) {
+      let j = null;
+      try {
+        const r = await fetch('/api/dispatch', { method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ room: row.id, url: row.url }) });
+        j = await r.json();
+      } catch { /* 落到下面的统一报错 */ }
+      if (!j || !j.ok) { this.onlineError((j && j.message) || '拿不到跨台入场券'); return; }
+      if (j.ticket) q = '?ticket=' + encodeURIComponent(j.ticket);
+    }
+    const wsUrl = String(row.url).replace(/^http/, 'ws') + '/ws' + q;
+    try { await this.game.onlineLobby(wsUrl); }
+    catch (e) { this.onlineError('连不上另一台：' + (e && e.message || e)); return; }
+    this.game.lobby.joinRoom(row.id);
     this.game.showRoomSoon();
   }
   // 呼号：要账号的服上它是服务端给的（renderIdentity 那一格只显示、不填），
@@ -663,7 +698,7 @@ export class Menu {
       const can = !playing && !full;
       return `<div class="room-row ${can ? '' : 'off'}">
         <div class="rr-name">${esc(x.title)}</div>
-        <div class="rr-meta">${esc(map.name)} · ${esc(mode.name)} · ${x.time || 10} 分</div>
+        <div class="rr-meta">${esc(map.name)} · ${esc(mode.name)} · ${x.time || 10} 分${x.remote ? ' · 另一台' : ''}</div>
         <div class="rr-n">${x.players | 0}/${x.max | 0}</div>
         <div class="rr-state">${playing ? '对局中' : (full ? '已满' : (x.ready | 0) + ' 已准备')}</div>
         <button class="btn small ${can ? '' : 'ghost'}" data-a="joinRow" data-room="${esc(x.id)}" ${can ? '' : 'disabled'}>${playing ? '观战不了' : '加入'}</button>

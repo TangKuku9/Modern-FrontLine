@@ -271,9 +271,13 @@ class Game {
   // ---------- 联机大厅：一条 WebSocket 从列表一路走到对局 ----------
   // 连接归 game 而不是归 menu：menu 会因为换屏反复重画，而这条连接身上的身份
   // （我在哪间房的哪个座位）必须跨过"大厅 → 房间 → 对局 → 回房间"整段活着。
-  onlineLobby() {
-    if (this.lobby && this.lobby.connected) return Promise.resolve(this.lobby);
+  // url 可带（跨台加入时是另一台的 ws 地址，见 menu.remoteJoin）：同台已连就复用这条连接；
+  // 换台就拆掉旧的 —— "一条连接走到底"的前提是同一台，旧连接上的座位/房间状态随之作废。
+  onlineLobby(url) {
+    if (this.lobby && this.lobby.connected && (!url || this.lobby.url === url)) return Promise.resolve(this.lobby);
+    if (this.lobby) { this.lobby.close(); this.lobby = null; }
     const lb = this.lobby = new LobbyClient(this, {
+      url,
       name: this.menu.lobby.name,
       onRooms: () => { if (this.menu.screen === 'online') this.menu.renderRooms(); },
       onRoom: (j) => this.onRoomFrame(j),

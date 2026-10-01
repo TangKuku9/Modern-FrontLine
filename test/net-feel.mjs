@@ -27,7 +27,8 @@ import { NetRoom } from '../server/room.mjs';
 import { HeadlessGame, preloadMaterials } from '../server/headless-game.mjs';
 import { pauseActions, isImeKey } from '../js/menu.js';
 import { parseChatCommand, toggleMute, isMuted, chatRowHtml, chatTime } from '../js/net/chat.mjs';
-import { FLAG, WEAPON_IDS } from '../js/quant.js';
+import { foldJudge, IDLE_FLOOR } from '../js/net/idle-ruler.mjs';
+import { FLAG, WEAPON_IDS, POS_STEP } from '../js/quant.js';
 import { WEAPONS } from '../js/data.js';
 
 const out = [];
@@ -866,6 +867,44 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     chatRowHtml({ ch: 'whisper', from: '甲', to: '乙', text: 'x', at: 0 }, { muted: ['甲'] }) === ''
     && chatRowHtml({ ch: 'emote', from: '甲', text: '敬了个礼', at: 0 }, { muted: ['甲'] }) === ''
     && chatRowHtml({ ch: 'whisper', from: '丙', to: '乙', text: 'x', at: 0 }, { muted: ['甲'] }).includes('x'));
+}
+
+// ───────────────────────── AA. 空跑窗尺子（附十四遗留，第 10 轮） ─────────────────────────
+// client.mjs 在每个空跑窗里量"补偿后的残差 < 我一拍的位移"。附十四立的账：静止时
+// "我这一步"退到 0.4 mm 的物理余颤，权威位置的量化噪声（±0.5 cm/轴，实测残差 2~4 mm）
+// 就够超尺子 ⇒ net-play 那格 foldBad===0 假红。修法是给尺子一个 2 cm 的下限
+// （js/net/idle-ruler.mjs），但**必须**配两条族群臂：下限不许吃掉真信号（AA2）、
+// 走动的窗口仍按自己的步长量（AA3/AA4）—— 否则下限一放大，判据就成了恒真绿灯。
+// 附十四记的现成样本直接当夹具用（0.0004 m 步长 / 2~4 mm 残差）。
+{
+  // 旧尺子：client.mjs 改掉之前的那句，原样抄在这儿 —— 反证臂拿它证明
+  // 下面的夹具真的分得开新旧两种判决，AA1 的绿不是恒绿。
+  const oldBad = (corrected, stepMeasured, vel) => corrected > (stepMeasured !== null ? stepMeasured : vel / 60);
+
+  ok('AA0 先决：下限钉在 2×位置量化步长，且高于两轴最坏量化噪声（√2·POS_STEP/2）',
+    IDLE_FLOOR === POS_STEP * 2 && IDLE_FLOOR > Math.SQRT2 * POS_STEP / 2, `IDLE_FLOOR=${IDLE_FLOOR} m`);
+  // 附十四的原话：stepMeasured 掉到 0.4 mm 量级，2~4 mm 的残差就够 foldBad。
+  const still = foldJudge({ corrected: 0.004, stepMeasured: 0.0004, speed: 0 });
+  ok('AA1 静止 + 噪声级残差（4 mm / 步长 0.4 mm）不记 foldBad，且这一格尺子来自下限',
+    !still.bad && still.floored && still.ruler === IDLE_FLOOR, `ruler=${still.ruler}`);
+  ok('AA1【反证】同一格喂旧尺子必红 —— 假红是旧写法自己的，不是新判据在放水',
+    oldBad(0.004, 0.0004, 0) === true);
+  ok('AA2 静止 + 真漏补量级的残差（一拍最低走速位移 0.074 m）必须红 —— 下限不许吃掉真信号',
+    foldJudge({ corrected: 0.074, stepMeasured: 0.0004, speed: 0 }).bad === true);
+  const move = foldJudge({ corrected: 0.081, stepMeasured: 0.077, speed: 4.62 });
+  ok('AA3【族群臂】走动的窗口按自己的步长量（0.081 > 0.077 ⇒ 红，与下限无关）',
+    move.bad === true && move.floored === false && move.ruler === 0.077, `ruler=${move.ruler}`);
+  ok('AA4【族群臂】走动 + 补偿到位（0.05 < 0.077）照旧不红 —— 下限没有把走动窗一并放过',
+    foldJudge({ corrected: 0.05, stepMeasured: 0.077, speed: 4.62 }).bad === false);
+  const vel = foldJudge({ corrected: 0.077, stepMeasured: null, speed: 4.46 });
+  ok('AA5 窗口太短取不到步长时走速度退路（4.46/60 ≈ 0.0743），真实漏补照样红',
+    Math.abs(vel.ruler - 4.46 / 60) < 1e-9 && vel.bad === true, `ruler=${vel.ruler.toFixed(4)}`);
+  ok('AA6 退路+下限合流的那格（速度 0、取不到步长）与 AA1 同判：噪声不红、floored 记账',
+    foldJudge({ corrected: 0.004, stepMeasured: null, speed: 0 }).floored === true
+    && foldJudge({ corrected: 0.004, stepMeasured: null, speed: 0 }).bad === false);
+  ok('AA7 边界：残差恰好等于尺子不红（判据是严格大于）—— 贴线的量化噪声不该记一笔',
+    foldJudge({ corrected: IDLE_FLOOR, stepMeasured: null, speed: 0 }).bad === false
+    && foldJudge({ corrected: IDLE_FLOOR + 1e-9, stepMeasured: null, speed: 0 }).bad === true);
 }
 
 // ───────────────────────── 收口 ─────────────────────────

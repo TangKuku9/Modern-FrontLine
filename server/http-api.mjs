@@ -201,6 +201,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
       '/api/register': 'POST',
       '/api/login': 'POST',
       '/api/recover': 'POST',    // 忘了密码：呼号 + 一次性恢复码 + 新密码
+      '/api/dispatch': 'POST',   // 跨台入场券（房间目录开着才有；要账号的服必须带会话）
       '/api/logout': 'POST',
     };
     const want = ROUTES[path];
@@ -349,6 +350,40 @@ export async function createAuth({ cfg = {}, store } = {}) {
       // 成功 = 登录成功（顺带把旧会话全部作废、并换一整叠新码，理由见 accounts.mjs）。
       pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) },
         r.recovery ? { recovery: r.recovery } : null);
+      return true;
+    }
+
+    if (path === '/api/dispatch') {
+      // ── 跨台入场券（房间目录开着才有；信任模型写在 server/room-dir.mjs 文件头）──
+      // 玩家在 A 台的页面上点 B 台的房：A 台验过他是谁（会话），B 台却不认识 A 台发的
+      // 会话 cookie —— 账号账本是**进程私有**的（server/multi-account-probe.mjs 钉着的那条账）。
+      // 这张票是中间的桥：A 台验明身份后把票写进目录，B 台在 ws 握手那一刻消费它。
+      // 票只带 key/呼号/XP（与一次成功登录能建立的身份等价）、单次有效、短 TTL ——
+      // 偷到票的窗口与偷到会话 cookie 同阶，没有引入新的信任级。
+      // 目录没开的服：404。客户端不会画出"另一台"的行，手工打它也拿不到票。
+      if (!ctx.dir) {
+        stat.rejected++;
+        send(res, 404, { ok: false, error: 'no_directory', message: '这台服务器未开启跨进程房间目录' });
+        return true;
+      }
+      let me = null;
+      if (ctx.requireAccount) {
+        me = await sessionOf(req, accounts);
+        if (!me) {
+          stat.rejected++;
+          send(res, 401, { ok: false, error: 'login_required', message: '注册或登录后才能获取跨台入场券' });
+          return true;
+        }
+      }
+      // 目标必须是**目录里登记着的另一台**、room 必须是它名下的行（mintFor 里验）：
+      // 不做这一步，"发票"就成了把本台的登录身份转发到任意地址的免费代理。
+      const tok = ctx.dir.mintFor({ room: String(body.room || ''), url: String(body.url || ''), user: me });
+      if (!tok) {
+        stat.rejected++;
+        send(res, 400, { ok: false, error: 'bad_target', message: '目标不在房间目录里（url 必须是目录中登记的另一台，room 必须是它名下的房）' });
+        return true;
+      }
+      send(res, 200, { ok: true, ticket: tok });
       return true;
     }
 

@@ -21,7 +21,7 @@
 ## 0. 先把自己关在门外看一遍（改代码之后必跑）
 
 ```bash
-npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / net-journal / codec / lagcomp / mp-rules / accounts / progress / hardening / room-flow / room-bots / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / heli-armor / optic / state-leak
+npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / net-journal / codec / lagcomp / mp-rules / accounts / progress / hardening / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / heli-armor / optic / state-leak
                   # 其中要一个真浏览器的那几份，名单见 README《验收》（从源码推的，别在这儿抄第二份）
 npm run test:all  # 再加两个真浏览器测试（net-play 对打、net-drop 掉线）
 ```
@@ -61,19 +61,30 @@ HOST=127.0.0.1 \
 
 **一个进程 = 一个权威端 = 最多 `MAX_ROOMS` 间对局（等待态另给 2× 额度）+ `MAX_CLIENTS` 条连接。**
 所以 README《带宽与容量》那张表是**每进程**的数（16 → 256 人都在一台里压出来的），
-不是集群的数。进程内的房间列表（`/api/rooms` + 大厅推送）是真的；**跨进程没有房间目录**，
-`?room=` 找的是你连上的那一台里的房。
+不是集群的数。sim 永远只在它出生的那个进程里跑 —— 目录只搬"哪台有什么房"这张名单，不搬运行状态。
 
-现在能起的多实例形状是"**按 `MAP` / `SEED` 起多台，玩家用地址选图**"：
+现在能起的多实例形状是"**一个大厅、多台执行**"（2026-10-01 起）：多台共用一个 `ROOMS_DB`
+目录文件，每台把自己的房间行自报进去（心跳 + TTL，一台崩了它的行在 TTL 内自然消失）；
+任何一台上打开的大厅都列全部台的房（带"另一台"标记与那台的地址），点击就跨台加入；
+要账号的部署凭**一次性入场票**跨台（玩家登录的那台发票、目标台握手时消费 —— 账号账本仍各台私有）。
 
 ```bash
-MAP=yard  SEED=20260925 … node server/net-server.mjs 8091
-MAP=depot SEED=7        … node server/net-server.mjs 8092   # 各自一份房间列表
+ROOMS_DB=/data/rooms.db PUBLIC_URL=http://游戏域:8091 MAP=yard  SEED=20260925 … node server/net-server.mjs 8091
+ROOMS_DB=/data/rooms.db PUBLIC_URL=http://游戏域:8092 MAP=depot SEED=7         … node server/net-server.mjs 8092
+# ALLOW_ORIGIN 要把所有实例的页面来源都列上（跨台握手时 Origin 是玩家所在那台的）
 ```
 
-两条**没有判据**、别当成已经验过的事：跨进程的房间目录与实例分派（要做就得先在进程外放一个
-目录），以及**多台进程共用同一个 `ACCOUNTS_DB` 文件**（现有账号判据全是单进程的；同库文件只在
-"杀一台再起一台"的顺序里用过，见 `test/hardening.mjs` 的 J 段）。
+自检三件事：`/healthz` 的 `roomDir` 格（开着没开、对外 url 对不对 —— 地址错了的症状是
+"列表里有别台的房、点进去连不上"）；`node test/room-dir.mjs`（三层判据：单元 / 访客双机 /
+账号票，含"不开 `ROOMS_DB` 行为不变"的反证臂）。`?room=` 深链的语义不变：它指向的地址就是它要连的那台。
+
+两件要分清的话。**多台进程共用同一个 `ACCOUNTS_DB` 文件**有探针（2026-10-01）：
+`node server/multi-account-probe.mjs` 起两台服务共一个库文件，五个场景、退出码判"实测与账一致" ——
+活进程账本互不可见（P1 注册的人 P2 重启前登录 401）、同名并发注册与两张码两台并发重设都是
+"两边都成功"、重启后那格绿。成因是 `SqliteStore` 的**账本进程私有**（开库载入一次 + 读全走内存 +
+写攒批刷盘），读数与成因见 `docs/net-vs-local-gaps.md` 附十五；进程内的并发双花已修
+（`test/accounts.mjs` 的 L 段）。红的那几格是**立了账的已知缺口**，不是已验过 —— 跨台的房间目录
+不碰它：跨台加入的身份是**票**桥过去的，账号本身仍各台一本账。
 
 红了怎么看：
 
@@ -260,8 +271,11 @@ docker run -d --name mw-room -p 8090:8090 --env-file .env -v mw-accounts:/data m
 ## 6. 这份清单**不管**的事（都立着账，别当成已经做完）
 
 - 多实例编排：**一个进程 = 一个权威端**（第 1 节末尾写了口径与容量表是每进程的数）。
-  进程内的房间列表已做，**跨进程**的房间目录与实例分派没做；`?room=` 只在连上的那一台里找房。
-  另外"多台共用同一个 `ACCOUNTS_DB`"没有判据。
+  **跨进程房间目录已收**（`ROOMS_DB`：自报 + 心跳 + TTL，一个大厅、多台执行；跨台加入凭一次性
+  入场票；判据 `test/room-dir.mjs`，用法与自检见第 1 节末尾）。多台共用同一个 `ACCOUNTS_DB`：
+  进程内的并发双花已修（`test/accounts.mjs` 的 L 段）；跨进程"账本进程私有"是立账的已知缺口，
+  探针 `node server/multi-account-probe.mjs` 五格读数钉着现状
+  （读数见 `docs/net-vs-local-gaps.md` 附十五）—— 目录不碰它，跨台身份是票桥过去的。
 - 战役经验不进账号（本地那一半永不上报，只影响自己显示）；限流按 IP（可伪装）。
 - ~~登录只有密码，没有找回~~ 已收口（2026-09-30）：注册与每次重设各发一叠 5 张一次性恢复码，
   用掉任意一张即整叠作废并换发新的；重设成功 = 登录 + 作废该账号全部旧会话；服主侧补发口
@@ -293,6 +307,10 @@ docker run -d --name mw-room -p 8090:8090 --env-file .env -v mw-accounts:/data m
 
 ---
 
-**第 9 轮结束时的遗留账**（"本机量不了"与"明说了没做"的那几条，含本清单 §4 那三条命令的读数还没补回来）
-汇总在 `docs/net-vs-local-gaps.md` 附十四：一张表写清每条现在什么状态、为什么停在这、下一轮第一步、
-今天能不能被机器看见；同一节末尾另有一份"别把这些当成遗留"的清单（有意为之的那些）。
+**遗留账**（"本机量不了"与"明说了没做"的那几条，含本清单 §4 那三条命令的读数还没补回来）
+汇总在 `docs/net-vs-local-gaps.md` 附十四（第 9 轮末的原貌）与**附十五（第 10 轮更新）**：一张表写清每条
+现在什么状态、为什么停在这、下一轮第一步、今天能不能被机器看见。第 10 轮（2026-10-01）收掉了空跑窗
+那把尺子（`js/net/idle-ruler.mjs`：静止下限 + 族群臂，net-play 假红的源头拆了）与 `test/image.mjs` 的段过滤器，
+量了"未补偿空跑窗"的分布（决定继续当读数），给共用账号库补了探针读数（`server/multi-account-probe.mjs`）
+并把**进程内**那一半修掉（`test/accounts.mjs` L 段）；仍欠的是容器真机读数、8 份浏览器判据 `launch()`
+中间档的本机实测、跨进程房间目录。同一节末尾另有一份"别把这些当成遗留"的清单（有意为之的那些）。

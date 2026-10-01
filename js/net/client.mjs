@@ -11,6 +11,7 @@ import { packInput, teamId, weaponId, FLAG, WORLD, uavBit } from '../quant.js';
 import { uavFromFlags } from '../match-rules.js';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
+import { foldJudge } from './idle-ruler.mjs';
 import { clamp } from '../util.js';
 import { addAccountXp, addLocalXp } from '../progress.mjs';
 import { Sentry, Heli, flagMesh } from '../mp.js';
@@ -621,18 +622,25 @@ export class NetClient {
       // 且 Δpos 与相邻两拍差分同向）。所以这里要一个能自己量出来的尺子，而不是"小于某个
       // 米数"：尺子就是我日记本里相邻两拍的距离（我自己走的，和判据无关）。
       // 判据形状：空跑窗的残差必须**小于一拍位移**。补偿漏了则残差 ≥ deficit 拍 ≥ 1 拍。
+      // 尺子的合成在 js/net/idle-ruler.mjs（纯函数，net-feel 有它的族群臂）：裸尺子在
+      // **静止**时退到 0.4 mm 的物理余颤上，而权威位置带 ±1 cm 量化 ⇒ 2~4 mm 的纯量化
+      // 噪声就够超尺子，net-play 假红（附十四立过账）。所以尺子有 2 cm 的下限 —— 高于
+      // 量化噪声、仍比任何一次真实漏补（≥1 拍 ≈ 7.4 cm）低一个量级；走动的窗口照旧按
+      // 自己的步长量，下限不改变它们的判决。旧尺子不许回来（test/docs-guard.mjs D′）。
       if (dTick > dAck || (this.lastRep | 0) > 0) {
         // 相邻两拍的位移：取基态那一格和它后一拍。取不到（窗口太短）就退回速度换算。
         const a = this.history.find(h => h.j && h.tick === start);
         const b2 = this.history.find(h => h.j && h.tick === ((start + 1) & 0xffff));
         const stepMeasured = a && b2 ? Math.hypot(b2.j.pos[0] - a.j.pos[0], b2.j.pos[2] - a.j.pos[2]) : null;
-        const step = stepMeasured !== null ? stepMeasured : Math.hypot(pl.vel.x, pl.vel.z) / 60;
+        const fj = foldJudge({ corrected: r.corrected, stepMeasured, speed: Math.hypot(pl.vel.x, pl.vel.z) });
         this.foldN = (this.foldN || 0) + 1;
+        if (fj.floored) this.foldFloor = (this.foldFloor || 0) + 1;
+        if (stepMeasured === null) this.foldVel = (this.foldVel || 0) + 1;
         this.foldMax = Math.max(this.foldMax || 0, r.corrected);
-        if (r.corrected > step) {
+        if (fj.bad) {
           this.foldBad = (this.foldBad || 0) + 1;
           this.foldWhy = this.foldWhy || [];
-          if (this.foldWhy.length < 8) this.foldWhy.push({ d: +r.corrected.toFixed(4), step: +step.toFixed(4), stepMeasured: stepMeasured !== null, deficit, lead, dTick, dAck, rep: e.rep | 0, carry: carry ? 'yes' : got, led: r.led, have: this.history.length });
+          if (this.foldWhy.length < 8) this.foldWhy.push({ d: +r.corrected.toFixed(4), step: +fj.step.toFixed(4), ruler: +fj.ruler.toFixed(4), floored: fj.floored, stepMeasured: stepMeasured !== null, deficit, lead, dTick, dAck, rep: e.rep | 0, carry: carry ? 'yes' : got, led: r.led, have: this.history.length });
         }
       }
       // 厘米级读数已经稳定在 0.08 附近，剩下那几个 0.15~0.22 的要能解释。

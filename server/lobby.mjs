@@ -115,6 +115,12 @@ export class Lobby {
     this.saveChat = opts.saveChat || (() => {});
     const hist = this.loadChat();
     this.chat = Array.isArray(hist) ? hist : [];
+    // 跨进程房间目录（net-server 注入，没开目录就是空数组）：别台的行跟着本地的一起推进
+    // 大厅帧 —— "ws 大厅帧"与"/api/rooms"必须是同一份名单，分两处各拼一遍就会漂移。
+    this.remoteRooms = opts.remoteRooms || (() => []);
+    // 本台名单变了（pushLobby 的每一个调用点）通知一声外面 —— 房间目录拿它自报行。
+    // 不通知的话，"在 A 台建的房"要等下一个心跳才出现在 B 台的列表里。
+    this.onChange = opts.onChange || null;
     this.rate = new WeakMap();                      // ws -> 聊天速率窗口
     // 每一种拒绝都要数得出来。理由和 lag / streak 那两组计数一模一样：
     // **这些失效全是静默的** —— "开始游戏点了没反应""聊天发不出去"在玩家侧都只是"这游戏坏了"，
@@ -160,10 +166,11 @@ export class Lobby {
   }
   list() { return [...this.rooms.values()].map(r => this.brief(r)); }
 
-  lobbyState() { return { t: 'lobby', online: this.conns.size, rooms: this.list() }; }
+  lobbyState() { return { t: 'lobby', online: this.conns.size, rooms: [...this.list(), ...this.remoteRooms()] }; }
   pushLobby() {
     const m = JSON.stringify(this.lobbyState());
     for (const ws of this.conns) this.send(ws, m);
+    if (this.onChange) this.onChange();
   }
 
   // 一间的完整状态。**每个接收者一份**：me 那一格是各人不同的（我是不是房主、我准备了没）。

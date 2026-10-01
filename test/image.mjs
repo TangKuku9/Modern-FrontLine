@@ -125,95 +125,109 @@ const payload = healthPayload(docker);
 ok('先决：Dockerfile 里抠得出 HEALTHCHECK 那句 `node -e`（抠不到就没有 C 段）',
   payload.length > 20 && payload.includes('healthz'), payload.slice(0, 60) + '…');
 
-console.log('── A 镜像清单 ──');
-// COPY 的源都得在仓库里：`COPY . .` 的来源是构建上下文，两行的源分开看。
-const copies = [...docker.matchAll(/^COPY\s+(.+)$/gm)].map(m => m[1].trim().split(/\s+/).slice(0, -1)).flat();
-const missCopy = copies.filter(c => c !== '.' && !existsSync(resolve(ROOT, c)));
-ok('A1 每条 COPY 的源在仓库里都存在（多写了不存在的文件，镜像构建时才炸）',
-  copies.length >= 2 && missCopy.length === 0, `COPY ${copies.length} 条${missCopy.length ? '，缺：' + missCopy.join(', ') : ''}`);
+// 只想跑某一段的时候：node test/image.mjs A（或 B / C / D）。默认全跑。
+// D 是"反证臂：纯函数走合成夹具"那段（照 test/net-drop.mjs 的 argv 惯例）。
+// 先决那四条永远执行 —— 它们是"这段判据活着"的前提，不属于任何一段。
+const ONLY = (process.argv[2] || '').toUpperCase();
+const skip = t => !!ONLY && !ONLY.includes(t);
 
-const cmdM = /^CMD\s+\[(.*)\]$/m.exec(docker);
-const cmdArgv = cmdM ? [...cmdM[1].matchAll(/"([^"]*)"/g)].map(m => m[1]) : [];
-const cmdFile = cmdArgv[1] || '';
-ok('A2 CMD 指向的那个文件存在（镜像里最后一行命令指向空气是最贵的死法）',
-  cmdArgv[0] === 'node' && !!cmdFile && existsSync(resolve(ROOT, cmdFile)), cmdArgv.join(' '));
+if (!skip('A')) {
+  console.log('── A 镜像清单 ──');
+  // COPY 的源都得在仓库里：`COPY . .` 的来源是构建上下文，两行的源分开看。
+  const copies = [...docker.matchAll(/^COPY\s+(.+)$/gm)].map(m => m[1].trim().split(/\s+/).slice(0, -1)).flat();
+  const missCopy = copies.filter(c => c !== '.' && !existsSync(resolve(ROOT, c)));
+  ok('A1 每条 COPY 的源在仓库里都存在（多写了不存在的文件，镜像构建时才炸）',
+    copies.length >= 2 && missCopy.length === 0, `COPY ${copies.length} 条${missCopy.length ? '，缺：' + missCopy.join(', ') : ''}`);
 
-ok('A3 镜像里默认 NODE_ENV=production（否则配置闸在容器里失效：不设 JOIN_CODE 也能带着公开默认码起来）',
-  /NODE_ENV\s*=\s*production/.test(docker), (docker.match(/ENV[\s\S]*?(?=\r?\n\r?\n)/) || [''])[0].replace(/\s+/g, ' ').slice(0, 120));
+  const cmdM = /^CMD\s+\[(.*)\]$/m.exec(docker);
+  const cmdArgv = cmdM ? [...cmdM[1].matchAll(/"([^"]*)"/g)].map(m => m[1]) : [];
+  const cmdFile = cmdArgv[1] || '';
+  ok('A2 CMD 指向的那个文件存在（镜像里最后一行命令指向空气是最贵的死法）',
+    cmdArgv[0] === 'node' && !!cmdFile && existsSync(resolve(ROOT, cmdFile)), cmdArgv.join(' '));
 
-const userLine = (/^USER\s+(\S+)\s*$/m.exec(docker) || [])[1] || '';
-ok('A4 镜像里不是 root 跑服务（这个进程会被喂任意客户端输入）',
-  !!userLine && userLine !== 'root' && userLine !== '0', `USER ${userLine || '(没写，即 root)'}`);
+  ok('A3 镜像里默认 NODE_ENV=production（否则配置闸在容器里失效：不设 JOIN_CODE 也能带着公开默认码起来）',
+    /NODE_ENV\s*=\s*production/.test(docker), (docker.match(/ENV[\s\S]*?(?=\r?\n\r?\n)/) || [''])[0].replace(/\s+/g, ' ').slice(0, 120));
 
-// `npm ci --omit=dev` 装的就是 dependencies 那一份：两处必须以同一种方式理解"运行时依赖"。
-ok('A5 运行时依赖只有 dependencies 那几个（playwright 必须在 devDependencies，否则镜像白白胖几百 MB）',
-  /npm ci --omit=dev/.test(docker) && !!pkg.devDependencies && !!pkg.devDependencies.playwright
-    && !(pkg.dependencies || {}).playwright,
-  `dependencies=${Object.keys(pkg.dependencies || {}).join(', ')} · devDependencies=${Object.keys(pkg.devDependencies || {}).join(', ')}`);
+  const userLine = (/^USER\s+(\S+)\s*$/m.exec(docker) || [])[1] || '';
+  ok('A4 镜像里不是 root 跑服务（这个进程会被喂任意客户端输入）',
+    !!userLine && userLine !== 'root' && userLine !== '0', `USER ${userLine || '(没写，即 root)'}`);
 
-console.log('── B 上下文与白名单 ──');
-const mustShip = [...closure.files, ...publicList(serverSrc)];
-const blocked = mustShip.filter(p => ignoredBy(p, ioLines));
-ok('B1 `.dockerignore` 没有排除运行时导入闭包里的任何一个文件',
-  closure.files.every(p => !ignoredBy(p, ioLines)),
-  blocked.filter(p => closure.files.includes(p)).length ? `被挡：${blocked.filter(p => closure.files.includes(p)).join(', ')}`
-    : `${closure.files.length} 个文件逐个过了一遍 .dockerignore`);
+  // `npm ci --omit=dev` 装的就是 dependencies 那一份：两处必须以同一种方式理解"运行时依赖"。
+  ok('A5 运行时依赖只有 dependencies 那几个（playwright 必须在 devDependencies，否则镜像白白胖几百 MB）',
+    /npm ci --omit=dev/.test(docker) && !!pkg.devDependencies && !!pkg.devDependencies.playwright
+      && !(pkg.dependencies || {}).playwright,
+    `dependencies=${Object.keys(pkg.dependencies || {}).join(', ')} · devDependencies=${Object.keys(pkg.devDependencies || {}).join(', ')}`);
+}
 
-const pub = publicList(serverSrc);
-ok('B2 `.dockerignore` 没有排除 `PUBLIC` 白名单里的任何一项（构建成功、起来却 404 是最贵的那种静默）',
-  pub.length >= 4 && pub.every(p => !ignoredBy(p, ioLines)),
-  pub.length ? `PUBLIC ${pub.length} 项：${pub.join(' ')}` : '服务端源码里找不到 PUBLIC 白名单');
+if (!skip('B')) {
+  console.log('── B 上下文与白名单 ──');
+  const mustShip = [...closure.files, ...publicList(serverSrc)];
+  const blocked = mustShip.filter(p => ignoredBy(p, ioLines));
+  ok('B1 `.dockerignore` 没有排除运行时导入闭包里的任何一个文件',
+    closure.files.every(p => !ignoredBy(p, ioLines)),
+    blocked.filter(p => closure.files.includes(p)).length ? `被挡：${blocked.filter(p => closure.files.includes(p)).join(', ')}`
+      : `${closure.files.length} 个文件逐个过了一遍 .dockerignore`);
 
-// 假绿防线：`.dockerignore` 若被清空，上面两条会自动全绿。上下文里真正存在的目录必须
-// 至少有一个被挡住的"该挡的东西"（node_modules / .git / test 这种），否则说明这份 ignore 表
-// 已经不是"挡东西"的表了。
-const ctxDirs = ['node_modules', '.git', 'test', 'server'];
-const blockedDirs = ctxDirs.filter(d => existsSync(resolve(ROOT, d)) && ignoredBy(d, ioLines));
-ok('B3 反过来：上下文里"该挡的那几个"确实被挡住了（表被清空 ⇒ 这里红，而不是 B1/B2 悄悄全绿）',
-  blockedDirs.length >= 3, `挡住 ${blockedDirs.join(', ')}`);
+  const pub = publicList(serverSrc);
+  ok('B2 `.dockerignore` 没有排除 `PUBLIC` 白名单里的任何一项（构建成功、起来却 404 是最贵的那种静默）',
+    pub.length >= 4 && pub.every(p => !ignoredBy(p, ioLines)),
+    pub.length ? `PUBLIC ${pub.length} 项：${pub.join(' ')}` : '服务端源码里找不到 PUBLIC 白名单');
 
-const pwInClosure = closure.files.filter(p => importsOf(readRel(p)).includes('playwright'));
-ok('B4 运行时闭包一个都不 import playwright（`--omit=dev` 之后镜像里没有它，import 到就是启动即崩）',
-  pwInClosure.length === 0, pwInClosure.length ? `这些文件 import 了它：${pwInClosure.join(', ')}` : `${closure.files.length} 个文件里没有一处`);
+  // 假绿防线：`.dockerignore` 若被清空，上面两条会自动全绿。上下文里真正存在的目录必须
+  // 至少有一个被挡住的"该挡的东西"（node_modules / .git / test 这种），否则说明这份 ignore 表
+  // 已经不是"挡东西"的表了。
+  const ctxDirs = ['node_modules', '.git', 'test', 'server'];
+  const blockedDirs = ctxDirs.filter(d => existsSync(resolve(ROOT, d)) && ignoredBy(d, ioLines));
+  ok('B3 反过来：上下文里"该挡的那几个"确实被挡住了（表被清空 ⇒ 这里红，而不是 B1/B2 悄悄全绿）',
+    blockedDirs.length >= 3, `挡住 ${blockedDirs.join(', ')}`);
 
-console.log('── C HEALTHCHECK 那句本身 ──');
-const srv = await withServer({});
-try {
-  const code = await new Promise((res) => {
-    const p = spawn(process.execPath, ['-e', payload], { env: { ...process.env, PORT: String(srv.port) } });
+  const pwInClosure = closure.files.filter(p => importsOf(readRel(p)).includes('playwright'));
+  ok('B4 运行时闭包一个都不 import playwright（`--omit=dev` 之后镜像里没有它，import 到就是启动即崩）',
+    pwInClosure.length === 0, pwInClosure.length ? `这些文件 import 了它：${pwInClosure.join(', ')}` : `${closure.files.length} 个文件里没有一处`);
+}
+
+if (!skip('C')) {
+  console.log('── C HEALTHCHECK 那句本身 ──');
+  const srv = await withServer({});
+  try {
+    const code = await new Promise((res) => {
+      const p = spawn(process.execPath, ['-e', payload], { env: { ...process.env, PORT: String(srv.port) } });
+      p.on('exit', c => res(c));
+    });
+    ok('C1 把 Dockerfile 里那句 PROBE 抠出来对一台真服跑：退出码 0（健康）',
+      code === 0, `PORT=${srv.port} 退出码 ${code}`);
+  } finally { srv.kill(); }
+
+  const deadPort = await freePort();
+  const deadCode = await new Promise((res) => {
+    const p = spawn(process.execPath, ['-e', payload], { env: { ...process.env, PORT: String(deadPort) } });
     p.on('exit', c => res(c));
   });
-  ok('C1 把 Dockerfile 里那句 PROBE 抠出来对一台真服跑：退出码 0（健康）',
-    code === 0, `PORT=${srv.port} 退出码 ${code}`);
-} finally { srv.kill(); }
+  ok('C2 **判别臂**：同一个端口没人听的时候退出码必须是 1（否则这句 HEALTHCHECK 是"永远健康"的装饰）',
+    deadCode === 1, `PORT=${deadPort}（空着）退出码 ${deadCode}`);
+}
 
-const deadPort = await freePort();
-const deadCode = await new Promise((res) => {
-  const p = spawn(process.execPath, ['-e', payload], { env: { ...process.env, PORT: String(deadPort) } });
-  p.on('exit', c => res(c));
-});
-ok('C2 **判别臂**：同一个端口没人听的时候退出码必须是 1（否则这句 HEALTHCHECK 是"永远健康"的装饰）',
-  deadCode === 1, `PORT=${deadPort}（空着）退出码 ${deadCode}`);
+if (!skip('D')) {
+  console.log('── 反证臂：纯函数走合成夹具 ──');
+  const ioOld = ['node_modules', '.git', 'test'];
+  ok('反证臂 A：把 `js/` 写进 .dockerignore ⇒ B1/B2 那把尺子当场报红',
+    ignoredBy('js/main.js', [...ioOld, 'js']) && ignoredBy('js/', [...ioOld, 'js']) && !ignoredBy('js/main.js', ioOld),
+    `加了 js ⇒ ${ignoredBy('js/main.js', [...ioOld, 'js'])}；没加 ⇒ ${ignoredBy('js/main.js', ioOld)}`);
 
-console.log('── 反证臂：纯函数走合成夹具 ──');
-const ioOld = ['node_modules', '.git', 'test'];
-ok('反证臂 A：把 `js/` 写进 .dockerignore ⇒ B1/B2 那把尺子当场报红',
-  ignoredBy('js/main.js', [...ioOld, 'js']) && ignoredBy('js/', [...ioOld, 'js']) && !ignoredBy('js/main.js', ioOld),
-  `加了 js ⇒ ${ignoredBy('js/main.js', [...ioOld, 'js'])}；没加 ⇒ ${ignoredBy('js/main.js', ioOld)}`);
+  const fj1 = closureOf('a.mjs', r => { const m = { 'a.mjs': "import './b.mjs'; import 'ws';", 'b.mjs': "export * from './c.mjs';", 'c.mjs': "import './a.mjs';" }; if (!(r in m)) throw new Error('no'); return m[r]; }, r => ['a.mjs', 'b.mjs', 'c.mjs'].includes(r));
+  ok('反证臂 B：闭包会跟着相对 import / re-export 走到底、把裸包名单列（少跟一层就漏掉该进镜像的文件；c.mjs 还指回 a.mjs，绕圈不能死循环）',
+    fj1.files.join(',') === 'a.mjs,b.mjs,c.mjs' && fj1.ext.join(',') === 'ws',
+    `files=${fj1.files.join(',')} ext=${fj1.ext.join(',')}`);
 
-const fj1 = closureOf('a.mjs', r => { const m = { 'a.mjs': "import './b.mjs'; import 'ws';", 'b.mjs': "export * from './c.mjs';", 'c.mjs': "import './a.mjs';" }; if (!(r in m)) throw new Error('no'); return m[r]; }, r => ['a.mjs', 'b.mjs', 'c.mjs'].includes(r));
-ok('反证臂 B：闭包会跟着相对 import / re-export 走到底、把裸包名单列（少跟一层就漏掉该进镜像的文件；c.mjs 还指回 a.mjs，绕圈不能死循环）',
-  fj1.files.join(',') === 'a.mjs,b.mjs,c.mjs' && fj1.ext.join(',') === 'ws',
-  `files=${fj1.files.join(',')} ext=${fj1.ext.join(',')}`);
+  ok('反证臂 C：`PUBLIC` 白名单抠不出来时返回空数组（B2 的先决臂据此报红，不是静默放过）',
+    publicList('const PUBLIC = [];').length === 0 && publicList('没有这一行').length === 0
+      && publicList("const PUBLIC = ['index.html'];").length === 1,
+    '空表/缺行 ⇒ 0 项；真表 ⇒ 1 项');
 
-ok('反证臂 C：`PUBLIC` 白名单抠不出来时返回空数组（B2 的先决臂据此报红，不是静默放过）',
-  publicList('const PUBLIC = [];').length === 0 && publicList('没有这一行').length === 0
-    && publicList("const PUBLIC = ['index.html'];").length === 1,
-  '空表/缺行 ⇒ 0 项；真表 ⇒ 1 项');
-
-ok('反证臂 D：HEALTHCHECK 那句抠不出来时返回空串（C 段的先决臂据此报红）',
-  healthPayload('没有这一行') === '' && healthPayload('HEALTHCHECK CMD node -e "x"') === 'x',
-  `缺行='' · 有行='${healthPayload('HEALTHCHECK CMD node -e "x"')}'`);
+  ok('反证臂 D：HEALTHCHECK 那句抠不出来时返回空串（C 段的先决臂据此报红）',
+    healthPayload('没有这一行') === '' && healthPayload('HEALTHCHECK CMD node -e "x"') === 'x',
+    `缺行='' · 有行='${healthPayload('HEALTHCHECK CMD node -e "x"')}'`);
+}
 
 console.log(`\n${fails ? 'RED' : 'GREEN'}  ${checks - fails}/${checks} 通过`);
 process.exit(fails ? 1 : 0);

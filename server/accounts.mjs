@@ -309,9 +309,28 @@ export class Accounts {
     // 可见的计数：和 lag / streak 那两组一样，这些失效**全是静默的**，
     // 运维只能从 /healthz 上看见。regs=0 尤其要留意：那说明注册这条路根本没人走通。
     this.stat = { regs: 0, logins: 0, recover: 0, rejects: {}, rateLimited: 0, busy: 0, scryptMs: 0, scryptN: 0 };
+    // 每呼号一把的串行链（_keyChain），见下面那段说明。
+    this._keyLocks = new Map();
   }
 
   _reject(why) { this.stat.rejects[why] = (this.stat.rejects[why] | 0) + 1; return { ok: false, error: why }; }
+
+  // ── 每呼号串行（第 10 轮，探针 server/multi-account-probe.mjs 实测出来的口）──
+  // register / login / recover 三个口都是"读一把 → await 真哈希（百毫秒级）→ 写回"的形状：
+  // 同一个呼号的两个请求在 await 处交错，就**都**读到旧账、**都**写回 —— 并发同名注册
+  // 两个都成功（一行库，后写的哈希悄悄顶掉先写的，其中一人从此登不进）；并发用两张不同
+  // 的恢复码**都**成功（"用掉一张整叠作废"被破成"两张都能用"）。这把锁只管**本进程**；
+  // 跨进程的同形缺口是另一条账（探针 S1~S3 红，见 docs/net-vs-local-gaps.md 附十五）——
+  // 那是"进程私有账本"的架构题，不在这把锁的射程里，也不许假装它被这里修掉了。
+  _keyChain(key, fn) {
+    const prev = this._keyLocks.get(key) || Promise.resolve();
+    // 前一个怎么收场都轮到自己进：失败的请求不许把后面的人堵死。
+    const next = prev.then(fn, fn);
+    const clean = () => { if (this._keyLocks.get(key) === next) this._keyLocks.delete(key); };
+    next.then(clean, clean);
+    this._keyLocks.set(key, next);
+    return next;
+  }
 
   async _throttled(fn) {
     if (inflight >= MAX_INFLIGHT) { this.stat.busy++; return 'busy'; }
@@ -360,31 +379,36 @@ export class Accounts {
     if (!this._checkInvite(code)) return this._reject('bad_invite');
 
     const key = nameKey(n);
-    if (this.store.getUser(key)) return this._reject('name_taken');
+    // 每呼号串行（判据在 test/accounts.mjs 的 L 段）：查重与写入之间隔着一次真哈希的
+    // await，同一个呼号的第二个请求会在那个窗口里读到同一个"没人"。限流与三项校验留在
+    // 锁外 —— 每个尝试都该计数，串行不该让谁绕过闸门。
+    return this._keyChain(key, async () => {
+      if (this.store.getUser(key)) return this._reject('name_taken');
 
-    let rec;
-    const t0 = now;
-    try {
-      const r = await this._throttled(() => hashPassword(password, this.scrypt));
-      if (r === 'busy') return this._reject('busy');
-      rec = r;
-    } catch (e) { return this._reject('hash_failed'); }
-    this.stat.scryptMs += this.now() - t0; this.stat.scryptN++;
+      let rec;
+      const t0 = now;
+      try {
+        const r = await this._throttled(() => hashPassword(password, this.scrypt));
+        if (r === 'busy') return this._reject('busy');
+        rec = r;
+      } catch (e) { return this._reject('hash_failed'); }
+      this.stat.scryptMs += this.now() - t0; this.stat.scryptN++;
 
-    const user = {
-      key, name: n, ...rec,
-      created: now, xp: 0, kills: 0, deaths: 0, matches: 0, wins: 0,
-    };
-    this.store.putUser(key, user);
-    this.stat.regs++;
-    // 恢复码在这一刻发出去，而且**只在这一刻**（原文不进库、不进审计、不进日志）。
-    // 发不出来（线程池满）时注册照样成功：这条路走不通还有服主的 CLI 那条路（issueRecovery），
-    // 而"因为发不出恢复码就不让人注册"是拿一个备用手段挡掉主流程。
-    const recovery = await this._mintRecovery(key);
-    // 注册成功直接给会话：多一步登录只是多一次打错密码的机会，不增加任何安全性
-    const { token, hash } = newToken();
-    this.store.createSession(hash, key, now + this.sessionTtlMs);
-    return { ok: true, token, name: n, profile: this.publicProfile(user), recovery };
+      const user = {
+        key, name: n, ...rec,
+        created: now, xp: 0, kills: 0, deaths: 0, matches: 0, wins: 0,
+      };
+      this.store.putUser(key, user);
+      this.stat.regs++;
+      // 恢复码在这一刻发出去，而且**只在这一刻**（原文不进库、不进审计、不进日志）。
+      // 发不出来（线程池满）时注册照样成功：这条路走不通还有服主的 CLI 那条路（issueRecovery），
+      // 而"因为发不出恢复码就不让人注册"是拿一个备用手段挡掉主流程。
+      const recovery = await this._mintRecovery(key);
+      // 注册成功直接给会话：多一步登录只是多一次打错密码的机会，不增加任何安全性
+      const { token, hash } = newToken();
+      this.store.createSession(hash, key, now + this.sessionTtlMs);
+      return { ok: true, token, name: n, profile: this.publicProfile(user), recovery };
+    });
   }
 
   async login(args = {}) {
@@ -408,30 +432,35 @@ export class Accounts {
     const over = !w1.ok ? w1 : (!w2.ok ? w2 : null);
     if (over) { this.stat.rateLimited++; return { ok: false, error: 'too_many', retryAfterMs: over.retryAfterMs }; }
 
-    const user = this.store.getUser(key);
-    let okPw;
-    try {
-      const r = await this._throttled(() => verifyPassword(String(password == null ? '' : password), user, this.scrypt));
-      if (r === 'busy') return this._reject('busy');
-      okPw = r;
-    } catch { okPw = false; }
+    // 锁内的道理与 register 同源：验证用的是锁开始时读到的哈希，而并发的 recover 会
+    // 轮换哈希并作废全部旧会话 —— "旧密码的验证"若能插在作废之后落地，就等于
+    // 重设密码赶不走一个正在进门的人。
+    return this._keyChain(key, async () => {
+      const user = this.store.getUser(key);
+      let okPw;
+      try {
+        const r = await this._throttled(() => verifyPassword(String(password == null ? '' : password), user, this.scrypt));
+        if (r === 'busy') return this._reject('busy');
+        okPw = r;
+      } catch { okPw = false; }
 
-    // 统一失败信息：**不区分"这个呼号不存在"和"密码不对"**。
-    // 区分了的话，这张嘴就把账号表送出去了 —— 攻击者先枚举出所有存在的呼号，
-    // 再把撞库火力集中到这些账号上。
-    // （上面 verifyPassword 在 user 为 null 时也会跑一次真哈希，所以耗时也一样。）
-    if (!user || !okPw) {
-      this.loginLimit.fail(`login-ip:${ip}`, now);
-      const f = this.loginLimit.fail(`login-name:${key}`, now);
-      return { ok: false, error: 'bad_credentials', retryAfterMs: f.retryAfterMs };
-    }
+      // 统一失败信息：**不区分"这个呼号不存在"和"密码不对"**。
+      // 区分了的话，这张嘴就把账号表送出去了 —— 攻击者先枚举出所有存在的呼号，
+      // 再把撞库火力集中到这些账号上。
+      // （上面 verifyPassword 在 user 为 null 时也会跑一次真哈希，所以耗时也一样。）
+      if (!user || !okPw) {
+        this.loginLimit.fail(`login-ip:${ip}`, now);
+        const f = this.loginLimit.fail(`login-name:${key}`, now);
+        return { ok: false, error: 'bad_credentials', retryAfterMs: f.retryAfterMs };
+      }
 
-    this.loginLimit.succeed(`login-ip:${ip}`);
-    this.loginLimit.succeed(`login-name:${key}`);
-    this.stat.logins++;
-    const { token, hash } = newToken();
-    this.store.createSession(hash, key, now + this.sessionTtlMs);
-    return { ok: true, token, name: user.name, profile: this.publicProfile(user) };
+      this.loginLimit.succeed(`login-ip:${ip}`);
+      this.loginLimit.succeed(`login-name:${key}`);
+      this.stat.logins++;
+      const { token, hash } = newToken();
+      this.store.createSession(hash, key, now + this.sessionTtlMs);
+      return { ok: true, token, name: user.name, profile: this.publicProfile(user) };
+    });
   }
 
   async logout(token) {
@@ -501,52 +530,57 @@ export class Accounts {
     if (!validPassword(password)) return this._reject('bad_password');
     if (!validName(n)) return this._reject('bad_recovery');
 
-    const recs = this._recoveryRecs(key);
-    const probe = normalizeRecoveryCode(code) || String(code == null ? '' : code);
+    // 读码 → 五次真哈希验证（数百毫秒）→ 轮换，这一整段锁进同呼号串行：并发的第二张
+    // 码必须在**换发之后**才开始读，读到的才是新账（否则"用掉一张整叠作废"破成
+    // "两张都能用"，两张码各自换出一叠，先响应那人手里那叠被后写的悄悄顶掉）。
+    return this._keyChain(key, async () => {
+      const recs = this._recoveryRecs(key);
+      const probe = normalizeRecoveryCode(code) || String(code == null ? '' : code);
 
-    // ── 这一圈**固定跑 RECOVERY_COUNT 次，而且不提前 break** ──
-    // 三个"顺手优化"各自会把它变成账号枚举器或位置提示器：
-    //   · 没有这个用户就整段跳过 ⇒ "存在"要 5 次哈希、"不存在"要 0 次，计时就是答案
-    //     （登录那边为此专门写了 DUMMY_PW，这里是同一个理由的另一个出口）；
-    //   · 命中就 break ⇒ 用第 1 张码比用第 5 张快 4 倍；
-    //   · 只在 recs 非空时才验 ⇒ 同上。
-    // 所以缺的那几张拿 null 喂给 verifyPassword —— 它自己在 rec 为空时会跑一次假哈希补时间。
-    let hit = -1;
-    for (let i = 0; i < RECOVERY_COUNT; i++) {
-      let ok = false;
-      try { ok = await verifyPassword(probe, recs[i] || null, this.scrypt); } catch { ok = false; }
-      // hit 走"第一个命中"，但比较**不落在这上面**：上面 5 次无论如何都跑完。
-      if (ok && hit < 0) hit = i;
-    }
-    if (hit < 0) {
-      this.loginLimit.fail(`recov-ip:${ip}`, now);
-      const f = this.loginLimit.fail(`recov-name:${key}`, now);
-      // 和登录**同一句话**：不区分"这个呼号不存在"、"他没有恢复码"、"码抄错了"。
-      // 分开写的话这个接口就是一个账号枚举器（而且比登录那个更好用：它不需要密码）。
-      return { ok: false, error: 'bad_recovery', retryAfterMs: f.retryAfterMs };
-    }
+      // ── 这一圈**固定跑 RECOVERY_COUNT 次，而且不提前 break** ──
+      // 三个"顺手优化"各自会把它变成账号枚举器或位置提示器：
+      //   · 没有这个用户就整段跳过 ⇒ "存在"要 5 次哈希、"不存在"要 0 次，计时就是答案
+      //     （登录那边为此专门写了 DUMMY_PW，这里是同一个理由的另一个出口）；
+      //   · 命中就 break ⇒ 用第 1 张码比用第 5 张快 4 倍；
+      //   · 只在 recs 非空时才验 ⇒ 同上。
+      // 所以缺的那几张拿 null 喂给 verifyPassword —— 它自己在 rec 为空时会跑一次假哈希补时间。
+      let hit = -1;
+      for (let i = 0; i < RECOVERY_COUNT; i++) {
+        let ok = false;
+        try { ok = await verifyPassword(probe, recs[i] || null, this.scrypt); } catch { ok = false; }
+        // hit 走"第一个命中"，但比较**不落在这上面**：上面 5 次无论如何都跑完。
+        if (ok && hit < 0) hit = i;
+      }
+      if (hit < 0) {
+        this.loginLimit.fail(`recov-ip:${ip}`, now);
+        const f = this.loginLimit.fail(`recov-name:${key}`, now);
+        // 和登录**同一句话**：不区分"这个呼号不存在"、"他没有恢复码"、"码抄错了"。
+        // 分开写的话这个接口就是一个账号枚举器（而且比登录那个更好用：它不需要密码）。
+        return { ok: false, error: 'bad_recovery', retryAfterMs: f.retryAfterMs };
+      }
 
-    let rec;
-    try {
-      const r = await this._throttled(() => hashPassword(password, this.scrypt));
-      if (r === 'busy') return this._reject('busy');
-      rec = r;
-    } catch { return this._reject('hash_failed'); }
+      let rec;
+      try {
+        const r = await this._throttled(() => hashPassword(password, this.scrypt));
+        if (r === 'busy') return this._reject('busy');
+        rec = r;
+      } catch { return this._reject('hash_failed'); }
 
-    this.store.patchUser(key, rec);
-    // 会话跟着密码一起作废：重设密码的**动机**通常正是"这号可能已经被人进去了"，
-    // 而留着旧会话等于把进来的人留在屋里 —— 他能安稳用到 30 天后自然过期。
-    this.store.deleteUserSessions(key);
-    this.loginLimit.succeed(`recov-ip:${ip}`);
-    this.loginLimit.succeed(`recov-name:${key}`);
-    // 用掉一张 = 换一整叠（见上面第 2 条）。
-    const recovery = await this._mintRecovery(key);
-    this.stat.recover++;
-    // 恢复成功就是一次登录（与注册同源）：一步进大厅，不让人再去另一屏把新密码重打一遍。
-    const { token, hash } = newToken();
-    this.store.createSession(hash, key, now + this.sessionTtlMs);
-    const u = this.store.getUser(key) || {};
-    return { ok: true, token, name: u.name || n, profile: this.publicProfile(u), recovery };
+      this.store.patchUser(key, rec);
+      // 会话跟着密码一起作废：重设密码的**动机**通常正是"这号可能已经被人进去了"，
+      // 而留着旧会话等于把进来的人留在屋里 —— 他能安稳用到 30 天后自然过期。
+      this.store.deleteUserSessions(key);
+      this.loginLimit.succeed(`recov-ip:${ip}`);
+      this.loginLimit.succeed(`recov-name:${key}`);
+      // 用掉一张 = 换一整叠（见上面第 2 条）。
+      const recovery = await this._mintRecovery(key);
+      this.stat.recover++;
+      // 恢复成功就是一次登录（与注册同源）：一步进大厅，不让人再去另一屏把新密码重打一遍。
+      const { token, hash } = newToken();
+      this.store.createSession(hash, key, now + this.sessionTtlMs);
+      const u = this.store.getUser(key) || {};
+      return { ok: true, token, name: u.name || n, profile: this.publicProfile(u), recovery };
+    });
   }
 
   // 服主 CLI 用的那条路：给一个**已存在**的呼号发一叠新码。

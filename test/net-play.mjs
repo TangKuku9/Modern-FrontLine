@@ -604,7 +604,8 @@ try {
     return { reconciles: n.reconciles || 0, replayed: n.replayed || 0, correctedMax: n.correctedMax || 0, steadyMax: n.steadyMax || 0, otherMax: n.otherMax || 0, starved: n.starved || 0, steadyN: n.steadyN || 0, aliveFlips: n.aliveFlips || 0, journalMisses: n.journalMisses || 0, caughtUp: n.caughtUp || 0, repN: n.repN || 0, repMax: n.repMax || 0, repsApplied: n.repsApplied || 0, repSkipped: n.repSkipped || 0, repForgotten: n.repForgotten || 0, qDrops: n.qDrops || 0, dupTicks: n.dupTicks || 0, repSkipWhy: n.repSkipWhy || [], missWhy: n.missWhy || [], snaps: n.snaps, ticks: window.game.tick, pair: n.pairProbe || null, worst: n.steadyWorst || [], flagMismatch: n.flagMismatch || 0, flagMismatchWhy: n.flagMismatchWhy || null, repUnder: n.repUnder || 0, repUnderMax: n.repUnderMax || 0, repUnderWhy: n.repUnderWhy || [],
       // 首段空跑（rep 报不出来的那几拍）的补偿读数：补了几包、共几拍、以及残差超尺子的现场
       carryN: n.carryN || 0, carryLead: n.carryLead || 0, carryMiss: n.carryMiss || 0, carryWhy: n.carryWhy || [],
-      foldN: n.foldN || 0, foldMax: n.foldMax || 0, foldBad: n.foldBad || 0, foldWhy: n.foldWhy || [] };
+      foldN: n.foldN || 0, foldMax: n.foldMax || 0, foldBad: n.foldBad || 0, foldWhy: n.foldWhy || [],
+      foldFloor: n.foldFloor || 0, foldVel: n.foldVel || 0 };
   });
   ok('每一拍快照都做了回滚重放', q.reconciles > 20, `${q.reconciles} 次 / ${q.snaps} 包快照`);
   // rep 通路的"有牙齿"断言：这一包报了重复拍 ⇔ 服务端比我供得快（饥饿）。
@@ -648,9 +649,12 @@ try {
   // 见 client.mjs 的 foldMax/foldWhy），不是"小于某个米数"这种可以随机器抖的阈值。
   // 牙齿在哪：补偿漏掉时残差恰好等于 deficit 拍的位移，deficit ≥ 1 就跨过这把尺子；
   // 而 deficit ≥ 2（实测那一包）是 2 倍尺子，怎么抖都跨得过去。反过来，补偿做到位时
-  // 残差只剩量化误差（位置量化 0.23 cm），离尺子差一个量级。
+  // 残差只剩量化误差（权威位置量化步长 POS_STEP = 1 cm，两轴实测 2~4 mm），离真信号差一个量级。
+  // 尺子在 js/net/idle-ruler.mjs 合成：静止时裸尺子退到 0.4 mm 的余颤上，所以有 2 cm 的
+  // 下限（foldFloor 记"哪几格靠下限"）；走动的窗口照旧按自己的步长量 —— 族群臂在
+  // test/net-feel.mjs 的 AA 段，旧尺子（纯 stepMeasured）不许回来（docs-guard D′）。
   ok('空跑窗的残差小于"我自己走一拍"（首段空跑被重演掉了，不是丢掉）', (q.foldBad || 0) === 0,
-    `空跑窗 ${q.foldN || 0} 个 · 最大残差 ${(q.foldMax || 0).toFixed(4)} m · 超尺子 ${q.foldBad || 0} 个`
+    `空跑窗 ${q.foldN || 0} 个（靠下限 ${q.foldFloor || 0} · 走速度退路 ${q.foldVel || 0}）· 最大残差 ${(q.foldMax || 0).toFixed(4)} m · 超尺子 ${q.foldBad || 0} 个`
     + `${(q.foldWhy || []).length ? ' · 明细 ' + JSON.stringify(q.foldWhy) : ''}`);
   // 该补而没补的，必须留下名字（旧写法在同样的窗里照样记一个 corrected，于是"少补了几拍"
   // 和"预测器算错了"在报表上完全同形）。这条只印不裁：真正裁的是上面那条量判据。

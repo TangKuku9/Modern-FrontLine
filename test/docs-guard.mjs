@@ -320,6 +320,14 @@ export const RETIRED_RULERS = [
     must: [/Number\.isFinite\(hz0\.clients\) && hz0\.clients >= 3/, /clients <= hz0\.clients - 1/,
       /C10a【先决】/, /C10b【先决】/, /C11 \*\*反证臂\*\*：关掉一条之后名额回来了/],
   },
+  {
+    id: '空跑窗尺子在静止时退到"我这一步"本身（0.4 mm 余颤）',
+    file: 'js/net/client.mjs',
+    why: '静止时 stepMeasured 掉到物理余颤（实测 ~0.0004 m），权威位置 ±1 cm 的量化噪声（2~4 mm）就够超尺子 ⇒ net-play 的 foldBad===0 假红（附十四立账，三轮没敢碰）',
+    closed: 'js/net/idle-ruler.mjs foldJudge：尺子 = max(实测步长, 2×位置量化步长)；族群臂在 test/net-feel.mjs AA 段（AA2 下限不吃真信号 / AA3、AA4 走动窗仍按自己步长量），foldFloor 记"哪几格靠下限"',
+    gone: [/const step = stepMeasured !== null \? stepMeasured : Math\.hypot\(pl\.vel/],
+    must: [/foldJudge\(\{ corrected: r\.corrected/, /foldFloor/],
+  },
 ];
 
 // 尺子架在源码上：文件读不到也算一条红，不是静默跳过（跳过就等于这张表恒绿）。
