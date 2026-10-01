@@ -6,6 +6,13 @@
 // （不要为了"显式一点"去写 credentials:'include'：那是跨源才需要的，
 // 而同源场景下写它只会让人以为这里有跨源问题）。
 //
+// ── 这个模块持有一个"标签页选择器"，它不是令牌也不是秘密 ──
+// 会话 cookie 按"源"共享：同一浏览器两个标签页各登一个账号，后登录的把先登录的顶掉，
+// 症状是"A 在大厅说话显示成 B 发的言"。登录响应会把本标签页私有的令牌多写进一枚
+// 按选择器命名的 cookie（机理与信任边界在 server/http-api.mjs 的 tabOf 那段），
+// 这里负责生成/携带选择器本身：每个 /api 请求带 x-tab 头，WebSocket 握手带 ?tab=
+// 参数（握手带不了自定义头 —— 与跨台票 ?ticket= 同一个先例）。
+//
 // ── 这个模块不判断密码强度、不判断呼号合法性 ──
 // 那些规则的真相在服务端（server/accounts.mjs 的白名单与长度限制）。
 // 客户端再写一份的症状是"前端说可以、服务端说不行"，而玩家看到的是**点了没反应** ——
@@ -25,9 +32,31 @@
 
 const TIMEOUT_MS = 8000;
 
+// 本标签页的选择器：8 个 [a-z0-9]（与服务端白名单 server/http-api.mjs:TAB_RE 同源，
+// 两头各抄一份会慢慢分叉 —— 所以这里的形状改动必须连服务端白名单一起改）。
+// 存 sessionStorage：按标签页隔离；复制标签页会带走一份副本 —— 副本沿用同一登录，
+// 符合直觉。被拒（极端隐私设置）就返回空串：不带选择器 = 退回"全浏览器一份"的老行为。
+const TAB_RE = /^[a-z0-9]{8}$/;
+
+export function tabNonce() {
+  try {
+    let t = sessionStorage.getItem('mf_tab');
+    if (!t || !TAB_RE.test(t)) {
+      // 8 字节、每字节出 1 个 base36 字符 = 恰好 8 位（不足 6 位会被服务端白名单拒掉，
+      // 那种红的表现是"修复看起来没生效"—— 量具全对、选择器没资格上车）
+      const b = new Uint8Array(8);
+      crypto.getRandomValues(b);
+      t = Array.from(b, x => (x % 36).toString(36)).join('');
+      sessionStorage.setItem('mf_tab', t);
+    }
+    return t;
+  } catch { return ''; }
+}
+
 export class Account {
   constructor() {
     this.user = null;             // null = 没登录；否则是 publicProfile 那个形状
+    this.tab = tabNonce();        // 本标签页的选择器（不是秘密，见文件头）
     this.inviteRequired = true;   // 保守默认：在问清楚之前先显示邀请码那一栏
     // 保守默认是"要账号"。两个方向的代价不对称：多显示一个密码框只是啰嗦一句，
     // 而**少**显示它会让这个服变成没人进得去 —— 所以默认值往严的那边倒。
@@ -44,10 +73,13 @@ export class Account {
   async _req(path, body) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    // x-tab：自定义头 = 非简单请求 = 跨站要先过预检，而我们不给 CORS 头 ——
+    // 和 content-type: application/json 同一道闸，不引入新的 CSRF 面。
+    const h = this.tab ? { 'x-tab': this.tab } : {};
     try {
       const r = await fetch(path, {
         method: body === undefined ? 'GET' : 'POST',
-        headers: body === undefined ? {} : { 'content-type': 'application/json' },
+        headers: body === undefined ? h : { 'content-type': 'application/json', ...h },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: ctl.signal,
       });

@@ -236,7 +236,7 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 
 ```bash
 npm test              # 主体档：gate + docs-guard + rollback + reconcile-chain + net-journal + codec + lagcomp + mp-rules + accounts + progress + hardening + room-flow + room-bots + room-dir + image + net-probe + deploy-probe + xenv + fps + viewmodel + gunvisual + net-feel + heli-armor + optic + state-leak
-npm run test:browser  # 对打与掉线两档：net-play + net-drop
+npm run test:browser  # 对打 / 掉线 / 同源双标签页三档：net-play + net-drop + tab-session
 npm run test:all      # 上面两档全跑
 ```
 
@@ -244,7 +244,7 @@ npm run test:all      # 上面两档全跑
 
 **比两个客户端的位置，只能比同一个服务端 tick。** "各自最后收到的那一包"不是同一拍：4.7 m/s 下错一包就是 0.12 m 的假差，于是这类判据随"谁先被调度到"又绿又红（`server/net-probe.mjs` 与 `test/net-play.mjs` 都在这上面红过，单独跑却都是绿的）。两份现在都**同时取样、只认共同的那一拍**，容差跟着收到 `1e-6`（同一拍的那份下行是同一批字节，逐位相同才是它该有的样子）。同理，凡是拿"我自己这一步"当尺子的判据，都得把"这一步真的在动"单列成一条判别臂 —— 站着不动时那把尺子会缩到量化噪声上去。换掉的旧尺子、以及新尺子那两条臂，由 `test/docs-guard.mjs` 的 D′ 段钉住不许换回去（记录见 `docs/net-vs-local-gaps.md` 附九）。第 9 轮又踩到同一类一次：`test/hardening.mjs` 那条"关掉一条连接之后名额还回来了"原本是 `await sleep(300)` 再重连 —— 拿**客户端的钟**去等服务端把 `close` 事件跑完，机器被拖热时 300 ms 不够，当场红成"配额没还回来"（`test:all` 最后一段红过一次，紧接着同一份代码单跑两次 111/111）。尺子同样换成了**服务端自报的数**（`/healthz` 的 `clients`，它和 `connsByIp` 的减一写在同一个 `ws.on('close')` 里），轮询到"在线数真的降了"再重连。第 10 轮把"尺子会缩到噪声"这条原则用到了空跑窗那把尺子自己身上：静止格给 `2×POS_STEP` 的下限、走动格仍按自己的步长量（`js/net/idle-ruler.mjs` + `test/net-feel.mjs` AA 段，旧尺子由 D′ 立碑不许回潮），见 `docs/net-vs-local-gaps.md` 附十四/附十五那条账。
 
-**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` —— 这份名单是**从源码推的**（谁 `import { chromium } from 'playwright'` 就是谁），守卫拿它逐份去对，漏写和多写都红。这 8 份的 `launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本仓库开发机上实际存在的那份绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据：改动前 8 份只有"Chrome + 那台开发机的绝对路径"两档，于是本仓库那句安装提示在没装 Chrome 的机器上是句空话 —— 现在文档守卫的 G 段逐份核它（少一档就红）。其余判据都在进程内跑完，不碰浏览器。
+**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` / `tab-session` —— 这份名单是**从源码推的**（谁 `import { chromium } from 'playwright'` 就是谁），守卫拿它逐份去对，漏写和多写都红。这 9 份的 `launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本仓库开发机上实际存在的那份绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据：改动前 8 份只有"Chrome + 那台开发机的绝对路径"两档，于是本仓库那句安装提示在没装 Chrome 的机器上是句空话 —— 现在文档守卫的 G 段逐份核它（少一档就红）。其余判据都在进程内跑完，不碰浏览器。
 
 - `server/gate.mjs` / `codec.mjs`：协议字段与包长自测（包长一变就打印新值）
 - `test/docs-guard.mjs`：文档守卫 —— 两份清单（README《验收》与 `docs/deploy-checklist.md` §0）和 `package.json` 三档脚本的**互相**覆盖、一份从源码推的浏览器分档名单，外加两张表：「已推翻的断言」（旧话不许再出现，收口记录也不许被删掉换绿）与「已换掉的尺子」（D′ 段，尺子架在测试源码上：`server/net-probe.mjs` 与 `test/net-play.mjs` 那两条"各自最后一包相减"、`≥50Hz` 那条绝对门槛、以及 `test/hardening.mjs` 那条"睡 300 ms 再重连" —— 旧写法不许回来，新写法**连它的先决臂与判别臂**也不许被删掉换绿）。六段之外还有两处"两半边一起看"：D″ 段（README《已知缺口》与部署清单**对同一件事必须说同一句话**：一处改了另一处没改要红）与 G 段（8 份浏览器判据的 `launch` 链里必须有一档交给 Playwright 自己解析，否则上面那句 `npx playwright install chromium` 是假的）。各段都带反证臂，且先决臂要求解析出来的集合非空（改个标题就想让它恒绿会被当场点名）
@@ -271,6 +271,7 @@ npm run test:all      # 上面两档全跑
 - `test/gunvisual.mjs`：枪械视觉六条（弹壳从哪儿冒 / 开火照不照得亮自己的枪 / 换弹时副手动不动 / AK 弹匣颜色 / 消焰器真消焰 / 照门是缺口还是实心板）。每条问的都是**被画出来的那个量**（弹壳世界坐标、灯强度、手的网格位置），不是"实现里有没有那段代码"
 - `server/xenv.mjs`：跨环境一致性（引擎指纹自校准两档，见上）
 - `test/net-play.mjs` / `test/net-drop.mjs`：两个真浏览器对打（延迟补偿与客户端帧时序唯一一起参与的地方）、掉线四种情形分开验收、联机入口真在菜单里。浏览器侧另有两处：**奖章弹窗**（net-play：真对局里打死的每一枪都必须带 `tags` 数组，再把一份生产形状的 `kill` 事件喂给生产用的 `onNetKill`，量的是 HUD 上真的多出"爆头 +50 / 四杀 +200"那两行，并且 `tags` 为空时只有击杀那一行）、**房间屏上的"补人"那一格**（net-drop 的 H 段：空房里那一行也要在 —— 与"有 Bot 才画"的难度行条件相反，这一格唯一的死法是它也等有 Bot 才画，那就没人造得出第一个 Bot）、**账号闸上的"忘了密码？"**（net-drop 的 I 段：点进去当场换成恢复表单、切形态不许把已经打好的呼号擦掉、注册之后**先**摆 5 张码再进大厅、码抄成小写且 `0→o` `1→l` 也能重设、换出来的新一叠与旧的那一叠无一张重合、旧密码当场登不上）
+- `test/tab-session.mjs`：**同源双标签页**（2026-10-01 · 标签页选择器）：会话 cookie 按"源"共享，同一浏览器两个标签页各登一个账号时后登录的把先登录的顶掉 —— 症状是"A 在大厅说话显示成 B 发的言"。两个 page 放进**同一个 context**（cookie 罐共享、sessionStorage 各自一份 —— 那才是真实用户的处境），量三件事：登录 B 之后标签页 1 问"我是谁"仍是 A、A 说话在 B 标签页看到署名 A（修前这里稳定是 B）、A 建的房座位上是 A。修法与信任边界在 `server/http-api.mjs` 的 tabOf 那段，cookie 语义本身的判据在 `test/hardening.mjs` 的 K 段
 
 ## 已知缺口
 

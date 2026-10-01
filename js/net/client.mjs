@@ -16,6 +16,7 @@ import { clamp } from '../util.js';
 import { addAccountXp, addLocalXp } from '../progress.mjs';
 import { Sentry, Heli, flagMesh } from '../mp.js';
 import { Projectile } from '../combat.js';
+import { tabNonce } from '../account.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
 // 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
@@ -23,7 +24,11 @@ const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Sprint | FLAG.OnGround | 
 export class NetClient {
   constructor(game, opts = {}) {
     this.game = game;
-    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+    // 握手带不了 x-tab 头，本台默认连接把标签页选择器放进 URL（?tab=，与跨台票
+    // ?ticket= 同一个先例）—— 要账号的服靠它在握手那一刻认出"这个标签页是谁"。
+    // 跨台的 url 由调用方给（身份由票钉死），不走这条默认拼接。
+    const tab = tabNonce();
+    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${tab ? '?tab=' + encodeURIComponent(tab) : ''}`;
     this.name = opts.name || '士兵';
     this.team = opts.team === 'B' ? 'B' : 'A';
     // 房间的显示名（联机大厅"创建房间"带来）。可选：不带就是"没起名"，

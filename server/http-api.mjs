@@ -16,6 +16,10 @@
 // 还有一个附带好处，对本项目很关键：**WebSocket 握手会自动带上这个 cookie**，
 // 所以服务端能在 upgrade 那一刻就把身份钉死，而不是等 join 帧里自报一个呼号。
 //
+// 同一浏览器两个标签页各登一个账号是支持的场景：登录响应在老名字之外多写一枚
+// 按"标签页选择器"命名的 cookie，之后带选择器的请求各用各的会话 —— 机理与
+// 信任边界写在下面 tabOf 那段（判据：hardening K 段 + test/tab-session.mjs）。
+//
 // ── 限流的 key 是 IP，而 X-Forwarded-For 默认**不认** ──
 // 认了的话任何人都能随便写这个头，于是"按 IP 限流"变成"按攻击者自己填的字符串限流"，
 // 整套限流直接变装饰品。只有在确实放在反向代理后面时才把 TRUST_PROXY 设成代理层数，
@@ -111,19 +115,56 @@ function send(res, status, obj, extra = {}) {
   res.end(body);
 }
 
-export function makeSessionCookie(token, { maxAge, secure }) {
-  const bits = [`${SESSION_COOKIE}=${encodeURIComponent(token)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`];
+export function makeSessionCookie(token, { maxAge, secure, name = SESSION_COOKIE }) {
+  const bits = [`${name}=${encodeURIComponent(token)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`];
   // Secure 只在 HTTPS 下加：加在明文 HTTP 上，浏览器会静默丢掉这个 cookie，
   // 症状是"登录说成功了，下一次请求就说不认识你"，而服务端日志一切正常。
   if (secure) bits.push('Secure');
   return bits.join('; ');
 }
 
+// ── 标签页选择器 ──
+// 会话 cookie 的作用域是"源"不是"标签页"：同一个浏览器开两个标签页各登一个账号，
+// 后登录的那份 Set-Cookie 会把先登录的顶掉（服务端那两行会话都还活着，只是浏览器
+// 只剩最后一枚同名 cookie）。先登录的标签页从此带着**别人**的令牌说话 —— 症状是
+// "A 在大厅说话，显示成 B 发的言"。修法不是把令牌搬进 sessionStorage（那要推翻
+// 文件头"令牌不进 JS 够得着的地方"这条决策），而是给每个标签页一个**公开的**随机
+// 选择器：登录响应把"这个标签页自己的"令牌多写进一枚按选择器命名的 cookie
+// （mf_sid_<tab>），此后带选择器的请求优先读它。
+// 选择器不是秘密：JS 可读、可伪造。伪造它的上限是"选到本浏览器自己登录过的某份
+// 会话"，拿不到任何新东西 —— 真正的凭证仍然只有 HttpOnly cookie 那一份。
+// 白名单（字符集/长度）挡的是把它塞进 cookie 名里那种注入，不是保密。
+const TAB_RE = /^[a-z0-9]{6,16}$/;
+
+// HTTP 请求从头里带（x-tab）；WebSocket 握手带不了自定义头，走 URL 参数（?tab=）——
+// 与跨台入场券 ?ticket= 同一个先例（net-server 的 ticketOf）。两处都收、字符集一样，
+// 一处定义两边共用 —— 抄第二份的症状是"HTTP 认得这个标签页、WS 不认得"。
+export function tabOf(req) {
+  const h = String((req.headers && req.headers['x-tab']) || '');
+  if (TAB_RE.test(h)) return h;
+  try {
+    const q = new URL(req.url, 'http://local').searchParams.get('tab') || '';
+    return TAB_RE.test(q) ? q : '';
+  } catch { return ''; }
+}
+
+export function tabCookieName(tab) { return `${SESSION_COOKIE}_${tab}`; }
+
 // 从请求里取会话（HTTP 与 WebSocket 握手共用同一个入口）。
 // 一处定义两边共用 —— 抄第二份的症状是"HTTP 认得你、WS 不认得你"，
 // 而表现只是"进去了但一直掉线"。
 export async function sessionOf(req, accounts) {
-  const token = parseCookies(req.headers && req.headers.cookie)[SESSION_COOKIE];
+  const jar = parseCookies(req.headers && req.headers.cookie);
+  // 带了选择器就先查它那份 —— 那是"这个标签页自己登录"的会话。
+  // 查不到（这个标签页还没登录过）再退回老名字。这条退路保住两条旧性质：
+  // 没带选择器的请求（老探针、手工 curl）照常工作；新开一个标签页
+  // 仍然"打开即上次登录的账号"。判据在 test/hardening.mjs K 段与 test/tab-session.mjs。
+  const tab = tabOf(req);
+  if (tab) {
+    const t = jar[tabCookieName(tab)];
+    if (t) return accounts.whoami(t);
+  }
+  const token = jar[SESSION_COOKIE];
   if (!token) return null;
   return accounts.whoami(token);
 }
@@ -175,6 +216,16 @@ export async function createAuth({ cfg = {}, store } = {}) {
     const path = url.split('?')[0];
     const ip = clientIp(req, trustProxy);
     const { stat } = ctx;
+    // 本请求的标签页选择器（没有就是空串 = 一切照旧，只用老名字那一枚）。
+    const tab = tabOf(req);
+    // 登录成功要写的 set-cookie：老名字一枚（新开标签页"打开即上次登录"的兜底），
+    // 带选择器时再加一枚**这个标签页私有的**。两枚名字不同，浏览器各存各的、
+    // 谁也不顶谁 —— 先登录的标签页不再被后登录的改身份。
+    const sessionCookies = (token) => {
+      const sc = [makeSessionCookie(token, { maxAge: ttlSec, secure })];
+      if (tab) sc.push(makeSessionCookie(token, { maxAge: ttlSec, secure, name: tabCookieName(tab) }));
+      return sc;
+    };
 
     if (path === '/api/status') {
       // 这个接口刻意**不需要登录也不需要 POST**：客户端在渲染登录框之前就得知道
@@ -325,7 +376,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
       if (!r.ok) return fail(r), true;
       stat.reg++;
       // 恢复码**就在这一条响应里**，之后再也要不回来（服务端只有哈希）。
-      pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) },
+      pass(r, { 'set-cookie': sessionCookies(r.token) },
         r.recovery ? { recovery: r.recovery } : null);
       return true;
     }
@@ -334,7 +385,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
       const r = await accounts.login({ name: body.name, password: body.password, ip });
       if (!r.ok) return fail(r), true;
       stat.login++;
-      pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) });
+      pass(r, { 'set-cookie': sessionCookies(r.token) });
       return true;
     }
 
@@ -348,7 +399,7 @@ export async function createAuth({ cfg = {}, store } = {}) {
       if (!r.ok) return fail(r), true;
       stat.recover++;
       // 成功 = 登录成功（顺带把旧会话全部作废、并换一整叠新码，理由见 accounts.mjs）。
-      pass(r, { 'set-cookie': makeSessionCookie(r.token, { maxAge: ttlSec, secure }) },
+      pass(r, { 'set-cookie': sessionCookies(r.token) },
         r.recovery ? { recovery: r.recovery } : null);
       return true;
     }
@@ -388,12 +439,28 @@ export async function createAuth({ cfg = {}, store } = {}) {
     }
 
     if (path === '/api/logout') {
-      const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-      await accounts.logout(token);
+      // cookie 两枚都清：只清标签页那枚的话，这个标签页下一次请求会退回到仍旧活着的
+      // 兜底 —— 症状是"登出说成功了，刷新一下又是登录态"；只清兜底那枚同理反过来。
+      // 服务端的**行**只杀本标签页自己的那份。兜底那枚的行不跟着杀 —— 它永远指向
+      // "最后一次登录"，那很可能正是**另一个标签页**此刻用着的同一行（同一个令牌写了两枚
+      // cookie）；杀了它，"每个标签页一份身份"就在登出这条路上漏气。它的 cookie 清掉之后
+      // 本标签页与新标签页都退不回它了，留下的只是别标签页自己那份还活着的凭据。
+      // 没带选择器的老形状（整浏览器一份）保持原语义：登出 = 杀行 + 清 cookie。
+      const jar = parseCookies(req.headers.cookie);
+      const tabTok = tab ? jar[tabCookieName(tab)] : undefined;
+      const legacyTok = jar[SESSION_COOKIE];
+      if (tab) {
+        if (tabTok) await accounts.logout(tabTok);
+      } else if (legacyTok) {
+        await accounts.logout(legacyTok);
+      }
       stat.logout++;
       // Max-Age=0 清掉它。只删服务端那一份是不够的：浏览器手里那个还在，
       // 下次访问还会带上，而服务端已经不认识它了 —— 表现是"登出之后一直说自己没登录"。
-      send(res, 200, { ok: true }, { 'set-cookie': makeSessionCookie('', { maxAge: 0, secure }) });
+      const clear = (name) => makeSessionCookie('', { maxAge: 0, secure, name });
+      const sc = [clear(SESSION_COOKIE)];
+      if (tab) sc.push(clear(tabCookieName(tab)));
+      send(res, 200, { ok: true }, { 'set-cookie': sc });
       return true;
     }
 

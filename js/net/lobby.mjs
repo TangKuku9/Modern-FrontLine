@@ -17,13 +17,17 @@
 // 这一层只把服务端报回来的 canStart/why 画出来 —— 客户端自己再算一遍的话，
 // 就会出现"按钮能点但服务端说不能开"，而那是这一轮要消灭的那类静默失效。
 import { decodeSnapshot } from '../../server/codec.mjs';
+import { tabNonce } from '../account.js';
 
 const TIMEOUT_MS = 12000;
 
 export class LobbyClient {
   constructor(game, opts = {}) {
     this.game = game;
-    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+    // 同 NetClient：本台默认连接带 ?tab=（握手带不了自定义头）；跨台的 url 由调用方给，
+    // 身份由那张票钉死，不需要也不该再带本台的选择器。
+    const tab = tabNonce();
+    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${tab ? '?tab=' + encodeURIComponent(tab) : ''}`;
     this.name = opts.name || '士兵';
     this.onRooms = opts.onRooms || (() => {});       // 列表 / 在线人数变了
     this.onRoom = opts.onRoom || (() => {});         // 房间状态变了（含局末回房）

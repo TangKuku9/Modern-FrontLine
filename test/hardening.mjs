@@ -804,6 +804,97 @@ try {
     }
   }
 
+  // ══════════ K 同源两标签页：tab 选择器 ══════════
+  // 会话 cookie 按"源"共享：同一浏览器两个标签页各登一个账号，后登录的把先登录的顶掉，
+  // 先登录的那个标签页从此替别人说话（玩家报的症状：A 在大厅说话显示成 B 发的言）。
+  // 机理见 server/http-api.mjs 的 tabOf 那段。浏览器侧的端到端判据在 test/tab-session.mjs
+  // （真浏览器、同 context 双 page）；这一段用裸 HTTP/WS 量 **cookie 语义本身**：
+  // 谁压过谁、退路保不保、登出清不清、非法选择器进不进得了 cookie 名。
+  {
+    const sK = await withServer({ JOIN_CODE: INVITE });
+    try {
+      // "浏览器"的替身：一枚罐（legacy 恒为最后登录写进的那份）+ 两个标签页各一枚选择器。
+      // 这正是 bug 的机理形状 —— 罐里的老名字**就是**被后登录顶掉之后的样子。
+      const jar = { taba01: '', tabb02: '', legacy: '' };
+      const grab = (headers, tab) => {
+        for (const sc of [].concat(headers['set-cookie'] || [])) {
+          const nm = sc.split('=')[0];
+          if (nm === 'mf_sid_' + tab) jar[tab] = sc.split(';')[0];
+          else if (nm === 'mf_sid') jar.legacy = sc.split(';')[0];
+        }
+      };
+      const me = async (cookie, tab) => JSON.parse((await raw(sK.base + '/api/me',
+        { headers: { cookie, ...(tab ? { 'x-tab': tab } : {}) } })).text);
+
+      const rA = await json(sK.base + '/api/register', { name: '标签甲', password: PW, code: INVITE }, { 'x-tab': 'taba01' });
+      grab(rA.headers, 'taba01');
+      chk(rA.status === 200 && !!jar.taba01 && !!jar.legacy,
+        'K1 带选择器的登录写下两枚 cookie：本标签页私有的 mf_sid_taba01 + 老名字兜底',
+        JSON.stringify({ taba01: !!jar.taba01, legacy: !!jar.legacy }));
+
+      const rB = await json(sK.base + '/api/register', { name: '标签乙', password: PW, code: INVITE }, { 'x-tab': 'tabb02' });
+      grab(rB.headers, 'tabb02');
+      chk(rB.status === 200 && !!jar.tabb02,
+        'K2 先决：标签页 2 也登好了（此刻罐里 legacy 已被乙顶掉 —— 那是 bug 的起点）', `${rB.status}`);
+
+      const mA = await me(`${jar.taba01}; ${jar.legacy}`, 'taba01');
+      chk(mA.loggedIn && mA.name === '标签甲',
+        'K3 标签页 1 问"我是谁"仍是 甲（选择器那份压过被顶掉的兜底 —— HTTP 半边的被测对象）', JSON.stringify(mA));
+      const mB = await me(`${jar.tabb02}; ${jar.legacy}`, 'tabb02');
+      chk(mB.loggedIn && mB.name === '标签乙', 'K4 标签页 2 是 乙（两枚互不覆盖）', JSON.stringify(mB));
+      const mNew = await me(jar.legacy, '');
+      chk(mNew.loggedIn && mNew.name === '标签乙',
+        'K5 没带选择器的请求读兜底（新开标签页＝最后登录的账号；老探针/手工 curl 的老性质不丢）', JSON.stringify(mNew));
+
+      // WS 半边：握手带不了 x-tab，选择器走 URL 参数（与跨台票 ?ticket= 同一个先例）。
+      // 两条连接共用一个罐 —— 同一浏览器两个标签页的真实处境。cookie 串与浏览器发出的
+      // 一样是**两枚都带**（tab 专属那枚没有选择器傍身时，服务端无从归属它 —— 拒是对的）。
+      const wa = await openWs(sK.ws + '?tab=taba01', `${jar.taba01}; ${jar.legacy}`);
+      wa.ws.send(JSON.stringify({ t: 'join', room: 'tabk1', name: '冒充者甲', team: 'A' }));
+      const wwa = await waitFor(wa.msgs, m => m.t === 'welcome');
+      chk(!!wwa && wwa.name === '标签甲',
+        'K6 标签页 1 的连接在握手那一刻被认成 甲（welcome.name 是服务端给的本人呼号，不是自报的）',
+        JSON.stringify(wwa && wwa.name));
+      const wb = await openWs(sK.ws + '?tab=tabb02', `${jar.tabb02}; ${jar.legacy}`);
+      wb.ws.send(JSON.stringify({ t: 'join', room: 'tabk1', name: '冒充者乙', team: 'B' }));
+      const wwb = await waitFor(wb.msgs, m => m.t === 'welcome');
+      const names = ((wwb && wwb.others) || []).map(o => o.name);
+      chk(!!wwb && wwb.name === '标签乙',
+        'K7 标签页 2 的连接是 乙（修前同一罐里两条连接全被认成后登录那位）', JSON.stringify(wwb && wwb.name));
+      chk(names.includes('标签甲') && !names.includes('冒充者甲') && !names.includes('冒充者乙'),
+        'K8 **反证臂**：乙眼里同房站着的正是会话里的 甲，join 自报名没生效（老判据在 tab 世界里不许松）',
+        JSON.stringify(names));
+
+      // 退路：?tab= 指一个没登录过的选择器 → 读兜底。这是"新开一个标签页"的 WS 形状。
+      const wf = await openWs(sK.ws + '?tab=fresh99', jar.legacy);
+      wf.ws.send(JSON.stringify({ t: 'join', room: 'tabk2', name: '路人', team: 'A' }));
+      await waitFor(wf.msgs, m => m.t === 'welcome');
+      const wj = await openWs(sK.ws + '?tab=taba01', `${jar.taba01}; ${jar.legacy}`);
+      wj.ws.send(JSON.stringify({ t: 'join', room: 'tabk2', name: '对照甲', team: 'B' }));
+      const wwj = await waitFor(wj.msgs, m => m.t === 'welcome');
+      chk(((wwj && wwj.others) || []).some(o => o.name === '标签乙'),
+        'K9 WS 退路：未登录过的选择器退回老名字（那间房里站着的正是兜底的 乙）',
+        JSON.stringify(((wwj && wwj.others) || []).map(o => o.name)));
+      wa.ws.close(); wb.ws.close(); wf.ws.close(); wj.ws.close();
+
+      // 登出：两枚都作废都清掉；另一个标签页不受牵连（老行为里同罐登出全没 —— 那是收窄不是回归）。
+      const lo = await json(sK.base + '/api/logout', {}, { cookie: `${jar.taba01}; ${jar.legacy}`, 'x-tab': 'taba01' });
+      const cleared = [].concat(lo.headers['set-cookie'] || []).map(sc => sc.split('=')[0]);
+      chk(cleared.includes('mf_sid') && cleared.includes('mf_sid_taba01'),
+        'K10 登出把两枚 cookie 都清掉（只清一枚的症状是"登出成功，刷新又登录"）', JSON.stringify(cleared));
+      const mOut = await me(jar.taba01, 'taba01');
+      chk(mOut.loggedIn === false, 'K11 登出之后标签页 1 真的没了', JSON.stringify(mOut));
+      const mB2 = await me(jar.tabb02, 'tabb02');
+      chk(mB2.loggedIn && mB2.name === '标签乙', 'K12 标签页 2 不受标签页 1 登出牵连', JSON.stringify(mB2));
+
+      // 注入臂：选择器要过白名单才进 cookie 名（mf_sid_<tab> 的 <tab> 是拼进名字的）。
+      const ev = await json(sK.base + '/api/register', { name: '注入臂', password: PW, code: INVITE }, { 'x-tab': 'x'.repeat(50) });
+      const evNames = [].concat(ev.headers['set-cookie'] || []).map(sc => sc.split('=')[0]);
+      chk(ev.status === 200 && evNames.length === 1 && evNames[0] === 'mf_sid',
+        'K13 **反证臂**：不合法的选择器 ⇒ 只写老名字一枚（白名单挡住 cookie 名注入）', JSON.stringify(evNames));
+    } finally { sK.kill(); }
+  }
+
 } catch (e) {
   console.log('CRASH ' + (e && (e.stack || e.message)));
   fails++;
