@@ -35,6 +35,11 @@ export const FLAG = {
 export const KEY = {
   Fwd: 1, Back: 2, Left: 4, Right: 8, Sprint: 16, Jump: 32, Crouch: 64,
   Reload: 128, Interact: 256, NVG: 512, Melee: 1024, InteractPressed: 2048,
+  // 数字键直选武器（1/2）。这两个位曾经不存在 —— main.js:snapshotInput 一直报着
+  // slot1/slot2，打包表里却没有它们，于是联机下按数字键切枪**服务端永远不知道**：
+  // 权威端停在主武器上连发步枪，客户端自己演的是手枪，快照再把权威的后坐喂回来。
+  // keys 是 u16，排到 InteractPressed(2048) 后还剩 4096/8192 两格，恰好放下。
+  Slot1: 4096, Slot2: 8192,
 };
 export const BTN = {
   Fire: 1, Ads: 2, FirePressed: 4, AdsPressed: 8, SwapNext: 16, SwapPrev: 32,
@@ -74,6 +79,9 @@ const KEYMAP = [
   ['Sprint', 'sprint'], ['Jump', 'jumpPressed'], ['Crouch', 'crouchPressed'],
   ['Reload', 'reloadPressed'], ['Interact', 'interact'], ['InteractPressed', 'interactPressed'],
   ['NVG', 'nvgPressed'], ['Melee', 'meleePressed'],
+  // 数字键直选武器。漏掉它们的症状见 KEY.Slot1 的注释 —— codec 自测的按键往返表
+  // （server/codec.mjs）把这两个字段也列了，谁再把它们从这张表里删掉当场就红。
+  ['Slot1', 'slot1'], ['Slot2', 'slot2'],
 ];
 // 投掷物的"按下/按住"两位都在 buttons 里：keys 只剩 16 位且已排到 1024，
 // 再往里塞会把按住位和按下位重到同一个掩码上（写过一次，症状是手雷自己掏出来）。

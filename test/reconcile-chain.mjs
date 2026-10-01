@@ -418,6 +418,54 @@ async function main() {
       ` · 多走拍数最多 ${overMax}（上界 ${(overMax * STEP_M).toFixed(4)} m）`);
   }
 
+  // ── 武器错位兜底（2026-10-01）：权威武器字节持久错位 ⇒ 1 秒后硬纠正 ──
+  // 触发条件在真实对局里是"切枪输入被上行队列溢出丢掉"（WebSocket 是 TCP，在途不丢，
+  // 这是唯一丢法），链上涌现不出来，所以直接喂：本地从没切过枪，权威端却一直说 m1911
+  // （weapon 字节 9）。修复前 srvWeapon 只被存进诊断读数没人消费，错位活满一整条命 ——
+  // 症状是"手里明明切成了手枪，按住左键却吃步枪的连续伤害、枪口还按步枪的上扬"。
+  {
+    const mk = async () => {
+      const g = new HeadlessGame(); await g.loadMap('yard');
+      const pl = await mkPlayer(g, 'wd');
+      const net = Object.create(NetClient.prototype);
+      Object.assign(net, {
+        game: g, history: [], localTick: 0, snaps: 0, serverTick: 0, lastSnapTick: undefined,
+        lastStart: undefined, lastRep: 0, lastRngState: undefined, hardSnap: false, lastMyAlive: true,
+        recIdx: 0, grace: 0, events: [], cid: 1, name: 'wd', team: 'A', remotes: new Map(), roster: new Map(),
+        lastLanding: null, lastLandingTick: null, snapLog: [], worldFlags: 0, mySnapshot: null,
+        hpMin: undefined, srvWeapon: undefined, remotePlayers: [],
+      });
+      return { g, pl, net };
+    };
+    // 喂 n **份快照**（每份 = SNAP 拍）：客户端原样站桩产拍，权威武器字节恒为 weaponByte。
+    // 第一版按拍数喂，25 拍只产出 8 份快照 —— 够不到 20 份的阈值，W1 假红（量具的错）。
+    const feedN = async ({ g, pl, net }, n, weaponByte) => {
+      for (let s = 0; s < n; s++) {
+        for (let k = 0; k < SNAP; k++) {
+          const inp = ZERO;
+          g.step(DT, inp, [{ pl, inp }]);
+          net.history.push({ tick: net.localTick & 0xffff, inp, j: pl.journal(), debt: 0 });
+          net.localTick++;
+        }
+        const e = entityOf(pl, net.localTick - 1, 0);
+        e.weapon = weaponByte;
+        net.serverTick = net.localTick;
+        net.reconcile(e, net.localTick, 0);
+      }
+    };
+    const w1 = await mk();
+    await feedN(w1, 25, 9);                    // WEAPON_IDS[9] = 'm1911'：20 份（1 秒）后必须纠正
+    chk('W1 持久错位（权威说是 m1911 而本地从没切过）⇒ 20 份快照后硬切到权威那把并记账',
+      w1.pl.ws.w.id === 'm1911' && (w1.net.wpnFixed | 0) === 1 && (w1.net.wpnMiss | 0) === 0,
+      `本地 ${w1.pl.ws.w.id} · wpnFixed=${w1.net.wpnFixed}`);
+    const w2 = await mk();
+    await feedN(w2, 12, 9);                    // 0.6 秒的错位 = 换枪输入在途的正常窗口
+    await feedN(w2, 12, 0);                    // 权威端又翻回 m4（输入被消费了）
+    chk('W2 反证臂：瞬时差（≤1 秒）不许触发纠正 —— 正常换枪的在途窗口不是故障',
+      w2.pl.ws.w.id === 'm4' && (w2.net.wpnFixed | 0) === 0 && (w2.net.wpnMiss | 0) === 0,
+      `本地 ${w2.pl.ws.w.id} · wpnFixed=${w2.net.wpnFixed}`);
+  }
+
   console.log(`\n${fails ? 'RED' : 'GREEN'}  ${checks - fails}/${checks} 通过`);
   process.exit(fails ? 1 : 0);
 }

@@ -229,11 +229,14 @@ if (isDirectRun()) {
     console.log(`  步态相位 u8 折叠：整圈最大误差 ${worst.toFixed(4)} rad ≤ 半格 ${(step / 2).toFixed(4)}；1.234 → ${got.toFixed(4)}（不是截断的 1）`);
   }
 
-  // 按键映射往返：sim 的 input 有 21 个布尔字段，打包再解包必须逐个原样回来。
+  // 按键映射往返：sim 的 input 有 23 个布尔字段，打包再解包必须逐个原样回来。
   // 这条是"按住右键掏手雷"那类错位的唯一防线 —— 位掩码写重了不会报错，只会手感怪。
+  // slot1/slot2（数字键切枪）曾经不在打包表里也不在这张往返表里 —— 双双漏网，
+  // 于是联机下按 1/2 服务端永远不知道（症状：手里是手枪、挨的是步枪的账）。
+  // 两处要一起动：这里少列一个，协议丢一个字段就没人拦。
   const fields = ['fwd', 'back', 'left', 'right', 'sprint', 'jumpPressed', 'crouchPressed', 'reloadPressed',
     'interact', 'interactPressed', 'nvgPressed', 'meleePressed', 'fire', 'ads', 'firePressed', 'adsPressed',
-    'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical'];
+    'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical', 'slot1', 'slot2'];
   const bad = [];
   for (const f of fields) {
     const src = {}; src[f] = true;

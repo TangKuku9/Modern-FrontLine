@@ -159,6 +159,12 @@ export class Projectile {
     this.game = game; this.type = type; this.pos = pos.clone(); this.vel = vel.clone(); this.owner = owner;
     this.fuse = fuse; this.alive = true; this.stuck = false; this.age = 0; this.bounces = 0;
     this.dumb = !!opts.dumb;
+    // mirror：这颗是**玩家自己武器状态机**扔出来的（手雷松手 / RPG 击发）。权威端据此在
+    // proj 事件上带 self 标记 —— 投掷者的客户端对那一颗**不再建表现副本**，因为它的本地
+    // 预测已经有一颗真的在飞（同一份 weapon-state 代码）。没有这个标记就没法区分"自己
+    // 预测过的"与"服务端替我生成的"（连杀排程的集束弹：呼叫者本地没有预测，必须照常
+    // 建副本，否则呼叫者自己反而看不见自己的空袭）。必须在 onProjectile 钩子**之前**落字段。
+    this.mirror = !!opts.mirror;
     let geo, m;
     if (type === 'frag') { geo = new THREE.SphereGeometry(0.05, 10, 8); m = mat('gunGreen'); }
     else if (type === 'semtex') { geo = new THREE.BoxGeometry(0.08, 0.05, 0.05); m = mat('yellowPaint'); }

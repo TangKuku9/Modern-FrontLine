@@ -629,6 +629,32 @@ try {
   }
   const wA = await A.page.evaluate(() => ({ local: window.game.player.ws.w.id, srv: window.game.net.srvWeapon, mag: [window.game.player.ws.w.mag, window.game.net.mySnapshot.mag] }));
   ok('服务端用的就是我这套装备（武器一致）', wA.local === wA.srv, `本地 ${wA.local} · 权威 ${wA.srv}`);
+
+  // ---- 数字键切枪上行 + 自投掷物去重（2026-10-01 两缺陷的端到端臂）----
+  // 上面那条"武器一致"断言早就在，但整个脚本没人按过 1/2 —— 断言活着、弹匣里没装子弹。
+  await focus(A);
+  {
+    for (let i = 0; i < 40 && !(await A.page.evaluate(() => window.game.player && window.game.player.alive)); i++) await sleep(250);
+    const want = await A.page.evaluate(() => ((window.game.net.welcome || {}).loadout || {}).secondary?.id || 'm1911');
+    // 数字键 1/2 曾经根本不在上行协议里（quant.js 打包表漏了 slot1/slot2）：本地切了、
+    // 权威端永远停在主武器上 —— 症状是"手里是手枪、按住左键吃步枪的连续伤害、
+    // 枪口还按步枪的后坐上扬（快照把权威的 pitch 喂回来）"。1.2 s 够输入在途 + 消费 + 快照回来。
+    await A.page.keyboard.press('Digit2');
+    await sleep(1200);
+    const w2 = await A.page.evaluate(() => ({ local: window.game.player.ws.w.id, srv: window.game.net.srvWeapon }));
+    ok('数字键切枪上行：按 2 之后权威端手里的就是副武器（与本地同一把）',
+      w2.local === w2.srv && w2.local === want, `本地 ${w2.local} · 权威 ${w2.srv} · 副武器 ${want}`);
+    await A.page.keyboard.press('Digit1');              // 把现场还给后面的用例
+    await sleep(900);
+    // 自己扔一颗雷：自己屏幕上该只有一颗（本地预测那颗）。修复前服务端的 proj 回声没有
+    // 主人标记，客户端照单全收再建一颗哑副本 —— 扔一颗看见两颗（RPG 同病）。
+    const f0 = await A.page.evaluate(() => window.game.projectiles.filter(p => p.type === 'frag' && p.alive).length);
+    await A.page.keyboard.down('KeyG'); await sleep(180); await A.page.keyboard.up('KeyG');
+    await sleep(700);
+    const f1 = await A.page.evaluate(() => window.game.projectiles.filter(p => p.type === 'frag' && p.alive).length);
+    ok('自己扔的雷只有一颗（服务端回声不再生成副本）', f1 === f0 + 1, `扔前 ${f0} · 扔后 ${f1}`);
+    await A.page.evaluate(() => { for (const p of window.game.projectiles) if (p.type === 'frag' && p.alive) p.remove(); });
+  }
   // 先决：被计入稳态的样本数必须够多。排除项（饥饿/重生/生死翻转/入场）一旦把样本
   // 吃光，下面那条就变成永远绿的空断言 —— 所以population本身要断言。
   ok('稳态样本够多（排除项没把总体吃光）', q.steadyN > 300, `稳态 ${q.steadyN} 包 / 共 ${q.reconciles} 包；饥饿 ${q.starved} · 生死翻转 ${q.aliveFlips}`);
@@ -818,12 +844,20 @@ try {
   await sleep(250);
   await A.page.evaluate(() => { if (window.game.player) window.game.player.pitch = -0.45; });
   await sleep(300);                                          // 等 ack 走过，重放不会把俯仰拽回去
+  const preShot = await A.page.evaluate(() => ({ mag: window.game.player.ws.w.mag, shots: window.game.player.stats.shots }));
   await A.page.mouse.down({ button: 'left' }); await sleep(80); await A.page.mouse.up({ button: 'left' });
   await sleep(450);
   const hzC2 = await (await fetch(srv.base + '/healthz')).json();
   const callsC2 = ((((hzC2.per || []).find(r => r.id === ROOM)) || {}).streak || {}).calls | 0;
   ok('左键确认：选点流程把 {t:"streak"} 发到了服务端（正好 +1；+2 = 按键字节没被拦住的双发）',
     !(await A.page.evaluate(() => window.game.net.targeting)) && callsC2 === calls0 + 1, `calls ${calls0} → ${callsC2}`);
+  // 确认那一下左键不是一发子弹：选点吞火（recordInput 对本地预测与上行同时清掉开火位）。
+  // 修复前这一下会本地真开一枪（pl.update 跑在 mode.update 之前，cool=0.3 拦不住同一拍）、
+  // 上行还带着开火位让权威端再开一枪 —— 各打一发各抬一次枪口。
+  const postShot = await A.page.evaluate(() => ({ mag: window.game.player.ws.w.mag, shots: window.game.player.stats.shots }));
+  ok('确认落点的那一下左键不走火（选点吞火：本地预测与上行都没有这一枪）',
+    postShot.shots === preShot.shots && postShot.mag === preShot.mag,
+    `shots ${preShot.shots} → ${postShot.shots} · mag ${preShot.mag} → ${postShot.mag}`);
 
   // ---- 结算面板：胜 / 平两格与胜负分（数的来源在 mp-rules K，这里量面板本身）----
   // 事件从**协议入口**喂（onControl，net-drop 用的同一个口）：真对局要打满击杀目标或

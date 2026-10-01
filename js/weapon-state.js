@@ -197,7 +197,9 @@ export class WeaponState {
     if (st.projectile === 'rocket') {
       // 抛射物的位置由服务端算，客户端自己那份要靠下行事件同步（P2）；
       // 重放时绝对不能再挤出一枚，那会有两枚同 id 的火箭各炸各的。
-      if (!replay) game.projectiles.push(new Projectile(game, 'rocket', origin.clone().addScaledVector(fwd, 0.8), fwd.clone().multiplyScalar(55), pl, 10));
+      // mirror：告诉权威端"投掷者本地预测了这一颗"——它的 proj 事件据此带 self，
+      // 投掷者的客户端不再为它建副本（否则眼前两枚火箭）。
+      if (!replay) game.projectiles.push(new Projectile(game, 'rocket', origin.clone().addScaledVector(fwd, 0.8), fwd.clone().multiplyScalar(55), pl, 10, { mirror: true }));
     } else {
       // 散布一定要算、随机数一定要抽，哪怕这一发不去打世界
       const spread = this.currentSpread() * DEG * 0.5;
@@ -301,7 +303,9 @@ export class WeaponState {
     const fuse = g.type === 'frag' ? Math.max(0.05, fuseBase - this.cookT) : fuseBase;
     const pos = pl.eyePoint(new THREE.Vector3()).addScaledVector(fwd, 0.4).add(new THREE.Vector3(0, -0.1, 0));
     const vel = inHand ? new THREE.Vector3() : fwd.clone().multiplyScalar(17).add(new THREE.Vector3(0, 3.5, 0)).add(pl.vel.clone().multiplyScalar(0.5));
-    if (!this.replay) game.projectiles.push(new Projectile(game, g.type, pos, vel, pl, fuse));
+    // mirror：同 fire() 的火箭那半 —— 投掷者本地预测了这一颗，服务端的 proj 事件
+    // 据此带 self，投掷者的客户端不再建副本（否则扔一颗雷看见两颗）。
+    if (!this.replay) game.projectiles.push(new Projectile(game, g.type, pos, vel, pl, fuse, { mirror: true }));
     if (inHand) { this.state = 'idle'; }
   }
 }

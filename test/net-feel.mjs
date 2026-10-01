@@ -389,6 +389,16 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     p ? `pos=${p.pos.x},${p.pos.z} vel.y=${p.vel.y}` : 'null');
   ok('J13 副本登记在 netId 表里（到点炸掉之后那张表要能收回去）', c.projs.get(5) === p);
 
+  // 自己的那颗不许双份。服务端对"玩家武器状态机扔出来的"那颗打了 mirror 标记，事件上
+  // 带 self —— 投掷者的客户端必须跳过它（本地预测那颗是真的在飞）。修复前事件里没有
+  // 主人标记，投掷者照单全收再建一个，症状是"自己扔一颗雷，眼前飞着两颗"。
+  feed([{ e: 'proj', netId: 6, kind: 'frag', x: 5, y: 1.5, z: 6, vx: 0, vy: 3, vz: 0, fuse: 3, team: 'A', cid: 7, self: true }]);
+  ok('J13b 自己的投掷物（self）不再建副本 —— 场上还是 J11 那一颗',
+    g.projectiles.length === 1 && !c.projs.has(6), `场上 ${g.projectiles.length} 颗`);
+  feed([{ e: 'proj', netId: 7, kind: 'bomb', x: 0, y: 40, z: 0, vx: 1, vy: -12, vz: 0, fuse: 10, team: 'A', cid: 7 }]);
+  ok('J13b′ 反证臂：自己叫的集束空袭**照常**建副本（本地没预测过它，这是呼叫者唯一的一双眼）',
+    g.projectiles.length === 2 && c.projs.get(7) === g.projectiles[1], `场上 ${g.projectiles.length} 颗`);
+
   // leave：既要开始淡出、又要有一句提示
   const said = [];
   g.hud.announce = (...a) => said.push(a[0]);
@@ -399,6 +409,64 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     c.leaving.indexOf(r) >= 0 && !c.remotes.has(3) && said.length === 1 && /老王/.test(said[0]),
     `leaving=${c.leaving.length} 提示=${JSON.stringify(said)}`);
   ok('J15 反证臂：淡出队列里的那个确实在淡（不是只挪了个表）', r.targetable === false && r.beginLeaveCalled !== false);
+}
+
+// ───────── J′. 投掷物的主人标记（服务端那一半）+ 选点吞火（2026-10-01 两缺陷）─────────
+// 两个缺陷同一条根：**权威端与客户端对同一件事各有各的真相，中间没有交接的凭据**。
+// 投掷物缺"这颗是谁的/他的客户端是否已经预测了"；空袭确认缺"这一下左键不是扳机"的约定。
+{
+  // —— 服务端那一半：announceProjectile 的单元（只碰 netIds / byPlayer / events，
+  //    用原型实例量，跟 K 段同一招 —— 不为它起一个真房间）——
+  const room = Object.create(NetRoom.prototype);
+  room.netIds = 0; room.events = []; room.byPlayer = new Map();
+  const owner = {};
+  room.byPlayer.set(owner, { cid: 41 });
+  room.announceProjectile({ owner, type: 'frag', pos: new THREE.Vector3(1, 2, 3), vel: new THREE.Vector3(0, -3, 0), fuse: 2.5, mirror: true });
+  const e1 = room.events[0];
+  ok('JZ1 服务端的 proj 事件带主人 cid 与 self 标记（客户端滤自己的唯一凭据）',
+    e1 && e1.e === 'proj' && e1.cid === 41 && e1.self === true,
+    JSON.stringify(e1 ? { cid: e1.cid, self: e1.self, kind: e1.kind } : null));
+  room.announceProjectile({ owner, type: 'bomb', pos: new THREE.Vector3(), vel: new THREE.Vector3(), fuse: 10 });
+  ok('JZ2 反证臂：连杀排程的弹（mirror 假）self 为假 —— 呼叫者本地没预测过，必须照常建副本',
+    room.events[1] && room.events[1].self === false);
+  room.announceProjectile({ owner: {}, type: 'frag', pos: new THREE.Vector3(), vel: new THREE.Vector3(), fuse: 3, mirror: true });
+  ok('JZ3 反证臂：主人不在座位表里（Bot 的雷）cid 为 null、self 为假 —— 谁收到谁建',
+    room.events[2] && room.events[2].cid === null && room.events[2].self === false);
+
+  // —— 客户端那一半：选点吞火整链（recordInput 存 → updateTargeting 消费）——
+  // 修复前确认落点的那一下左键是一发真子弹：本地预测打一发（pl.update 跑在 mode.update
+  // 之前，cool=0.3 拦不住同一拍）、上行还带着开火位让服务端再打一发。
+  const g2 = makeGame();
+  g2.camera.getWorldDirection = (v) => v.set(0, -0.4, -1).normalize();
+  g2.world.raycast = () => ({ point: new THREE.Vector3(4, 0, 5) });
+  g2.world.root = new THREE.Scene();
+  g2.player = { name: '我', team: 'A', pos: new THREE.Vector3(), alive: true, journal: () => null, ws: { cool: 0 } };
+  const c2 = new NetClient(g2, { url: 'ws://127.0.0.1:1/ws', name: '我', team: 'A' });
+  c2.cid = 7;
+  const sent = [];
+  c2.ws = { readyState: 1, send: (m) => sent.push(m) };
+  c2.streakState = [{ id: 'cluster', ready: true, used: false, cost: 5 }];
+  const inp1 = { fire: true, firePressed: true, mdx: 0, mdy: 0, streak: -1 };
+  c2.targeting = { slot: 0 };
+  c2.recordInput(10, inp1);
+  const pe = c2.pending[c2.pending.length - 1];
+  ok('JZ4 选点中的左键被 recordInput 吞掉：上行包不带开火位、本地输入对象也被清（预测打不出这一发）',
+    pe && !(pe.buttons & 1) && !(pe.buttons & 4) && inp1.fire === false && inp1.firePressed === false
+    && c2.confirmShot === true,
+    `buttons=${pe && pe.buttons} confirmShot=${c2.confirmShot}`);
+  c2.updateTargeting(inp1);
+  const sf = sent.map(s => JSON.parse(s)).find(f => f.t === 'streak');
+  ok('JZ5 同拍消费：确认照常发出 {t:"streak"} 窄帧、本地压枪 cool=0.3、选点退出、点击残留清零',
+    !!sf && sf.slot === 0 && g2.player.ws.cool === 0.3 && c2.targeting === null && c2.confirmShot === false,
+    JSON.stringify(sf || null));
+  // 反证臂：点空（这一拍没照到地面）就丢 —— 不许顺延到"后来才照到"的那一拍凭空确认。
+  c2.targeting = { slot: 0 };
+  g2.world.raycast = () => null;
+  c2.recordInput(11, { fire: true, firePressed: true, mdx: 0, mdy: 0, streak: -1 });
+  c2.updateTargeting({ firePressed: false, adsPressed: false });
+  ok('JZ6 反证臂：点空的确认就地作废（选点还开着、没有请求发出去、残留不留给下一拍）',
+    c2.targeting !== null && sent.length === 1 && c2.confirmShot === false,
+    `sent=${sent.length} targeting=${!!c2.targeting}`);
 }
 
 // ───────────────────────── K. 服务端那两扇门（差距 5 / 34）─────────────────────────

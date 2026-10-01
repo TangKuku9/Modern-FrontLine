@@ -75,6 +75,10 @@ export class NetClient {
     this.pickups = new Map();                         // id -> 地上的枪（哑模型）
     this.leaving = [];                                // 正在淡出的远端玩家（已经不在权威世界里）
     this.pingSent = 0; this.pingGot = 0;
+    // 集束选点吞掉的确认点击（recordInput 存、updateTargeting 消费 —— 同一拍的一存一取，
+    // 见 recordInput 开头那段）。选点结束后必须清（useStreak / updateTargeting 两条路都清），
+    // 残留的 true 会让"后来才照到地面"的那一拍凭空确认一次空袭。
+    this.confirmShot = false;
   }
 
   connect() {
@@ -246,6 +250,16 @@ export class NetClient {
   // 每个模拟 tick 调一次：记历史 + 排队上行
   recordInput(tick, inp) {
     this.localTick = tick;
+    // 选点流程吞火。game.update 的顺序是 recordInput → pl.update（本地预测）→ mode.update
+    // （updateTargeting 消费确认），所以只有在这里动手，才能对"本地预测"与"上行"同时生效：
+    // 确认落点的那一下左键不许是一枪 —— 不吞的话本地预测真开一发（pl.update 在前），
+    // 上行也带着开火位（服务端照单全收），两边各打一发各抬一次枪口。点空了（没照到地面）
+    // 也一样吞：选点中的左键要么确认、要么什么都不是，不该漏成一发真子弹。
+    // 点过哪一下存进 confirmShot，同拍后段的 updateTargeting 消费。
+    if (this.targeting) {
+      if (inp.firePressed) this.confirmShot = true;
+      inp.firePressed = false; inp.fire = false;
+    }
     const t16 = tick & 0xffff;
     // 报给服务端的"我看到哪一拍"。时钟口径是**服务端拍号**，不是本机 tick —— 两者差着一个
     // 任意的起点偏移，把它混进延迟补偿会让回溯量整体偏掉一个常数（而那个常数随每个人
@@ -464,6 +478,29 @@ export class NetClient {
     // 下一窗只会在这份状态"就是它那个时刻"时才用它（见 carryOf 里 useLanded 那段）。
     this.lastLanding = r.landed || null;
     this.lastLandingTick = r.landed ? start : null;
+    // ── 武器兜底 ── 快照里的武器字节是权威端"我手里是什么"的唯一说法，以前只被存进
+    // srvWeapon 当诊断读数、没人消费。正常换枪也会错位一小段（切枪输入在途 ≈ RTT +
+    // 一份快照，两端随后自愈），所以不碰瞬时差：**连续 20 份快照（1 秒）还错着**才认定
+    // 是某一拍的切枪输入没能生效（WebSocket 是 TCP，在途不丢，唯一丢法是上行队列溢出
+    // —— INPUT_QUEUE 满、最新的那几拍被扔掉），硬切到权威那一把，并把基态的 cur 一起
+    // 改掉 —— 基态不改的话，下一次回滚又从旧武器出发，每秒来回翻一次。被丢的输入拍号
+    // 一定比基态旧（丢的是队尾），所以改基态就断了重演把它捡回来的路。
+    // 触发过这个兜底的对局 qDrops 必然非零 —— 排障先看它。
+    if (!r.hard && this.srvWeapon) {
+      const lw = pl.ws && pl.ws.w ? pl.ws.w.id : null;
+      if (lw && lw !== this.srvWeapon) {
+        this.wpnMiss = (this.wpnMiss || 0) + 1;
+        if (this.wpnMiss >= 20) {
+          const idx = pl.ws.slots.findIndex(s => s.id === this.srvWeapon);
+          if (idx >= 0) {
+            pl.ws.switchTo(idx);
+            if (this.lastLanding) this.lastLanding.cur = idx;
+            this.wpnFixed = (this.wpnFixed || 0) + 1;
+          }
+          this.wpnMiss = 0;                 // 修不了（权威那把我不在手上：等 pickupTake 回声）也重新计时
+        }
+      } else this.wpnMiss = 0;
+    }
     if (carry) {
       this.carryN = (this.carryN || 0) + 1; this.carryLead = (this.carryLead || 0) + r.led;
       // 基态是从哪来的：landed（上一包那一刻，不累积）还是退回日记本那一格（会累积漂移）。
@@ -1014,6 +1051,7 @@ export class NetClient {
     const s = this.streakState[i];
     if (!s || !s.ready || s.id !== 'cluster') return false;
     this.targeting = { slot: i };
+    this.confirmShot = false;           // 新一轮选点不许继承上一轮的残留点击
     this.game.hud.announce('选择空袭目标', '左键确认 · 右键取消', 2.5);
     return true;
   }
@@ -1030,7 +1068,12 @@ export class NetClient {
     this.tgtMesh.visible = !!hit;
     if (hit) this.tgtMesh.position.copy(hit.point).setY(hit.point.y + 0.1);
     game.hud.prompt('<b>左键</b>确认空袭目标 · <b>右键</b>取消');
-    if (inp.firePressed && hit) {
+    // 点击从 confirmShot 来（recordInput 在选点期间把 inp 的开火位吞了，见那段注释）；
+    // inp.firePressed 留在条件里是给不经 recordInput 的直接调用兜底。消费必须**一次性**：
+    // 点空（这一拍没照到地面）就丢，不许顺延到"后来才照到"的那一拍凭空确认。
+    const click = inp.firePressed || this.confirmShot;
+    this.confirmShot = false;
+    if (click && hit) {
       // 只交**选择**（落点）：扣不扣槽、落哪儿、炸多久全部由权威端裁 —— 本地先扣槽
       // 再发请求的话，请求被拒时那个槽就白扣了（"按下即消耗"的复发形态）。
       this.ws.send(JSON.stringify({ t: 'streak', slot: t.slot, x: +hit.point.x.toFixed(2), z: +hit.point.z.toFixed(2) }));
@@ -1048,6 +1091,11 @@ export class NetClient {
   spawnProjectile(ev) {
     const g = this.game;
     if (!g.world) return;                       // 地图还没加载完时收到的一条迟到事件
+    // 自己的那颗不建副本：本地预测（weapon-state 的松手投掷 / RPG 击发）已经有一颗真的
+    // 在飞，服务端广播回来的这份起手状态只该给别人看。self 由权威端按"这颗是玩家武器
+    // 状态机扔的"定（mirror 标记），集束空袭的弹不带 self —— 呼叫者本地没有预测，
+    // 这份事件副本是他看见自己空袭的唯一途径，跳过它呼叫者反而什么都看不见。
+    if (ev.self) return;
     const owner = { team: ev.team, isPlayer: ev.team === this.team, alive: true };
     const p = new Projectile(g, ev.kind, new THREE.Vector3(ev.x, ev.y, ev.z),
       new THREE.Vector3(ev.vx, ev.vy, ev.vz), owner, ev.fuse, { dumb: true });

@@ -182,8 +182,14 @@ export class NetRoom {
   announceProjectile(p) {
     p.netId = ++this.netIds;
     const o = p.owner;
+    // 主人是谁（cid）与"他的客户端是否已经预测了这一颗"（self = mirror 且是真人）。
+    // 以前事件里两格都没有，投掷者自己的客户端收到广播只能照单全收再建一个副本 ——
+    // 本地预测那颗是真的在飞，于是"自己扔一颗雷，眼前飞着两颗"，想滤都无从滤起。
+    // 集束空袭的弹不走 mirror（呼叫者本地没有预测，事件副本是他唯一的一双眼），
+    // 主人不在座位表里（Bot / 空主人）时 cid 为 null、self 恒假 —— 客户端照常建副本。
+    const oc = o ? this.byPlayer.get(o) : null;
     this.events.push({
-      e: 'proj', netId: p.netId, kind: p.type,
+      e: 'proj', netId: p.netId, kind: p.type, cid: oc ? oc.cid : null, self: !!(oc && p.mirror),
       x: p.pos.x, y: p.pos.y, z: p.pos.z,
       vx: p.vel.x, vy: p.vel.y, vz: p.vel.z,
       fuse: Math.max(0, Math.round((p.fuse || 0) * 100) / 100),
@@ -883,6 +889,12 @@ export class NetRoom {
   requestStreak(cid, slot, target) {
     const c = this.clients.get(cid);
     if (!c || !c.pl.alive) return null;
+    // 确认落点的那一下不该是一枪。客户端在 recordInput 里把选点期间的开火位整个吞掉了
+    // （连本地预测一起拦），但"确认之后按住扳机不放"的那些拍还在上来 —— 这边不设同一道
+    // cool 的话，权威端在确认后立刻恢复开火，而客户端的预测被自己的 cool 拦到 0.3 s 后，
+    // 两边差出一个点射的后坐与弹药。与单机 mp.js:updateTargeting 同一句、与客户端
+    // updateTargeting 的 cool 各管一边。
+    c.pl.ws.cool = Math.max(c.pl.ws.cool, 0.3);
     return this.callStreak(c, slot, target);
   }
 
