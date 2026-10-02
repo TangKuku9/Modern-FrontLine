@@ -2,8 +2,8 @@
 import * as THREE from 'three';
 import { createSoldierModel, animateSoldier, makeNameTag, applyFlashTex } from './soldier.js';
 import { computeStats, WEAPONS } from './data.js';
-import { fireHitscan, Projectile } from './combat.js';
-import { clamp, damp, rand, angleDiff, raySphere, rayAABB, spreadDir, DEG, pick, rng } from './util.js';
+import { fireHitscan, Projectile, hitTestPlayer } from './combat.js';
+import { clamp, damp, rand, angleDiff, spreadDir, DEG, pick, rng } from './util.js';
 
 const DIFF = [
   { react: 0.8, spread: 3.4, burst: [2, 4], pause: [0.6, 1.2], dmg: 0.55, view: 50, turn: 4 },
@@ -62,23 +62,20 @@ export class Bot {
     this.dmgTaken = new Map();
   }
   get crouch() { return this.anim.crouch; }
-  eyePos(out) { return out.set(this.pos.x, this.pos.y + 1.6 - this.anim.crouch * 0.5, this.pos.z); }
+  // 命中盒的第四个入参（js/combat.js:hitTestPlayer）。延迟补偿的 pose 环存的就是
+  // (x, y, z, curEye()) 这四个量 —— 盒子依赖什么，缓冲里就得存什么。
+  curEye() { return 1.6 - this.anim.crouch * 0.5; }
+  eyePos(out) { return out.set(this.pos.x, this.pos.y + this.curEye(), this.pos.z); }
   chestPos(out) { return out.set(this.pos.x, this.pos.y + 1.2 - this.anim.crouch * 0.4, this.pos.z); }
   forward(out) { return out.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)); }
+  // 命中盒收编进共用定义（js/combat.js:hitTestPlayer）。旧的私盒（半宽 0.27、头心
+  // 1.68−0.5c、r 0.15）与共用的那张（0.30 / eye+0.02 / 0.145）各窄 3cm、高 6cm——
+  // 服务端裁 Bot 用私盒、客户端本地反馈用公盒，边缘弹就是第三层"本地中、权威不中"。
+  // 收编的副作用是 Bot 的腿也算腿（0.85 倍）而旧私盒那段只算身体——与真人/远端同一套，
+  // 单机联机从此一个手感。改盒子的同时必须记得 test/lagcomp.mjs 的规格注释。
   hitTest(o, d, maxT) {
     if (!this.alive) return null;
-    const c = this.anim.crouch;
-    const hy = this.pos.y + 1.68 - c * 0.5;
-    let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, this.pos.x, hy, this.pos.z, 0.15);
-    if (t >= 0 && t < maxT) return { t, part: 'head' };
-    const lt = 0.9 - c * 0.35;
-    const b = { x0: this.pos.x - 0.27, x1: this.pos.x + 0.27, y0: this.pos.y + lt, y1: hy - 0.13, z0: this.pos.z - 0.27, z1: this.pos.z + 0.27 };
-    t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, maxT);
-    if (t >= 0) return { t, part: 'body' };
-    const l = { x0: this.pos.x - 0.2, x1: this.pos.x + 0.2, y0: this.pos.y, y1: this.pos.y + lt, z0: this.pos.z - 0.2, z1: this.pos.z + 0.2 };
-    t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, l, maxT);
-    if (t >= 0) return { t, part: 'legs' };
-    return null;
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), o, d, maxT);
   }
   takeDamage(dmg, info) {
     if (!this.alive) return false;

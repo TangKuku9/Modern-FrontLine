@@ -107,7 +107,15 @@ export class NetRoom {
     //   noView   客户端没报拍号（还没收到过快照 / 老客户端）—— 这是设计好的退化，不算故障
     //   stale    报了**非零**拍号却被闸门拒 —— 口径不合或客户端卡住；健康链路上必须为 0
     //   poseMiss 闸门放行了、姿态缓冲里却没有那一拍 —— 缓冲比窗短，症状是"延迟越大越打不中"
-    this.lag = { shots: 0, ok: 0, noView: 0, stale: 0, poseMiss: 0, dMin: 0, dMax: 0, dSum: 0, staleWhy: [] };
+    //   botRewound / botPoseMiss —— 同一道闸对 **Bot** 那一半的读数。旧版只给真人建 pose 环，
+    //     Bot 一律按"当下"裁决，而它在客户端屏幕上滞后 ~150ms：横向一走就出盒。这类失效
+    //     旧计数器量不到（shots/ok 照样全绿），这正是它活到今天的原因（2026-10-02 香港
+    //     服实测"本地杀三次、权威不上账"）—— 所以 Bot 那一半必须自己有格子。
+    this.lag = { shots: 0, ok: 0, noView: 0, stale: 0, poseMiss: 0, dMin: 0, dMax: 0, dSum: 0, staleWhy: [], botRewound: 0, botPoseMiss: 0 };
+    // Bot 的姿态环。它与真人的同一把尺（PoseRing）、同一个报值（开枪者的 view）、同一道窗
+    // （rewindTick 的 60 拍上限）—— 唯一的区别是钥匙：真人挂在 client 上，Bot 挂在这张表里
+    // （Bot 没有连接，"不给 Bot 造假 client"的纪律不变）。查询端在 shotRewind 的闭包里。
+    this.botPose = new Map();
     // 规则内核：分数、UAV/白磷弹计时、按拍排程的空袭，都在它里面。单机 MPMatch
     // 用的是同一个类 —— 这就是"联机规则"这一项的全部含义。
     this.rules = new MatchRules(opts.cfg || { mode: opts.mode || 'tdm' });
@@ -588,6 +596,14 @@ export class NetRoom {
     // 必须写在 game.step 之后：在那之前这一拍的位移还没算出来，存下去的就是上一拍的姿态，
     // 于是"回溯 N 拍"会系统性少一拍 —— 那种偏差只有半个身位，谁都不会报错。
     for (const c of this.clients.values()) c.pose.record(this.tick, c.pl);
+    // Bot 同样逐拍入环（同一句 record：Bot 有 pos 与 curEye()，命中盒依赖的四个量都齐）。
+    // 尸体也照记：开枪者的报值完全可能落在"它刚死还没倒稳"的那几拍上，回溯回去必须
+    // 查得到那一拍 —— 打不打得中由 traceBullet 的 alive 门说了算，不由缓冲说了算。
+    if (this.game) for (const b of this.game.bots) {
+      let ring = this.botPose.get(b);
+      if (!ring) { ring = new PoseRing(); this.botPose.set(b, ring); }
+      ring.record(this.tick, b);
+    }
   }
 
   // 延迟补偿的取料口：js/weapon-state.js:fire 在裁决每一发之前问一句"这一发按哪一拍的姿态算"。
@@ -621,9 +637,20 @@ export class NetRoom {
     return (e) => {
       if (e === shooter) return null;                 // 不回溯开枪者自己：它瞄的是自己预测的位置
       const oc = this.byPlayer.get(e);
-      if (!oc) return null;
-      const p = oc.pose.at(t);                        // 那一拍不在缓冲里 → 交回 null（= 按当下判）
-      if (!p) L.poseMiss++;
+      if (oc) {
+        const p = oc.pose.at(t);                      // 那一拍不在缓冲里 → 交回 null（= 按当下判）
+        if (!p) L.poseMiss++;
+        return p;
+      }
+      // Bot 与真人同一把尺、同一个报值、同一道窗。它没有连接，但姿态环不挑人 ——
+      // 旧版只查 byPlayer，于是 Bot 永远按"当下"裁决：客户端屏幕上的它滞后 INTERP_DELAY
+      // + RTT/2（50ms 链路上 ≈150ms），横向一走就超出命中盒，服务端却拿现在的位置验，
+      // 大多数枪因此被判空 —— "本地杀三次、权威不上账"的根因就在这一段缺位。
+      const ring = this.botPose.get(e);
+      if (!ring) return null;                         // 不是真人也不是 Bot（直升机/哨戒机）：照旧按当下
+      const p = ring.at(t);
+      if (!p) { L.botPoseMiss++; return null; }       // 与真人同一个语义：缓冲比窗短的那一格
+      L.botRewound++;
       return p;
     };
   }
@@ -677,7 +704,7 @@ export class NetRoom {
   // 往房间里放一个 AI。当前联机对局里**不自动放**（真人对真人），但这条通道必须能跑：
   // 判据靠它验"群体警戒在房间里真的会扩散"，而"没人时拿 AI 填房"将来也走这里。
   addBot(bot) { this.game.addBot(bot); this.bots.set(bot, bot.group || null); return bot; }
-  removeBot(bot) { this.game.removeBot(bot); this.bots.delete(bot); }
+  removeBot(bot) { this.game.removeBot(bot); this.bots.delete(bot); this.botPose.delete(bot); }
 
   // Bot 的快照行。它和真人那一份**必须长成一个形状**（同样的 25 字节、同样的字段顺序）：
   // 客户端只有一份 NetPlayer，按 id 取插值缓存，不区分对面是人还是 Bot。

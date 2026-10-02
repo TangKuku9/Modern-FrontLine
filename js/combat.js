@@ -14,8 +14,10 @@ const _p = new THREE.Vector3(), _q = new THREE.Vector3();
 // 这里要是蹭用了别人的临时向量，症状会是"偶发的火星喷向奇怪的方向"而没人查得到。
 const _n = new THREE.Vector3();
 
-// 玩家命中盒的解析定义（头球 + 躯干 AABB）。**一处定义，四处用**：
+// 玩家命中盒的解析定义（头球 + 躯干 AABB）。**一处定义，五处用**：
 // 本机玩家的当下裁决（js/player.js:hitTest）、远端玩家的即时反馈（js/net/remote.mjs:hitTest）、
+// Bot 的裁决（js/ai.js:hitTest，2026-10-02 收编——此前私盒半宽 0.27 比这里窄 3cm，
+// 是"本地中、权威不中"的第三层来源）、
 // 服务端按历史姿态的回溯裁决（延迟补偿，server/room.mjs:shotRewind → traceBullet 的 rewind 回调）、
 // 以及判据里"这一枪该不该中"的预测（test/lagcomp.mjs 调的就是它）。
 // 参数抽成 (x,y,z,eye) 四个标量而不是整个 Player，是因为延迟补偿每拍要存的就只是这四个量
@@ -24,7 +26,7 @@ const _n = new THREE.Vector3();
 export function hitTestPlayer(x, y, z, eye, o, d, maxT) {
   // 与外观贴合:头球 0.145 ≈ 盔体 0.135 + 1cm 容差(旧 0.16 比盔大一圈,贴着盔边擦过也算爆头);
   // 躯干半宽 0.30 盖住肩球 0.285(旧 0.28,打肩球边缘不判中)。改这里同时影响本机/远端/
-  // 服务端回溯三路裁决与 test/lagcomp.mjs 的判据线。
+  // Bot/服务端回溯四路裁决与 test/lagcomp.mjs 的判据线。
   const hy = y + eye + 0.02;
   let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x, hy, z, 0.145);
   if (t >= 0 && t < maxT) return { t, part: 'head' };

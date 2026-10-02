@@ -203,6 +203,82 @@ for (const c of cells) {
   }
 }
 
+// ── Bot 也在回溯集合里（2026-10-02 香港服实测"本地杀三次、权威不上账"）──
+// 症状：Bot 没有连接，旧 shotRewind 的回溯闭包只查 byPlayer —— Bot 永远按"当下"裁决。
+// 而它在客户端屏幕上滞后 INTERP_DELAY + RTT/2（50ms 链路上 ≈150ms ≈ 9 拍），横向一走
+// 就超出命中盒：Bot 走速 4.46 m/s，9 拍位移 0.67 m，是半宽 0.30 的两倍多。二维逻辑与
+// 真人矩阵**完全同构**，"不报"那一格天然就是修复前的行为（反证臂不用另造）。
+{
+  const BOTSPEED = 4.46;                     // 与真人先决同档（冲刺），位移/拍 0.074 m
+  const bot = room.spawnBot({ name: '靶机', team: 'B', skill: 1 });
+  bot.update = () => {};                     // AI 冻结：位置由探针逐拍推，几何完全确定
+  const resetB = () => {
+    S.respawn(SP.clone(), 0);
+    bot.respawn(TP0.clone(), -Math.PI / 2);
+    // 真人乙挪出弹道并停在左侧开阔带：他不喂输入时服务端按住最后一份（KEY.Fwd）会继续走，
+    // 停在 z=25.5 那条线上就有替 Bot 挨枪的风险 —— 每次重摆回 x=−15，走 80 拍也只到 −9。
+    T.respawn(groundAt(new THREE.Vector3(-15, 0, 25.5)), -Math.PI / 2);
+    ca.q.length = 0; cb.q.length = 0;
+    ca.lastInput = decodeInputBits(0, 0); cb.lastInput = decodeInputBits(0, 0);
+  };
+  // 与 step() 同构，但只喂甲：Bot 的位移在每拍推进**之前**做 —— record 在 room.step 尾部
+  // （game.step 之后），所以环里存的就是"这一拍末尾"的姿态，与真人同一套编号口径。
+  const stepB = (over = {}) => {
+    bot.pos.x += BOTSPEED * DT;
+    room.applyInput(ca.cid, { tick: ++tickA, keys: 0, buttons: BTN.Ads, mdx: 0, mdy: 0, view: 0, ...over });
+    room.step();
+    if (room.tick % SNAP_EVERY === 0) room.snapshot();
+  };
+  const shootBot = (L, view) => {
+    const base = L + 42;
+    const W = base + ((SNAP_EVERY - ((room.tick + base) % SNAP_EVERY)) % SNAP_EVERY);
+    resetB();
+    for (let i = 0; i < W; i++) stepB();
+    const past = room.tick + 2 - L;          // 与真人 shoot() 同一拍号口径（cur = 此刻+1）
+    const ring = room.botPose.get(bot);
+    if (!ring) return { err: 'Bot 的姿态环不存在' };
+    const posePast = ring.at(past);
+    if (!posePast) return { err: `第 ${past} 拍不在 Bot 姿态环里（窗口 ${LAG_HIST}）` };
+    aimAt(posePast[0], posePast[1] + 1.1, posePast[2]);
+    stepB();                                 // 瞄准拍：aimYaw/aimPitch 在拍末写好
+    const ro = S.eyePoint(new THREE.Vector3());
+    const rd = S.aimDir(new THREE.Vector3());
+    const wh = W0.raycast(ro, rd, 400);
+    const predicted = !!hitTestPlayer(posePast[0], posePast[1], posePast[2], posePast[3], ro, rd, wh ? wh.t : 1e9);
+    const perpNow = +perpTo(ro, rd, bot.pos.x, bot.pos.z).toFixed(3);
+    const perpPast = +perpTo(ro, rd, posePast[0], posePast[2]).toFixed(3);
+    const dist = +Math.hypot(posePast[0] - ro.x, posePast[2] - ro.z).toFixed(2);
+    const rew0 = room.lag.botRewound;
+    const hp0 = bot.hp;
+    stepB({ buttons: BTN.Ads | BTN.Fire, view: view === 'past' ? past : 0 });
+    return {
+      predicted, actual: bot.hp < hp0, dmg: hp0 - bot.hp, rew: room.lag.botRewound - rew0,
+      perpNow, perpPast, dist, wall: wh ? +wh.t.toFixed(2) : null, past,
+    };
+  };
+
+  const hit = shootBot(36, 'past');
+  chk(!hit.err && !!room.botPose.get(bot), 'Bot：姿态环真的建起来了（room.botPose 里查得到它；环在 step 里建档）');
+  chk(!hit.err && hit.predicted && hit.actual, 'Bot：瞄过去 + 报过去 ⇒ 命中（回溯覆盖 Bot）',
+    JSON.stringify(hit));
+  chk(!hit.err && hit.perpPast < 0.20, 'Bot · 该中的一枪瞄点误差 < 0.20 m', `垂距过去 ${hit.err ? '-' : hit.perpPast}`);
+  chk(!hit.err && (hit.wall === null || hit.wall > hit.dist), 'Bot · 目标在墙前面（中不是墙替它挡的）',
+    `墙距 ${hit.err ? '-' : hit.wall} / 目标距 ${hit.err ? '-' : hit.dist}`);
+  chk(!hit.err && hit.rew >= 1, 'Bot · botRewound 计了这一枪（Bot 那一半的补偿不再是观测盲区）',
+    `botRewound 增量 ${hit.err ? '-' : hit.rew}`);
+  const miss = shootBot(36, 'off');
+  chk(!miss.err && miss.predicted && !miss.actual, 'Bot【反证臂】同一枪不报拍号 ⇒ 按当下判 ⇒ 打不中（= 修复前的行为）',
+    JSON.stringify(miss));
+  chk(!miss.err && miss.perpNow > 1.0, 'Bot · 该不中的一枪目标离射线 > 1.0 m（按当下位置）',
+    `垂距现在 ${miss.err ? '-' : miss.perpNow}`);
+  chk(!miss.err && miss.rew === 0, 'Bot · 反证臂不涨 botRewound（被拒的枪根本不进回溯闭包）',
+    `botRewound 增量 ${miss.err ? '-' : miss.rew}`);
+  chk(room.lag.botPoseMiss === 0, 'Bot · botPoseMiss 全程为 0（环的窗口盖得住回溯上限）',
+    `botPoseMiss=${room.lag.botPoseMiss}`);
+  room.removeBot(bot);
+  chk(!room.botPose.has(bot), 'Bot · 移除 Bot 连姿态环一起收掉（不留无主账本）');
+}
+
 // ── 闸门的边界：正好在上限上要接受，超一拍要拒绝 ──
 // 这一条量的是 rewindTick 那道窗的两端：右端是 lastSnapSent（服务端真发出去过的最新一拍），
 // 左端是它往前 LAG_MAX_TICKS 拍。探针把 W 取成 3 的倍数 ⇒ lastSnapSent = W，而回溯目标恒为

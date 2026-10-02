@@ -370,7 +370,9 @@ async function serveStatic(req, res) {
       if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0), fails: r.__fails | 0, netDrops: r.__netDrops | 0, qDrop: r.qDrop | 0,
         // 延迟补偿的四项计数（定义见 server/room.mjs 的 this.lag）。带上它的理由和 hz/fails 一样：
         // 这个玩家"永远没有补偿"在玩家侧的表现只是打不中，运维必须能在这里先看见。
-        lag: r.lag ? { shots: r.lag.shots, ok: r.lag.ok, noView: r.lag.noView, stale: r.lag.stale, poseMiss: r.lag.poseMiss, depth: [r.lag.dMin, r.lag.dMax, r.lag.ok ? +(r.lag.dSum / r.lag.ok).toFixed(1) : 0] } : null,
+        // botRewound/botPoseMiss 是 Bot 那一半：旧版没有这两个格子时，"Bot 全部按当下裁决"
+        // 这类失效在 shots/ok 上完全看不出来（那两项照样全绿）——盲区本身也要有名字。
+        lag: r.lag ? { shots: r.lag.shots, ok: r.lag.ok, noView: r.lag.noView, stale: r.lag.stale, poseMiss: r.lag.poseMiss, depth: [r.lag.dMin, r.lag.dMax, r.lag.ok ? +(r.lag.dSum / r.lag.ok).toFixed(1) : 0], botRewound: r.lag.botRewound | 0, botPoseMiss: r.lag.botPoseMiss | 0 } : null,
         // 连杀奖励的三项计数（定义见 server/room.mjs 的 this.streak）。它和 lag 是同一类
         // 东西：**失效是全静默的** —— 玩家按 3 没反应，既不报错也不崩，运维只能从这里看见。
         // calls=0 尤其要留意：那说明上行那一位根本没接通（客户端旧版本、或按了没发出去）。
