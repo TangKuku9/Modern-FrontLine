@@ -203,7 +203,7 @@ export class WeaponState {
     } else {
       // 散布一定要算、随机数一定要抽，哪怕这一发不去打世界
       const spread = this.currentSpread() * DEG * 0.5;
-      let anyHit = false, kill = false, head = false;
+      let anyHit = false, kill = false, head = false, killEnt = null;
       const tracers = wantFx ? [] : null;   // 交给视图模型画：命中点是权威结果，线段端点不是
       // 延迟补偿：这一枪要在"开枪者当时看到的那一拍"上验，而不是当下。取料、四道拒绝与
       // 上限都在 server/lagcomp.mjs + server/room.mjs:shotRewind —— 这里只问一句"有没有"。
@@ -215,10 +215,21 @@ export class WeaponState {
         const d = spreadDir(fwd, spread, new THREE.Vector3(), pl.rng);
         if (replay) continue;
         const r = fireHitscan(game, pl, origin, d, st, st.name, hopts);
-        if (r.ent) { anyHit = true; if (r.killed) kill = true; if (r.part === 'head') head = true; }
+        if (r.ent) { anyHit = true; if (r.killed) { kill = true; killEnt = r.ent; } if (r.part === 'head') head = true; }
         if (wantFx && i < 3 && (this.shotsInRow % 2 === 1 || st.pellets > 1 || st.fire !== 'auto')) tracers.push(r.point.clone());
       }
-      if (anyHit) { pl.stats.hits++; game.hud.hitmarker(kill, head); game.audio.hit(kill, head); }
+      if (anyHit) {
+        pl.stats.hits++;
+        // 击杀反馈对账：本地预测的"打死了"只是候选。alive 的真值在快照里、击杀播报走
+        // 权威 kill 事件（main.js:onNetKill 里击杀音/弹窗/记分那一条）——预测抢先放
+        // "击杀音+红叉"的症状是：服务端把这一枪判空时（对移动目标，滞后 ~150ms 很常见），
+        // 预测 hp 被下一份快照抹回去，下一枪又"死"一次，于是"不断击杀反馈但它不死"。
+        // 远端实体（game.net.deferKill 认领）降级成普通命中反馈，红叉与击杀音等权威
+        // 事件到齐；单机/服务端没有 game.net，照旧即时——那边预测就是裁决本身。
+        const gate = kill && game.net && game.net.deferKill && game.net.deferKill(killEnt);
+        game.hud.hitmarker(gate ? false : kill, head);
+        game.audio.hit(gate ? false : kill, head);
+      }
       // 开火事件无条件发：枪口火光、抛壳、后坐顶枪都靠它，tracers 只是其中可选的一段
       // 抛壳按口径分，null = 不抛：发射器与左轮不抛（左轮的弹壳留在弹巢里，装弹时才退，
       // 每发抛一颗黄铜是物理说不通的那种错）；霰弹枪以前被排除在外，其实泵动一拉就抛一个壳。
@@ -258,7 +269,9 @@ export class WeaponState {
     }
     if (best) {
       const killed = best.takeDamage(135, { attacker: pl, dir: fwd, weapon: '近战', melee: true });
-      game.hud.hitmarker(killed, false); game.audio.hit(killed);
+      // 与 fire() 同一条对账：远端实体的"预测致死"降级为命中反馈，权威侧走 kill 事件。
+      const gate = killed && game.net && game.net.deferKill && game.net.deferKill(best);
+      game.hud.hitmarker(gate ? false : killed, false); game.audio.hit(gate ? false : killed);
       game.effects.blood(best.chestPos(new THREE.Vector3()), fwd, false);
     } else {
       const hit = game.world.raycast(eye, fwd, 1.8);

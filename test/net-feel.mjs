@@ -22,6 +22,8 @@ import * as THREE from 'three';
 import { NetPlayer, LEAVE_FADE, INTERP_DELAY } from '../js/net/remote.mjs';
 import { createSoldierModel, animateSoldier } from '../js/soldier.js';
 import { flashAt, Projectile, explode } from '../js/combat.js';
+import { WeaponState } from '../js/weapon-state.js';
+import { rng } from '../js/util.js';
 import { NetClient } from '../js/net/client.mjs';
 import { NetRoom, RESPAWN_DELAY } from '../server/room.mjs';
 import { Sentry } from '../js/mp.js';
@@ -1102,6 +1104,76 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   ok('AB3【反证臂】坏的那几枚各自计一笔 pingBad（"丢掉"这件事本身可数）',
     badS.pingBad === 1 && badM.pingBad === 1 && badN.pingBad === 1 && good.pingBad === 0,
     JSON.stringify([badS.pingBad, badM.pingBad, badN.pingBad]));
+}
+
+// ───────────────────────── AC. 击杀反馈对账（2026-10-02 香港服实测）─────────────────────────
+// 症状：开枪的瞬间击杀音/红叉当场就响，目标却"死"了又活 —— 服务端把这一枪判空时
+// （对移动目标，画面滞后 ~150ms 很常见），预测 hp 被下一份快照抹回，下一枪又"死"一次，
+// 于是"不断击杀反馈但它不死"。收法：远端实体的"预测致死"降级为普通命中反馈
+// （weapon-state 经 NetClient.deferKill 认领），红叉与击杀音由权威 kill 事件到齐
+// （main.js:onNetKill 本来就放击杀音，红叉随本轮补上）——预测侧无对账、无撤销，
+// 是因为它根本不需要撤销：**真凭据只有事件那一份**。
+// 这一节量两端：NetClient 的认领语义，与 weapon-state 消费端真的按认领结果分流。
+{
+  // ① 认领语义
+  const g1 = makeGame();
+  const c1 = new NetClient(g1, { url: 'ws://127.0.0.1:1/ws', name: '我', team: 'A' });
+  c1.cid = 7;
+  const ent1 = (id, team, x) => ({ id, x, y: 0, z: 0, yaw: 0, pitch: 0, hp: 100, flags: FLAG.Alive | FLAG.OnGround, weapon: 0, mag: 30, phase: 0, vx: 0, vz: 0, team, ack: 0, rep: 0 });
+  c1.onSnapshot({ tick: 100, seq: 1, worldFlags: 0, rngState: 1, entities: [ent1(3, 1, 1)] }, 0);
+  const r3 = c1.remotes.get(3);
+  ok('AC1【先决】远端副本真的建出来了（不然认领语义量的是空气）', !!r3);
+  ok('AC2 远端副本被认领 ⇒ 预测侧降级（击杀反馈等权威事件）',
+    c1.deferKill(r3) === true);
+  ok('AC3 不认识的实体不认领 ⇒ 调用方保持旧行为（单机形状 / 兜底）',
+    c1.deferKill({ id: 999 }) === false && c1.deferKill(null) === false && c1.deferKill({}) === false);
+
+  // ② 消费端分流：真 WeaponState + 全桩 game。目标桩"一枪必死"（takeDamage ⇒ true 恒真），
+  //    这样 r.killed 恒真，红叉的形状只由 deferKill 决定 —— 分流本身被隔离出来量。
+  const mkShot = (netStub) => {
+    const g = makeGame();
+    g.world.raycast = () => null;
+    const marks = [], hits = [];
+    g.hud.hitmarker = (k, h) => marks.push([k, h]);
+    g.audio.hit = (k, h) => hits.push([k, h]);
+    if (netStub) g.net = netStub;
+    const target = {
+      alive: true, team: 'B', metal: false,
+      hitTest: () => ({ t: 10, part: 'body' }),
+      takeDamage: () => true,
+    };
+    const pl = {
+      pos: new THREE.Vector3(), vel: { x: 0, z: 0 }, onGround: true, crouchT: 0,
+      sprinting: false, sliding: false, team: 'A', alive: true, hp: 100, maxHp: 100,
+      yaw: 0, pitch: 0, revealT: 0, hasPerk: () => false, rng,
+      stats: { shots: 0, hits: 0 },
+      eyePoint: (v) => v.set(0, 1.62, 0),
+      aimDir: (v) => v.set(0, 0, -1),
+      punch: () => {},
+    };
+    g.entities = [target];
+    const ws = new WeaponState(g, pl);
+    ws.setLoadout([{ id: 'ak' }]);
+    // setLoadout 进 'switch'（0.5s）挡火：先空转把切枪走完，再扣扳机 —— 不然四条
+    // 断言量的是"没开过枪"（shots 恒 0），全是假红。
+    for (let i = 0; i < 35; i++) ws.update(1 / 60, { fire: false, ads: false, mdx: 0, mdy: 0 });
+    ws.update(1 / 60, { fire: true, ads: false, mdx: 0, mdy: 0 });
+    return { marks, hits, shots: pl.stats.shots, hitStat: pl.stats.hits };
+  };
+  const a = mkShot(null);
+  ok('AC4 单机形状（没有 game.net）：预测致死照旧即时放红叉与击杀音（预测就是裁决本身）',
+    a.marks.length === 1 && a.marks[0][0] === true && a.hits.length === 1 && a.hits[0][0] === true,
+    JSON.stringify({ marks: a.marks, hits: a.hits }));
+  const b = mkShot({ deferKill: () => true });
+  ok('AC5 联机 + 认领：同一条预测降级为普通命中（红叉与击杀音等权威事件到齐）',
+    b.marks.length === 1 && b.marks[0][0] === false && b.hits.length === 1 && b.hits[0][0] === false,
+    JSON.stringify({ marks: b.marks, hits: b.hits }));
+  const c = mkShot({ deferKill: () => false });
+  ok('AC6【反证臂】联机但不认领：即时击杀反馈原样保留（deferKill 不是无脑降级）',
+    c.marks.length === 1 && c.marks[0][0] === true, JSON.stringify(c.marks));
+  ok('AC7【先决】三种形状下开枪数与命中数各记一次（分流只动反馈的形状，不动账）',
+    a.shots === 1 && b.shots === 1 && c.shots === 1 && a.hitStat === 1 && b.hitStat === 1 && c.hitStat === 1,
+    JSON.stringify([a, b, c].map(x => [x.shots, x.hitStat])));
 }
 
 // ───────────────────────── 收口 ─────────────────────────

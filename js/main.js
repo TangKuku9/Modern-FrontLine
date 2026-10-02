@@ -410,6 +410,11 @@ class Game {
     // 一半在调用方转、一半在被调方转，正是这个洞的成因 —— 收口到拼 innerHTML 的那一处。
     this.hud.killfeed(killer, victim, ev.weapon, ev.head);
     if (killer.isPlayer) {
+      // 红叉在权威时刻到齐。预测侧的击杀反馈已降级为普通命中（weapon-state 的 deferKill
+      // 把"本地说死了"只当候选），这条 kill 事件就是"真死了"的唯一凭据 —— 击杀音、弹窗、
+      // 记分本来都在这里，红叉也归队。它同时覆盖"本地没预测到"的击杀（雷的溅射、哨戒机
+      // 的账——那些 takeDamage 路径本来就不打 hitmarker），预测与否不再决定红叉的形状。
+      this.hud.hitmarker(true, !!ev.head);
       // popup 走的是 textContent（不是 innerHTML），所以这里**不许**转义：
       // 转了的话屏幕上显示的是 `&lt;` 本身 —— 少一道转义看不出来，多一道一眼能看见。
       this.hud.popup(`${ev.pts ? '+' + ev.pts + '  ' : ''}击杀 ${ev.victim}`, '#d4f24a');

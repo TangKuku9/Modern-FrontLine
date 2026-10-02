@@ -430,6 +430,16 @@ export class NetClient {
     for (const r of this.remotes.values()) if (r.name === name) return r;
     return null;
   }
+  // 击杀反馈的对账口（js/weapon-state.js:fire / doMelee 在本地预测出"这一枪打死他了"
+  // 的时候问一句）。返回 true = 这个实体是远端副本：它的死活由快照写、击杀播报由权威
+  // kill 事件带（main.js:onNetKill 里击杀音/弹窗/记分本来就在那条路上）——预测侧因此
+  // 降级成普通命中反馈，红叉与击杀音等权威时刻到齐。否则（不是远端实体）交回 false，
+  // 调用方照旧即时放：单机没有 game.net 根本走不到这里；走到了又不认识的实体没有
+  // "下一份快照会纠正它"的兜底，宁可保持旧行为也不吞反馈。
+  deferKill(ent) {
+    if (!ent || ent.id === undefined) return false;
+    return this.remotes.get(ent.id) === ent;
+  }
 
   // 回滚重放本体在 js/net/predict.mjs（那边同时被 test/rollback.mjs 逐位断言）。
   // 这里只负责"从历史里切出该重演的那段"。
