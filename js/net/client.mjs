@@ -6,7 +6,7 @@
 // 之所以重放得起，是因为 P0 那几件事：固定步长、玩法随机流可播种、
 // 权威侧不碰渲染。重放时把世界侧副作用（命中、特效、噪声）关掉，只重跑自身状态。
 import * as THREE from 'three';
-import { NetPlayer, INTERP_DELAY } from './remote.mjs';import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
+import { NetPlayer, INTERP_DELAY, setInterpDelay } from './remote.mjs';import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
 import { uavFromFlags } from '../match-rules.js';
 import { kitsOf } from '../loadout.mjs';
@@ -375,6 +375,20 @@ export class NetClient {
     }
     if (Number.isFinite(now)) { this._tickAt = now; this._tickAtTick = snap.tick; }
     this.snaps++; this.snapGap = 0; this.serverTick = snap.tick;
+    // ── 插值回退自适应（值域与语义见 remote.mjs 的 INTERP_MIN/MAX 那段）──
+    // 固定 100ms 是按"最差链路"拍的：快照 50ms 一班，回退真正要盖住的只是"下一班还没
+    // 到"的那段时间。这里按**到达节奏**收放：间隔的 EMA + 抖动（相邻间隔对 EMA 的偏离）
+    // 的 EMA + 一点余量。前 8 包不动手 —— 握手/进图期的突发会把样本带歪，宁可先保守。
+    // 只量到达时刻，不碰拍号：回退与拍号流水（snapLog）各自独立，撕不裂。
+    if (Number.isFinite(now) && this._arrAt !== undefined) {
+      const d = now - this._arrAt;
+      const jit = Math.abs(d - (this._dlEma ?? d));
+      this._dlEma = this._dlEma === undefined ? d : this._dlEma * 0.8 + d * 0.2;
+      this._jitEma = this._jitEma === undefined ? jit : this._jitEma * 0.8 + jit * 0.2;
+      this._dlN = (this._dlN || 0) + 1;
+      if (this._dlN >= 8) setInterpDelay(this._dlEma + this._jitEma + 0.015);
+    }
+    if (Number.isFinite(now)) this._arrAt = now;
     // 到达时刻是渲染时刻的坐标原点（remote.mjs 的插值也用它），所以流水在这里记。
     this.snapLog.push({ t: now, tick: snap.tick });
     if (this.snapLog.length > 24) this.snapLog.shift();

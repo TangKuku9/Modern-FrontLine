@@ -19,7 +19,7 @@
 // 建的那三个 canvas）。NetClient 那一段更轻 —— onEvents 是个纯方法，直接喂事件帧即可。
 import '../server/browser-shim.mjs';
 import * as THREE from 'three';
-import { NetPlayer, LEAVE_FADE, INTERP_DELAY } from '../js/net/remote.mjs';
+import { NetPlayer, LEAVE_FADE, INTERP_DELAY, setInterpDelay } from '../js/net/remote.mjs';
 import { createSoldierModel, animateSoldier } from '../js/soldier.js';
 import { flashAt, Projectile, explode } from '../js/combat.js';
 import { WeaponState } from '../js/weapon-state.js';
@@ -1174,6 +1174,42 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   ok('AC7【先决】三种形状下开枪数与命中数各记一次（分流只动反馈的形状，不动账）',
     a.shots === 1 && b.shots === 1 && c.shots === 1 && a.hitStat === 1 && b.hitStat === 1 && c.hitStat === 1,
     JSON.stringify([a, b, c].map(x => [x.shots, x.hitStat])));
+}
+
+// ───────────────────────── AD. 插值回退自适应（2026-10-02 轮低危账）─────────────────────────
+// 固定 100ms 是按"最差链路"拍的：快照 50ms 一班，回退真正要盖住的只是"下一班还没到"的
+// 那段时间。回退每多 10ms，屏幕上的别人就旧 10ms、开枪要提前的量随之变大。收法：按
+// 到达间隔的 EMA + 抖动的 EMA + 余量收放，夹在 55–120ms（remote.mjs 的 INTERP_MIN/MAX）。
+// 关键不变式：renderTick（报给服务端的拍号）与 NetPlayer.update 读同一个活绑定 ——
+// 自适应改值之后，"报的拍号 = 渲染的那一拍"必须原样成立，不然补偿口径整体错位。
+{
+  const g = makeGame();
+  const c = new NetClient(g, { url: 'ws://127.0.0.1:1/ws', name: '我', team: 'A' });
+  c.cid = 7;
+  const ent = (id, team, x) => ({ id, x, y: 0, z: 0, yaw: 0, pitch: 0, hp: 100, flags: FLAG.Alive | FLAG.OnGround, weapon: 0, mag: 30, phase: 0, vx: 0, vz: 0, team, ack: 0, rep: 0 });
+  const frame = (entities, tick, now) => c.onSnapshot({ tick, seq: 1, worldFlags: 0, rngState: 1, entities }, now);
+  // 规整 20Hz ×10 包（前 8 包不动手，之后 EMA 已收敛）：间隔 50ms + 余量 15ms ⇒ 65ms
+  for (let i = 0; i < 10; i++) frame([ent(3, 1, 1)], 600 + i * 3, i * 0.05);
+  ok('AD1 规整到达 ⇒ 回退收到 间隔+余量（不再按最差链路的 100ms）',
+    Math.abs(INTERP_DELAY - 0.065) < 1e-9, `INTERP_DELAY=${INTERP_DELAY}`);
+  // 恒等式在自适应之后仍成立（拍号流水与时间流水都是线性的，两边可以精确对上）
+  const lastP = c.snapLog[c.snapLog.length - 1];
+  const t0 = lastP.t + 0.01;
+  const v = c.renderTick(t0);
+  const spec = lastP.tick - 60 * (INTERP_DELAY + (lastP.t - t0));
+  ok('AD2 报值恒等式在自适应之后仍成立（renderTick 与 NetPlayer 同一个活绑定，口径不裂）',
+    Math.abs(v - spec) < 1e-6, `实测 ${v} / 规格 ${spec.toFixed(3)}`);
+  // 抖动进来：相邻间隔交替 70/30ms（均值仍 50ms）—— 间隔 EMA 不变、抖动 EMA ≈20ms ⇒ 放宽
+  let t = 0.5, tick = 630;
+  for (let i = 0; i < 20; i++) { frame([ent(3, 1, 1)], tick, t); t += (i % 2 === 0 ? 0.07 : 0.03); tick += 3; }
+  ok('AD3 抖动进来 ⇒ 回退放宽（盖住迟到的下一班，而不是硬压出顿挫）',
+    INTERP_DELAY > 0.075 && INTERP_DELAY < 0.12, `INTERP_DELAY=${INTERP_DELAY.toFixed(4)}`);
+  // 间隔爆表（断流又恢复）⇒ 夹在上限，不跟着飞 —— 尾巴交给外推（上限 0.15s）盖
+  for (let i = 0; i < 6; i++) frame([ent(3, 1, 1)], 690 + i * 3, 1.5 + i * 0.5);
+  ok('AD4 间隔爆表 ⇒ 夹在上限 120ms（下限防顿挫、上限防漂，两端都要在）',
+    Math.abs(INTERP_DELAY - 0.12) < 1e-9, `INTERP_DELAY=${INTERP_DELAY}`);
+  setInterpDelay(0.10);   // 复位：不给这条判据之后的任何读者留一个被改动过的常数
+  ok('AD5 复位臂：判据跑完把常数还回去（模块级状态不许跨节泄漏）', INTERP_DELAY === 0.10);
 }
 
 // ───────────────────────── 收口 ─────────────────────────

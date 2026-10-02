@@ -20,7 +20,17 @@ import { angleDiff, clamp, lerp } from '../util.js';
 import { hitTestPlayer } from '../combat.js';
 import { FLAG, WEAPON_IDS } from '../quant.js';
 
-export const INTERP_DELAY = 0.10;                   // 渲染回退量，秒
+// 插值回退量（秒）。它不再是一个写死的常数而是**可收放的**：NetClient 每收一份快照
+// 按"到达间隔的 EMA + 抖动的 EMA + 余量"重设（js/net/client.mjs:onSnapshot），夹在
+// 上下限之间。为什么要收：回退每多 10ms，屏幕上的别人就旧 10ms，开枪要提前的量随之
+// 变大（50ms 链路上固定 100ms 意味着瞄准一个 ~150ms 前的世界）。为什么有下限：回退
+// 必须盖住"最新一班快照还没到"的那段时间，压得太低插值窗会追上缓冲末端、退化成外推。
+// renderTick（报给服务端的拍号）与 NetPlayer.update 读的是**同一个活绑定**，两条口径
+// 天然一致 —— 改一处忘一处的症状（"报的拍号和渲染的不是同一拍"）在这条结构下不存在。
+export const INTERP_MIN = 0.055;
+export const INTERP_MAX = 0.12;
+export let INTERP_DELAY = 0.10;                     // 渲染回退量，秒（初值 = 旧固定值，保守起点）
+export function setInterpDelay(v) { INTERP_DELAY = clamp(v, INTERP_MIN, INTERP_MAX); }
 export const MAX_EXTRAPOLATION = 0.15;              // 速度外推上限，秒
 export const LEAVE_FADE = 0.8;                      // 离房淡出时长，秒
 const TRACER_LEN = 60;                              // 曳光画多长，米
