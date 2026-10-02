@@ -108,7 +108,11 @@ export class NetPlayer {
     if (!this.leaving && before !== this.kits[this.weaponId]) this.swapWeapon(this.weaponId);
   }
   dispose() {
-    if (this._fadeMats) for (const m of this._fadeMats) m.opacity = 1;
+    // 淡出用的材质是 beginLeave 里换上去的**私有 clone**（见那里的注释）：全局共享材质
+    // 从头到尾没被碰过，所以这里不存在"恢复 opacity"这一步 —— 旧实现那句
+    // `m.opacity = 1` 一刀切，正是"别人一退出、我的瞄准镜片永久变不透明"的出处
+    // （MATS.lens 的玻璃基线是 0.25）。clone 释放掉即可，纹理是共享引用、不动。
+    if (this._fadeMats) { for (const m of this._fadeMats) m.dispose(); this._fadeMats = null; }
     this.game.scene.remove(this.model.root);
     this.buf.length = 0;
   }
@@ -137,16 +141,28 @@ export class NetPlayer {
 
   // 人走了 / 掉线：不瞬时从世界上抹掉，先淡出。瞬时消失没有办法从画面上与"我自己卡了"
   // 分辨 —— 而那正是联机里最容易误判的一类现象。
+  // 淡出**不许直接写共享材质**：士兵和手上的枪的材料多半来自 materials.js 的全局 MATS
+  // （镜片 lens、分划 reticle、军服 fab_*、枪身 gunMetal……第一人称视图模型用的是**同一批
+  // 实例**）。旧实现把收集到的材质 transparent=true、逐帧写 opacity、dispose 再恢复
+  // opacity=1 —— 于是"别人退出对局"的那 0.8 秒里，我的瞄准镜片跟着他一起变透明
+  // （0.25 → 0），淡完还被一刀切恢复成不透明玻璃（0.25 → 1），军服那批 opaque 材质则
+  // 从此永远走透明渲染管线（transparent 没人恢复）。修法：把淡出模型的每块 mesh 换成
+  // **私有 clone**（同一原材质只 clone 一份，mesh 间仍共享、渲染批次不变），淡出只写
+  // clone，dispose 丢弃 clone —— 全局材质没人动过，也就无所谓恢复。
   beginLeave() {
     if (this.leaving) return;
     this.leaving = true; this.leaveT = 0;
     this.targetable = false;                   // 已经不在权威世界里了：不许再被打
     this.alive = false;
-    this._fadeMats = this._fadeMats || [];
+    const clones = new Map();                  // 原材质 → 私有 clone（同一次淡出内共享）
     this.model.root.traverse(o => {
       if (!o.isMesh || !o.material) return;
-      if (this._fadeMats.indexOf(o.material) < 0) this._fadeMats.push(o.material);
+      let c = clones.get(o.material);
+      if (!c) { c = o.material.clone(); clones.set(o.material, c); }
+      o.material = c;
     });
+    this._fadeMats = [...clones.values()];
+    // opaque 材质参与淡出必须开 transparent —— 只开在 clone 上，原材质不知道这件事
     for (const m of this._fadeMats) m.transparent = true;
   }
   get fadedOut() { return this.leaving && this.leaveT >= LEAVE_FADE; }

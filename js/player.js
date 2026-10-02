@@ -376,10 +376,14 @@ export class Player {
     if (input.tacticalPressed && this.tactical) ws.beginThrow('tactical', this.tactical.id);
     if (ws.state === 'cook' && !input.lethal && !input.tactical) ws.endThrow();
     ws.update(dt, input, opts);
-    // 相机
-    this.updateCamera(dt);
+    // 相机。replay（回滚重放，js/net/predict.mjs 调进来）只重建玩法状态、不表现视角：
+    // updateCamera 前半段的 camPos/aimYaw/aimPitch 必须照算（弹道从它们取，重放要逐拍
+    // 一致），但**真相机不能写** —— 重放拿的是退回旧拍的 adsT（比如死前的 1），
+    // 写了就是把 FOV 拽回那一拍的窄视野；联机死亡尤其可见：onNetDeath 刚把 FOV 复位，
+    // 下一次对账重放又把它写回 ADS。
+    this.updateCamera(dt, !!(opts && opts.replay));
   }
-  updateCamera(dt) {
+  updateCamera(dt, replay) {
     const ws = this.ws;
     const eyeT = this.pos.y + this.curEye() - (this.sliding ? 0.25 : 0);
     this.eyeSmooth = damp(this.eyeSmooth, eyeT, 18, dt);
@@ -401,7 +405,10 @@ export class Player {
     this.camPos.set(this.pos.x, this.eyeSmooth - this.landDip + bob, this.pos.z);
     this.aimYaw = this.yaw + sx;
     this.aimPitch = this.pitch + ws.rp + this.punchV + sy;
-    if (this.game.player !== this) return;
+    // 真相机只属于"这台机器上的本机玩家，且不是在重放"：服务端同时跑 N 份 sim 时
+    // 各算各的 camPos/aimYaw/aimPitch（上面那半段），只有本机玩家才写那块真相机；
+    // replay 时连本机也不写（见 player.update 末尾的注释）。
+    if (replay || this.game.player !== this) return;
     const cam = this.game.camera;
     cam.position.copy(this.camPos);
     cam.rotation.order = 'YXZ';

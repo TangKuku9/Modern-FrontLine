@@ -445,6 +445,16 @@ class Game {
     this.dead = true;
     this.deathAt = performance.now() / 1000;
     this._respawnAsked = false;
+    // 联机的死亡不走 takeDamage（血量由快照直接覆盖，js/net/predict.mjs 写 pl.hp）——
+    // 单机那条致死分支里的**清场三件**在这里一处都不会跑，得自己补齐，否则：
+    //   · ws.onDeath 不调 ⇒ adsT / scopeState 冻在死前那一拍，死亡视角上一直挂着一层
+    //     瞄具遮罩（单机的 state-leak ① 修过，联机这条路径当时没人修）；
+    //   · 相机 FOV 不复位 ⇒ 死亡镜头停在 ADS 的窄视野里；
+    //   · alive 不落地 ⇒ kill 事件先于快照对账到达的那几十毫秒里，"还活着"的那几拍
+    //     update 会拿着还按着的开镜输入把刚清掉的 adsT 又演回来。
+    pl.alive = false; pl.hp = 0; pl.stats.deaths++;
+    if (pl.ws) pl.ws.onDeath();
+    if (this.camera) { this.camera.fov = this.settings.fov; this.camera.updateProjectionMatrix(); }
     // 死亡镜头要转向击杀者。本机手上没有"是谁在打我"这件事（快照只给位置）。
     // **先按 cid 找**（重名时按名字会转向另一个同名的人，指一个假方向比不指更糟），
     // 拿不到 cid 再退回名字。找不到的（哨戒机枪 / 直升机 / 已经走了的人）留 null，只有沉镜头。
@@ -939,7 +949,11 @@ class Game {
       this.grade.uniforms.nvg.value = this.nvg && pl.alive && !this.scopeState ? 1 : 0;
       document.getElementById('nvgFrame').classList.toggle('hidden', !(this.nvg && pl.alive && !this.scopeState));
       this.renderer.toneMappingExposure = (this.world.env.exposure ?? 1) * (this.nvg ? 1.0 : 1);
-      this.setThermal(this.scopeState === 'thermal');
+      // thermal 与上面那行 nvg 同一条 alive 防护：死亡期间对账重放会拿死前那份
+      // "按着开镜"的输入重演 ws.update，把 scopeState 写回 scoped —— 热成像是活人
+      // 的瞄具，死了就该熄（nvg 那行早有 pl.alive，这行原先没有，开热成像镜被击杀
+      // 后整个死亡视角都是热成像滤色就是它）。
+      this.setThermal(pl.alive && this.scopeState === 'thermal');
       this.grade.uniforms.hurt.value = pl.alive ? Math.max(0, 1 - pl.hp / pl.maxHp - 0.2) : 0.8;
     }
     // 结算停摆的后半句：Bot/投掷物/拾取不再推进（世界冻住），但 mode.update 照走 ——

@@ -188,7 +188,112 @@ const res = await page.evaluate(async () => {
       `${ws2.slots[0].mag}/${ws2.slots[0].stats.mag}`);
   }
 
-  // ---------- ④ 别的玩家/服务端给的字符串进 innerHTML 之前必须转义（M10）----------
+  // ---------- ⑥ 联机的死亡路径：onNetDeath ----------
+  // 联机里本地玩家的血量由快照直接覆盖（js/net/predict.mjs 写 pl.hp / pl.alive），
+  // 全程不走 takeDamage —— 单机那条致死分支里的清场（ws.onDeath / FOV 复位 / alive
+  // 落地）在这条路径上一处都不会跑。这里直接调 onNetDeath 模拟"服务端 kill 事件到达"
+  // （ev 形状与真实调用点 js/net/client.mjs 的 kill 分支一致），量三件事：
+  //   · 清场本体：scopeState / adsT / FOV / alive；
+  //   · 读取侧兜底：死亡期间对账重放会拿死前输入重演 ws.update、把 scopeState 写回
+  //     scoped —— HUD 与 thermal 必须按 alive 挡住（与 NVG 那行同一防护）；
+  //   · 重放本身不写真相机（否则 FOV 又被拽回 ADS）。
+  {
+    // D3 那一步重新 startGame 过，g.player 已经是新实例 —— 这一段必须取**新鲜引用**
+    // （第一版沿用了文件顶部的旧 ws/pl，量的是上上局的死对象：adsT 恒 0、而 fov 的
+    // 窄值来自新玩家在真开镜 —— 一半新一半旧，怎么都对不上）。
+    const plN = g.player, wsN = plN.ws;
+    wsN.replaceSlot(0, { id: 'l115', att: {}, camo: 'none' }, 5, 30);
+    frames(20);
+    wsN.switchTo(0);
+    frames(60);
+    frames(200, () => { g.input.buttons = 4; });
+    ok('L0 前提：活着时开镜（联机路径的同一套摆位）', wsN.adsT > 0.9 && g.scopeState === 'sniper' && !hidden('scope'),
+      `adsT=${wsN.adsT.toFixed(3)} scopeState=${g.scopeState}`);
+    const fovAds = g.camera.fov;
+    ok('L0ᵃ 前提：FOV 确实被收窄', fovAds < g.settings.fov - 5, `${fovAds.toFixed(1)}° < ${g.settings.fov}°`);
+
+    g.onNetDeath({ killer: '凶手甲', victim: plN.name, weapon: 'ak', head: false });
+    // 快照对账随后到（真实时序里它和 kill 事件几乎同时、甚至先到：predict.mjs 直接
+    // 覆盖 pl.hp / pl.alive）。**必须**在这之后才断言 —— 第一版没有这两行，旧实现上
+    // "kill 事件不清场"的症状被活人正常收镜那条路掩盖了（alive 还挂着 true，
+    // frames 期间 ws.update 照跑，adsT 自己衰减回去），四条断言全是假绿。
+    plN.alive = false; plN.hp = 0;
+    g.input.buttons = 0;
+    frames(30);
+    ok('L1ᵃ 联机死亡后 scopeState 归 null', g.scopeState === null, String(g.scopeState));
+    ok('L1ᵇ 联机死亡后 adsT 清零（onNetDeath 调了 ws.onDeath）', wsN.adsT === 0, 'adsT=' + wsN.adsT);
+    ok('L1ᶜ 死亡视角上没有瞄具遮罩', hidden('scope'), 'hidden=' + hidden('scope'));
+    ok('L1ᵈ 相机 FOV 回到腰射值', Math.abs(g.camera.fov - g.settings.fov) < 0.5, `${g.camera.fov.toFixed(1)}° vs ${g.settings.fov}°`);
+    ok('L1ᵉ alive 已落地（无论 kill 事件与快照谁先到）', plN.alive === false, 'alive=' + plN.alive);
+    ok('L1ᶠ 死亡界面出现', !hidden('deathScreen'), 'hidden=' + hidden('deathScreen'));
+
+    // 读取侧兜底：伪造"对账重放把 scopeState 写回 scoped"（predict 的重放窗口覆盖死亡
+    // 时刻时真的会发生，用的还是死前那份按着开镜的输入），HUD / thermal 必须挡住。
+    g.scopeState = 'sniper';
+    frames(5);
+    ok('L2ᵃ scopeState 被重放写回时，死亡视角仍无遮罩（HUD 读取侧有 alive 防护）', hidden('scope'),
+      `scopeState=${g.scopeState}`);
+    ok('L2ᵇ 热成像也不因重放写回而点亮（与 NVG 同一条防护）', g.thermalOn === false, 'thermalOn=' + g.thermalOn);
+    g.scopeState = null;
+
+    // 重放不写真相机。重放的真实形状是：predict 先 applyJournal 把人退回死前那一拍
+    // （alive=true、adsT=1），再调 replay 的 update —— 所以守卫必须在"复活 + 开镜 +
+    // replay"上量才有意义；对尸体直接 update 的话 _sim 在 alive 检查处整个早退，
+    // 两条断言都是恒真绿灯（第一版就栽在这）。
+    const fovBefore = g.camera.fov;
+    plN.alive = true; wsN.adsT = 1;            // 手动摆出"journal 退回死前那一拍"的形状
+    plN.update(1 / 60, g.input, { replay: true });
+    ok('L3ᵃ 回滚重放不写真相机（FOV 不被拽回 ADS）',
+      Math.abs(g.camera.fov - fovBefore) < 1e-6 && Math.abs(g.camera.fov - g.settings.fov) < 0.5,
+      `${fovBefore.toFixed(1)}° → ${g.camera.fov.toFixed(1)}°`);
+    // 反证臂：同一份状态、非 replay 的正常 update 必须写相机 —— 它红了说明
+    // updateCamera 整个被跳过了，那是修过头。
+    plN.update(1 / 60, g.input);
+    ok('L3ᵇ 反证：非重放的正常 update 仍写相机（开镜状态的窄 FOV 可见）', g.camera.fov < g.settings.fov - 5,
+      `${g.camera.fov.toFixed(1)}° < ${g.settings.fov}°`);
+    plN.alive = false;                         // 摆位结束，把人放回死亡态（本段到此为止）
+  }
+
+  // ---------- ⑦ 远端玩家的退出淡出：不许碰共享材质 ----------
+  // bug 形状：淡出直接写材质的 transparent/opacity、dispose 再一刀切恢复 opacity=1 ——
+  // 而士兵与枪的材料来自 materials.js 的全局 MATS，与我的第一人称枪是**同一批实例**
+  // （镜片 lens=0.25、分划 reticle、军服 fab_*、枪身 gunMetal…）。症状："xxx 退出了
+  // 对局"之后，我的瞄准镜片在那 0.8 秒里跟着变透明（0.25→0），淡完被永久恢复成
+  // 不透明玻璃（0.25→1），军服那批 opaque 材质从此走透明渲染管线（transparent 没人恢复）。
+  {
+    const { NetPlayer } = await import('./js/net/remote.mjs');
+    const matsMod = await import('./js/materials.js');
+    const lens = matsMod.mat('lens'), fab = matsMod.mat('fab_enemy');
+    ok('F0 前提：镜片基线 0.25 半透明、军服 opaque',
+      lens.opacity === 0.25 && lens.transparent === true && fab.transparent === false,
+      `lens=${lens.opacity}/${lens.transparent} fab=${fab.transparent}`);
+    // 枪必须带红点镜（optic: reddot）：lens/reticle 材质只存在于装了瞄具的枪模上，
+    // 素枪只有军服和枪身 —— 第一版没装 optic，lens 那几条断言整个空转（假绿）。
+    const mk = (id) => new NetPlayer(g, { id, name: '路人' + id, team: 'B', weapon: 'm4',
+      kits: { m4: { att: { optic: 'reddot' } } },
+      x: g.player.pos.x + 2, y: g.player.pos.y, z: g.player.pos.z, yaw: 0 });
+    const r1 = mk(901), r2 = mk(902);
+    r1.beginLeave(); r2.beginLeave();          // 两个人先后脚退出（共享同一批全局材质）
+    // 前提中的前提：镜片真的被收进了淡出集合 —— 这条不成立的话，下面 F1/F2 里
+    // 所有 lens 断言都是"压根没人碰它"的恒真绿灯。
+    ok('F0ᵇ 前提：镜片材质在淡出集合里', !!r1._fadeMats && r1._fadeMats.some(m => m.opacity === 0.25),
+      `fadeMats=${r1._fadeMats && r1._fadeMats.length}`);
+    r1.update(0.05); r2.update(0.05);          // 淡出进行中
+    ok('F1 淡出进行中：全局镜片一个字段都没动', lens.opacity === 0.25 && lens.transparent === true, `opacity=${lens.opacity}`);
+    ok('F1ᵇ 军服也没被拉进透明管线', fab.transparent === false, 'transparent=' + fab.transparent);
+    // 反证臂：淡出本身必须真的在走（否则 F1/F1ᵇ 是"淡出根本没跑"的恒真绿灯）
+    const mid = r1._fadeMats && r1._fadeMats.map(m => m.opacity);
+    ok('F1ᶜ 反证：模型自己的材质确实在变透明', !!mid && mid.length > 0 && mid.every(v => v < 1),
+      JSON.stringify(mid && mid.slice(0, 4)));
+    for (let i = 0; i < 20; i++) { r1.update(0.05); r2.update(0.05); }   // 推完 0.8s 淡出
+    r1.dispose();                              // 旧实现在这里把 lens.opacity 一刀切成 1
+    ok('F2 第一个退出者 dispose 后：镜片仍是 0.25', lens.opacity === 0.25, `opacity=${lens.opacity}`);
+    ok('F2ᵇ 军服仍是 opaque', fab.transparent === false, 'transparent=' + fab.transparent);
+    r2.dispose();
+    ok('F3 第二个退出者 dispose 后全局材质仍未动（同时退出互不污染）',
+      lens.opacity === 0.25 && fab.transparent === false, `lens=${lens.opacity} fab=${fab.transparent}`);
+  }
+
   // 性质：**纵深防御**。服务端的呼号白名单（NAME_RE）眼下把 `<` 压死了，所以它在真机上
   // 一次都触发不了 —— 而"永远触发不了"的东西最容易被下一次重构顺手删掉（看起来没人用）。
   // 所以判据直接在真 DOM 上打一枪，看两件事：

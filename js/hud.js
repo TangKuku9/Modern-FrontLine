@@ -238,7 +238,8 @@ export class HUD {
     const ws = pl.ws, w = ws.w;
     // 准星
     const ch = $('crosshair');
-    const scoped = game.scopeState;
+    // 死了就不许再挂瞄具遮罩（scoped 加 alive 防护的原因见下面 scope 那一段）
+    const scoped = !!(pl.alive && game.scopeState);
     const hideCross = ws.adsT > 0.4 || pl.sprinting || !pl.alive || (w && w.stats.type === 'sniper');
     ch.style.display = hideCross ? 'none' : 'block';
     if (w && !hideCross) {
@@ -249,6 +250,9 @@ export class HUD {
       cs[2].style.left = (-px - 9) + 'px'; cs[3].style.left = px + 'px';
     }
     // 瞄准镜
+    // pl.alive 的防护与 main.js 里 NVG/thermal 同一条（读取侧兜底）：联机死亡期间
+    // 对账重放会拿死前的输入重演 ws.update，把 scopeState 写回 scoped —— 清场本体
+    // 在 main.js:onNetDeath（调 ws.onDeath），这里挡的是"死后又被重放写回"的那一路。
     const sc = $('scope');
     if (scoped) { sc.classList.remove('hidden'); sc.className = scoped === 'sniper' ? '' : scoped; }
     else sc.classList.add('hidden');
