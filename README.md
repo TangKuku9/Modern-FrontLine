@@ -115,13 +115,15 @@ Dockerfile / .env.example      镜像与部署配置模板（`.env.example` 不�
 - 下行快照定长：头 11 B + 每人 25 B。16 人 @20Hz 时**每客户端 65.8 kbps**（由 `node server/codec.mjs` 自测打印，改字段就会变，该自测在 `npm test` 里）。
 - 上行输入 16 B/拍/人，攒一渲染帧一个包。其中 `view`（u16，最后 2 B）= **发出这一拍时我屏幕上渲染的是服务端的哪一拍**，延迟补偿需要的全部输入就是它；报拍号而不是"我延迟几拍"，因为后者要把 `INTERP_DELAY` 和本机帧时序折成一个数，于是两端各有一份会各自漂移的延迟模型。拍号每 65536 回绕，服务端按 `cur` 高位拼回绝对拍号。
 - `streak`（最后 1 B）= 这一拍按了 3/4/5 中哪一个，没按 `0xff`。它必须是**按下沿**而非按住，这样上行每条最多一条请求，服务端不必再做边沿检测；服务端只在**真的消费到新输入的那一拍**处理它（饥饿空跑复用的旧输入里可能还留着上次请求）。
-- 命中盒只有**一处定义**（`js/combat.js:hitTestPlayer`），服务端当下裁决 / 服务端回溯裁决 / 客户端反馈三处共用；回溯缓冲也只存命中盒依赖的那 4 个标量。
+- 命中盒只有**一处定义**（`js/combat.js:hitTestPlayer`），服务端当下裁决 / 服务端回溯裁决 / Bot 裁决 / 客户端反馈（本机与远端）五处共用；回溯缓冲也只存命中盒依赖的那 4 个标量（Bot 的环存它自己的 `curEye()`，与裁决用的盒子同源）。
 
 ### 延迟补偿
 
 三跳各做一件事：① 客户端每拍上报 `view`；② `rewindTick` 过闸 —— 右端是不可伪造的 `lastSnapSent`（我确实发过这一拍），左端是 `LAG_MAX_TICKS = 60`（1 秒），四种情况一律拒绝（一份快照都没发过 / 报当下或将来 / 比已发的新 / 超上限）；③ 过闸后从 `PoseRing` 取那一拍的 `[x, y, z, eye]` 交给 `traceBullet` 的 `rewind` 回调。
 
-出窗的报值一律**拒绝并退回按当下判**，不夹到窗沿：夹了能换成"错得少一点的补偿"，但那是把"我看到的其实是一秒前"抹成一个假的深度。客户端帧时序导致的那约 0.5 秒残差会记在 `/healthz` 的 `lag.stale` 上，不是静默的。
+**回溯集合里必须有人也有 Bot**（附二十）：真人环挂在 client 上，Bot 环挂在房间的 `botPose` 表里，同一把尺、同一个报值、同一道窗。少一半的症状是"打真人正常、打移动 Bot 永远偏"——Bot 在客户端屏幕上滞后 ~150ms，横向一走就出盒。
+
+出窗的报值一律**拒绝并退回按当下判**，不夹到窗沿：夹了能换成"错得少一点的补偿"，但那是把"我看到的其实是一秒前"抹成一个假的深度。客户端帧时序导致的那约 0.5 秒残差会记在 `/healthz` 的 `lag.stale` 上，不是静默的。客户端的插值回退 `INTERP_DELAY` 不再写死 100ms：按快照到达间隔与抖动的 EMA 收放（55–120ms），`renderTick` 与插值读同一个活绑定，报值与画面永远同一拍（附二十）。
 
 ### 预测与回滚
 
@@ -218,7 +220,7 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 
 **账号库要挂出来**，否则容器一重建所有人就登不上（`.env.example` 里 `ACCOUNTS_DB=/data/accounts.db` 指容器内路径）。
 
-- 健康检查 `GET /healthz` → `{ok, rooms, clients, tickHz, uptime, draining, heapMB, per[]}`；`per[]` 逐间报 `hz / stepMs / behindMs / fails`；另有 `lag{shots, ok, noView, stale, poseMiss, depth[]}`（延迟补偿四项）与 `streak{calls, accepted, rejected, byId}`、`worldFlags`、`gate{}`、`auth.store`（`MemoryStore` vs `SqliteStore`）、`lobby{}`。这些计数存在的理由是一样的：这类失效在玩家侧只表现为"打不中""按了没反应"，运维得能在服务端先看见。Dockerfile 已挂 HEALTHCHECK。
+- 健康检查 `GET /healthz` → `{ok, rooms, clients, tickHz, uptime, draining, heapMB, per[]}`；`per[]` 逐间报 `hz / stepMs / behindMs / fails`；另有 `lag{shots, ok, noView, stale, poseMiss, depth[], botRewound, botPoseMiss}`（延迟补偿计数——bot 两格是 Bot 那一半的观测，没有它们时"Bot 全部按当下裁决"在 shots/ok 上完全看不出）与 `streak{calls, accepted, rejected, byId}`、`worldFlags`、`gate{}`、`auth.store`（`MemoryStore` vs `SqliteStore`）、`lobby{}`。这些计数存在的理由是一样的：这类失效在玩家侧只表现为"打不中""按了没反应"，运维得能在服务端先看见。Dockerfile 已挂 HEALTHCHECK。
 - 下线：收到 `SIGTERM` 先置 `draining`（LB 可据此摘实例），给在册连接发一条带原因的 `note` 并以 `1001` 关闭，停房间循环，在 `SHUTDOWN_GRACE_MS` 内退净。
 - ⚠ 上面两条 docker 指令在本机**没跑过**（开发机没装 docker）。不需要 docker 的那一半已经量了（`test/image.mjs`，在 `npm test` 里）：每条 `COPY` 的源都在仓库里、`CMD` 指着真文件、镜像默认 `NODE_ENV=production`、非 root、运行时导入闭包（从 `server/net-server.mjs` 递归推的 32 个文件）与 `PUBLIC` 白名单一条都没被 `.dockerignore` 挡住、闭包里没有一处 import playwright，而且 Dockerfile 里那句 HEALTHCHECK 的 payload 会被抠出来**对一台真服跑**（退出码 0）**再对一个空端口跑**（退出码必须 1）。剩下没验的就是这四条：真的 `docker build`、真的 `docker run`、镜像层体积、以及 `SIGTERM` 那段在 **Windows 上没被测过**（libuv 的 `child.kill()` 是直接 TerminateProcess，信号送不进子进程），Linux 上由 `server/deploy-probe.mjs` 验收。
 
