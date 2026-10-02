@@ -23,6 +23,11 @@ import { openSocket, tabNonce } from '../account.js';
 const HISTORY = 240;                                 // 回滚窗口，4 秒
 // 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
 const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Sprint | FLAG.OnGround | FLAG.Sliding;
+// 队伍键的规范形。只放行 'B' 与 'P' 前缀（'P'+cid 是自由混战每人一支的独立队，是
+// 播报前缀 / 直升机归属 / own、foes 过滤 / 名牌的**敌我键**——把它压成 'A' 的症状是
+// 全场都是"队友"、自己叫的直升机被念成敌机）。URL team= 的直连路上只有 'A'/'B'，
+// 老服务端的脏值照旧归 'A'。
+const normTeam = (t) => (t === 'B' ? 'B' : t && t[0] === 'P' ? t : 'A');
 export class NetClient {
   constructor(game, opts = {}) {
     this.game = game;
@@ -33,7 +38,7 @@ export class NetClient {
     this.tab = opts.url ? '' : tabNonce();
     this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
     this.name = opts.name || '士兵';
-    this.team = opts.team === 'B' ? 'B' : 'A';
+    this.team = normTeam(opts.team);
     // 房间的显示名（联机大厅"创建房间"带来）。可选：不带就是"没起名"，
     // 列表里显示房号。它**不是房号** —— 房号在 room 那一格，白名单不同（见服务端 cleanTitle）。
     this.title = opts.title || '';
@@ -164,7 +169,9 @@ export class NetClient {
       if (j.name) { this.name = j.name; if (this.game) this.game.playerName = j.name; }
       // 阵营由服务端说（房间那条路上它是"房里站的那一队"，不是网址里的 team=）。
       // 老服务端没这一格时退回自己那份 —— 那是 ?online=1 直连的语义，没有房间就没有队。
-      if (j.team) this.team = j.team === 'B' ? 'B' : 'A';
+      // FFA 下原样收下 'P'+cid：后面 own/foes 过滤、"敌方"前缀、直升机归属全拿它当键，
+      // 压成 'A' 的话自己的连杀播报也会带"敌方"。
+      if (j.team) this.team = this.ffa ? j.team : normTeam(j.team);
       // 连杀奖励的槽位表由服务端给：**按 3/4/5 各是什么、每个要几杀**，这两件事的真相
       // 在权威端（js/match-rules.js 的账本里）。客户端自己按 data.js 那份渲染的话，
       // 服务端换一项、客户端还显示旧的 —— 症状是"按了没反应"，正是这一轮要消灭的东西。
@@ -407,10 +414,18 @@ export class NetClient {
         const who = this.roster.get(e.id) || {};
         r = new NetPlayer(this.game, {
           id: e.id, name: who.name || ('玩家 ' + e.id),
-          team: teamId(e.team) || (this.team === 'A' ? 'B' : 'A'),
+          // 队伍键按保真度取：FFA 下 roster 里 welcome/join 带的**原始** 'P'+cid（敌我键
+          // 就长这样）＞ 按 id 还原（真人快照 id = cid、Bot 的队号 = netId，同一分配器，
+          // roster 迟到一拍时兜出来的值与服务器同串）＞ 团队模式的 1 字节索引。
+          // FFA 下走 teamId(e.team) 必然全场同队（快照里 'P'+cid 只占 'P' 通道一位）——
+          // 名牌挂满全场、军服全蓝、播报全"敌方"，就是这一格曾经的样子。
+          team: this.ffa ? (who.team || 'P' + e.id) : (teamId(e.team) || (this.team === 'A' ? 'B' : 'A')),
           weapon: e.weapon,
           perks: who.perks,
           kits: who.kits,
+          // FFA 没有队友蓝：军服在敌军系里按 id 轮转（与单机 FFA 的 bot 池同两格，
+          // mp.js:88），同屏几个人至少红/褐可辨。
+          modelStyle: this.ffa ? (e.id % 2 ? 'insurgent' : 'enemy') : undefined,
           // 起点用这一包的坐标：留 (0,0,0) 会让第一帧把别人摆在地图原点。
           // （插值本身没跑起来时，那个原点读数会一直挂着 —— 见 test/net-play.mjs 的 rendered 差值）
           x: e.x, y: e.y, z: e.z, yaw: e.yaw,
@@ -1089,11 +1104,14 @@ export class NetClient {
       const t = Math.max(0, this.timeLeft | 0);
       const mm = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
       if (this.ffa) {
-        // 自由混战的比分条：我的击杀 + 名次 + 榜首（与单机 MPMatch.hudScore 的 ffa 分支同形）
+        // 自由混战的比分条：我的击杀 + 名次 + 榜首（与单机 MPMatch.hudScore 的 ffa 分支同形）。
+        // 右格是**榜首的击杀**，榜首若就是我自己就改显第二名（mp.js:441 的同一守卫）——
+        // 少了守卫，领跑者的左格右格是同一个数，看上去就成了"红蓝两队比分相同"。
         const rows = (this.board && this.board.rows) || [];
         const me = rows.findIndex(r => r.cid === this.cid);
         const mine = me >= 0 ? rows[me] : null;
-        hud.scorebar(`<div class="sb-team a">${mine ? mine.k : 0}</div><div class="sb-time">${mm}<br><small style="font-size:11px;color:#aaa">第 ${me >= 0 ? me + 1 : '-'} 名</small></div><div class="sb-team b">${rows[0] ? rows[0].k : 0}</div>`);
+        const lead = rows[0] && rows[0].cid !== this.cid ? rows[0] : rows[1];
+        hud.scorebar(`<div class="sb-team a"><small style="font-size:10px;color:#9cf">我</small> ${mine ? mine.k : 0}</div><div class="sb-time">${mm}<br><small style="font-size:11px;color:#aaa">第 ${me >= 0 ? me + 1 : '-'} 名</small></div><div class="sb-team b"><small style="font-size:10px;color:#f96">榜首</small> ${lead ? lead.k : 0}</div>`);
       } else {
         // 占领点的名字条挂在旗顶（与单机 MPMatch.update 的 hudScore/markers 同形）
         let fl = '';

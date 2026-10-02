@@ -438,7 +438,9 @@ export class MPMatch {
       const r = this.ranking();
       const me = r.findIndex(x => x.e.isPlayer);
       const lead = r[0];
-      html = `<div class="sb-team a">${pl.stats.kills}</div><div class="sb-time">${t}<br><small style="font-size:11px;color:#aaa">第 ${me + 1} 名</small></div><div class="sb-team b">${lead.e.isPlayer ? (r[1] ? r[1].k : 0) : lead.k}</div>`;
+      // 左右两格加"我/榜首"小字：红蓝格子本来就是团队模式的壳，不标的话领跑者两格
+      // 同数（自己超自己时右格显第二名），看起来像比分出了问题（联机同款，client.mjs）。
+      html = `<div class="sb-team a"><small style="font-size:10px;color:#9cf">我</small> ${pl.stats.kills}</div><div class="sb-time">${t}<br><small style="font-size:11px;color:#aaa">第 ${me + 1} 名</small></div><div class="sb-team b"><small style="font-size:10px;color:#f96">榜首</small> ${lead.e.isPlayer ? (r[1] ? r[1].k : 0) : lead.k}</div>`;
     } else {
       let flags = '';
       if (this.flags) flags = `<div class="sb-flags">${this.flags.map(f => `<div class="sb-flag ${f.owner === pl.team ? 'A' : f.owner ? 'B' : ''}">${f.name}</div>`).join('')}</div>`;

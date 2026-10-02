@@ -680,6 +680,14 @@ export class NetRoom {
   // 全是静默的（"某个人永远进不了记分板"）。所以它只有一个 netId（快照里的那个 id）。
   spawnBot({ name = 'Bot', team = 'A', skill = 1 } = {}) {
     if (!this.started) return null;
+    // 自由混战：Bot 也跟真人一样各占一支独立"队"（addClient 里那句的同款，单机是
+    // js/mp.js:88 的 'F'+i）。不重编的话 Bot 终生带着大厅发的 'A'/'B'：isEnemy 认出
+    // 两营 —— 同营互不为敌、枪声互滤，异营全营响应，出生点反堆叠也只认跨队 ——
+    // 打起来是 TDM：两拨 bot 各自抱团、各堆一翼，真人被两边轮流猎。
+    // 队号从 NEXT_CID 取（与真人 cid / Bot 的 netId 是同一个分配器）：局内唯一，
+    // 不会撞上任何真人的 'P'+cid。取出的号顺手复用成它的 netId（下面那次 ++ 省掉）。
+    let ffaId = null;
+    if (this.rules.ffa) { ffaId = NEXT_CID++; team = 'P' + ffaId; }
     const sp = this.spawnPoint(team);
     const wid = BOT_WEAPONS[Math.floor(rng.next() * BOT_WEAPONS.length) % BOT_WEAPONS.length];
     const def = MAPS[this.mapId] || {};
@@ -689,14 +697,20 @@ export class NetRoom {
     const bot = new Bot(this.game, {
       team, name, weaponId: wid, att: randomAtt(wid), difficulty: skill,
       pos: sp.pos, yaw: sp.yaw, role: 'mp',
-      style: team === 'A' ? styles[0] : styles[1],
+      // 涂装跟队走（A=友军蓝 / B=敌军红）。FFA 没有"友军"：按单机 FFA 的那口池子
+      // （mp.js:88）在敌军系里轮转，不然半场 bot 穿着友军蓝在人堆里跑。
+      style: this.rules.ffa
+        ? (styles[1] === 'enemy' ? ['enemy', 'insurgent'] : [styles[1], 'insurgent'])[Math.floor(rng.next() * 2)]
+        : (team === 'A' ? styles[0] : styles[1]),
       camo: BOT_CAMOS[Math.floor(rng.next() * BOT_CAMOS.length) % BOT_CAMOS.length],
     });
     bot.isBot = true;
     // 同步 id 与真人的 cid **共用同一个分配器**。两边各起一套编号的话，某天一个 Bot 的 id
     // 撞上一个人的 cid，客户端会把两者认成同一个实体 —— 症状是"两个人共用一个位置"，
     // 而协议上没有任何一处会报错（快照里的 id 只是一个 u16）。
-    bot.netId = NEXT_CID++;
+    // FFA 下直接复用上面取的队号：队键 'P'+号 与 netId 号 同源同值，roster 兜底还原
+    // （客户端 'P'+e.id）拿到的就是服务器上的真值。
+    bot.netId = ffaId != null ? ffaId : NEXT_CID++;
     this.addBot(bot);
     return bot;
   }

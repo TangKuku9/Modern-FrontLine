@@ -204,7 +204,12 @@ export class MatchRules {
   // 但从来没人往里写过东西，于是"UAV 上线了"这件事在客户端根本无从得知。
   worldFlags() {
     let f = 0;
-    if (this.uavActive('A')) f |= WORLD.UAV;
+    // FFA 的 UAV 账按"每人一支队"记（键是 'P'+cid），'A'/'B' 两格永远查不到它 ——
+    // 没有这一句，联机 FFA 呼叫 UAV 后这个字节里的 UAV 位根本不亮，小地图一个点不给。
+    // 位只有两个、人却人人一支，FFA 下只能折成"任何人开着 UAV 就亮"：人人为敌，
+    // 一张透视图对全场等价（对没开的人相当于吃了别人 UAV 的亏，与团队模式里被对面
+    // UAV 透是同一件事），单机 FFA 的表现也是这一种。
+    if (this.ffa ? this.uav.size > 0 : this.uavActive('A')) f |= WORLD.UAV;
     if (this.uavActive('B')) f |= WORLD.UAV_B;
     if (this.wpTicks > 0) f |= WORLD.WhitePhosphorus;
     if (this.over) f |= WORLD.MatchOver;

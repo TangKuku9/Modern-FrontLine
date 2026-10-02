@@ -145,5 +145,9 @@ export const weaponIndex = (id) => Math.max(0, WEAPON_IDS.indexOf(id));
 export const weaponId = (n) => WEAPON_IDS[n] || 'm4';
 
 export const TEAM_IDS = ['A', 'B', 'P'];
-export const teamIndex = (t) => Math.max(0, TEAM_IDS.indexOf(t));
+// 'P'+cid（自由混战每人一支的独立队）不在表里 —— 没有 'P' 前缀这一句，它的索引是 -1
+// 被钳成 0，全场（连"自己"在内）都在快照里变成 'A' 队。快照的 1 字节表达不了每人的
+// 序号，所以这里只负责把它送进 'P' 通道（索引 2）：解码端在 FFA 下**不消费这个字节判
+// 敌我**，队伍键以 roster / 事件里带的原始串为准（js/net/client.mjs 的三处失真口）。
+export const teamIndex = (t) => (t && t[0] === 'P' ? 2 : Math.max(0, TEAM_IDS.indexOf(t)));
 export const teamId = (n) => TEAM_IDS[n] || 'A';

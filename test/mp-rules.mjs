@@ -13,7 +13,7 @@
 import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
 import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks } from '../js/match-rules.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
-import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD } from '../js/quant.js';
+import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD, teamIndex, teamId } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
 import { KILLSTREAKS } from '../js/data.js';
 import * as THREE from 'three';
@@ -835,6 +835,106 @@ sec('P. 结算停摆：matchOver 之后这一局不再有战斗');
   ok('P8 终局记分板随 matchOver 补发（面板上的击杀列不少最后一杀）',
     !!pBoard && pBoard.rows.length === 2, JSON.stringify(pBoard && pBoard.rows.map(r => `${r.name}:${r.k}`)));
   void PB;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('Q. FFA 的队键全链保真（独立队不许在快照/客户端/Bot 三处被抹成团队队）');
+// ═══════════════════════════════════════════════════════════════════════════
+// 2026-10-02 单真人+满 Bot 的实测四报同根：'P'+cid 这个敌我键在两处被抹掉 ——
+// 快照 teamIndex 把它钳成 0（'A'），客户端把己方队压成 'A'；外加 spawnBot 不给 Bot
+// 重编独立队。四报 = 全场"队友"名牌 / 积分条两格同数 / Bot 两营抱团两翼出生 /
+// 自己呼叫的直升机被念"敌方"。本节每条判据的措辞写的就是它压住哪一报。
+
+{
+  // —— 编码通道 ——
+  ok('Q1【反证旧病】teamIndex("P3") 不再被钳成 0（旧实现全场在快照里变 "A" 队）',
+    teamIndex('P3') === 2 && teamIndex('P0') === 2 && teamIndex('P') === 2);
+  ok('Q2 团队模式两格不受影响、脏值照旧归 0（老协议安全）',
+    teamIndex('A') === 0 && teamIndex('B') === 1 && teamIndex(undefined) === 0 && teamId(2) === 'P');
+
+  // —— 房间里的队键（快照通道 + roster 通道都要是原始串）——
+  const roomQ = new NetRoom({ id: 'rules-q', mapId: 'yard', seed: 20261002, mode: 'ffa', streaks: ['uav', 'cluster', 'heli'] });
+  await roomQ.start();
+  const QA = roomQ.addClient({ name: '独狼', team: 'A' });
+  const qBots = [];
+  for (let i = 0; i < 8; i++) qBots.push(roomQ.spawnBot({ name: 'Bot' + i, team: i % 2 ? 'A' : 'B', skill: 1 }));
+  const qTeams = [QA.team, ...qBots.map(b => b.team)];
+  ok('Q3 真人 + 8 Bot 的队键两两互异（这条红了 = 有人和别人共队，名牌/友伤全串）',
+    new Set(qTeams).size === qTeams.length, qTeams.join(','));
+  ok('Q4 Bot 的队键是 "P"+netId（与真人 cid 同一分配器，永不撞号；roster 兜底按 id 还原得回真值）',
+    qBots.every(b => b.team === 'P' + b.netId) && QA.team === 'P' + QA.cid);
+  roomQ.step();
+  const qBack = decodeSnapshot(encodeSnapshot({ ...roomQ.snapshot(), seq: 1 }).view);
+  ok('Q5 快照 25 字节通道里全部实体走 P 通道（字节=2；敌我键以 roster/事件原始串为准）',
+    qBack.entities.length === 9 && qBack.entities.every(e => e.team === 2), qBack.entities.map(e => e.team).join(','));
+
+  // —— Bot 敌我（"抱团"的根：同营互不为敌 → 两营各抱一团、共同猎真人）——
+  ok('Q6 FFA 下任意两个 Bot 互为敌人、且认真人为敌',
+    qBots[0].isEnemy(qBots[1]) && qBots[1].isEnemy(qBots[0]) && qBots.every(b => b.isEnemy(QA.pl)));
+  ok('Q7 isEnemy 其余条款原样（不打直升机、不打死人）',
+    !qBots[0].isEnemy({ team: 'P99', alive: true, isHeli: true }) && !qBots[0].isEnemy({ team: 'P99', alive: false }));
+
+  // 反证臂：这条红了 = 把 TDM 的营地语义也拆了。
+  const roomQ2 = new NetRoom({ id: 'rules-q2', mapId: 'yard', seed: 20261002, mode: 'tdm' });
+  await roomQ2.start();
+  const qA1 = roomQ2.spawnBot({ name: '蓝1', team: 'A', skill: 1 });
+  const qA2 = roomQ2.spawnBot({ name: '蓝2', team: 'A', skill: 1 });
+  const qB1 = roomQ2.spawnBot({ name: '红1', team: 'B', skill: 1 });
+  ok('Q8【反证】TDM 下同营 Bot 仍互不为敌、异营互为敌、队键保持大厅发的 A/B',
+    !qA1.isEnemy(qA2) && qA1.isEnemy(qB1) && qA1.team === 'A' && qB1.team === 'B');
+
+  // —— 出生散布：反堆叠只认跨队，同营互不算 foes 时同营 Bot 反复堆回同一批点 ——
+  const nnMed = (pts) => {
+    const ds = pts.map((p, i) => Math.min(...pts.filter((_, j) => j !== i).map(q => p.distanceTo(q))));
+    ds.sort((a, b) => a - b);
+    return ds[Math.floor(ds.length / 2)];
+  };
+  const ffaMed = nnMed(qBots.map(b => b.pos.clone()));
+  const sideBots = [];
+  for (let i = 0; i < 8; i++) sideBots.push(roomQ2.spawnBot({ name: '同营' + i, team: 'A', skill: 1 }).pos.clone());
+  const sideMed = nnMed(sideBots);
+  ok('Q9 FFA 下 Bot 出生散布不差于 TDM 同营对照（同营堆叠的机制已拆）',
+    ffaMed >= sideMed - 0.5, `ffa=${ffaMed.toFixed(1)}m tdm同营=${sideMed.toFixed(1)}m`);
+
+  // —— 武装直升机的归属（事件里 team 必须是呼叫者的原始队键）——
+  const qSlot = QA.book.slots.findIndex(s => s.id === 'heli');
+  for (let k = 0; k < 8 && !QA.book.slots[qSlot].ready; k++) QA.book.charge(1);
+  const qEv0 = roomQ.events.length;
+  ok('Q10 heli 槽经 7 杀就绪、呼叫被接受', QA.book.slots[qSlot].ready && roomQ.callStreak(QA, qSlot) === 'heli');
+  const qEvs = roomQ.events.slice(qEv0);
+  const qTurret = qEvs.find(e => e.e === 'turret' && e.kind === 'heli');
+  const qSelf = qEvs.find(e => e.e === 'announce' && e.to === 'self');
+  const qFoes = qEvs.find(e => e.e === 'announce' && e.to === 'foes');
+  ok('Q11 turret 事件带呼叫者原始队键（旧链路上它和本机队键永不相等 → 自己的直升机被当敌机）',
+    !!qTurret && qTurret.team === QA.team && !!qSelf && qSelf.cid === QA.cid && qSelf.text === '武装直升机已就位'
+    && !!qFoes && qFoes.team === QA.team && qFoes.text === '武装直升机来袭');
+  // 客户端三条路由的同款代数（js/net/client.mjs:onEvents）：self 认数字 cid、
+  // own/foes 与"敌方"前缀拿原始队键比。键保真后：呼叫者不收"来袭"、自己的播报无前缀。
+  const qRouteFoes = (ev, my) => !(ev.to === 'foes' && ev.team === my);
+  const qPre = (ev, my) => (ev.team === my ? '' : '敌方');
+  ok('Q12 【路由】呼叫者自己滤掉 foes 预警；自己的播报无"敌方"、别人的带',
+    qRouteFoes(qFoes, QA.team) === false
+    && qPre({ team: QA.team, text: '武装直升机已就位' }, QA.team) === ''
+    && qPre({ team: qBots[0].team, text: 'UAV 已上线' }, QA.team) === '敌方');
+
+  // —— UAV 的 worldFlags 位（FFA 账按 "P"+cid 记，A/B 两格查不到它）——
+  ok('Q13 没人开 UAV 时位不亮（量具先自证）', (roomQ.rules.worldFlags() & WORLD.UAV) === 0);
+  roomQ.rules.uavStart(QA.pl.team, 600);
+  ok('Q14 FFA 下 uavStart("P1") 后 UAV 位亮（旧实现查 uavActive("A") 恒假，小地图一个点不给）',
+    (roomQ.rules.worldFlags() & WORLD.UAV) !== 0);
+
+  // —— 记分板 rows（积分条与名次的输入）+ 客户端右格守卫 ——
+  roomQ.pushBoard();
+  const qBoard = roomQ.events.filter(e => e.e === 'board').pop();
+  ok('Q15 rows 按击杀降序、带 rank、每行带原始队键',
+    qBoard.rows.length === 9 && qBoard.rows.every((r, i) => i === 0 || qBoard.rows[i - 1].k > r.k
+      || (qBoard.rows[i - 1].k === r.k && qBoard.rows[i - 1].s >= r.s))
+    && qBoard.rows[0].rank === 1 && qBoard.rows.every(r => (r.team || '')[0] === 'P'));
+  const qRows = qBoard.rows.map(r => ({ cid: r.cid, k: r.k }));
+  qRows[0].k = 5; qRows[0].cid = QA.cid; if (qRows[1]) qRows[1].k = 3;    // 让领跑者=我
+  const qLead = qRows[0] && qRows[0].cid !== QA.cid ? qRows[0] : qRows[1];
+  ok('Q16 右格守卫：榜首是我 → 显第二名（旧代码左右两格同数，看上去像红蓝比分相同）',
+    qLead && qLead.k === 3, JSON.stringify(qRows.map(r => r.k)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

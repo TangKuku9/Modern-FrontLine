@@ -308,7 +308,8 @@ export class HUD {
       const wh = game.world.raycast(cam.position, d, 60);
       if (wh) best = wh.t;
       for (const e of game.entities) {
-        if (e === pl || !e.alive || e.team === pl.team || !e.hitTest) continue;
+        // FFA 下 team 是每人一支的独立键，拿"同队"排除会把全场跳过 —— 瞄谁都不出名字。
+        if (e === pl || !e.alive || (e.team === pl.team && !(game.mode && game.mode.ffa)) || !e.hitTest) continue;
         const h = e.hitTest(cam.position, d, best);
         if (h) { name = e.name; best = h.t; }
       }
