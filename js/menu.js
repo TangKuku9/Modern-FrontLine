@@ -627,6 +627,14 @@ export class Menu {
     if (fn && !fn(lb)) { this.onlineError('大厅连接刚刚断了，这一句没发出去'); return false; }
     return true;
   }
+  // 房间屏上行的闸（与进房三件套的 lobbyAsk 同一族）：连接不在手上时，加 / 减 Bot、
+  // 换队、准备、改设置、开始这些按钮原来全是静默丢帧 —— "点了没反应"那一族里最后
+  // 几个没设闸的入口。LobbyClient 那几条上行现在都把"真的发出去了吗"交回来，这里统一问。
+  roomAsk(fn) {
+    const lb = this.game.lobby;
+    if (!lb || !lb.connected) { this.onlineError('还没连上大厅，稍等一下（或点「重新连接」）'); return; }
+    if (!fn(lb)) this.onlineError('大厅连接刚刚断了，这一下没发出去');
+  }
   // 重连大厅：扔掉断了的那条连接，重新走一遍 onlineLobby()。**不刷新页面** ——
   // 这一页上还有房名、地图、装备选择与聊天框里没发完的字，F5 会把它们全丢掉。
   onlineRelobby() {
@@ -719,6 +727,11 @@ export class Menu {
     const lb = this.game.lobby;
     const note = this.el.querySelector('#lbNote'), on = this.el.querySelector('#lbOnline');
     if (on) on.textContent = lb ? String(lb.online) : '—';
+    // 「重新连接」跟着连接的**真相**走，不跟着"进这一屏的那一瞬间"走：首次进大厅时
+    // 连接还没建起来，showOnlineLobby 把它亮出来，此后连上了没有任何一处收回去 ——
+    // 一个常亮的重连按钮是在宣称"连接是断的"。这里是这一屏唯一每次推送都过的地方。
+    const re = this.el.querySelector('#lbRe');
+    if (re) re.style.display = (lb && lb.connected && !lb.lost) ? 'none' : '';
     if (!lb || !lb.connected) {
       // 三种状态三句话（M9）：「断线了」说成「正在进入大厅…」是一句会一直说下去的谎，
       // 而这一行是玩家唯一能看到"发生了什么、接下来该干嘛"的地方。lost 由 LobbyClient 的
@@ -825,7 +838,11 @@ export class Menu {
     // 渲染（含时间戳与屏蔽过滤）在 js/net/chat.mjs:chatRowHtml —— 与对局 HUD 共用一份，
     // 免得"大厅里有时间戳、对局里没有"这种只在两个界面之间才看得见的差异又长出来。
     const lb = this.game.lobby;
-    const mine = !!(lb && x.from && x.from === (lb.state && lb.state.me && lb.state.me.name));
+    const me = lb && lb.state && lb.state.me;
+    // "我这行"认 **sid**（服务端在房间频道那一行特意带的），名字只做没有 sid 那些行
+    // （全服频道 / 私聊回执）的退路：访客服上两条"士兵"同名，按名字认会把别人的行
+    // 高亮成我的 —— 服务端留 sid 这一格正是为了这个。
+    const mine = !!(me && (x.sid != null ? x.sid === me.sid : x.from && x.from === me.name));
     return chatRowHtml(x, { mine, muted: (this.game.profile && this.game.profile.muted) || [] });
   }
   pushChat(root, ch, row) {
@@ -901,14 +918,20 @@ export class Menu {
     this.on(r, '[data-a=leave]', () => this.roomLeave());
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('onlineRoom'));
     this.on(r, '[data-a=ready]', () => this.roomReady());
-    this.on(r, '[data-a=start]', () => { const l = this.game.lobby; if (l) l.start(); });
+    this.on(r, '[data-a=start]', () => this.roomAsk(l => l.start()));
     this.on(r, '[data-a=toA]', () => this.roomTeam('A'));
     this.on(r, '[data-a=toB]', () => this.roomTeam('B'));
     this.on(r, '[data-a=addA]', () => this.roomAddBot('A'));
     this.on(r, '[data-a=addB]', () => this.roomAddBot('B'));
-    // Bot 那一行点一下就移除。只给房主：不是房主点了会收到服务端一句拒绝，
-    // 而"点了没反应但服务端其实拒了"正是这一层要避免的那种界面 —— 干脆不让它能点。
-    this.on(r, '.seat[data-bid]', (el) => this.roomDelBot(+el.dataset.bid));
+    // Bot 那一行点一下就移除。**必须委托**而不能用 on()：名单是 renderRoom 每次推送
+    // 都整块重画的，而 on() 是绑定时一次性查询 —— 绑这一行的时候座位栏还是空壳，
+    // 监听器一个都落不到后来才长出来的 Bot 行上，症状就是"点了没反应"（服务端判据
+    // 与计数全是通的，room-flow/room-bots 走协议，也盖不到这根 DOM 线）。
+    // 只对房主、且只在等待态放行：对局中服务端拒得静默，按钮文案也已经收了。
+    r.addEventListener('click', (e) => {
+      const el = e.target.closest('.seat[data-bid]');
+      if (el) this.roomDelBot(+el.dataset.bid);
+    });
     this.bindChat(r, 'room');
     this.renderRoom();
     this.renderChat(r, 'room');
@@ -1008,24 +1031,25 @@ export class Menu {
       cfg.querySelectorAll('.seg div[data-dis="0"]').forEach(d => d.addEventListener('click', () => {
         const sg = d.parentElement, v = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
         const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : sg.id === 'rmScore' ? 'scoreLimit' : sg.id === 'rmBot' ? 'botSkill' : sg.id === 'rmFill' ? 'fill' : 'minutes';
-        if (this.game.lobby) this.game.lobby.setCfg({ [key]: v });
+        this.roomAsk(l => l.setCfg({ [key]: v }));
       }));
     }
   }
   roomReady() {
     const lb = this.game.lobby, st = lb && lb.state; if (!st || !st.me) return;
-    if (lb) lb.ready(!st.me.ready);
+    this.roomAsk(l => l.ready(!st.me.ready));
   }
   roomTeam(team) {
-    const lb = this.game.lobby; if (lb) lb.setTeam(team);
+    this.roomAsk(l => l.setTeam(team));
   }
   roomAddBot(team) {
-    const lb = this.game.lobby; if (lb) lb.addBot(team);
+    this.roomAsk(l => l.addBot(team));
   }
   roomDelBot(bid) {
     const lb = this.game.lobby, st = lb && lb.state;
     if (!lb || !st || !st.me || !st.me.isHost) return;
-    lb.removeBot(bid);
+    if (st.room && st.room.state === 'playing') return;   // 对局中封盘：服务端同判，且拒得静默
+    this.roomAsk(l => l.removeBot(bid));
   }
   roomLeave() {
     const lb = this.game.lobby; if (lb) lb.leaveRoom();
@@ -1155,7 +1179,11 @@ export class Menu {
     this.on(r, '[data-p=tactical]', () => this.pickSimple(ci, 'tactical'));
     this.on(r, '[data-p=perks]', () => this.pickPerks(ci));
     this.on(r, '[data-p=streaks]', () => this.pickStreaks());
-    this.on(r, '[data-a=back]', () => { if (this.loadoutFrom === 'lobby') this.showLobby(); else if (this.loadoutFrom === 'online' || this.loadoutFrom === 'onlineRoom') this.showOnlineLobby(); else if (this.loadoutFrom === 'pause') this.showPause(); else this.showMain(); });
+    // 从房间屏进来的就**回房间屏**：人还占着座位，落回大厅列表等于把一个在册的人
+    // 丢在大厅 —— 房间帧只在房间屏上被收（onRoomFrame 按屏分流），他从此看不见那间房，
+    // 也再没有路走回去（而"从大厅点加入"会被当成重新进房，整出一串多余的副作用）。
+    // 座位要是散了，showOnlineRoom 自己的守卫会把他送回大厅，这条路两头都站得住。
+    this.on(r, '[data-a=back]', () => { if (this.loadoutFrom === 'lobby') this.showLobby(); else if (this.loadoutFrom === 'onlineRoom') this.showOnlineRoom(); else if (this.loadoutFrom === 'online') this.showOnlineLobby(); else if (this.loadoutFrom === 'pause') this.showPause(); else this.showMain(); });
   }
   picker(title, sub, inner, onBack) {
     const scr = this.el.firstChild;

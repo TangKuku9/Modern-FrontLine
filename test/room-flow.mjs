@@ -513,6 +513,92 @@ try {
   fa.close();
   srvF.kill();
 
+  console.log('\n── M：一条连接同时只占一个座位（幽灵座位与僵尸房的三个口）──');
+  // 症状级现场：房主在 A 房里点了"编辑配装"，回到大厅列表（旧版客户端的路由把他丢在那儿），
+  // 这时点"加入"另一间房 —— 旧服务端不清旧座位，A 房从此挂着一个走不掉、准备不了的
+  // "房主"：谁也开不了局，断线清理只认 seatOf（最后一间），sweep 只收空房 —— 那间房
+  // 活到进程重启。三个口各钉一条：同房重进 = 幂等回房间；跨房进 = 先退旧座；坐着建房 = 先退旧座。
+  const srvM = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
+  const z1 = client(srvM.ws, '座甲'), z2 = client(srvM.ws, '座乙'), z3 = client(srvM.ws, '座丙');
+  await z1.opened; await z2.opened; await z3.opened;
+  for (const c of [z1, z2, z3]) { c.send({ t: 'lobby' }); await c.until(j => j.t === 'lobby'); }
+  z1.send({ t: 'createRoom', room: 'oneseat', name: '座甲', title: '一座房' });
+  await z1.until(j => j.t === 'room' && j.room && j.room.id === 'oneseat', 6000);
+  z2.send({ t: 'joinRoom', room: 'oneseat', name: '座乙' });
+  await z2.until(j => j.t === 'room' && j.me, 6000);
+  z1.send({ t: 'botAdd' });
+  await z1.until(j => j.t === 'room' && (j.bots || []).length === 1, 6000);
+  // 摆盘：甲+乙都站 A 队、Bot 落 B 队 —— 这样"重新落座"那个旧病（_freeTeam 重平衡）
+  // 会把乙甩去 B 队，而幂等路径必须让他原地不动。
+  z2.send({ t: 'team', team: 'A' });
+  await z1.until(j => j.t === 'room' && j.seats.filter(s => s.team === 'A').length === 2, 6000);
+
+  // ── 口①：同房重进是"回房间"，不是"重新进房" ──
+  // joinRoom 在重帧的最小间隔那一档（HEAVY_MIN_FRAMES），被拒的尝试也盖章 —— 连发
+  // 之间要留出 250ms；断言前清队列，until 才不会捞到陈年广播帧冒充这一句的应答。
+  const enters0 = (([...z1.frames].reverse().find(j => j.t === 'room' && j.chat) || { chat: [] }).chat || [])
+    .filter(c => /进来了/.test(c.text || '')).length;
+  await sleep(300);
+  z2.frames.length = 0; z1.frames.length = 0;
+  z2.send({ t: 'joinRoom', room: 'oneseat', name: '座乙' });
+  const zm1 = await z2.until(j => j.t === 'room' && j.room && j.room.id === 'oneseat', 6000);
+  const z1ent = await z1.until(j => j.t === 'room' && j.room && j.room.id === 'oneseat', 6000);
+  const chatNow = ((z1ent && z1ent.chat) || []).filter(c => /进来了/.test(c.text || '')).length;
+  ok('已经在房里再点一次加入：座位原地不动（不被重新分队）',
+    !!zm1 && zm1.me && zm1.me.team === 'A', `team=${zm1 && zm1.me && zm1.me.team}`);
+  ok('【判別臂】同房重进不多一句"进来了"（多的那句在别人屏上看着像又进来一个人）',
+    chatNow === enters0, `进来了 ${enters0} → ${chatNow}`);
+  ok('同房重进不动名单（一个座位、一个 Bot，一个都不少）',
+    zm1 && zm1.seats.length === 2 && zm1.bots.length === 1,
+    JSON.stringify({ seats: zm1 && zm1.seats.length, bots: zm1 && zm1.bots.length }));
+
+  // ── 口②：跨房进 = 旧座退干净，不留幽灵 ──
+  await sleep(300);
+  z3.send({ t: 'createRoom', room: 'elsewhere', name: '座丙', title: '另一间' });
+  await z3.until(j => j.t === 'room' && j.room && j.room.id === 'elsewhere', 6000);
+  await sleep(300);
+  z2.frames.length = 0; z1.frames.length = 0; z3.frames.length = 0;
+  z2.send({ t: 'joinRoom', room: 'elsewhere', name: '座乙' });
+  const z3b = await z3.until(j => j.t === 'room' && j.seats && j.seats.length === 2, 6000);
+  // 幽灵最毒的一格：它要是"还没准备的人"，开局判据就永远差一口。乙真的走了，
+  // 房里只剩"房主 + Bot"，canStart 必须自己好起来（与"少一人"是同一帧 —— 之后
+  // 这间房再没有别的活动，分开等第二条永远等不到）。
+  const z1b = await z1.until(j => j.t === 'room' && j.seats && j.seats.length === 1 && j.canStart === true, 6000);
+  ok('跨房加入：新房间里人齐了', !!z3b && z3b.seats.some(s => s.name === '座乙'), JSON.stringify(z3b && z3b.seats.map(s => s.name)));
+  ok('旧房间当场少一个（不是名单上还挂着一份）', !!z1b, JSON.stringify(z1b && z1b.seats.map(s => s.name)));
+  ok('旧房间人数回到"1 人 + 1 Bot"（列表与名单是同一份账）',
+    ((await apiRooms(srvM.base)).find(x => x.id === 'oneseat') || {}).players === 2,
+    JSON.stringify((await apiRooms(srvM.base)).find(x => x.id === 'oneseat')));
+  ok('【判別臂】人走了这间还能开（旧病现场：幽灵座位让开始按钮永远灰着）',
+    !!z1b && z1b.canStart === true, JSON.stringify(z1b && z1b.why));
+
+  // ── 口③：坐着建房 = 先退旧座（但建房被拒时不许把现座也丢了 —— 撞号那条路）──
+  await sleep(300);
+  z3.frames.length = 0;
+  z3.send({ t: 'createRoom', room: 'elsewhere', name: '座丙' });
+  const dupM = await z3.until(j => j.t === 'err', 4000);
+  ok('撞号的建房被拒，且**没有**把自己从现在的房里踢出去（拒绝就是拒绝，不带副作用）',
+    !!dupM && /已经有人/.test(dupM.msg || '') && z3b.seats.length === 2,
+    JSON.stringify(dupM && dupM.msg));
+  await sleep(300);
+  z2.frames.length = 0;
+  z3.send({ t: 'createRoom', room: 'fresh', name: '座丙', title: '第三间' });
+  const z2h = await z2.until(j => j.t === 'room' && j.me && j.me.isHost === true, 6000);
+  ok('坐着的人另起一间：旧座退掉、房主移交给出还活着的人（不是旧房挂着他）',
+    !!z2h && ((await apiRooms(srvM.base)).find(x => x.id === 'elsewhere') || {}).players === 1,
+    JSON.stringify({ elsewhere: (await apiRooms(srvM.base)).find(x => x.id === 'elsewhere'), fresh: (await apiRooms(srvM.base)).find(x => x.id === 'fresh') }));
+
+  // ── 断线清账：走的那个人的座位，哪间都不能留 ──
+  z2.close();
+  await sleep(400);
+  ok('断线之后不留幽灵（这一间没人了就该从清单上消失）',
+    !(await apiRooms(srvM.base)).some(x => x.id === 'elsewhere'),
+    JSON.stringify((await apiRooms(srvM.base)).map(x => x.id)));
+  ok('别的房间不受牵连（新座与旧座是两本账，清账只清自己的）',
+    !!((await apiRooms(srvM.base)).find(x => x.id === 'oneseat')) && !!((await apiRooms(srvM.base)).find(x => x.id === 'fresh')));
+  z1.close(); z3.close();
+  srvM.kill();
+
   console.log('\n── H：连杀选单走完整条链（选 → 座位 → 开局 → 各回各的回显）──');
   const srv5 = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
   const u = client(srv5.ws, '选甲'), v = client(srv5.ws, '选乙'), w = client(srv5.ws, '选丙');

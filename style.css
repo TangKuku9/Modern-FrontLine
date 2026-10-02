@@ -109,8 +109,12 @@ html, body { position: fixed; inset: 0; }
 .room-row.off { opacity: .5; }
 /* 聊天两栏共用一个外壳。行数上限是**画面上限**（40 条），服务端那份缓冲另有 50/40 条
    （见 server/lobby.mjs）—— 两边不必相等，但都得有上限：没上限的那一版会在长夜之后
-   把上万个 div 塞进菜单，症状是"开着大厅的页面越来越卡"。 */
-.chat-box { display: flex; flex-direction: column; min-height: 0; }
+   把上万个 div 塞进菜单，症状是"开着大厅的页面越来越卡"。
+   flex-shrink:0 是给"发送"按钮保命的：房间屏中列在 Bot 难度行出现后会变紧，而这一壳
+   带着 min-height:0，是列里唯一肯被压扁的 —— 压扁后输入行从面板底部溢出来、叠到
+   #rmErr 上，后画的那层吃掉点击，症状是"发送按钮有时点不到"（聊天行越多叠得越深）。
+   宁可让 .lobby-body 出滚动条（它本来就 overflow-y:auto），也不许输入行离开自己的面板。 */
+.chat-box { display: flex; flex-direction: column; min-height: 0; flex-shrink: 0; }
 .chat-lines { flex: 1; min-height: 88px; max-height: 158px; overflow-y: auto; font-size: 12px; line-height: 1.7; color: #cfcfcf; }
 .chat-line b { color: #8fb8ff; font-weight: 700; }
 .chat-line.team b { color: #7fe07f; }

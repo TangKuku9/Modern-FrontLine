@@ -120,14 +120,16 @@ export class LobbyClient {
   leaveRoom() { this.send({ t: 'leaveRoom' }); }
   // 准备那一格顺手把**当前的配装**一起交出去：从"编辑装备"回房间屏的时候这一句会重发，
   // 于是"改了枪但没把新枪带进对局"那种错位没有机会发生（服务端只在开局那一刻读它）。
-  ready(on) { this.send({ t: 'ready', on: !!on, ...this._id() }); }
-  setTeam(team) { this.send({ t: 'team', team }); }
-  setCfg(o = {}) { this.send({ t: 'roomCfg', ...o }); }
+  // 下面这几条都把 send 的结果（"真的发出去了吗"）交回去：菜单屏的 roomAsk 闸拿它
+  // 分辨"发成功了"和"连接不在手上，这一下丢了" —— 静默丢帧是"点了没反应"的根。
+  ready(on) { return this.send({ t: 'ready', on: !!on, ...this._id() }); }
+  setTeam(team) { return this.send({ t: 'team', team }); }
+  setCfg(o = {}) { return this.send({ t: 'roomCfg', ...o }); }
   // 加 / 减 Bot。判据全在服务端（只有房主能改、位置满了就拒）—— 这里连"我是不是房主"
   // 都不判：客户端自己再判一遍的话，界面上的按钮灰不灰和服务端放不放行就成了两个真相。
-  addBot(team) { this.send({ t: 'botAdd', team }); }
-  removeBot(bid) { this.send({ t: 'botDel', bid }); }
-  start() { this.send({ t: 'start' }); }
+  addBot(team) { return this.send({ t: 'botAdd', team }); }
+  removeBot(bid) { return this.send({ t: 'botDel', bid }); }
+  start() { return this.send({ t: 'start' }); }
   say(ch, text) { const t = String(text || '').trim().slice(0, 120); if (t) this.send({ t: 'say', ch, text: t }); }
 
   close() {

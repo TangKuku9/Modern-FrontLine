@@ -241,7 +241,13 @@ export class Lobby {
     this.pushLobby();          // 在线人数变了，别人那份列表也要跟着变（不重推就永远少一个人）
   }
   detach(ws) {
-    this.leaveRoom(ws);
+    // 按 **ws** 把每一间里的座位都退掉，不按 seatOf：seatOf 只指向最后一间，一旦哪条
+    // 路漏清了旧座位（守卫生效前的旧连接、未来的新入口），幽灵座位就没人认领 ——
+    // sweep 只收空房，那间房会带着一个走不掉的"房主"活到进程重启，谁也开不了局。
+    // 正常的单座位路径与 leaveRoom 完全同一条（_dropSeat），推送次数不变。
+    for (const room of [...this.rooms.values()]) {
+      for (const s of [...room.seats.values()]) if (s.ws === ws) this._dropSeat(room, s, ws);
+    }
     if (this.conns.delete(ws)) this.pushLobby();
   }
 
@@ -381,6 +387,10 @@ export class Lobby {
     }
     const bad = modeGate(msg.mode);
     if (bad) { this.stat.badMode++; return { ok: false, message: bad }; }
+    // 落座前先退掉别处的座位（判据与 joinRoom 那条同一句）。放在**全部拒绝项之后**：
+    // 建房被拒的人不该把现在坐着的位子也一并丢了。
+    const at = this.seat(ws);
+    if (at) this.leaveRoom(ws);
     const mode = MODE_IDS.has(msg.mode) ? msg.mode : 'tdm';
     const room = this._mkRoom(id, flat(msg.title, 24), MAP_IDS.has(msg.map) ? msg.map : 'yard',
       mode, cleanMinutes(msg.minutes), cleanScore(msg.scoreLimit, mode));
@@ -400,6 +410,15 @@ export class Lobby {
     const room = this.rooms.get(id);
     if (!room) { this.stat.badId++; return { ok: false, message: '那间房已经不在了' }; }
     if (room.stage !== 'waiting') { this.stat.playing++; return { ok: false, message: '那间房正在对局中，等它打完或在列表里另找一间' }; }
+    // 一条连接同时只占**一个**座位。已经在这一间里 = 这一句其实是"回房间"：原样推一份
+    // 状态就完事 —— 放它走重新落座的话，_freeTeam 会重新分队、准备清零，还白送一句
+    // "进来了"（客户端从"编辑装备"回来的路上就会重发这一句，那些副作用全是白送的）。
+    // 在别的间里 = 先把那边退干净再落座：不清的话旧房间留下一张走不掉、准备不了的
+    // 幽灵座位 —— 房主是它的话那间永远开不了局，断线清理又只认 seatOf（最后一间），
+    // 而 sweep 只收空房：一间僵尸房就这么活到进程重启。
+    const at = this.seat(ws);
+    if (at && at.room === room) { this.pushRoom(room); return { ok: true, room, seat: at.seat }; }
+    if (at) this.leaveRoom(ws);
     const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks, msg.view);
     // 满了而补人开着：先让一个 Bot 站起来（真人优先），再放座位。
     const yielded = this._makeRoomForHuman(room);
@@ -430,7 +449,13 @@ export class Lobby {
   leaveRoom(ws) {
     const at = this.seat(ws);
     if (!at) return;
-    const { room, seat } = at;
+    this._dropSeat(at.room, at.seat, ws);
+  }
+
+  // 摘掉一个座位的**全部后续**：告别一句、移交房主、补人、广播、空房回收。从
+  // leaveRoom 里拆出来是因为 detach 也要走这一份 —— seatOf 只指向这条连接的
+  // **最后一间**，只按它清理的话，任何一处历史漏清留下的孤儿座位都永远无人认领。
+  _dropSeat(room, seat, ws) {
     room.seats.delete(seat.sid);
     this.seatOf.delete(seat.sid);
     if (ws && ws.__sid === seat.sid) ws.__sid = null;
