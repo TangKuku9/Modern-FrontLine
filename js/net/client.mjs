@@ -8,7 +8,7 @@
 import * as THREE from 'three';
 import { NetPlayer, INTERP_DELAY, setInterpDelay } from './remote.mjs';import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
-import { uavFromFlags } from '../match-rules.js';
+import { uavFromFlags, SAY, streakOwn, SAY_START, medalSay } from '../match-rules.js';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { foldJudge } from './idle-ruler.mjs';
@@ -28,6 +28,16 @@ const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Sprint | FLAG.OnGround | 
 // 全场都是"队友"、自己叫的直升机被念成敌机）。URL team= 的直连路上只有 'A'/'B'，
 // 老服务端的脏值照旧归 'A'。
 const normTeam = (t) => (t === 'B' ? 'B' : t && t[0] === 'P' ? t : 'A');
+
+// 敌方那一句的前缀。**只在这一处加，而且已经加过的不再加** ——
+// 服务端给 foes 那几句的文案本身带"敌方"（SAY.clusterFoe / SAY.wpFoe / ANNOUNCE.capLostTitle），
+// 客户端再拼一次的后果是"敌方敌方空袭来袭"。以前那版无条件拼，于是占点那一句
+// 实际念出来是"敌方A 点已失守"（前缀 + 服务端文案里那个已经带前缀的"敌方"）。
+const withFoePrefix = (voice, text) => {
+  const t = String(text || '');
+  return (t.startsWith('敌方') || voice.startsWith('敌方')) ? voice : '敌方' + voice;
+};
+
 export class NetClient {
   constructor(game, opts = {}) {
     this.game = game;
@@ -969,21 +979,28 @@ export class NetClient {
         if (ev.cid === this.cid) {
           const i = this.streakState.findIndex(s => s.id === ev.id);
           this.game.hud.announce(`${ev.name} 就绪`, `按 [${i + 3}] 呼叫`, 2.5);
-          this.game.audio.say(ev.name + '已就绪'); this.game.audio.beep(3);
+          this.game.audio.say(SAY.ready(ev.name)); this.game.audio.beep(3);
         }
       } else if (ev.e === 'streak') {
         this.setStreakSlot(ev.id, { ready: false, used: true });
-        if (ev.cid === this.cid) this.game.audio.say(ev.name + '已呼叫');
+        // 按 id 走共用表，不拿 ev.name 拼 —— 单机那边也是按 id 分支的固定文案
+        // （'无人机已上线'），以前联机念"侦察无人机已呼叫"，同一件事两种措辞。
+        if (ev.cid === this.cid) this.game.audio.say(streakOwn(ev.id) || SAY.ready(ev.name));
       } else if (ev.e === 'turret') {
         this.spawnTurret(ev);
       } else if (ev.e === 'gone') {
         this.removeTurret(ev.netId);
       } else if (ev.e === 'announce') {
-        // team 是**呼叫者的队**，是按接收者过滤不了的那种广播 —— 所以"敌方"这个词
-        // 在这里加，而不是让服务端给每个人各编一份文案。
+        // **语音走服务端下发的 `say`**，屏幕大字走 `text`；两者都不在本地拼。
+        // 以前这里是 `say((mine ? '' : '敌方') + ev.text)` —— 拿屏幕大字当语音念，
+        // 于是三个症状叠在一起：①"敌方"前缀与服务端文案里的"敌方"重复（占点那一句
+        // 出来是"敌方A 点已失守"）；②大字里的空格被念出来（"已占领 A 点"）；③服务端
+        // 以后改措辞时联机得手工同步，两边各走各的。
+        // `say` 缺字段（老服务端）时退回 text —— 宁可念旧的成品句，也不开口不出声。
         const mine = ev.team === this.team;
-        this.game.hud.announce(ev.text, mine ? '' : '敌方', 2.5);
-        this.game.audio.say((mine ? '' : '敌方') + ev.text);
+        const voice = ev.say || ev.text || '';
+        this.game.hud.announce(ev.text, '', 2.5);
+        if (voice) this.game.audio.say(mine ? voice : withFoePrefix(voice, ev.text));
       } else if (ev.e === 'firstBlood') {
         if (ev.cid === this.cid) this.game.hud.popup('首杀', '', true);
       } else if (ev.e === 'assist' && ev.cid === this.cid) {
@@ -1079,7 +1096,7 @@ export class NetClient {
         this.game.ending = true;                 // 不置上的话松开指针锁那一下会弹暂停，盖在结算上
         document.getElementById('deathScreen').classList.add('hidden');
         this.game.hud.announce(title, '', 4);
-        this.game.audio.say(title);
+        this.game.audio.say(win === 'win' ? SAY.win : win === 'draw' ? SAY.draw : SAY.lose);
         this.game.hud.showScoreboard(true);
         this.showResults(win, title);
       }
@@ -1207,7 +1224,7 @@ export class NetClient {
       // 再发请求的话，请求被拒时那个槽就白扣了（"按下即消耗"的复发形态）。
       this.ws.send(JSON.stringify({ t: 'streak', slot: t.slot, x: +hit.point.x.toFixed(2), z: +hit.point.z.toFixed(2) }));
       this.targeting = null; game.hud.prompt(null);
-      game.audio.say('集束空袭已确认');
+      game.audio.say(SAY.clusterOwn);
       // 确认后压到松手为止（输入形状，见 recordInput 开头那段）。**不要**在这里写
       // `ws.cool = 0.3`：那是 sim 之外的状态，回滚重放看不见它，会在"确认后按住"的
       // 每一次重放里造出一发幻影弹（本地凭空比权威少一发，永不自愈）。

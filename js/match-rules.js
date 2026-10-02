@@ -271,7 +271,78 @@ export function killMedals(tags) {
   return out;
 }
 
-// ---------- 击杀时生效的 Perk（拾荒者 / 速愈） ----------
+// ---------- 播报文案（语音 + 屏幕大字）：两端共用这一份 ----------
+//
+// 为什么它该在规则内核里：这一格以前是**三份**字面量 —— 单机 js/mp.js 的 say('…')、
+// 服务端 server/room.mjs 的 announce text、以及联机客户端 client.mjs 自己拼的
+// '敌方' + ev.text。三份各自长出来的症状不是报错，而是玩家侧的"出入"：
+//单机说"敌方无人机已上线"、联机念"UAV 已上线"（英文缩写，念法不可控）；
+//单机"敌方武装直升机进入战区"、联机"敌方武装直升机来袭"。
+// 更糟的一类是**缺**的：联机开局没有"行动开始"、连杀奖章一句都不念 ——
+// 而这层整类差异此前在判据里是隐形的，因为 test/net-feel.mjs 把 audio.say 打了空桩。
+//
+// 形状照 MEDAL_LABEL / killMedals：**语义进、文本出**，调用方不写死任何一句成品话。
+// `say` 为空串 = 这一格不念（不是念一个空字符串）。
+export const SAY = {
+  // —— 连杀奖励被呼叫：按 id 走，不按名字 ——
+  uavOwn: '无人机已上线',
+  clusterOwn: '集束空袭已确认',
+  sentryOwn: '哨戒机枪已部署',
+  heliOwn: '武装直升机已就位',
+  wpOwn: '白磷弹投放',
+  // —— 敌方来袭（对面那一队听见的）——
+  uavFoe: '敌方无人机已上线',
+  clusterFoe: '敌方空袭来袭，寻找掩护',
+  heliFoe: '敌方武装直升机进入战区',
+  wpFoe: '白磷弹来袭，离开火区',
+  // —— 槽位充能到线 ——
+  ready: name => name + '已就绪',
+  // —— 击杀奖章：只有连杀类念得出来（与单机 mp.js 的 startsWith('chain') 同一条件）——
+  medalChain: label => label,
+  // —— 对局结束 ——
+  win: '胜利', draw: '平局', lose: '失败',
+  // —— 占点 ——
+  // 语音这一侧**不给空格**：TTS 念"已占领 A 点"会在字母名上顿一下。
+  capOwn: f => `已占领${f}点`,
+  capFoe: f => `${f}点已失守`,
+  // —— 部署失败（只说给呼叫者自己）——
+  sentryBlocked: '无法在此部署，位置被挡住',
+};
+
+// 屏幕大字（hud.announce 的 title）同样一份：它与语音常常**不是同一句话**
+// （单机的 '敌方 UAV 已上线' 带副标题 '幽灵技能可规避'），所以分开两张表而不是硬凑。
+export const ANNOUNCE = {
+  uav: 'UAV 已上线', uavFoe: '敌方 UAV 已上线',
+  cluster: '集束空袭已呼叫', clusterFoe: '敌方空袭来袭！',
+  wp: '白磷弹投放', wpFoe: '白磷弹来袭',
+  heli: '武装直升机已就位', heliFoe: '敌方武装直升机',
+  sentry: '哨戒机枪已部署', sentryBlocked: '无法在此部署',
+  turretLost: kind => kind + '被摧毁',
+  // 占点那两句**保留**"已占领 A 点"的空格 —— 屏幕大字是给人看的，字母名之间留白
+  // 更好读，而语音那一侧不给空格（SAY.capOwn）。两句话形状不同是故意的。
+  capTitle: f => `已占领 ${f} 点`,
+  capLostTitle: f => `敌方${f}点已失守`,
+};
+
+// 按槽位 id 取"我自己呼叫了它"该念的那一句。**这是给联机客户端用的** ——
+// 服务端那条 announce 已经带 say 了，但 streak 事件（"我按了 3"）只带 id 与 name，
+// 客户端要自己查这一份。查不到（老服务端 / 以后加了新槽位）返回空串，由调用方退回
+// SAY.ready(name) —— 宁可念一句不完全对味的，也不要静默。
+export const streakOwn = (id) => ({
+  uav: SAY.uavOwn, cluster: SAY.clusterOwn, sentry: SAY.sentryOwn,
+  heli: SAY.heliOwn, wp: SAY.wpOwn,
+}[id] || '');
+
+// 开局那一句：模式名由调用方给（MP_MODES 在两端共读），这里只拼形状。
+export const SAY_START = name => name + '，行动开始';
+
+// 击杀奖章里**只有连杀类要念**。判据是 tag 形状，与单机 mp.js:playerKill 的
+// `m.tag.startsWith('chain')` 同一句 —— 两端跑这一份，不再各写一遍。
+export function medalSay(tag, label) {
+  return String(tag || '').startsWith('chain') ? SAY.medalChain(label) : '';
+}
+
+
 // 两端共用这一份：单机 MPMatch.playerKill 与联机权威端 NetRoom.onKill 都调它；联机的
 // 客户端在**自己的**击杀事件上再跑一遍它自己那份状态机（服务端管权威血量/弹药，客户端
 // 管屏幕上的计数，各应用一次、互不覆盖）。返回的 texts 是弹窗文案 —— 文案归表现层，

@@ -33,6 +33,8 @@ import { parseChatCommand, toggleMute, isMuted, chatRowHtml, chatTime } from '..
 import { foldJudge, IDLE_FLOOR } from '../js/net/idle-ruler.mjs';
 import { FLAG, WEAPON_IDS, POS_STEP } from '../js/quant.js';
 import { WEAPONS } from '../js/data.js';
+import { SAY as SAY_TRI, streakOwn, medalSay, SAY_START } from '../js/match-rules.js';
+import { readFileSync } from 'node:fs';
 
 const out = [];
 const ok = (label, cond, extra = '') => out.push([!!cond, label + (extra ? '  ' + extra : '')]);
@@ -44,7 +46,7 @@ const angDiff = (a, b) => { let d = (b - a) % TWO_PI; if (d > Math.PI) d -= TWO_
 // 记录"表现层到底调了什么"。刻意不用真 Effects/Audio：那一层要 WebGL 与 AudioContext，
 // 而这里要断言的是**调用次数与参数**，不是听感。
 function makeGame() {
-  const log = { shot: 0, step: 0, reload: [], tracer: 0, flashLight: 0, muzzle: 0, ring: [], hurt: 0, markers: null, smoke: 0 };
+  const log = { shot: 0, step: 0, reload: [], tracer: 0, flashLight: 0, muzzle: 0, ring: [], hurt: 0, markers: null, smoke: 0, said: [] };
   const game = {
     time: 0, scene: new THREE.Scene(), entities: [], projectiles: [],
     world: { def: { surface: 'dirt' }, lineBlocked: () => false },
@@ -59,7 +61,12 @@ function makeGame() {
     audio: {
       shot: () => { log.shot++; }, step: () => { log.step++; },
       reload: (s) => log.reload.push(s), ring: () => { log.ring.push(1); },
-      hurt: () => { log.hurt++; }, explosion: () => {}, whoosh: () => {}, say: () => {}, beep: () => {},
+      hurt: () => { log.hurt++; }, explosion: () => {}, whoosh: () => {},
+      // 语音播报**按文本记账**，不当空桩。这一格曾是 `say: () => {}`，于是"联机少念一句 /
+      // 多念一句 / 念错"这一整类差异在 186 条判据里结构性隐形（见 V 段文件头注）。
+      // 注意 speechSynthesis 在 Node 里根本不存在，所以这里量的是**调用与实参**，
+      // 不是听感 —— 而"念没念、念的是什么"恰好就是这一层要钉的东西。
+      say: (t) => { log.said.push(t); }, beep: () => {},
       // 直升机的旋翼循环音走这三个（Heli 构造/update 要用）
       loop: () => {}, setLoopVol: () => {}, stopLoop: () => {}, click: () => {}, ui: () => {},
     },
@@ -1210,6 +1217,144 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     Math.abs(INTERP_DELAY - 0.12) < 1e-9, `INTERP_DELAY=${INTERP_DELAY}`);
   setInterpDelay(0.10);   // 复位：不给这条判据之后的任何读者留一个被改动过的常数
   ok('AD5 复位臂：判据跑完把常数还回去（模块级状态不许跨节泄漏）', INTERP_DELAY === 0.10);
+}
+
+// ───────────────────────── V. 语音播报（2026-10-02 收口）─────────────────────────
+// 这一段存在的理由是**它本来量不到**：上面 makeGame 里的 audio 桩曾把 say 打成
+// `say: () => {}`，于是"联机少念一句 / 念错 / 不念"这一整类差异在 186 条判据里
+// 结构性隐形。症状清单（全部是玩家侧的"出入"，不报错）：
+//   · 联机开局静默（单机说"团队死斗，行动开始"）；
+//   · 联机连杀奖章静默（单机念"双杀/暴走/无人可挡"）；
+//   · 同一件事两端措辞不同（单机"敌方无人机已上线" / 联机"UAV 已上线"）；
+//   · 占点那一句被念成"敌方A 点已失守"（服务端文案已带"敌方"，客户端又拼一次）。
+// 修法照 killMedals 的形状：语义进、文本出（js/match-rules.js 的 SAY / ANNOUNCE），
+// 服务端下发 `say` 字段，客户端不再拿屏幕大字当语音念。
+//
+// **量的不是听感**（speechSynthesis 在 Node 里不存在），而是"念没念、念的是什么"。
+{
+  // 先决：录音桩是活的。空桩的话下面每一条都会因为 log.said 恒空而"恰好通过"，
+  // 方向正好反了 —— 所以这条必须先立，且它自己带反证臂（桩确实记了两条）。
+  const g0 = makeGame();
+  g0.audio.say('甲'); g0.audio.say('乙');
+  ok('V0【先决】audio.say 桩真的在记账（不是空桩 —— 这一格曾是 say: () => {}）',
+    g0.log.said.length === 2 && g0.log.said[0] === '甲' && g0.log.said[1] === '乙',
+    JSON.stringify(g0.log.said));
+  ok('V0b【反证臂】没调用时它是空的（不是"恒有值"的那盏绿灯）',
+    makeGame().log.said.length === 0, JSON.stringify(makeGame().log.said));
+
+  const feed = (team, cid, evs) => {
+    const g = makeGame();
+    g.player.team = team;
+    // matchOver 那一支要真 DOM（deathScreen + showResults 走结算页）。**桩的缺口在这里补**，
+    // 不改被测对象（见文件头纪律③）—— 只给它一个能挂 classList 的假元素。
+    const el = { classList: { add() { }, remove() { } }, style: {}, textContent: '', innerHTML: '' };
+    const prevDoc = globalThis.document;
+    globalThis.document = { getElementById: () => el, createElement: () => ({ style: {}, classList: { add() { } }, appendChild() { } }) };
+    const c = new NetClient(g, { url: 'ws://127.0.0.1:1/ws', name: '我', team });
+    c.cid = cid;
+    c.streakDefs = [{ id: 'uav', name: '侦察无人机' }];
+    c.streakState = [{ id: 'uav', ready: true }];
+    c.showResults = () => { };                 // 结算页不进这一段的范围
+    try { c.onEvents({ ev: evs }); }
+    finally { globalThis.document = prevDoc; }
+    return { said: g.log.said, c };
+  };
+
+  // ── 语音走服务端下发的 say，不拿屏幕大字当语音 ──
+  // 这一条钉的是"两份文案分家"：服务端给 say（无空格、带正确措辞），text 是给人看的大字。
+  // 旧写法是 `say((mine?'':'敌方') + ev.text)`，念出来是"已占领 A 点"（带空格）。
+  const own = feed('A', 7, [{ e: 'announce', team: 'A', to: 'own', say: '已占领A点', text: '已占领 A 点' }]);
+  ok('V1 占点·己方：念的是 say 那一版，不是屏幕大字（不念出多余的空格）',
+    own.said.length === 1 && own.said[0] === '已占领A点', JSON.stringify(own.said));
+
+  // ── 敌方前缀**只加一次**：服务端文案已带"敌方"时不许再拼 ──
+  // 反证臂是这一整段的核心：把服务端文案里那个"敌方"去掉，它**必须**自己补上 ——
+  // 否则这条判据会被"永远不拼前缀"骗过去（那正是另一个方向的同类 bug）。
+  // 注意用例里 text 与 say 要**同时**不带前缀：守卫读的是 text || say 的开头，
+  // 只让一边不带就变成"本来就带前缀"的重复路径，量不到"自己补"这一格。
+  const foeAlready = feed('B', 9, [{ e: 'announce', team: 'A', to: 'foes', say: '敌方空袭来袭，寻找掩护', text: '敌方空袭来袭！' }]);
+  ok('V2 敌方文案已带前缀时**不重复**（旧写法这里会念成"敌方敌方空袭来袭"）',
+    foeAlready.said.length === 1 && foeAlready.said[0] === '敌方空袭来袭，寻找掩护'
+    && !/敌方敌方/.test(foeAlready.said[0]), JSON.stringify(foeAlready.said));
+  const foePlain = feed('B', 9, [{ e: 'announce', team: 'A', to: 'foes', say: '武装直升机进入战区', text: '武装直升机进入战区' }]);
+  ok('V3【反证臂】文案不带前缀时它自己补上（不是"永远不拼"骗过去的）',
+    foePlain.said.length === 1 && foePlain.said[0] === '敌方武装直升机进入战区',
+    JSON.stringify(foePlain.said));
+
+  // ── to 路由仍然生效（V 段不许为了改文案把定向弄坏）──
+  ok('V4【反证臂】foes 那一句仍然只给对面（我这一队收不到）',
+    feed('A', 7, [{ e: 'announce', team: 'A', to: 'foes', say: '敌方空袭来袭', text: '敌方空袭来袭！' }]).said.length === 0);
+  ok('V5 self 仍然只给呼叫者（别人的部署失败不念给我）',
+    feed('A', 7, [{ e: 'announce', team: 'A', to: 'self', cid: 9, say: '无法在此部署，位置被挡住', text: '无法在此部署' }]).said.length === 0);
+
+  // ── 呼叫连杀：按 id 查共用表，不是"侦察无人机已呼叫" ──
+  // 旧写法是 `say(ev.name + '已呼叫')`，而单机那边念的是"无人机已上线" ——
+  // 同一件事两种措辞，且 ev.name 是服务端下发的字段（文案真相散在两处）。
+  const st = feed('A', 7, [{ e: 'streak', cid: 7, team: 'A', id: 'uav', name: '侦察无人机' }]);
+  ok('V6 呼叫槽位：念的是共用表里那一句（不再是"侦察无人机已呼叫"）',
+    st.said.length === 1 && st.said[0] === '无人机已上线', JSON.stringify(st.said));
+  const stHeli = feed('A', 7, [{ e: 'streak', cid: 7, team: 'A', id: 'heli', name: '武装直升机' }]);
+  ok('V7 呼叫直升机念"武装直升机已就位"（与单机 mp.js 同一句）',
+    stHeli.said.length === 1 && stHeli.said[0] === '武装直升机已就位', JSON.stringify(stHeli.said));
+  // 反证臂：不认识的 id 退回"名字+已就绪"那一句，而不是静默（静默的形状和"漏了"一样）
+  const stBad = feed('A', 7, [{ e: 'streak', cid: 7, team: 'A', id: 'nope', name: '新槽位' }]);
+  ok('V8【反证臂】未知 id 退回一个非空句子（不许静默 —— 静默与"漏念"同形）',
+    stBad.said.length === 1 && stBad.said[0].length > 0, JSON.stringify(stBad.said));
+  // 表本身的先决臂：五个槽位各有一句，且**互不相同**（塌成同一句的形状是"全都念同一句"）
+  ok('V8b【先决】共用表覆盖全部五个槽位且互不相同',
+    ['uav', 'cluster', 'sentry', 'heli', 'wp'].every(id => streakOwn(id)) &&
+    new Set(['uav', 'cluster', 'sentry', 'heli', 'wp'].map(streakOwn)).size === 5);
+  ok('V9 别人的槽位就绪不念给我（这一格带 cid）',
+    feed('A', 7, [{ e: 'streakReady', cid: 9, slot: 0, id: 'uav', name: '侦察无人机' }]).said.length === 0);
+
+  // ── 结算念胜负（走共用表，且**按 win/draw/lose 三态**各量一次）──
+  // 三态是必须的：只量"胜利"的话，把 lose 写成 win 也能绿。
+  // winner 的形状是**队名**（tdm/dom 传 'A'/'B'，自由混战才传 cid），而"我"那台视角
+  // 固定是 team=A、cid=7 —— 所以只有传 'A' 才是赢、传 'B' 才是输、传 null 才是平。
+  const over = (winner) => feed('A', 7, [{ e: 'matchOver', winner }]);
+  ok('V10 结算播报（winner=我方队名）念"胜利"', over('A').said.join() === '胜利', JSON.stringify(over('A').said));
+  ok('V10b 结算播报（winner=对方队名）念"失败"', over('B').said.join() === '失败', JSON.stringify(over('B').said));
+  ok('V10c 结算播报（winner=null）念"平局"', over(null).said.join() === '平局', JSON.stringify(over(null).said));
+  ok('V11【反证臂】平局与失败是两句话（表没把三者塌成一个）',
+    SAY_TRI.win !== SAY_TRI.lose && SAY_TRI.draw !== SAY_TRI.win && SAY_TRI.draw !== SAY_TRI.lose);
+
+  // ── 集束点确认（客户端本地那条，联机独有）──
+  ok('V12 集束确认念"集束空袭已确认"（与单机同一句）', SAY_TRI.clusterOwn === '集束空袭已确认');
+
+  // ── 暂停时语音被掐掉（联机独有的面：权威端照跑，事件照来）──
+  // 这一条量的是 main.js:pause 里那一句 cancel。它是纯 DOM/窗口侧的，Node 里没有
+  // speechSynthesis，所以这里**只钉源码形状**（真跑起来的那条判据在浏览器档）——
+  // 写清楚是"源码形状"而不是"行为"，免得它日后绿着绿着就没人再看了。
+  const mainSrc = readFileSync(new URL('../js/main.js', import.meta.url), 'utf8');
+  const pauseBody = (mainSrc.match(/pause\(v\)\s*\{[\s\S]*?\n  \}/) || [''])[0];
+  ok('V13 暂停时 cancel 语音合成（源码形状：speechSynthesis 暂停期间不会静默）',
+    /speechSynthesis/.test(pauseBody) && /cancel\(\)/.test(pauseBody), pauseBody.slice(0, 60));
+  ok('V14【反证臂】pause 里不是 stopAll（那会把 resume 后要续的循环音也收掉）',
+    !/stopAll\(\)/.test(pauseBody));
+
+  // ── main.js 的两处（开局 / 连杀奖章）：进程内量不到，只能审源码形状 ──
+  // **为什么只能是形状**：`js/main.js` 不导出 Game（README《验收》里"面板那一半在
+  // test/net-play.mjs 里量，因为 js/main.js 不导出 Game"是同一条理由），所以
+  // onNetKill 与开局那一段在 Node 里跑不起来。**真行为判据在 test/net-play.mjs 的
+  // SAY 段**（真页面里 spy audio.say），下面这两条是进程内的兜底 —— 它们的作用是
+  // "删掉那两行时这里先红"，而不是"证明它念对了"（那件事由浏览器档负责）。
+  // 写清楚这一点，免得日后有人把这两条绿当成"语音没问题"的证据。
+  // onNetKill 到下一个同缩进方法之间那一段（用 onNetDeath 作右界，比数花括号稳）
+  const killStart = mainSrc.indexOf('onNetKill(ev) {');
+  const killEnd = mainSrc.indexOf('onNetDeath(ev) {', killStart);
+  const killBody = killStart >= 0 ? mainSrc.slice(killStart, killEnd > killStart ? killEnd : killStart + 2000) : '';
+  ok('V15 开局播报那一声还在（源码形状；真行为见 net-play 的 SAY 段）',
+    /audio\.say\(\s*SAY_START\(/.test(mainSrc), '');
+  ok('V16 连杀奖章在 onNetKill 里念出来，且走 medalSay（源码形状；真行为见 net-play）',
+    /medalSay\(/.test(killBody) && /audio\.say\(\s*v\s*\)/.test(killBody),
+    killBody ? `onNetKill 体长 ${killBody.length}` : 'onNetKill 段没匹配到');
+  // 反证臂：medalSay 只对 chain* 返回非空 —— 这一条量的是**规则那一侧**，
+  // 它不依赖 main.js（所以是真行为而不是形状）。爆头/近战/远距离/复仇都不念。
+  ok('V17【反证臂】medalSay 只对 chain* 非空（爆头/近战/远距离/复仇一律不念）',
+    medalSay('chain2', '双杀') === '双杀' && medalSay('chain6', '无人可挡') === '无人可挡' &&
+    medalSay('head', '爆头') === '' && medalSay('melee', '近战击杀') === '' &&
+    medalSay('longshot', '远距离击杀') === '' && medalSay('revenge', '复仇') === '' &&
+    medalSay(undefined, '无 tag') === '');
 }
 
 // ───────────────────────── 收口 ─────────────────────────

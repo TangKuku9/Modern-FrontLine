@@ -21,3 +21,6 @@ server/match-browser.json
 
 # test/ 下这些是原仓库作者留下的截图/临时输出习惯，一并忽略
 test/*.png
+
+# WorkBuddy 的本机记忆目录（工作日志与长期笔记，机器本地，不属于源码）
+.workbuddy/

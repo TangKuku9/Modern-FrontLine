@@ -582,6 +582,32 @@ try {
     md.noTags.every(r => !r.m) && md.noTags.some(r => r.t.includes('击杀')),
     JSON.stringify(md.noTags.map(r => (r.m ? '★' : '') + r.t)));
 
+  // ── 语音播报：连杀奖章要**念出来**（2026-10-02 收口）──
+  // 这一格以前是隐形的：audio.say 在 Node 判据里被打成空桩，而 main.js 不导出 Game
+  // （所以进程内跑不到 onNetKill）。症状是"单机听得见'四杀'，联机只有一行字"。
+  // 这里在**真页面**里 spy 住 audio.say，量的是真 onNetKill 的行为。
+  const SAY = () => {
+    const g = window.game;
+    const said = [];
+    const orig = g.audio.say.bind(g.audio);
+    g.audio.say = (t, ...rest) => { said.push(t); return orig(t, ...rest); };
+    try {
+      g.onNetKill({ e: 'kill', killer: g.player.name, victim: '靶子三号', weapon: 'ak', head: true, pts: 350, tags: ['head', 'chain4'] });
+      const chainSaid = said.slice();
+      said.length = 0;
+      // 判别臂：只有爆头、没有连杀 —— 不该念（medalSay 只对 chain* 返回非空）
+      g.onNetKill({ e: 'kill', killer: g.player.name, victim: '靶子四号', weapon: 'ak', head: true, pts: 150, tags: ['head'] });
+      const headOnly = said.slice();
+      return { chainSaid, headOnly };
+    } finally { g.audio.say = orig; }
+  };
+  const say = await A.page.evaluate(SAY);
+  console.log(`  甲语音（带四杀）：${JSON.stringify(say.chainSaid)} · （只有爆头）：${JSON.stringify(say.headOnly)}`);
+  ok('连杀奖章在联机会念出来（与单机 mp.js 同一条件：只有 chain* 念）',
+    say.chainSaid.includes('四杀'), JSON.stringify(say.chainSaid));
+  ok('【反证】只有爆头的那一杀不念（不是"每个奖章都念一遍"）',
+    !say.headOnly.includes('爆头'), JSON.stringify(say.headOnly));
+
 
   await sleep(4500);
   const after = async (p) => p.page.evaluate(() => {

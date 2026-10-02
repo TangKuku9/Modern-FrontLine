@@ -7,7 +7,7 @@ import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, comput
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
-import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick } from './match-rules.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, SAY, SAY_START, ANNOUNCE } from './match-rules.js';
 import { addLocalXp } from './progress.mjs';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
@@ -92,7 +92,7 @@ export class MPMatch {
     }
     game.hud.reset();
     game.hud.announce(mname, `${def.name} · ${this.ffa ? '率先达到 ' + this.scoreLimit + ' 次击杀' : '目标分数 ' + this.scoreLimit}`, 4);
-    game.audio.say(mname + '，行动开始');
+    game.audio.say(SAY_START(mname));
     this.updateStreakHUD();
   }
   addBot(team, name, style) {
@@ -224,7 +224,8 @@ export class MPMatch {
     // 两端同一批 tags 出来的就是同一行字。
     for (const m of killMedals(sc.tags)) {
       game.hud.popup(`${m.label} +${m.points}`, '', true);
-      if (m.tag.startsWith('chain')) game.audio.say(m.label);
+      const v = medalSay(m.tag, m.label);
+      if (v) game.audio.say(v);
     }
     if (pl.stats.streak % 5 === 0) game.hud.popup(`连杀 ×${pl.stats.streak}`, '', true);
     pl.stats.score += sc.points;
@@ -242,7 +243,7 @@ export class MPMatch {
     for (const i of this.streakBook.charge(v)) {
       const def = KILLSTREAKS.find(k => k.id === this.streakState[i].id);
       this.game.hud.announce(def.name + ' 就绪', `按 [${i + 3}] 呼叫`, 2.5);
-      this.game.audio.say(def.name + '已就绪');
+      this.game.audio.say(SAY.ready(def.name));
       this.game.audio.beep(3);
     }
     this.updateStreakHUD();
@@ -255,18 +256,18 @@ export class MPMatch {
     const team = bot.team;
     if (bot.streak === 3) {
       this.rules.uavStart(team, 25 * 60);
-      if (team !== game.player.team) { game.hud.announce('敌方 UAV 已上线', '幽灵技能可规避', 3); game.audio.say('敌方无人机已上线'); }
+      if (team !== game.player.team) { game.hud.announce(ANNOUNCE.uavFoe, '幽灵技能可规避', 3); game.audio.say(SAY.uavFoe); }
       else game.hud.announce('友方 UAV 已上线', '', 2);
     } else if (bot.streak === 5) {
       const targets = this.enemiesOf(team).filter(e => !(e.isPlayer && e.hasPerk('coldblooded')));
       if (targets.length) {
         const t = pick(targets);
         this.clusterStrike(t.pos.clone(), bot, rand(0, Math.PI * 2));
-        if (team !== game.player.team) { game.hud.announce('敌方空袭来袭！', '立即寻找掩护', 3); game.audio.say('敌方空袭来袭，寻找掩护'); }
+        if (team !== game.player.team) { game.hud.announce(ANNOUNCE.clusterFoe, '立即寻找掩护', 3); game.audio.say(SAY.clusterFoe); }
       }
     } else if (bot.streak === 7) {
       this.spawnHeli(team, bot);
-      if (team !== game.player.team) { game.hud.announce('敌方武装直升机', '', 3); game.audio.say('敌方武装直升机进入战区'); }
+      if (team !== game.player.team) { game.hud.announce(ANNOUNCE.heliFoe, '', 3); game.audio.say(SAY.heliFoe); }
     }
   }
 
@@ -288,16 +289,16 @@ export class MPMatch {
     if (s.id === 'sentry') {
       const f = pl.forward(new THREE.Vector3()); f.y = 0; f.normalize();
       const p = pl.pos.clone().addScaledVector(f, 2);
-      if (game.world.lineBlocked(pl.pos.clone().setY(pl.pos.y + 0.5), p.clone().setY(p.y + 0.5))) { game.hud.popup('无法在此部署', '#f66'); return; }
+      if (game.world.lineBlocked(pl.pos.clone().setY(pl.pos.y + 0.5), p.clone().setY(p.y + 0.5))) { game.hud.popup(ANNOUNCE.sentryBlocked, '#f66'); game.audio.say(SAY.sentryBlocked); return; }
       if (!this.streakBook.consume(s)) return;
       this.active.push(new Sentry(game, p, pl));
-      game.audio.say('哨戒机枪已部署');
+      game.audio.say(SAY.sentryOwn);
       this.updateStreakHUD();
       return;
     }
     if (!this.streakBook.take(i)) return;
-    if (s.id === 'uav') { this.rules.uavStart(pl.team); game.hud.announce('UAV 已上线', '', 2); game.audio.say('无人机已上线'); }
-    else if (s.id === 'heli') { this.spawnHeli(pl.team, pl); game.audio.say('武装直升机已就位'); }
+    if (s.id === 'uav') { this.rules.uavStart(pl.team); game.hud.announce(ANNOUNCE.uav, '', 2); game.audio.say(SAY.uavOwn); }
+    else if (s.id === 'heli') { this.spawnHeli(pl.team, pl); game.audio.say(SAY.heliOwn); }
     else if (s.id === 'wp') this.whitePhosphorus(pl);
     this.updateStreakHUD();
   }
@@ -307,7 +308,7 @@ export class MPMatch {
   clusterStrike(pos, owner, ang) { spawnCluster(this.game, this.rules.clock, pos, owner, ang); }
   whitePhosphorus(owner) {
     const game = this.game;
-    game.hud.announce('白磷弹投放', '', 3); game.audio.say('白磷弹来袭');
+    game.hud.announce(ANNOUNCE.wp, '', 3); game.audio.say(SAY.wpFoe);
     // 计时器归规则内核（联机权威端读的是同一个字段），落火与即时灼烧归共用那一段
     this.rules.wpTicks = WP_SECONDS * 60;
     phosphorusSweep(game, this.rules.clock, owner, this.enemiesOf(owner.team));
@@ -361,7 +362,7 @@ export class MPMatch {
         if (capped) {
           const mine = capped === pl.team;
           game.hud.announce(`${mine ? '已占领' : '失去'} ${f.name} 点`, '', 2);
-          game.audio.say(mine ? `已占领${f.name}点` : `${f.name}点已失守`);
+          game.audio.say(mine ? SAY.capOwn(f.name) : SAY.capFoe(f.name));
           for (const e of inRange) {
             if (!e.alive || e.team !== capped) continue;
             if (e.isPlayer) { e.stats.score += 200; e.stats.captures++; game.hud.popup('+200 占领', '', true); }
@@ -425,7 +426,7 @@ export class MPMatch {
     if (inp.firePressed && hit) {
       this.clusterStrike(hit.point.clone(), game.player, game.player.yaw + Math.PI / 2);
       this.streakBook.consume(t.s); this.targeting = null; game.hud.prompt(null);
-      game.audio.say('集束空袭已确认'); this.updateStreakHUD();
+      game.audio.say(SAY.clusterOwn); this.updateStreakHUD();
       game.player.ws.cool = 0.3;
     } else if (inp.adsPressed) { this.targeting = null; game.hud.prompt(null); }
   }
@@ -486,7 +487,7 @@ export class MPMatch {
     // 单机对局这一笔同样是**本地经验**：它没有服务端裁决可依，所以不进账号（js/progress.mjs）。
     // 同一件事的另一半在 js/net/client.mjs：联机那一局登录玩家记账号那份、访客记本地那份。
     addLocalXp(game.profile, xp); game.saveProfile();
-    game.audio.say(win === 'win' ? '胜利' : win === 'draw' ? '平局' : '失败');
+    game.audio.say(win === 'win' ? SAY.win : win === 'draw' ? SAY.draw : SAY.lose);
     game.hud.announce(win === 'win' ? '胜利' : win === 'draw' ? '平局' : '失败', '', 3);
     setTimeout(() => {
       if (document.pointerLockElement) document.exitPointerLock();

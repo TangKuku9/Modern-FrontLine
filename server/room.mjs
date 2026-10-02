@@ -13,7 +13,7 @@ import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput, unpackStreak, uavBit, WORLD } from '../js/quant.js';
 import { sanitizeLoadout, kitsOf } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
-import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick } from '../js/match-rules.js';
+import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, SAY, ANNOUNCE } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
 import { Sentry, Heli, BOT_WEAPONS, randomAtt } from '../js/mp.js';
 import { KILLSTREAKS, DEFAULT_STREAKS, BOT_NAMES } from '../js/data.js';
@@ -482,8 +482,11 @@ export class NetRoom {
     if (this.flags) {
       for (const cap of flagsTick(this.flags, this.rules, this.game.entities, DT).caps) {
         this.events.push({ e: 'flagCap', name: cap.f.name, owner: cap.team, prog: 0 });
-        this.events.push({ e: 'announce', team: cap.team, to: 'own', text: `已占领 ${cap.f.name} 点` });
-        this.events.push({ e: 'announce', team: cap.team, to: 'foes', text: `${cap.f.name} 点已失守` });
+        // 占点两条：屏幕大字与语音**分开给**。以前 text 写成 `已占领 ${name} 点`（带空格），
+        // 客户端拿它当语音念出来就是"已占领 A 点"—— 多出来的空格让 TTS 在字母名上
+        // 顿一下。SAY 那一侧是模板函数，形状与单机 mp.js 的 `已占领${f.name}点` 逐字相同。
+        this.events.push({ e: 'announce', team: cap.team, to: 'own', say: SAY.capOwn(cap.f.name), text: ANNOUNCE.capTitle(cap.f.name) });
+        this.events.push({ e: 'announce', team: cap.team, to: 'foes', say: SAY.capFoe(cap.f.name), text: ANNOUNCE.capLostTitle(cap.f.name) });
         for (const e of cap.inRange) {
           if (!e.alive || e.team !== cap.team) continue;
           const cc = this.byPlayer.get(e);
@@ -547,7 +550,7 @@ export class NetRoom {
         const kind = a.isTurret ? '哨戒机枪' : '武装直升机';
         // 这句不带 to：客户端按"是不是自己这一队"决定要不要在前面加"敌方"
         // （对面听到"敌方武装直升机被击落"，自己这边听到"武装直升机被击落"）。
-        this.events.push({ e: 'announce', team: a.team, text: kind + '被摧毁' });
+        this.events.push({ e: 'announce', team: a.team, say: ANNOUNCE.turretLost(kind), text: ANNOUNCE.turretLost(kind) });
         const kc = a.killer ? this.byPlayer.get(a.killer) : null;
         if (kc) this.events.push({ e: 'popup', cid: kc.cid, text: '摧毁' + kind });
       }
@@ -1045,7 +1048,10 @@ export class NetRoom {
 
     if (s.id === 'uav') {
       this.rules.uavStart(pl.team);
-      this.events.push({ e: 'announce', team: pl.team, text: 'UAV 已上线' });
+      // **语义下发，不成品文案**：say 由两端共查 js/match-rules.js 的 SAY 表出。
+      // 以前这里写死 'UAV 已上线'，而单机 mp.js 念的是"敌方无人机已上线" —— 同一件事
+      // 两套措辞，且 "UAV" 交给 TTS 的念法不可控（实测念成三个字母）。
+      this.events.push({ e: 'announce', team: pl.team, say: SAY.uavOwn, text: ANNOUNCE.uav });
     } else if (s.id === 'cluster') {
       // 弹幕中心 = 玩家**在屏幕上选的那一点**（与单机 updateTargeting 同语义）：
       // 选择来自客户端的确认帧，地面高度与成不成立由权威端算。
@@ -1055,10 +1061,11 @@ export class NetRoom {
       // 式子的话，弹幕走向会不一样而没人会去量它（曾经这里写过 atan2(fwd.z, fwd.x)，
       // 与单机差一个镜像 —— 弹从反方向飞来）。
       clusterStrike(game, this.rules.clock, center, pl, pl.yaw + Math.PI / 2);
-      this.events.push({ e: 'announce', team: pl.team, to: 'own', text: '集束空袭已呼叫' });
+      this.events.push({ e: 'announce', team: pl.team, to: 'own', say: SAY.clusterOwn, text: ANNOUNCE.cluster });
       // 「来袭」是**给对面**的那一句：单机里它是 announce('敌方空袭来袭！','立即寻找掩护')，
       // 联机以前只播"谁呼叫了什么"，被炸的那一方屏幕上没有任何预警。
-      this.events.push({ e: 'announce', team: pl.team, to: 'foes', text: '空袭来袭，立即寻找掩护' });
+      // 措辞取单机那一份（SAY.clusterFoe），不再是联机自己发明的"立即寻找掩护"。
+      this.events.push({ e: 'announce', team: pl.team, to: 'foes', say: SAY.clusterFoe, text: ANNOUNCE.clusterFoe });
     } else if (s.id === 'wp') {
       this.rules.wpTicks = WP_SECONDS * 60;
       this.wpOwner = pl;                       // 持续灼烧要认"谁放的这一片火"
@@ -1071,8 +1078,8 @@ export class NetRoom {
         e: 'wpFires', team: pl.team,
         spots: spots.map(p => [+p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2)]),
       });
-      this.events.push({ e: 'announce', team: pl.team, to: 'own', text: '白磷弹投放' });
-      this.events.push({ e: 'announce', team: pl.team, to: 'foes', text: '白磷弹来袭，离开火区' });
+      this.events.push({ e: 'announce', team: pl.team, to: 'own', say: SAY.wpOwn, text: ANNOUNCE.wp });
+      this.events.push({ e: 'announce', team: pl.team, to: 'foes', say: SAY.wpFoe, text: ANNOUNCE.wpFoe });
     } else if (s.id === 'sentry') {
       const fwd = pl.forward(new THREE.Vector3()); fwd.y = 0; fwd.normalize();
       const p = pl.pos.clone().addScaledVector(fwd, 2);
@@ -1083,7 +1090,7 @@ export class NetRoom {
         c.book.refund(s);
         // to:'self' —— 这句是**说给呼叫者自己**的失败原因，不是给别人看的战报。
         // 以前它按队广播，于是全场都收到"敌方 无法在此部署"（别人的失败被念成了敌情）。
-        this.events.push({ e: 'announce', team: pl.team, to: 'self', cid: c.cid, text: '无法在此部署，位置被挡住' });
+        this.events.push({ e: 'announce', team: pl.team, to: 'self', cid: c.cid, say: SAY.sentryBlocked, text: ANNOUNCE.sentryBlocked });
         return null;
       }
       const se = new Sentry(game, p, pl);
@@ -1093,7 +1100,7 @@ export class NetRoom {
         e: 'turret', netId: se.netId, kind: 'sentry', team: pl.team,
         x: se.pos.x, y: se.pos.y, z: se.pos.z, yaw: se.yaw, dur: SENTRY_SECONDS,
       });
-      this.events.push({ e: 'announce', team: pl.team, to: 'self', cid: c.cid, text: '哨戒机枪已部署' });
+      this.events.push({ e: 'announce', team: pl.team, to: 'self', cid: c.cid, say: SAY.sentryOwn, text: ANNOUNCE.sentry });
     } else if (s.id === 'heli') {
       const h = new Heli(game, pl.team, pl);
       h.netId = ++this.netIds;
@@ -1105,10 +1112,10 @@ export class NetRoom {
         // 的直升机 —— 它可能已经被打掉一半了，而下一班 heliHp 还没到。
         hp: Math.round(h.hp), maxHp: Math.round(h.maxHp),
       });
-      this.events.push({ e: 'announce', team: pl.team, to: 'self', cid: c.cid, text: '武装直升机已就位' });
+      this.events.push({ e: 'announce', team: pl.team, to: 'self', cid: c.cid, say: SAY.heliOwn, text: ANNOUNCE.heli });
       // 对面那一句：单机是 announce('敌方武装直升机', '')（js/mp.js:255），联机原来完全没有 ——
-      // 直升机在你头顶盘旋时，屏幕上不该什么提示都没有。
-      this.events.push({ e: 'announce', team: pl.team, to: 'foes', text: '武装直升机来袭' });
+      // 直升机在你头顶盘旋时，屏幕上不该什么提示都没有。措辞取单机那一份。
+      this.events.push({ e: 'announce', team: pl.team, to: 'foes', say: SAY.heliFoe, text: ANNOUNCE.heliFoe });
     }
     return s.id;
   }

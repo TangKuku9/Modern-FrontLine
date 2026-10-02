@@ -18,7 +18,7 @@ import { Menu } from './menu.js';
 import { MPMatch } from './mp.js';
 import { Campaign } from './campaign.js';
 import { Player } from './player.js';
-import { onKillPerks, killMedals, pickupsExpire, pickupAction } from './match-rules.js';
+import { onKillPerks, killMedals, medalSay, SAY_START, pickupsExpire, pickupAction } from './match-rules.js';
 import { NetClient } from './net/client.mjs';
 import { killfeedIdent, killerRemote } from './net/identity.mjs';
 import { LobbyClient } from './net/lobby.mjs';
@@ -263,6 +263,10 @@ class Game {
     const md = MP_MODES.find(m => m.id === welcome.mode) || { name: welcome.mode || '对局' };
     const lim = welcome.scoreLimit || (welcome.mode === 'dom' ? 200 : welcome.mode === 'ffa' ? 25 : 50);
     this.hud.announce(md.name, `率先达到 ${lim}${welcome.mode === 'dom' ? ' 分' : ' 次击杀'}`, 4);
+    // 开局那一声（与单机 MPMatch.start 的 say 同形状，走共用表 SAY_START）。
+    // 以前联机这里只有屏幕大字、没有语音 —— 单机会说"团队死斗，行动开始"，
+    // 联机静默开局。缺口不大但它是"两边手感不一样"清单上最靠前的一条。
+    this.audio.say(SAY_START(md.name));
     this.renderer.compile(this.scene, this.camera);
     this.menu.hide();
     document.getElementById('clickToPlay').classList.remove('hidden');
@@ -421,7 +425,14 @@ class Game {
       // 逐条奖章：事件里的 tags 就是服务端 killScore 算出来的那几条，文案与分值问
       // js/match-rules.js:killMedals —— 与单机 js/mp.js:playerKill 共用同一张表。
       // 以前联机只有上面那一行总分，爆头/近战/远距离/复仇/连杀在屏幕上一条都没有。
-      for (const m of killMedals(ev.tags)) this.hud.popup(`${m.label} +${m.points}`, '', true);
+      for (const m of killMedals(ev.tags)) {
+        this.hud.popup(`${m.label} +${m.points}`, '', true);
+        // **连杀奖章要念出来**（medalSay 只对 chain* 返回非空，与单机 mp.js:playerKill
+        // 的 `m.tag.startsWith('chain')` 同一条件）。以前联机只弹窗不出声，于是
+        // 单机听得见"无人可挡"、联机只有一行字 —— 这是这一格最响的一条出入。
+        const v = medalSay(m.tag, m.label);
+        if (v) this.audio.say(v);
+      }
       this.audio.hit(true, !!ev.head);
       // 拾荒者 / 速愈在**我这台机器的**状态机上再跑一遍同一份规则（js/match-rules.js:
       // onKillPerks）：服务端那份管权威血量与弹药，这份管屏幕上的计数 —— 缺了它的症状是
@@ -615,8 +626,16 @@ class Game {
   pause(v) {
     if (this.state !== 'play') return;
     this.paused = v;
-    if (v) { this.menu.showPause(); if (document.pointerLockElement) document.exitPointerLock(); }
-    else { this.menu.hide(); this.lock(); }
+    if (v) {
+      this.menu.showPause();
+      if (document.pointerLockElement) document.exitPointerLock();
+      // 暂停时把**语音**掐掉，循环音留着（resume 之后要接着响）。
+      // 这一条是联机独有的面：单机暂停时游戏逻辑整个停摆，没有任何东西会再调用 say；
+      // 联机那边**权威端照跑**，事件照来，onEvents 里的播报照念 —— 症状是玩家在暂停
+      // 菜单上听到"敌方空袭来袭"，而屏幕上什么也没发生。stopAll 会连循环音一起收掉，
+      // 所以这里只 cancel 语音合成那一句。
+      if (window.speechSynthesis) { try { speechSynthesis.cancel(); } catch (e) { } }
+    } else { this.menu.hide(); this.lock(); }
   }
 
   // 掉线可见性。症状原来是这样的：服务器重启 / 网络断 → 世界静止，但屏幕上没有任何

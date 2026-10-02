@@ -11,7 +11,7 @@
 // 每一节都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。下面每条的措辞写的就是"这条红了说明什么坏了"。
 import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
-import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks } from '../js/match-rules.js';
+import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE } from '../js/match-rules.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD, teamIndex, teamId } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
@@ -765,6 +765,13 @@ ok('O4 独占到线：换旗 + flagCap 事件（客户端旗子的颜色靠它�
 ok('O5 换旗那两句定向播报（own=已占领 / foes=已失守）',
   roomO.events.some(e => e.e === 'announce' && e.to === 'own' && /已占领/.test(e.text))
   && roomO.events.some(e => e.e === 'announce' && e.to === 'foes' && /已失守/.test(e.text)));
+// 语音那一侧与大字**分开**：大字留空格（"已占领 A 点"），语音不给（"已占领A点"）。
+// 以前两边是同一句话，于是联机把"已占领 A 点"念出来 —— TTS 在字母名上顿一下。
+ok('O5b 占点播报的语音走共用表，且**不含**那个空格',
+  roomO.events.some(e => e.e === 'announce' && e.to === 'own' && e.say === SAY.capOwn('A') && !/\s/.test(e.say)),
+  JSON.stringify(roomO.events.filter(e => e.e === 'announce').map(e => e.say)));
+ok('O5c【反证臂】语音与大字确实不同（否则这条判据恒绿）',
+  roomO.events.some(e => e.e === 'announce' && e.to === 'own' && e.say !== e.text));
 
 const s0 = roomO.rules.scores[OA.pl.team];
 roomO.step(); roomO.step();
@@ -907,7 +914,16 @@ sec('Q. FFA 的队键全链保真（独立队不许在快照/客户端/Bot 三�
   const qFoes = qEvs.find(e => e.e === 'announce' && e.to === 'foes');
   ok('Q11 turret 事件带呼叫者原始队键（旧链路上它和本机队键永不相等 → 自己的直升机被当敌机）',
     !!qTurret && qTurret.team === QA.team && !!qSelf && qSelf.cid === QA.cid && qSelf.text === '武装直升机已就位'
-    && !!qFoes && qFoes.team === QA.team && qFoes.text === '武装直升机来袭');
+    && !!qFoes && qFoes.team === QA.team && qFoes.text === ANNOUNCE.heliFoe,
+    `self=${qSelf && qSelf.text} foes=${qFoes && qFoes.text}`);
+  // 语音那一侧也钉住：**与单机同一句**（这一格以前是联机自己发明的"武装直升机来袭"，
+  // 而单机念的是"敌方武装直升机进入战区"）。同一个事件上 text 与 say 是两句话，
+  // 所以两条都在，判据要分别问 —— 只问一条的话，另一条塌了没人知道。
+  ok('Q11b 同一事件的语音走共用表，且与单机 mp.js 同一句',
+    qSelf && qSelf.say === SAY.heliOwn && qFoes && qFoes.say === SAY.heliFoe,
+    `self.say=${qSelf && qSelf.say} foes.say=${qFoes && qFoes.say}`);
+  ok('Q11c【反证臂】语音与大字**不是**同一句（否则又退回"拿大字当语音念"）',
+    qFoes && qFoes.say !== qFoes.text, `say=${qFoes && qFoes.say} text=${qFoes && qFoes.text}`);
   // 客户端三条路由的同款代数（js/net/client.mjs:onEvents）：self 认数字 cid、
   // own/foes 与"敌方"前缀拿原始队键比。键保真后：呼叫者不收"来袭"、自己的播报无前缀。
   const qRouteFoes = (ev, my) => !(ev.to === 'foes' && ev.team === my);
