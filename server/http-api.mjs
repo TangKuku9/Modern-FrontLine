@@ -20,6 +20,18 @@
 // 按"标签页选择器"命名的 cookie，之后带选择器的请求各用各的会话 —— 机理与
 // 信任边界写在下面 tabOf 那段（判据：hardening K 段 + test/tab-session.mjs）。
 //
+// ── 副本堆积这三条在这一轮收口（M11）──
+//   · 会话 cookie 一律带 `__Host-` 前缀（HTTPS 下；明文下不带，理由见 cookieNames）。
+//     它堵的是"同站另一个子域种一枚同名 cookie 把你的身份换掉"—— 那个名只接受
+//     Secure + Path=/ + 无 Domain 的写入，而投掷**必须**带 Domain。读的时候前缀名优先，
+//     于是子域能种的那枚（无前缀）永远压不过真的那枚。
+//   · 登出 = 作废**这个身份的全部会话**，不只是当前这一枚令牌。旧行为留下一串
+//     仍然可用的副本（直到 30 天 TTL），而用户已经说了"我登出去了"。
+//   · 标签页选择器**不再进 URL**（`?tab=` 已删）。它改走 WebSocket 子协议：握手带不了
+//     自定义头，而子协议是那条通道上唯一留给应用语义的标准位置。URL 会落进反向代理的
+//     访问日志、浏览器历史与 Referer，子协议不会（残余风险：会转储握手头的代理仍看得见它 ——
+//     它只是选择器，不是凭证，所以这里只降到"不主动泄露"，没声称"看不见"）。
+//
 // ── 限流的 key 是 IP，而 X-Forwarded-For 默认**不认** ──
 // 认了的话任何人都能随便写这个头，于是"按 IP 限流"变成"按攻击者自己填的字符串限流"，
 // 整套限流直接变装饰品。只有在确实放在反向代理后面时才把 TRUST_PROXY 设成代理层数，
@@ -39,7 +51,7 @@ const BODY_LIMIT = 4 * 1024;
 // 不能写成两句。写了的话这张嘴就把账号表送出去了 —— 攻击者先枚举出存在的呼号，
 // 再把撞库火力集中到那几个账号上。（accounts.mjs 那边也做了一样的处理，
 // 两边是同一道防线：那边管返回值，这边管文案。）
-const ERRORS = {
+export const ERRORS = {
   // 文案来自 accounts.mjs 的 NAME_RULE_TEXT —— 见那边的注释：这句话有两个出口（这里是注册，
   // 那边是访客进房），而它们必须是同一句。
   bad_name: [400, NAME_RULE_TEXT],
@@ -88,7 +100,12 @@ export function parseCookies(header) {
     const i = part.indexOf('=');
     if (i < 0) continue;
     const k = part.slice(0, i).trim();
-    if (k) out[k] = decodeURIComponent(part.slice(i + 1).trim());
+    if (!k) continue;
+    // decodeURIComponent 对畸形百分号编码（`a=%`、`a=%zz`）**抛 URIError**。原来它一路
+    // 冒到路由层 ⇒ "一条畸形 cookie"变成一次 400 加一条错误堆栈进日志：刷日志不要成本，
+    // 而它连一道防线都没碰到。这里退化成原样保留（认不出来就让上层当"没有这枚"）。
+    const raw = part.slice(i + 1).trim();
+    try { out[k] = decodeURIComponent(raw); } catch { out[k] = raw; }
   }
   return out;
 }
@@ -136,37 +153,87 @@ export function makeSessionCookie(token, { maxAge, secure, name = SESSION_COOKIE
 // 白名单（字符集/长度）挡的是把它塞进 cookie 名里那种注入，不是保密。
 const TAB_RE = /^[a-z0-9]{6,16}$/;
 
-// HTTP 请求从头里带（x-tab）；WebSocket 握手带不了自定义头，走 URL 参数（?tab=）——
-// 与跨台入场券 ?ticket= 同一个先例（net-server 的 ticketOf）。两处都收、字符集一样，
-// 一处定义两边共用 —— 抄第二份的症状是"HTTP 认得这个标签页、WS 不认得"。
+// HTTP 请求从头里带（x-tab）；WebSocket 握手带不了自定义头，走**子协议**
+// （客户端 `new WebSocket(url, [tab])`，服务端从 sec-websocket-protocol 读）。
+// 两处都收、字符集一样，一处定义两边共用 —— 抄第二份的症状是"HTTP 认得这个标签页、WS 不认得"。
+//
+// M11：这里**收过** URL 参数 `?tab=`，现在不收了。URL 会落进反向代理的访问日志、浏览器历史、
+// Referer，而它能被用来把"这次连接对应的是哪一枚 cookie"关联出来；子协议不会。
+// 旧形状是**故意不留**兼容那一半的 —— 留着的话"删掉了"就只是一句宣言，
+// 判据 G4 钉的正是"URL 里那个 tab 不再被采信"。
 export function tabOf(req) {
-  const h = String((req.headers && req.headers['x-tab']) || '');
-  if (TAB_RE.test(h)) return h;
-  try {
-    const q = new URL(req.url, 'http://local').searchParams.get('tab') || '';
-    return TAB_RE.test(q) ? q : '';
-  } catch { return ''; }
+  const h = (req && req.headers) || {};
+  const x = String(h['x-tab'] || '');
+  if (TAB_RE.test(x)) return x;
+  // 子协议可能是一张逗号分隔的清单，第一个能过白名单的就算数。
+  const p = String(h['sec-websocket-protocol'] || '');
+  for (const one of p.split(',')) { const t = one.trim(); if (TAB_RE.test(t)) return t; }
+  return '';
 }
 
 export function tabCookieName(tab) { return `${SESSION_COOKIE}_${tab}`; }
+
+// ── `__Host-` 前缀：让"同站子域投掷一枚同名 cookie"这条路不成立 ──
+// 会话 cookie 的作用域是**源**：凡是能往这个源写 cookie 的东西都能影响服务端读到谁。
+// 同站的另一个子域（或一个被投毒的子域）可以给父域种一枚同名 cookie，而"服务端读到哪一枚"
+// 在过去是不确定的。`__Host-` 名只接受 Secure + Path=/ + 无 Domain 的写入 ——
+// 这三条恰好是子域投掷做不到的（投掷必须带 Domain）。于是那枚 cookie 无法被冒充。
+//
+// **只在 secure 下用前缀**：`__Host-` 名要求 Secure，明文 HTTP 上带前缀的写入会被浏览器
+// **静默丢掉**，症状与"Secure 属性加在明文 HTTP 上"一模一样 —— 登录说成功了、下一次请求
+// 就说不认识你（见 makeSessionCookie 里那条注释，同一个理由、同一个条件）。
+//
+// 读的时候**两种名字都读、前缀名优先**：于是灰度期（刚从明文切到 HTTPS、浏览器里还留着
+// 无前缀那枚）与测试环境（http，只有无前缀那枚）都照常工作，而"子域种下的那枚无前缀 cookie"
+// 永远压不过真的那枚 —— 这一半才是防御本身（行为判据 G2b，它红的含义就是"读的顺序反了"）。
+const HOST_PREFIX = '__Host-';
+
+// 一枚会话在两个名字下都可能存在：前缀名（HTTPS）与老名字（明文 / 灰度期）。
+// 顺序 = 优先级，而且**只有这一处**定义 —— 读（sessionTokenOf）与清（/api/logout）共用它，
+// 抄第二份的症状是"认人时用前缀那枚、清除时清老那枚"。
+export function cookieNames(tab) {
+  const base = tab ? tabCookieName(tab) : SESSION_COOKIE;
+  return [HOST_PREFIX + base, base];
+}
 
 // 从请求里取会话（HTTP 与 WebSocket 握手共用同一个入口）。
 // 一处定义两边共用 —— 抄第二份的症状是"HTTP 认得你、WS 不认得你"，
 // 而表现只是"进去了但一直掉线"。
 export async function sessionOf(req, accounts) {
-  const jar = parseCookies(req.headers && req.headers.cookie);
-  // 带了选择器就先查它那份 —— 那是"这个标签页自己登录"的会话。
-  // 查不到（这个标签页还没登录过）再退回老名字。这条退路保住两条旧性质：
-  // 没带选择器的请求（老探针、手工 curl）照常工作；新开一个标签页
-  // 仍然"打开即上次登录的账号"。判据在 test/hardening.mjs K 段与 test/tab-session.mjs。
+  // 逐个候选**试到自己能认出人来为止**，而不是只试第一枚。
+  // 只试第一枚的偏差在"tab 那枚 cookie 还在、服务端那行却没了"（会话过期 / 被登出 /
+  // 换过库）时显形：它返回 null，而浏览器里那枚**老名字**的有效会话明明还在 ——
+  // 玩家被要求重新登录，凭证却就躺在包里。方向是保守的（认不出就是不认），但代价是白登一次。
+  // sessionTokenOf 仍然只取一枚（登出那条路用它，语义停在"一枚"上）。
+  const cookies = parseCookies(req.headers && req.headers.cookie);
   const tab = tabOf(req);
-  if (tab) {
-    const t = jar[tabCookieName(tab)];
-    if (t) return accounts.whoami(t);
+  const order = tab ? [...cookieNames(tab), ...cookieNames('')] : cookieNames('');
+  const tried = new Set();
+  for (const n of order) {
+    const t = cookies[n];
+    if (!t || tried.has(t)) continue;
+    tried.add(t);
+    const who = await accounts.whoami(t);
+    if (who) return who;
   }
-  const token = jar[SESSION_COOKIE];
-  if (!token) return null;
-  return accounts.whoami(token);
+  return null;
+}
+
+// 这个请求该用哪一枚令牌？—— **认人与登出共用同一套优先级**（一处定义）。
+// 分开写的症状很具体：认人时按选择器那份、清除时按兜底那份 —— 于是"登出成功了"，
+// 而刚刚那个身份的那枚令牌还活着。那正是 M11 原文的形状。
+//
+// 顺序 = 优先级：带了选择器就先查它那份（那是"这个标签页自己登录"的会话），
+// 查不到（这个标签页还没登录过）再退回兜底那份。这条退路保住两条旧性质：
+// 没带选择器的请求（老探针、手工 curl）照常工作；新开一个标签页
+// 仍然"打开即上次登录的账号"。判据在 test/hardening.mjs K 段与 test/tab-session.mjs。
+// 每一格里**前缀名优先于老名字**（cookieNames 的顺序）—— 那才是防投掷的那一半。
+export function sessionTokenOf(req, jar = null) {
+  const cookies = jar || parseCookies(req.headers && req.headers.cookie);
+  const tab = tabOf(req);
+  const order = tab ? [...cookieNames(tab), ...cookieNames('')] : cookieNames('');
+  for (const n of order) if (cookies[n]) return cookies[n];
+  return '';
 }
 
 export async function createAuth({ cfg = {}, store } = {}) {
@@ -196,7 +263,23 @@ export async function createAuth({ cfg = {}, store } = {}) {
   apiStat = {
     reg: 0, login: 0, recover: 0, logout: 0, me: 0, rejected: 0, tooLarge: 0, badMethod: 0,
     tooMany: 0, busy: 0, notFound: 0,
+    // 登出真的吊销掉了几行会话（M11）。它是"这次登出把副本清干净了吗"的唯一读数：
+    // 恒等于 1 的含义就是"只有当前那一枚被作废"—— 也就是旧行为本身。
+    logoutRevoked: 0,
+    // 轻接口的按 IP 配额（M7）。它单独一格而不是并进 tooMany：那一格是"账号维度被限"
+    //（注册/登录/恢复），这一格是"这个 IP 把只读接口当成了刷子"，修法完全不同
+    //（一个是等，一个多半是有人在拿你的站当探测目标）。
+    lightLimited: 0,
   };
+  // ── 只读接口的按 IP 配额（M7）──
+  // /api/rooms 是匿名可达的（访客服），/api/dispatch 登录后就没有别的闸 ——
+  // 前者每次会让共享目录 SQLite 写两笔，后者会 INSERT 一张票。
+  // 上限刻意宽（默认 120/分钟）：大厅自己的轮询是秒级，几十个人共用一台也不会碰到它；
+  // 它挡的是"把只读接口当刷子"的那种流量。
+  const readLimit = new RateLimiter({ windowMs: 60_000, max: (cfg.readPerMin | 0) || 120 });
+  // 两个接口共用同一个 key ⇒ 共用一份额度（分两个 key 就等于给刷子两倍预算，
+  // 与 accounts 那边"登录/恢复必须共用额度"是同一条纪律）。
+  const readQuota = (ip) => readLimit.hit(`read-ip:${ip}`);
   const secure = cfg.cookieSecure != null ? cfg.cookieSecure : !!cfg.prod;
   const trustProxy = cfg.trustProxy | 0;
   const ttlSec = Math.floor(accounts.sessionTtlMs / 1000);
@@ -218,12 +301,15 @@ export async function createAuth({ cfg = {}, store } = {}) {
     const { stat } = ctx;
     // 本请求的标签页选择器（没有就是空串 = 一切照旧，只用老名字那一枚）。
     const tab = tabOf(req);
-    // 登录成功要写的 set-cookie：老名字一枚（新开标签页"打开即上次登录"的兜底），
+    // 登录成功要写的 set-cookie：兜底一枚（新开标签页"打开即上次登录"），
     // 带选择器时再加一枚**这个标签页私有的**。两枚名字不同，浏览器各存各的、
     // 谁也不顶谁 —— 先登录的标签页不再被后登录的改身份。
+    // 名字取 cookieNames 里该用的那一格：secure 下是 `__Host-` 前缀名，明文下是老名字
+    //（带前缀的写入在明文下会被浏览器静默丢掉 —— 见 cookieNames 那段）。
+    const sidName = (t) => cookieNames(t)[secure ? 0 : 1];
     const sessionCookies = (token) => {
-      const sc = [makeSessionCookie(token, { maxAge: ttlSec, secure })];
-      if (tab) sc.push(makeSessionCookie(token, { maxAge: ttlSec, secure, name: tabCookieName(tab) }));
+      const sc = [makeSessionCookie(token, { maxAge: ttlSec, secure, name: sidName('') })];
+      if (tab) sc.push(makeSessionCookie(token, { maxAge: ttlSec, secure, name: sidName(tab) }));
       return sc;
     };
 
@@ -235,9 +321,11 @@ export async function createAuth({ cfg = {}, store } = {}) {
         send(res, 405, { ok: false, error: 'bad_method', message: '请求方式不支持' }, { allow: 'GET' });
         return true;
       }
+      // **不再报注册用户总数**（低危账）：这个接口刻意不需要登录，于是"这个服上有多少
+      // 账号"是白送的站点规模情报 —— 谁都能拉一次，还能按天差分出增长曲线。
+      // 客户端渲染登录框要的是另外两格（要不要邀请码 / 要不要账号），一格不少。
       send(res, 200, {
         ok: true, inviteRequired: ctx.inviteRequired, requireAccount: ctx.requireAccount,
-        accounts: store.countUsers(),
       });
       return true;
     }
@@ -313,6 +401,13 @@ export async function createAuth({ cfg = {}, store } = {}) {
           send(res, 401, { ok: false, error: 'login_required', message: '注册或登录后才能查看房间列表' });
           return true;
         }
+      }
+      // 配额在**做完工作之后**判当然没意义，先判：这个接口的每一次成功调用都要写共享库（见上面）。
+      const rq = readQuota(ip);
+      if (!rq.ok) {
+        stat.lightLimited++;
+        send(res, 429, { ok: false, error: 'too_many', message: '刷得太快了，等一下再拉', retryAfterMs: rq.retryAfterMs });
+        return true;
       }
       send(res, 200, { ok: true, rooms: ctx.listRooms ? ctx.listRooms() : [] });
       return true;
@@ -426,6 +521,14 @@ export async function createAuth({ cfg = {}, store } = {}) {
           return true;
         }
       }
+      // 与 /api/rooms 共用同一份额度（同一个 IP 一个预算）：这一条每次要往共享库
+      // INSERT 一张票，同样没有别的闸。
+      const dq = readQuota(ip);
+      if (!dq.ok) {
+        stat.lightLimited++;
+        send(res, 429, { ok: false, error: 'too_many', message: '刷得太快了，等一下再要票', retryAfterMs: dq.retryAfterMs });
+        return true;
+      }
       // 目标必须是**目录里登记着的另一台**、room 必须是它名下的行（mintFor 里验）：
       // 不做这一步，"发票"就成了把本台的登录身份转发到任意地址的免费代理。
       const tok = ctx.dir.mintFor({ room: String(body.room || ''), url: String(body.url || ''), user: me });
@@ -439,28 +542,28 @@ export async function createAuth({ cfg = {}, store } = {}) {
     }
 
     if (path === '/api/logout') {
-      // cookie 两枚都清：只清标签页那枚的话，这个标签页下一次请求会退回到仍旧活着的
-      // 兜底 —— 症状是"登出说成功了，刷新一下又是登录态"；只清兜底那枚同理反过来。
-      // 服务端的**行**只杀本标签页自己的那份。兜底那枚的行不跟着杀 —— 它永远指向
-      // "最后一次登录"，那很可能正是**另一个标签页**此刻用着的同一行（同一个令牌写了两枚
-      // cookie）；杀了它，"每个标签页一份身份"就在登出这条路上漏气。它的 cookie 清掉之后
-      // 本标签页与新标签页都退不回它了，留下的只是别标签页自己那份还活着的凭据。
-      // 没带选择器的老形状（整浏览器一份）保持原语义：登出 = 杀行 + 清 cookie。
-      const jar = parseCookies(req.headers.cookie);
-      const tabTok = tab ? jar[tabCookieName(tab)] : undefined;
-      const legacyTok = jar[SESSION_COOKIE];
-      if (tab) {
-        if (tabTok) await accounts.logout(tabTok);
-      } else if (legacyTok) {
-        await accounts.logout(legacyTok);
-      }
+      // ── 登出 = 作废**这个身份的全部会话**，不只是递进来的这一枚（M11）──
+      // 旧行为是"只删当前那一枚令牌的行"。它的漏不是理论上的：同一份令牌会被写进两枚
+      // cookie（兜底 + 本标签页），同一个账号在别的标签页/别的设备上还可能有别的会话行 ——
+      // 那些**仍然是可用的凭证**，一直活到 30 天 TTL。用户说了"我登出去了"，服务端却还留着
+      // 一串能把他登回来的东西：这是"拒绝没有真的拒绝"，而且在两侧都是静默的。
+      // 代价写清楚：同账号在别的标签页/别的设备上会一起下线。这是**选择**不是副作用 ——
+      // 在这个账本里"登出"就等于"这个身份在本服务器上的会话全部作废"。
+      // 别的账号不受影响，而那一条必须单独钉住：把实现写成"清全场"也能让下面几条绿。
+      //
+      // 取哪一枚令牌走 sessionTokenOf —— 与 sessionOf **同一套优先级**。分开写就会
+      // "按选择器那份认人、按兜底那份清"，而那正是这个洞的形状。
+      const r = await accounts.logoutUser(sessionTokenOf(req));
       stat.logout++;
-      // Max-Age=0 清掉它。只删服务端那一份是不够的：浏览器手里那个还在，
+      // 吊销了几行必须数出来（/healthz 的 auth.logoutRevoked）：这条链失效的样子是
+      // "登出看起来成功了、副本还活着"，玩家侧和日志里都看不出来，只有计数能先看见。
+      stat.logoutRevoked += r.killed;
+      // Max-Age=0 清掉 cookie。只删服务端那一份是不够的：浏览器手里那个还在，
       // 下次访问还会带上，而服务端已经不认识它了 —— 表现是"登出之后一直说自己没登录"。
+      // 两种名字都清（前缀名与老名字在灰度期可能并存）；没带选择器时不发它那一对。
       const clear = (name) => makeSessionCookie('', { maxAge: 0, secure, name });
-      const sc = [clear(SESSION_COOKIE)];
-      if (tab) sc.push(clear(tabCookieName(tab)));
-      send(res, 200, { ok: true }, { 'set-cookie': sc });
+      const sc = cookieNames('').concat(tab ? cookieNames(tab) : []).map(clear);
+      send(res, 200, { ok: true, revoked: r.killed }, { 'set-cookie': sc });
       return true;
     }
 

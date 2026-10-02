@@ -10,8 +10,10 @@
 // 会话 cookie 按"源"共享：同一浏览器两个标签页各登一个账号，后登录的把先登录的顶掉，
 // 症状是"A 在大厅说话显示成 B 发的言"。登录响应会把本标签页私有的令牌多写进一枚
 // 按选择器命名的 cookie（机理与信任边界在 server/http-api.mjs 的 tabOf 那段），
-// 这里负责生成/携带选择器本身：每个 /api 请求带 x-tab 头，WebSocket 握手带 ?tab=
-// 参数（握手带不了自定义头 —— 与跨台票 ?ticket= 同一个先例）。
+// 这里负责生成/携带选择器本身：每个 /api 请求带 x-tab 头，WebSocket 握手带**子协议**
+// （下面 openSocket —— 握手带不了自定义头，而子协议是那条通道上唯一留给应用语义的位置）。
+// M11 之前走的是 URL 上的 ?tab=：那个位置会落进反向代理的访问日志、浏览器历史与 Referer，
+// 子协议不会。服务端那边同一件事写在 server/http-api.mjs 的 tabOf。
 //
 // ── 这个模块不判断密码强度、不判断呼号合法性 ──
 // 那些规则的真相在服务端（server/accounts.mjs 的白名单与长度限制）。
@@ -51,6 +53,16 @@ export function tabNonce() {
     }
     return t;
   } catch { return ''; }
+}
+
+// 选择器**怎么上车**只有这一处：HTTP 走 x-tab 头，WebSocket 走子协议
+// （服务端从 sec-websocket-protocol 里读，见 server/http-api.mjs 的 tabOf）。
+// 两个客户端（大厅 / 对局）各拼一次的症状，正是这套选择器最初要修的那个 bug 的镜像：
+// "大厅认得你、进了房就不认得"。
+// 不带选择器时不传第二个参数 —— 传空数组在部分实现上会被当成"要一个空协议"而握手失败，
+// 而那种失败的样子是"登录之后连不上"，跟选择器一点关系都看不出来。
+export function openSocket(url, tab) {
+  return tab ? new WebSocket(url, [tab]) : new WebSocket(url);
 }
 
 export class Account {

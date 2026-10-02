@@ -58,9 +58,13 @@ const cookieOf = r => {
   return first.split(';')[0];
 };
 
-function openWs(url, cookie) {
+// protocol = 标签页选择器。它走**子协议**，不再走 URL 参数（M11）：握手带不了自定义头，
+// 而子协议是那条通道上唯一留给应用语义的标准位置（服务端从 sec-websocket-protocol 读）。
+// ws 客户端的签名是 (url, protocols, options) —— 不传 protocols 时第二参当 options 用。
+function openWs(url, cookie, protocol) {
   return new Promise((res, rej) => {
-    const ws = new WebSocket(url, { headers: cookie ? { cookie } : {} });
+    const opts = { headers: cookie ? { cookie } : {} };
+    const ws = protocol ? new WebSocket(url, [protocol], opts) : new WebSocket(url, opts);
     const msgs = [];
     ws.on('message', d => { try { const m = JSON.parse(String(d)); msgs.push(m); } catch { /* 二进制快照，不要 */ } });
     ws.on('open', () => res({ ws, msgs }));
@@ -831,6 +835,15 @@ try {
       chk(rA.status === 200 && !!jar.taba01 && !!jar.legacy,
         'K1 带选择器的登录写下两枚 cookie：本标签页私有的 mf_sid_taba01 + 老名字兜底',
         JSON.stringify({ taba01: !!jar.taba01, legacy: !!jar.legacy }));
+      // ── M11 的反方向：**明文这一台上名字不许带 `__Host-` 前缀** ──
+      // 前缀名要求 Secure，明文下带前缀的写入会被浏览器静默丢掉 —— 那正是
+      // "登录说成功了、下一次请求说不认识你"（makeSessionCookie 那条注释的同一个坑）。
+      // 前缀名本身在 test/service-guards.mjs 的 G 段量（那一台显式开了 COOKIE_SECURE）。
+      // 这一条是它的反证臂：只有那一条的话，把前缀写成无条件的也能全绿。
+      const namesA = [].concat(rA.headers['set-cookie'] || []).map(sc => sc.split('=')[0]);
+      chk(namesA.length === 2 && namesA.includes('mf_sid') && namesA.includes('mf_sid_taba01'),
+        'K1b【反证臂】明文（非 secure）⇒ 名字不带 __Host- 前缀（带前缀的写入会被浏览器丢掉）',
+        JSON.stringify(namesA));
 
       const rB = await json(sK.base + '/api/register', { name: '标签乙', password: PW, code: INVITE }, { 'x-tab': 'tabb02' });
       grab(rB.headers, 'tabb02');
@@ -846,16 +859,17 @@ try {
       chk(mNew.loggedIn && mNew.name === '标签乙',
         'K5 没带选择器的请求读兜底（新开标签页＝最后登录的账号；老探针/手工 curl 的老性质不丢）', JSON.stringify(mNew));
 
-      // WS 半边：握手带不了 x-tab，选择器走 URL 参数（与跨台票 ?ticket= 同一个先例）。
-      // 两条连接共用一个罐 —— 同一浏览器两个标签页的真实处境。cookie 串与浏览器发出的
-      // 一样是**两枚都带**（tab 专属那枚没有选择器傍身时，服务端无从归属它 —— 拒是对的）。
-      const wa = await openWs(sK.ws + '?tab=taba01', `${jar.taba01}; ${jar.legacy}`);
+      // WS 半边：握手带不了 x-tab，选择器走**子协议**（M11 之前是 URL 参数 `?tab=`，
+      // 那个位置会落进反向代理的访问日志、浏览器历史与 Referer）。两条连接共用一个罐 ——
+      // 同一浏览器两个标签页的真实处境。cookie 串与浏览器发出的一样是**两枚都带**
+      //（tab 专属那枚没有选择器傍身时，服务端无从归属它 —— 拒是对的）。
+      const wa = await openWs(sK.ws, `${jar.taba01}; ${jar.legacy}`, 'taba01');
       wa.ws.send(JSON.stringify({ t: 'join', room: 'tabk1', name: '冒充者甲', team: 'A' }));
       const wwa = await waitFor(wa.msgs, m => m.t === 'welcome');
       chk(!!wwa && wwa.name === '标签甲',
         'K6 标签页 1 的连接在握手那一刻被认成 甲（welcome.name 是服务端给的本人呼号，不是自报的）',
         JSON.stringify(wwa && wwa.name));
-      const wb = await openWs(sK.ws + '?tab=tabb02', `${jar.tabb02}; ${jar.legacy}`);
+      const wb = await openWs(sK.ws, `${jar.tabb02}; ${jar.legacy}`, 'tabb02');
       wb.ws.send(JSON.stringify({ t: 'join', room: 'tabk1', name: '冒充者乙', team: 'B' }));
       const wwb = await waitFor(wb.msgs, m => m.t === 'welcome');
       const names = ((wwb && wwb.others) || []).map(o => o.name);
@@ -865,11 +879,11 @@ try {
         'K8 **反证臂**：乙眼里同房站着的正是会话里的 甲，join 自报名没生效（老判据在 tab 世界里不许松）',
         JSON.stringify(names));
 
-      // 退路：?tab= 指一个没登录过的选择器 → 读兜底。这是"新开一个标签页"的 WS 形状。
-      const wf = await openWs(sK.ws + '?tab=fresh99', jar.legacy);
+      // 退路：子协议指一个没登录过的选择器 → 读兜底。这是"新开一个标签页"的 WS 形状。
+      const wf = await openWs(sK.ws, jar.legacy, 'fresh99');
       wf.ws.send(JSON.stringify({ t: 'join', room: 'tabk2', name: '路人', team: 'A' }));
       await waitFor(wf.msgs, m => m.t === 'welcome');
-      const wj = await openWs(sK.ws + '?tab=taba01', `${jar.taba01}; ${jar.legacy}`);
+      const wj = await openWs(sK.ws, `${jar.taba01}; ${jar.legacy}`, 'taba01');
       wj.ws.send(JSON.stringify({ t: 'join', room: 'tabk2', name: '对照甲', team: 'B' }));
       const wwj = await waitFor(wj.msgs, m => m.t === 'welcome');
       chk(((wwj && wwj.others) || []).some(o => o.name === '标签乙'),

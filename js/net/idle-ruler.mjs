@@ -29,9 +29,20 @@ export const IDLE_FLOOR = POS_STEP * 2;
 //   bad     残差超尺子 ⇒ 这一窗记一笔 foldBad
 //   floored 尺子是被下限托起来的（静止/极慢）⇒ 客户端记 foldFloor，
 //           报表分得开"哪几格是自己的步长在量、哪几格靠下限" —— 下限不许悄悄变成恒真
-export function foldJudge({ corrected, stepMeasured = null, speed = 0 } = {}) {
+// tickHz = 服务端的**拍频**。不许写死 60 —— 它是协议里的一格（client 从快照流里量到，
+// 见 js/net/client.mjs:onSnapshot 的 tickHz），写死的话服务端拍频一改这把退路尺子就静默失准；
+// 而退路那一支只在"窗口太短、量不到实测步长"的少数样本上生效，失准连读数都看不出来。
+export function foldJudge({ corrected, stepMeasured = null, speed = 0, tickHz = 60 } = {}) {
   const hasStep = stepMeasured !== null && stepMeasured !== undefined && Number.isFinite(stepMeasured);
-  const step = hasStep ? stepMeasured : (Number.isFinite(speed) ? speed : 0) / 60;
+  const hz = Number.isFinite(tickHz) && tickHz > 0 ? tickHz : 60;
+  const step = hasStep ? stepMeasured : (Number.isFinite(speed) ? speed : 0) / hz;
   const ruler = Math.max(step, IDLE_FLOOR);
-  return { step, ruler, bad: corrected > ruler, floored: step < IDLE_FLOOR };
+  // 判决用**非**严格大于：残差恰好等于一拍位移，正是"漏补一拍"这个形状本身。
+  // 严格大于的话，残差与实测步长各自都带量化噪声，落在相等那一侧的样本一律报绿 ——
+  // 而那正是**假绿**方向（这一条是附十九里低危账点名的那格）。
+  //
+  // 余量很薄，**不能**靠再收紧阈值来加强：实测残差（0.03~0.22 m）与一拍位移是同一个
+  // 量级，阈值一往下挪就会把正常窗判红（恒红），而不是把漏补抓出来。要让"单拍漏补"
+  // 变成稳健判据，得先把残差本身降下来 —— 记在 docs/net-vs-local-gaps.md 的低危账上。
+  return { step, ruler, hz, bad: corrected >= ruler, floored: step < IDLE_FLOOR };
 }

@@ -24,7 +24,8 @@ import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { WebSocketServer } from 'ws';
 import { NetRoom, DT, SNAP_EVERY, RESPAWN_DELAY } from './room.mjs';
-import { Lobby, MAX_SEATS, CHAT_LEN, flat } from './lobby.mjs';
+import { fanout, nadeCounts } from './fanout.mjs';
+import { Lobby, MAX_SEATS, CHAT_LEN, flat, HEAVY_FRAMES, HEAVY_MIN_FRAMES, roomId } from './lobby.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
 import { RoomDirectory } from './room-dir.mjs';
@@ -103,6 +104,9 @@ export const CFG = {
   // 公开服调大就等于把这条防线拆掉 —— 所以它得是一个能看见、能改的数，不是一个藏在代码里的常数。
   regPerHour: int(process.env.REG_PER_HOUR, 8),
   loginPer5Min: int(process.env.LOGIN_PER_5MIN, 12),
+  // 只读接口的按 IP 配额（/api/rooms、/api/dispatch，M7）。默认宽（120/分钟）：
+  // 大厅自己的轮询是秒级，几十个人共用一台也碰不到它 —— 它挡的是"把只读接口当刷子"。
+  readPerMin: int(process.env.READ_PER_MIN, 120),
 
   // ── 长连接的三个闸门（这是真正会被打的那一面）──
   // ① 每连接每秒消息数。HTTP 洪水打的是静态文件（有 etag/gzip/缓存，很便宜），
@@ -234,7 +238,7 @@ const LOBBY_FRAMES = new Set(['lobby', 'say', 'createRoom', 'joinRoom', 'quickRo
   'ready', 'team', 'roomCfg', 'start', 'botAdd', 'botDel', 'report']);
 
 // 房间的显示名（联机大厅"创建房间"带来的那一格）。它**不是房号** ——
-// 房号另有白名单（pickRoom 的 [A-Za-z0-9_.-]），中文房名直接当房号会被清洗成空串、
+// 房号另有白名单（server/lobby.mjs 的 roomId），中文房名直接当房号会被清洗成空串、
 // 退化成 auto（悄悄塞进别人的房间）。所以房名只做显示，且：
 //   · 拍平控制字符（换行能伪造清单行/日志行）、压缩空白、截 24 字；
 //   · 空串不写（"没起名"和"起了个空名字"不是一回事）。
@@ -259,6 +263,10 @@ function roomList() {
     // 永远点不进去的空房"。在跑的那局的真实人数由下面 lobby 那份补上（等待态那张名单）。
     if (!r.clients.size) continue;
     seen.add(r.id);
+    // live 房的行要与等待态那一份**同形状**（低危账）：两边各写一份字段表的话，客户端在
+    // "等着的房"和"已经开打的房"上拿到的是两种对象，而缺的那几格只表现为界面上一格空白 ——
+    // 不报错。所以 bots/time/score/host 一个都不少，取不到就写它的**空值**而不是省略键。
+    const w = lobby.rooms.get(r.id);            // 从大厅开出来的局：房主名在大厅那一份名单上
     out.push({
       id: r.id,
       title: r.title || r.id,
@@ -266,8 +274,15 @@ function roomList() {
       mode: (r.rules && r.rules.mode) || 'tdm',
       players: r.clients.size,
       max: MAX_SEATS,
+      // live 房没有"准备"这回事（人已经在局里了）—— 0 是它的空值，不是"没人准备"。
       ready: 0,
+      bots: r.bots ? r.bots.size : 0,
+      time: (r.rules && r.rules.timeLimit) || 0,
+      score: (r.rules && r.rules.scoreLimit) || 0,
       state: 'playing',        // 上面已经把"没人在里面的 live 房"筛掉了，走到这里必然是有局的
+      // 直连进来的局**没有房主**（谁都能开、也没有"谁说了算"这一格）；从大厅开出来的那一种
+      // 才有房主，名字在大厅那份名单上。缺了这一格，客户端在两种局上会画出两种列表。
+      host: w ? ((w.seats.get(w.hostSid) || {}).name || '') : '',
     });
   }
   // 等待态的那些也在这张清单里 —— "大厅列表"和"/api/rooms"必须是同一份东西，
@@ -294,7 +309,31 @@ function ticketOf(req) {
 // 计数要落在生产面上（/healthz 的 gate{}）：限流生效的样子和"服务挂了"在玩家侧完全一样，
 // 都是"进不去" —— 没有计数就只能靠猜。
 const connsByIp = new Map();
-const gate = { connIp: 0, msgFlood: 0, roomQuota: 0, noAuth: 0 };
+const gate = {
+  connIp: 0, msgFlood: 0, roomQuota: 0, noAuth: 0,
+  // ── 每 IP 连接闸的三个簿记（M4）──
+  // 这三个数存在的理由是那条链路的失效**完全静默**：配额被绕过时没有任何一条日志，
+  // 玩家侧看到的是别人也进不来（maxClients 被占满），而不是"我被拒了"。
+  //   connReserved  握手阶段占下的名额（+1 发生在 verifyClient 里，见那一节的长注释）
+  //   connReleased 名额被交还的累计次数（拒绝时当场还、连接关闭时还）
+  //   originRefused 来源白名单拒了几条（M5）。它和 refusedConn 同类，但**不能合并**：
+  //                 "来源不对"与"IP 太多"是同一种 403/429 之外的两件事，修法完全不同。
+  // 恒等式 connReserved - connReleased === 当前活着的连接数（wss.clients.size）。
+  // 不成立就说明有条路径没还名额 —— 那正是"配额被一点点吃光"的形状。
+  connReserved: 0, connReleased: 0, originRefused: 0,
+  // ── "一条连接身在两局"这条纪律的三个计数 ──
+  // 它和上面四个一样：失效是静默的 —— 玩家侧看到的只是"能玩"或者"卡"，而服务端
+  // 那边多出来的是一份 60Hz 空转的 sim + 一个打不死的记分板实体 + 一间永不回收的空房
+  // （空房回收只认 clients.size ≥ 1，而幽灵永远占着一个座）。
+  //   reJoinInLive 唯一一条**今天真的到得了**的路：身在 live 局里又发 createRoom/
+  //                joinRoom/quickRoom。正常玩家到不了（他要先打完或退出），所以正常部署
+  //                里它是 0；非零 = 有人在拿客户端脚本反复试。
+  //   ghostBlocked / ghostEvicted 是第二、三道防线（enterMatch 与 beginLive 的清座）。
+  //                它们**今天到不了**，因为前面那两道守卫已经把路堵死了 —— 能到才是坏消息。
+  //                留着是因为每条各自只值一行，而漏掉的代价是一间永不回收的房；判据里
+  //                也如实写着"它们是恒 0 的防线"，不是"没人这么干"（见 test/service-guards.mjs A 段）。
+  reJoinInLive: 0, ghostBlocked: 0, ghostEvicted: 0,
+};
 
 // ── 这个 try/catch 是必须的，不是"防御性编程" ──
 // 下面第一句 `decodeURIComponent('%')` 会抛 URIError。而 createServer(handler) **不理会**
@@ -324,7 +363,11 @@ async function serveStatic(req, res) {
       const r = p.__room;
       // fails 是"这一间这一秒有多少拍在抛异常"：一个客户端的坏数据打死一屋子人之前，
       // 这个数字会先动。运维要能一眼看见坏孩子，而不是等玩家发帖。
-      if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0), fails: r.__fails | 0,
+      // netDrops = 被背压闸跳过的快照份数（定义见 broadcast）。它和 fails/hz 同一类：
+      // "我一直收不到快照"在玩家侧表现为"世界静止"，运维只能从这里先看见。
+      // qDrop = 输入队列满时挤掉的最旧拍数（定义见 server/room.mjs:applyInput）。同一类：
+      // "我明明在走他却站着"没有日志，只能从这里先看见。
+      if (r) per.push({ id: r.id, clients: r.clients.size, hz: +(r.__hz || 0).toFixed(1), stepMs: +(r.__stepMs || 0).toFixed(3), behindMs: Math.round(r.__behindMs || 0), fails: r.__fails | 0, netDrops: r.__netDrops | 0, qDrop: r.qDrop | 0,
         // 延迟补偿的四项计数（定义见 server/room.mjs 的 this.lag）。带上它的理由和 hz/fails 一样：
         // 这个玩家"永远没有补偿"在玩家侧的表现只是打不中，运维必须能在这里先看见。
         lag: r.lag ? { shots: r.lag.shots, ok: r.lag.ok, noView: r.lag.noView, stale: r.lag.stale, poseMiss: r.lag.poseMiss, depth: [r.lag.dMin, r.lag.dMax, r.lag.ok ? +(r.lag.dSum / r.lag.ok).toFixed(1) : 0] } : null,
@@ -354,7 +397,14 @@ async function serveStatic(req, res) {
         // 启动日志那行只有人盯着看，remote-probe 拿这一格和"陌生来源握手的实测结果"互相印证，
         // 两处不一致说明有一边在撒谎。
         originCheck: CFG.origins.length > 0,
-        refusedConn: gate.connIp, refusedMsg: gate.msgFlood, refusedRoom: gate.roomQuota, refusedAuth: gate.noAuth },
+        refusedConn: gate.connIp, refusedMsg: gate.msgFlood, refusedRoom: gate.roomQuota, refusedAuth: gate.noAuth,
+        // 幽灵座那三个计数（定义见 gate 的声明）。reJoinInLive 是活的读数；
+        // ghostBlocked / ghostEvicted 是第二、三道防线的读数，正常部署里恒 0 ——
+        // 而它们非零的含义不是"经常发生"，而是"第一道守卫漏了"。
+        reJoinInLive: gate.reJoinInLive, ghostBlocked: gate.ghostBlocked, ghostEvicted: gate.ghostEvicted,
+        // 每 IP 连接闸的簿记（M4）。invariant：connReserved - connReleased === clients。
+        // 只把"拒了多少"（connIp）报出去是不够的 —— 绕过了多少是**看不见**的那一半。
+        connReserved: gate.connReserved, connReleased: gate.connReleased, originRefused: gate.originRefused },
       // 大厅与房间那一层的计数。同一类理由：那五种"开始游戏点了没反应"和"聊天发不出去"
       // 在玩家侧都只是"这游戏坏了"，而原因（不是房主 / 有人没准备 / 刷屏被限流 / 房号撞了）
       // 各不相同，不数出来就只能靠猜。
@@ -390,6 +440,34 @@ async function serveStatic(req, res) {
   res.writeHead(200, base).end(e.buf);
 }
 
+// ── WS 来源白名单怎么算"匹配"（M5）──
+// 旧写法是 `origin.endsWith(o.replace(/^\*\.?/, '.'))`，它的错在于那个替换**只对通配项生效**：
+// 正则 `^\*\.?` 要求字符串以 `*` 开头，于是普通项 `example.com` 一个字符都不会被改，
+// 判据当场退化成 `origin.endsWith('example.com')` —— `https://evilexample.com` 整体放行。
+// 现在按**主机边界**判：点（子域）或 `://`（裸域）必须正好落在域名前面。
+//   完整来源（带 scheme / 端口）  原样比
+//   *.example.com                 子域任意、裸域也算（endsWith('.example.com') 天然满足）
+//   example.com                   裸域与任意子域，但**不许**别的域名以它结尾
+// 不带 Origin 的调用方（curl、同级进程、健康探针）一律放行 —— 这一层拦的是
+// "别的网站的访客"，不是"攻击者"（脚本伪造 Origin 本来就容易，README 里没写成安全边界）。
+function originAllowed(origin, list = CFG.origins) {
+  const org = String(origin || '').trim().toLowerCase();
+  if (!org) return true;
+  for (const raw of list) {
+    const pat = String(raw || '').trim().toLowerCase().replace(/\/+$/, '');
+    if (!pat) continue;
+    if (org === pat) return true;
+    if (pat.startsWith('*.')) { if (org.endsWith(pat.slice(1))) return true; continue; }
+    // 裸主机名：`://example.com`（裸域）或 `.example.com`（子域）都算命中；
+    // `evilexample.com` 两条都不满足 —— 那正是这条判据要挡住的那一个。
+    if (org.endsWith('://' + pat) || org.endsWith('.' + pat)) return true;
+  }
+  return false;
+}
+
+// 会触发"全大厅广播 / 跨进程写"的那几条大厅帧（M7）与其中的分档，都在 lobby.mjs ——
+// 付钱的是那一层。这里只负责把帧型翻成"要不要走最小间隔"这一个布尔。
+
 const httpServer = createServer(handleRequest);
 // 慢速攻击（slowloris）：一个连接每次只发几个字节、永远不发完。不设上限的话每个这样的连接
 // 都占着一个 socket，几百个就能把文件描述符吃光。Node 的默认值是 300s/60s，太宽。
@@ -403,19 +481,30 @@ const wss = new WebSocketServer({
   verifyClient: ({ req, origin }, done) => {
     // ── 顺序有讲究：先挡最便宜的，再挡要查会话的 ──
     // 把要 await 的鉴权放在最前面的话，一个洪水源可以让每个连接都触发一次会话查找。
-    if (CFG.origins.length && origin) {
-      // 浏览器必带 Origin；不带（curl、同级进程、健康探针）放行，脚本伪造 Origin 本来也容易，
-      // 这一层拦的是"别的网站的访客"，不是"攻击者"。
-      if (!CFG.origins.some(o => o === origin || origin.endsWith(o.replace(/^\*\.?/, '.')))) {
-        return done(false, 403, 'origin not allowed');
-      }
+    if (CFG.origins.length && origin && !originAllowed(origin)) {
+      gate.originRefused++;
+      return done(false, 403, 'origin not allowed');
     }
-    const ip = clientIp(req, CFG.trustProxy);
-    if ((connsByIp.get(ip) | 0) >= CFG.connsPerIp) {
+    // ── 每 IP 的连接名额：**先占位，再 await**（M4）──
+    // 改动前的形状是"这里只检查、+1 在 connection 事件里"，而这两点之间隔着下面那次
+    // 异步会话查找。同 IP 的 N 条并发握手于是全部读到同一个旧值 ⇒ connsPerIp 形同虚设：
+    // 一个源就能把 maxClients 占满，把所有人关在门外（而玩家侧看到的只是"这服满了"）。
+    // 现在 +1 同步落在这里，任何一条"走到一半被拒"的出口都必须 release() —— 名额与
+    // 活着的连接一一对应（invariant 见 gate.connReserved 那段）。
+    const ip = req.__ip = clientIp(req, CFG.trustProxy);
+    const used = connsByIp.get(ip) | 0;
+    if (used >= CFG.connsPerIp) {
       gate.connIp++;
       // 429 而不是 403：这是一个**配额**问题，客户端可以等一下再来。
       return done(false, 429, 'too many connections from this address');
     }
+    connsByIp.set(ip, used + 1);
+    gate.connReserved++;
+    const release = () => {
+      const n = (connsByIp.get(ip) | 0) - 1;
+      if (n > 0) connsByIp.set(ip, n); else connsByIp.delete(ip);
+      gate.connReleased++;
+    };
     // ── 身份在**握手那一刻**定下来，不听 join 帧里自报的呼号 ──
     // 这是本轮最要紧的一处接线：以前 name 是客户端随便写的字符串，服务端只是截到 24 字。
     // 现在它来自会话，join 里的 name 字段直接不看。
@@ -432,12 +521,13 @@ const wss = new WebSocketServer({
           const got = dir ? dir.consumeTicket(ticketOf(req)) : null;
           if (got) { req.__user = got; return done(true); }
           gate.noAuth++;
+          release();                       // 名额当场还回去（这条连接永远不会抵达 connection）
           return done(false, 401, 'login required');
         }
         req.__user = u;
         done(true);
       })
-      .catch(() => { gate.noAuth++; done(false, 500, 'auth error'); });
+      .catch(() => { gate.noAuth++; release(); done(false, 500, 'auth error'); });
   },
 });
 const rooms = new Map();
@@ -562,7 +652,8 @@ async function getRoom(id, user = null, opts = {}) {
 // 自动分配按**人最多且没满**的那间塞（fill-first）：对局类服务要的是把人凑一起，
 // 而不是负载均衡 —— 按最少人数分会让每个访客都开一间新房，永远碰不到人。
 async function pickRoom(requested, user = null) {
-  const id = String(requested == null ? 'auto' : requested).slice(0, 48).replace(/[^A-Za-z0-9_.-]/g, '') || 'auto';
+  // 清洗走 lobby.mjs 那一处（一处定义，低危账点名的 32 vs 48 就在这里）。
+  const id = (requested == null ? '' : roomId(requested)) || 'auto';
   if (id === 'auto') {
     let best = null, bestN = -1;
     for (const p of rooms.values()) {
@@ -570,7 +661,9 @@ async function pickRoom(requested, user = null) {
       // __closed = 从房间大厅开出来的私人局：快速加入不许把人往里塞
       // （列表上那间房的门已经关了，硬塞进去等于把"房主开局"那道闸绕过去）。
       if (!room || room.__stop || room.__closed) continue;
-      if (room.clients.size > bestN && room.clients.size < 16) { best = room; bestN = room.clients.size; }
+      // 座位上限用导出的 MAX_SEATS，不写字面 16 —— server/lobby.mjs 开头那段注释预言的
+      // 正是这个漂移形状：上限一改，这里静默留在 16（"快速加入把你塞进一间满房"）。
+      if (room.clients.size > bestN && room.clients.size < MAX_SEATS) { best = room; bestN = room.clients.size; }
     }
     if (best) return best;
   }
@@ -581,8 +674,24 @@ async function pickRoom(requested, user = null) {
 // 两个调用点：直连对局的 join 帧，和房主按下开始（beginLive）。之所以只留一份：
 // welcome 那一格里装着槽位表、装备回声、种子与 cid —— 每一格的失效都是静默的
 // （少一格槽位表就是"那条路上按 3 没反应"），而两份副本必然会在某次改动后少一格。
-function enterMatch(room, ws, { name, team, loadout, streaks, account }) {
-  const c = room.addClient({ name, team, loadout, streaks, account });
+function enterMatch(room, ws, { name, team, loadout, streaks, account, view = null }) {
+  // ── 一条连接只许占一个座：这里是**唯一**的收口，两个调用点（join 帧 / 房主开局）都过它 ──
+  // 为什么必须有：`ws.__cid` 是"这条连接是谁"的唯一凭据，而 close 处理只认 **当前**
+  // `ws.__room`（见下面的 ws.on('close')）。一旦同一条 ws 被第二次 enterMatch 覆盖掉
+  // __cid/__room，旧房里那条 client 条目就再也没有任何路径会调 removeClient ——
+  // 它永远占着 `clients.size ≥ 1`：
+  //   · 空房回收永远不触发（sweeper 只看 clients.size）；
+  //   · 一份 60Hz sim + 一个死了自动重生的记分板实体永久空转；
+  //   · 访客服下建房不占配额（配额只查登录用户）⇒ MAX_ROOMS 可被幽灵全部占死，直到重启。
+  // 拒绝而不是"顺手把他从旧局摘掉"：那两件事的后果不同 —— 摘掉等于替调用方做了一个
+  // 它没打算做的决定（旧局里的队友会看到他凭空消失）。摘旧局只发生在**开局前的清座**
+  // 那一条路上（beginLive），那里是"这条连接自己申请进新局"，摘掉旧座才是它的本意。
+  if (ws.__cid != null) {
+    gate.ghostBlocked++;
+    console.error(`[ghost] 拒绝一条已在房间 ${ws.__room ? ws.__room.id : '(?)'} 里的连接再次进房（cid ${ws.__cid}）`);
+    return null;
+  }
+  const c = room.addClient({ name, team, loadout, streaks, account, view });
   ws.__cid = c.cid; ws.__room = room; c.ws = ws;
   return c;
 }
@@ -710,7 +819,16 @@ function doWhisper(ws, msg) {
     return;
   }
   const { me, people } = peopleOf(ws);
-  const target = people.find(p => p.name === to);
+  const hits = people.filter(p => p.name === to);
+  // 重名：**拒绝，而不是挑第一个**。访客服上两个"访客"是常态，默默挑第一个的形状是
+  // "我把这句话发给了另一个人，而对方那边看起来一切正常"。说清楚比改掉他好 ——
+  // 这一条与"找不到人"是两件事，所以单独计数（whisperAmbiguous）。
+  if (hits.length > 1) {
+    lobby.stat.whisperAmbiguous++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: `有 ${hits.length} 个人叫「${to}」，让他们改个呼号再私聊` }));
+    return;
+  }
+  const target = hits[0];
   if (!target) {
     lobby.stat.whisperNoTarget++;
     lobby.send(ws, JSON.stringify({ t: 'err', msg: '找不到「' + to + '」（只能私聊同一局或同一房间里的人）' }));
@@ -774,7 +892,15 @@ function doReport(ws, msg) {
   // 只会变成骚扰工具（随便填个名字就能让服务端给人记档）。寻人面与私聊同一份。
   const { me, people } = peopleOf(ws);
   const meName = me.name;
-  const target = people.find(p => p.name === who) || null;
+  // 与私聊同一条纪律：重名时拒绝而不是挑第一个 —— 举报记档是要落到**具体某个人**头上的，
+  // 挑错了就是在给别人记一笔（而玩家看到的是"已记录"）。两处共用同一份寻人面，也共用同一条规矩。
+  const hits = people.filter(p => p.name === who);
+  if (hits.length > 1) {
+    lobby.stat.reportAmbiguous++;
+    lobby.send(ws, JSON.stringify({ t: 'err', msg: `有 ${hits.length} 个人叫「${who}」，找不到该记谁` }));
+    return;
+  }
+  const target = hits[0] || null;
   if (!target) {
     lobby.stat.reportNoTarget++;
     lobby.send(ws, JSON.stringify({ t: 'err', msg: '找不到「' + who + '」（只能举报同一局或同一房间里的人）' }));
@@ -810,10 +936,37 @@ async function beginLive(wroom) {
   // 这间是私人房：只接纳房里那些人。不立这一条的话，任何人都能照着列表里那个房号
   // 手打一个网址挤进别人的对局（"房主要求人人准备"这道闸就白做了 —— 他从没准备过）。
   live.__closed = true;
+  // ── 开局前"清座"：把还坐在**别的 live 局**里的连接从这一局的名单里摘掉 ──
+  // 这一条与 join 帧/大厅帧那两道守卫是同一件事的三个入口（"一条连接 = 一个座"）。
+  // 那两道挡的是新的请求；这一道挡的是**已经**形成的形状：名单是在更早的时刻定下的，
+  // 而那条连接在这中间可能已经从别处拿到了 __cid。不摘的话 enterMatch 会拒绝它
+  // （守卫在那一处），而这一局的开局就少一个人 —— 与其让守卫在循环里悄悄少放一个人，
+  // 不如在这里显式摘掉并留下痕迹。
+  // 先收集再改表：`leaveRoom` 会在遍历途中删 wroom.seats 的条目。
+  const ghosts = [];
+  for (const s of wroom.seats.values()) if (s.ws && s.ws.readyState === 1 && s.ws.__cid != null) ghosts.push(s);
+  for (const s of ghosts) {
+    const old = s.ws.__room;
+    gate.ghostEvicted++;
+    console.warn(`[ghost] 开局前把 cid ${s.ws.__cid} 从房间 ${old ? old.id : '(?)'} 摘掉（他申请进 ${wroom.id}）`);
+    if (old) old.removeClient(s.ws.__cid);      // 旧局那一边的 client 条目必须真的被删掉
+    s.ws.__cid = null; s.ws.__room = null;
+    lobby.leaveRoom(s.ws);                      // 等待房这一边的座位也摘掉（不能两边都留着）
+  }
+  if (!wroom.seats.size) {
+    // 名单上的连接全是幽灵 / 全掉线了。开一间没人（只剩 Bot）的局没有意义，
+    // 而且它会把房间卡在"对局中"：当场还回去并在房间屏上说清楚。
+    lobby.startFailed(wroom, '名单上的连接都还在别的对局里');
+    return { ok: false, message: '名单上的连接都还在别的对局里' };
+  }
   const put = [];
   for (const s of wroom.seats.values()) {
     if (!s.ws || s.ws.readyState !== 1) continue;         // 掉线的人不进对局：他在名单上已经不在了
-    put.push({ s, c: enterMatch(live, s.ws, { name: s.name, team: s.team, loadout: s.loadout, streaks: s.streaks, account: s.account }) });
+    const c = enterMatch(live, s.ws, { name: s.name, team: s.team, loadout: s.loadout, streaks: s.streaks, account: s.account, view: s.view });
+    // 走到这里还被拒 = 上面那道清座漏了一种形状。不静默跳过：说清楚是哪一个，
+    // 后面 welcome/loop 都以为他被放进去了。
+    if (!c) { console.error(`[ghost] 开局时 ${s.name} 仍被 enterMatch 拒绝（房 ${wroom.id}）`); continue; }
+    put.push({ s, c });
   }
   // Bot 在**所有人安放完之后**再放：welcomeFrame 的 others 要能列出它们，
   // 而 spawnPoint 挑出生点时也要避开已经站在场上的人（先放 Bot 的话，第一个 Bot
@@ -881,30 +1034,15 @@ function startRoomLoop(room, id) {
 function broadcast(room) {
   const { view, byteLength } = encodeSnapshot({ ...room.snapshot(), seq: (room.seq = (room.seq || 0) + 1) });
   // 一份 Buffer 发给这个房间的所有人：ws.send 不会改写传入的 Buffer，没必要每人再拷一次。
-  // 必须按 room.clients 发，不能遍历 wss.clients —— 一台服务上跑多个房间时，
-  // 遍历全部套接字会把别的房间（包括已经空掉的房间，实体表是 0 个）的快照塞给所有人。
-  // 客户端拿到的就是"随机变成没有人的世界 + 陌生 ack"，症状是弹匣数字乱跳、别人凭空消失。
   const buf = Buffer.from(view.buffer, 0, byteLength);
+  // 事件在这里一次排干（splice），再整份交给 fanout —— **顺序与去留的纪律在
+  // server/fanout.mjs 里**（事件排在背压闸之前、次序上先事件后快照，以及为什么）。
+  // 搬出去的理由只有一个：那份文件能被判据在进程内直接用假 ws 量，而这一份不能
+  // （import server/net-server.mjs 等于起一台服务器）。见 test/net-audit.mjs 的 D 段。
   const ev = room.events.splice(0, room.events.length);
   const evMsg = ev.length ? JSON.stringify({ t: 'ev', tick: room.tick, ev }) : null;
-  for (const c of room.clients.values()) {
-    const ws = c.ws;
-    if (!ws || ws.readyState !== 1) continue;
-    // 背压闸：积压超限的连接跳过这份快照（可替换），不许让一条卡死的连接把进程内存
-    // 慢慢吃穿。跳过要留下**一次**痕迹（边沿记，不刷屏）—— 否则"有人一直收不到快照"
-    // 这种事只能靠内存曲线倒推。
-    if (ws.bufferedAmount > CFG.wsBacklogBytes) {
-      if (!room.__netStall) { room.__netStall = true; console.log(`[room ${room.id}] cid ${c.cid} 下行积压 ${ws.bufferedAmount} B，跳过快照（TCP 零窗？）`); }
-      room.__netDrops = (room.__netDrops || 0) + 1;
-      continue;
-    }
-    room.__netStall = false;
-    // 事件先于快照发：重生事件会让客户端把这次位置跳变当"服务端整体重置"处理。
-    // 反过来的话，那一包快照会先被当成一次普通校正，量出 29 m 的"预测偏差"，
-    // 还会拿死亡前的日记本去回滚 —— 表现就是重生后被拽回死点一下。
-    if (evMsg) ws.send(evMsg);
-    ws.send(buf, { binary: true });
-  }
+  const { stalls } = fanout(room, evMsg, buf, CFG.wsBacklogBytes);
+  for (const s of stalls) console.log(`[room ${room.id}] cid ${s.cid} 下行积压 ${s.backlog} B，跳过快照（TCP 零窗？）`);
 }
 
 // 空房间回收：一份 sim = 一张地图的 world + 若干玩家 + 事件表，放着不回收就是
@@ -982,8 +1120,10 @@ wss.on('connection', (ws, req) => {
   // 大厅里还没进任何一间房的人也要能说话（全服频道）。这一格此刻就定下来，
   // 不等到 createRoom —— 因为 say 只认座位上/这一格的名字，谁后填的都不算。
   if (ws.__user) ws.__name = ws.__user.name;
-  ws.__ip = clientIp(req || { socket: {} }, CFG.trustProxy);
-  connsByIp.set(ws.__ip, (connsByIp.get(ws.__ip) | 0) + 1);
+  // 名额**已经在握手时占好了**（见 verifyClient 那一节）：这里不再 +1，
+  // 否则一条连接会占两个名额，配额看起来只有一半。
+  ws.__ip = (req && req.__ip) || clientIp(req || { socket: {} }, CFG.trustProxy);
+  if (!(req && req.__ip)) { connsByIp.set(ws.__ip, (connsByIp.get(ws.__ip) | 0) + 1); gate.connReserved++; }
   ws.__msgWin = { t: Date.now(), n: 0 };
   // "还活着"记成时间戳，不记成"这一轮扫描时标志位是不是 true"——见下面 heartbeats 的注释。
   ws.__pongAt = Date.now();
@@ -1025,7 +1165,19 @@ wss.on('connection', (ws, req) => {
         // 一条连接只许进一个房间：反复 join 会往房间里塞出一串没人退出的玩家
         //（removeClient 只认最后那一份 ws.__cid），表现是"幽灵玩家"占着出生点。
         if (ws.__cid != null) { ws.send(JSON.stringify({ t: 'err', msg: '这条连接已经进过房间了' })); return; }
+        // 反方向的同一个洞：这条连接在**等待房**里已经有座位了（从大厅建的/进的房），
+        // 却绕过大厅直接 join 一个 live 房。它拿到 __cid 之后，等待房里那个座还在 ——
+        // 房主一按开始（beginLive）就会往同一份名单里塞一个已经属于别的局的连接。
+        // 两条守卫合起来才是完整的"一条连接 = 一个座"（只写上面那条的症状：
+        // 建房 → 直连 join → 回房间按开始 ⇒ 幽灵座）。
+        if (lobby.seat(ws)) { ws.send(JSON.stringify({ t: 'err', msg: '你已经在房间里了，先退出那间房' })); return; }
         if (draining) { ws.send(JSON.stringify({ t: 'err', msg: '服务器正在下线，请稍后重连' })); return; }
+        // 满员条件是**严格大于** —— 低危账里那条"写 > 会超 1 人"在本版是**不成立**的：
+        // 那条账是照审计文档里的行号写的，而那一行在旧版是 verifyClient（那时新连接还没进
+        // wss.clients，`>` 确实会多放一个）；现在的检查跑在 **join 帧**上，这一条连接**已经**
+        // 在 clients.size 里，所以 `size > max` 恰好等于"最多 maxClients 人进得来"。
+        // 改成 >= 会把最后一个名额也拒掉（上限悄悄少一个）—— 这是本仓库自己的判据抓出来的：
+        // test/service-guards.mjs 的 I 段（I0 量的一侧、I1b 量另一侧），第一版写成 >= 时 I0 当场红。
         if (wss.clients.size > CFG.maxClients) { ws.send(JSON.stringify({ t: 'err', msg: `这台服务器已满（${CFG.maxClients} 人）` })); return; }
         const user = ws.__user;
         if (CFG.requireAccount && !user) { ws.send(JSON.stringify({ t: 'err', msg: '需要先登录' })); return; }
@@ -1048,11 +1200,17 @@ wss.on('connection', (ws, req) => {
           // 要账号的服上这一格来自会话；访客可玩的服上是自报呼号（已过白名单）。
           // 两条路都**不用再 slice(0,24)**：白名单本身限了 2~16 个字。
           name, team: msg.team === 'B' ? 'B' : 'A', loadout: msg.loadout || null, streaks: msg.streaks || null, account: user ? user.key : null,
+          // 视角设置（sens/adsSens/invertY）：**每人一份**，由 addClient 清洗后挂到 Player 上。
+          // 不带它的话服务端拿硬编码的 1.0 积分视角，而快照每 20Hz 覆盖客户端 ——
+          // 调过滑条的玩家全程橡皮筋（详见 js/player.js:VIEW_LIMITS）。
+          view: msg.view || null,
         });
         ws.send(JSON.stringify(welcomeFrame(room, c)));
         console.log(`[join] ${c.name} → cid ${c.cid} @ ${room.id}（在线 ${room.clients.size}，本机 ${wss.clients.size} 连接 / ${rooms.size} 间）`);
       } else if (msg.t === 'ping') {
-        ws.send(JSON.stringify({ t: 'pong', c: msg.c, s: Date.now(), tick: ws.__room?.tick ?? 0 }));
+        // 投掷物还剩几颗：**每连接一份**，所以搭 pong 而不是进那块全房共享的快照
+        //（理由与移植到 server/fanout.mjs 的原因，见 fanout.mjs:nadeCounts 那段）。
+        ws.send(JSON.stringify({ t: 'pong', c: msg.c, s: Date.now(), tick: ws.__room?.tick ?? 0, nades: nadeCounts(ws.__room, ws.__cid) }));
       } else if (msg.t === 'loadout' || msg.t === 'respawn' || msg.t === 'streak') {
         // 对局内的三条**窄**控制帧。它们都只认"这条连接当前在哪个房间的哪个座位"，
         // 而那个座位是握手时定下的 ⇒ 客户端报不了别人的 cid，也没有越权的余地。
@@ -1069,8 +1227,30 @@ wss.on('connection', (ws, req) => {
         const id = () => {
           const n = joinName(ws.__user, msg.name);
           ws.__name = n;
-          return { name: n, account: ws.__user ? ws.__user.key : null, xp: ws.__user ? (ws.__user.xp | 0) : 0, loadout: msg.loadout || null, streaks: msg.streaks || null };
+          // view 与 join 帧同一格（同样每人一份）：建房/进房那一帧把它交给座位，
+          // 开局（beginLive → enterMatch）再交给那间 sim。漏了这一格的话，
+          // "从房间开出来的局"里灵敏度无效，而"直连的局"里有效 —— 那是个极难归因的分叉。
+          return { name: n, account: ws.__user ? ws.__user.key : null, xp: ws.__user ? (ws.__user.xp | 0) : 0, loadout: msg.loadout || null, streaks: msg.streaks || null, view: msg.view || null };
         };
+        // 一条连接可以"身在 A 局、再开 B 局"是这条纪律的入口。直连 join 有守卫、
+        // 局末 returnRoom 会把 __cid 清掉，唯独大厅这三条路没有查过 —— 而它们的后果最重
+        // （旧局留下永久幽灵，见 enterMatch 那段注释）。拒绝而不是静默忽略：
+        // 玩家点"创建房间"却什么都没发生，在界面上和"按钮坏了"一模一样。
+        if (ws.__cid != null && (msg.t === 'createRoom' || msg.t === 'joinRoom' || msg.t === 'quickRoom')) {
+          gate.reJoinInLive++;
+          ws.send(JSON.stringify({ t: 'err', msg: '你还在另一局里，先打完或退出那一局' }));
+          return;
+        }
+        // ── 帧型闸门（M7）──
+        // 总闸是**不分帧型**的（wsMsgPerSec），而上面这几条大厅帧每一种都值钱：
+        // 一次全大厅广播 + （开着目录的部署）一次跨进程 SQLite 写。一条连接拿满总闸去
+        // 建房退房，就能把所有人的大厅拖慢。这里按**连接**限速，被限的那一帧不作数。
+        // 纯读的帧不在此列：lobby / say（自己那一套）/ report（另算）。
+        if (HEAVY_FRAMES.has(msg.t) && !lobby.allowHeavy(ws, Date.now(), HEAVY_MIN_FRAMES.has(msg.t))) {
+          lobby.stat.heavyRate++;
+          ws.send(JSON.stringify({ t: 'err', msg: '操作太快了，缓一下' }));
+          return;
+        }
         if (msg.t === 'lobby') lobby.attach(ws);
         else if (msg.t === 'say') {
           // 频道路由，四代语义一次列清（混在一起的症状是"老判据莫名其妙红"）：
@@ -1123,6 +1303,7 @@ wss.on('connection', (ws, req) => {
     // 一个"连上但不 join"的连接就永远占着配额 —— 而那种连接恰好是最便宜的攻击形状。
     const n = (connsByIp.get(ws.__ip) | 0) - 1;
     if (n > 0) connsByIp.set(ws.__ip, n); else connsByIp.delete(ws.__ip);
+    gate.connReleased++;
     const room = ws.__room;
     if (room && ws.__cid != null) { room.removeClient(ws.__cid); console.log(`[leave] cid ${ws.__cid} 断开（在线 ${room.clients.size}）`); }
     // 座位也要跟着退：一个人都没了的房间要被回收，而房主跑掉的那间要移交（见 lobby.mjs）。

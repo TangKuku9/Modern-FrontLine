@@ -529,7 +529,16 @@ export class Sentry {
     g.traverse(o => { if (o.isMesh) o.castShadow = true; });
     g.position.copy(this.pos); game.scene.add(g);
     this.mesh = g; this.head = head;
-    game.entities.push(this);
+    // 只有**权威的那一个**进实体表 —— 与下面 Heli 构造函数同一口径。
+    // game.entities 是"谁会被子弹与爆炸遍历到"的名单（js/combat.js:traceBullet / explode），
+    // 放进去就等于"这台机器上可以裁决它的血量"。客户端的哑副本（opts.dumb）不进 ⇒
+    // 本地子弹从它身上穿过去，血量只由权威端说了算。
+    // 旧写法无条件 push，两头的症状各一个，**都不报错**：本地子弹把别人的机枪
+    // "假打死"（本地爆炸 + popup，而权威那台还活着，随后 gone 事件又带回一份 popup ⇒ 重复）；
+    // 而且它会被 enemiesOf()（js/mp.js）算成敌人，Bot 会朝一台打不死的机枪开枪。
+    // 它照样转、照样有枪口火光：那一路走的是 NetClient.turrets 那张表
+    //（js/net/client.mjs 每帧 t.update(dt)），与 entities 无关。
+    if (!this.dumb) game.entities.push(this);
   }
   eyePos(o) { return o.set(this.pos.x, this.pos.y + 1.0, this.pos.z); }
   chestPos(o) { return o.set(this.pos.x, this.pos.y + 0.8, this.pos.z); }

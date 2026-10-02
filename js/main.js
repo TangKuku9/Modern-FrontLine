@@ -20,18 +20,20 @@ import { Campaign } from './campaign.js';
 import { Player } from './player.js';
 import { onKillPerks, killMedals, pickupsExpire, pickupAction } from './match-rules.js';
 import { NetClient } from './net/client.mjs';
+import { killfeedIdent, killerRemote } from './net/identity.mjs';
 import { LobbyClient } from './net/lobby.mjs';
 import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS, MP_MODES } from './data.js';
 import { repairClass } from './loadout.mjs';
 import { applyAccountXp } from './progress.mjs';
 import { damp } from './util.js';
+import { escHtml } from './escape.js';
 import { Account } from './account.js';
 import { unpackInput } from './quant.js';
 
-// 拼进 innerHTML 的**服务端字符串**（呼号、离开提示）一律先剥掉角括号。
-// 被攻破的服务器不该能往这台页面上塞脚本，而 HUD 那几处（announce/killfeed）走的就是 innerHTML。
-const escHtml = (s) => String(s == null ? '' : s).replace(/[<>]/g, '');
+// 拼进 innerHTML 的**服务端字符串**（呼号、离开提示、掉线说明）一律先过 escHtml。
+// 实现在 js/escape.js（**全仓唯一的一份**）—— 原来这里只有一个"剥掉角括号"的本地版本，
+// 连 `&` 都不转，于是 `&lt;script&gt;` 这种字符串会被浏览器当成真标签再解析一次（M10）。
 
 // 结算停摆时替换用的输入：unpackInput(0,0) 就是"什么都没按"的那一份（与服务端解包
 // 空输入是同一个构造器，逐字段同形）。共享一个对象而不是每拍 new：消费方只读。
@@ -285,6 +287,8 @@ class Game {
       onError: (m) => this.menu.onlineError(m),
       onNote: (m) => this.onLobbyNote(m),
       onBegin: (j) => this.startMatchFromLobby(j),
+      // 大厅那条连接断了（M9）。这一层原先**没有任何人知道**：见 onLobbyLost。
+      onClose: (info) => this.onLobbyLost(info),
     });
     return lb.connect().catch(e => { this.lobby = null; throw e; });
   }
@@ -321,6 +325,24 @@ class Game {
     // 只塞进 net.events 的话没人读它 —— 那正是"服务器重启后所有人站在一个静止的世界里"。
     if (this.state === 'play' && this.hud) this.hud.announce(msg, '', 6);
     else this.menu.onlineError(msg);
+  }
+  // 大厅那条连接断了（M9）。改动前 js/net/lobby.mjs 的 onclose 一个回调都不发：
+  // 房表不再刷、按钮静默失灵、"正在进入大厅…"在已经断线时继续撒谎，而"正在进房…"
+  // 那一层全屏加载更是永久卡死（唯一出路 F5）。对局层早有 netLostUi，大厅层什么都没有。
+  onLobbyLost(info) {
+    const why = '大厅连接已断开' + (info && info.reason ? '：' + info.reason : '');
+    // ① 对局期间这条 socket 就是 NetClient 的那一条（startMatchFromLobby 里 attach 过来的），
+    //    而 attach **不装 onclose** —— 所以干净的下线原先只能等 2.5 秒的"半开连接"看门狗
+    //    发现。那 2.5 秒里玩家站在一个静止的世界里、屏幕上什么都没有（net-drop 的 A 段量的
+    //    正是"掉线要能被看见"，而这条路上它慢了整整 2.5 秒）。这里当场转告它。
+    if (this.state === 'play') {
+      if (this.net && !this.net.lost) this.net.markLost(info && info.code === 1001 ? 'lost' : 'closed', (info && info.reason) || '');
+      return;
+    }
+    // ② 菜单这一侧：onlineError 里那段守卫会把"正在进房…"的加载层收掉并退回大厅 ——
+    //    它本来就是为这一格写的（拒绝恰恰是最需要让人看见的一种结果）。
+    this.menu.onlineError(why);
+    if (this.menu.screen === 'online') this.menu.renderRooms();   // 房表那一格停止撒谎
   }
   // 建房 / 加入之后先占住这一屏：座位应答到达之前不画房间（画了会是一屏空座位）。
   // 应答失败时 onlineError 会清掉这个标记并退回大厅，人不会被卡在"正在进房…"上。
@@ -369,19 +391,28 @@ class Game {
   // 明确的调用点。以前一个都不存在 —— 于是联机里"打死了没有任何提示、死了没有画面、
   // 挨打没有方向"这三条同时成立，而服务端**早就把这些事件发出来了**（`g.onNetKill &&`
   // 那一句恒为空过，不报错）。
+  // "谁是谁"这件事（cid 优先、名字兜底）的唯一一份实现在 js/net/identity.mjs ——
+  // 击杀播报与死亡镜头两个调用点共用它。各写一遍的症状见那份文件的头注释：
+  // 播报写错 ⇒ 别人的击杀画成"我拿的"；镜头写错 ⇒ 转向另一个同名的人。
+  identCtx() {
+    const me = this.player;
+    return {
+      myCid: this.net ? this.net.cid : null,
+      myName: me ? me.name : null,
+      myTeam: me ? me.team : null,
+      remotes: this.net ? this.net.remotes : null,
+    };
+  }
   onNetKill(ev) {
     const me = this.player;
-    const myName = me && me.name;
-    // hud.killfeed 收的是**实体**（它只读 .name / .isPlayer / .team 三格），而事件里
-    // 只有名字，所以这里造两个同形的轻量对象 —— 改 HUD 的签名会让单机那条路一起动。
-    const mk = (name) => {
-      const r = this.net && this.net.remoteByName ? this.net.remoteByName(name) : null;
-      return { name, isPlayer: name === myName, team: r ? r.team : (name === myName && me ? me.team : null) };
-    };
-    const killer = mk(ev.killer), victim = mk(ev.victim);
-    this.hud.killfeed(killer, victim, escHtml(ev.weapon), ev.head);
+    const { killer, victim } = killfeedIdent(ev, this.identCtx());
+    // weapon 与两个呼号**不再在这里转义**：它们都在 hud.killfeed 内部过 escHtml（M10）。
+    // 一半在调用方转、一半在被调方转，正是这个洞的成因 —— 收口到拼 innerHTML 的那一处。
+    this.hud.killfeed(killer, victim, ev.weapon, ev.head);
     if (killer.isPlayer) {
-      this.hud.popup(`${ev.pts ? '+' + ev.pts + '  ' : ''}击杀 ${escHtml(ev.victim)}`, '#d4f24a');
+      // popup 走的是 textContent（不是 innerHTML），所以这里**不许**转义：
+      // 转了的话屏幕上显示的是 `&lt;` 本身 —— 少一道转义看不出来，多一道一眼能看见。
+      this.hud.popup(`${ev.pts ? '+' + ev.pts + '  ' : ''}击杀 ${ev.victim}`, '#d4f24a');
       // 逐条奖章：事件里的 tags 就是服务端 killScore 算出来的那几条，文案与分值问
       // js/match-rules.js:killMedals —— 与单机 js/mp.js:playerKill 共用同一张表。
       // 以前联机只有上面那一行总分，爆头/近战/远距离/复仇/连杀在屏幕上一条都没有。
@@ -398,10 +429,10 @@ class Game {
     this.dead = true;
     this.deathAt = performance.now() / 1000;
     this._respawnAsked = false;
-    // 死亡镜头要转向击杀者。本机手上没有"是谁在打我"这件事（快照只给位置），事件给的
-    // 是名字 ⇒ 按名字去远端表里找那一个人。找不到的（哨戒机枪 / 直升机 / 已经走了的人）
-    // 留 null，那条路只有沉镜头 —— 指一个假方向比不指更糟。
-    this.deathKiller = this.net && this.net.remoteByName ? this.net.remoteByName(ev.killer) : null;
+    // 死亡镜头要转向击杀者。本机手上没有"是谁在打我"这件事（快照只给位置）。
+    // **先按 cid 找**（重名时按名字会转向另一个同名的人，指一个假方向比不指更糟），
+    // 拿不到 cid 再退回名字。找不到的（哨戒机枪 / 直升机 / 已经走了的人）留 null，只有沉镜头。
+    this.deathKiller = killerRemote(ev, this.identCtx());
     const el = document.getElementById('deathScreen');
     el.classList.remove('hidden');
     document.getElementById('killerInfo').innerHTML = ev.killer && ev.killer !== ev.victim
@@ -598,7 +629,9 @@ class Game {
       const why = n.lost === 'stale' ? '与服务器失联' : '连接已断开';
       // hud.announce 走 innerHTML（HUD 别处要放标签），而这里拼进来的两串都来自**服务端**，
       // 所以一律过 escHtml（定义在文件头，别的 innerHTML 拼接点也用它）。
-      const detail = (n.serverNote ? escHtml(n.serverNote) + ' · ' : '') + escHtml(n.lostReason) + '（服务器可能在更新）';
+      // 这两串都会交给 hud.announce，而它内部已经过 escHtml（M10）—— 在这里再转一次
+      // 的话屏幕上会显示成 `&lt;`。转义的责任只有一处，多一处就是错。
+      const detail = (n.serverNote ? n.serverNote + ' · ' : '') + n.lostReason + '（服务器可能在更新）';
       this.hud.announce(why, detail + ' 按 Enter 重新连接', Infinity);      // Infinity = 不自动消失
       return;
     }
@@ -805,7 +838,12 @@ class Game {
     setSoldierEye(this.camera.position);   // 士兵距离细节档的观察点(每帧一次,soldier 内部自己裁)
     if (this.state === 'play') {
       if (!this.paused) {
-        if (this.settings.fixedStep === false) {
+        // fixedStep=false 是给单机留的 A/B 开关，**联机下不认它**。
+        // 变步长那一支不推进 this.tick，而 this.tick 就是上行输入里的拍号（见 recordInput）——
+        // 恒为 0 的话服务端把每一包都当重复包丢掉（server/room.mjs 的 d === 0），症状是
+        // "联机完全不跟手，但不报任何错、也不掉线"。开关不在菜单里，可 localStorage 里
+        // 残留一个旧值就中招 ⇒ 这条归一必须做在**联机入口**，不能指望没人设过它。
+        if (this.settings.fixedStep === false && !this.net) {
           this.update(rdt, this.snapshotInput());         // 旧行为原样保留，供 A/B 对比
         } else {
           this.acc += raw;

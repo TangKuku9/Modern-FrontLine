@@ -6,7 +6,7 @@
 // js/match-rules.js，那是单机 MPMatch 与这里共用的同一份内核。
 import * as THREE from 'three';
 import { HeadlessGame, preloadMaterials } from './headless-game.mjs';
-import { Player } from '../js/player.js';
+import { Player, sanitizeViewSettings } from '../js/player.js';
 import { Bot } from '../js/ai.js';
 import { MAPS } from '../js/maps.js';
 import { rng } from '../js/rng.js';
@@ -121,6 +121,11 @@ export class NetRoom {
     //   accepted  真的生效了
     //   rejected  报了请求但槽位不就绪 / 越界（正常对局里该是 0：HUD 只让按就绪的）
     this.streak = { calls: 0, accepted: 0, rejected: 0, byId: {}, why: [] };
+    // 输入队列的溢出读数（/healthz 的 per[].qDrop）。
+    // 它和 lag / streak 是同一类：**失效是全静默的** —— 队列满掉的那些拍没有任何一条日志，
+    // 玩家侧的表现为"我明明在走，他却站着"，或者"回头补枪补了个空"，而且当局不自愈。
+    // 没有这个数，运维只能靠"有人说手感怪"去猜。
+    this.qDrop = 0;
     // 群体警戒（js/ai.js 的 alertGroup）。房间目前不放 AI，但这条链路要能通 ——
     // 它是 headless-game 已经铺好、只断在最后一跳的那种**静默失效**：调用点被
     // `game.alertGroup &&` 挡着，缺了实现在两边都不报错，只是"整组敌人不会一起警戒"。
@@ -251,7 +256,7 @@ export class NetRoom {
     return { pos, yaw: Math.atan2(pos.x, pos.z) };
   }
 
-  addClient({ name = '士兵', team = 'A', loadout = null, streaks = null, account = null } = {}) {
+  addClient({ name = '士兵', team = 'A', loadout = null, streaks = null, account = null, view = null } = {}) {
     const cid = NEXT_CID++;
     // 自由混战：每人一支独立"队"（与单机的 'P' / 'F'+i 同义）。这不是显示用的标签 ——
     // 友伤/闪光/白磷都按 team 判敌我，共用一支队的话同队的人互相打不掉血。
@@ -261,6 +266,16 @@ export class NetRoom {
     // 同一对值才算得出同一个后坐/散布，而 cid 是它从 welcome 里拿到的那个 —— 服务端这里
     // 必须在建人之前就把 cid 交出去，两端才不会出现"流对不上"的第三种版本。
     const pl = new Player(this.game, { team, pos: sp.pos, yaw: sp.yaw, name, rngSeed: this.seed, rngTag: cid });
+    // 视角设置：**每人一份**，从 join 帧那一格经 sanitizeViewSettings 重建后挂到人身上。
+    // 挂在 pl 上而不是本房间唯一的 game.settings 上 —— 一个房间里两个人的灵敏度可以不同，
+    // 而 game.settings 是一份（一个进程一份 HeadlessGame）。硬编码 1.0 的症状见
+    // js/player.js:VIEW_LIMITS 那段长注释（甩枪橡皮筋 / 反转 Y 打架）。
+    // 没带这一格（老客户端、探针）时 pl.sens 保持 null，_sim 退回 game.settings（= 1.0），
+    // 与改动前逐位相同。
+    if (view) {
+      const vs = sanitizeViewSettings(view);
+      pl.sens = vs.sens; pl.adsSens = vs.adsSens; pl.invertY = vs.invertY;
+    }
     // 装备以服务端查表重建为准（为什么要拦、拦掉的是什么，见 js/loadout.mjs）。
     // 重建后这份要挂到人身上：welcome 得把同一个对象发回去，客户端按它配枪 —— 两边各自
     // 拿一份副本算 stats，就是"本地打中了、权威说没有"那种没人报错的分歧。
@@ -343,7 +358,16 @@ export class NetRoom {
     // 按拍入队，一步只取一条。直接在收包时覆盖 lastInput 会丢中间拍：
     // 一个包带 3 拍时只有最后一拍生效，而 mdx 是"那一拍的鼠标位移"，
     // 丢掉的就是转向 —— 客户端重放却会把它们全算上，两边永久错开。
-    if (c.q.length < INPUT_QUEUE) { c.q.push(inp); c.lastQueued = inp.tick; c.got = true; }
+    // ── 队列满的时候丢**最旧**的一拍，不是丢刚收到的这一拍 ──
+    // 为什么方向很重要：队列是"还没被消费的输入"，而服务端一步只取一条。
+    // 一次突发（后台标签页恢复、TCP 零窗恢复后操作系统把攒下的报文一起吐出来）可能
+    // 一次塞进几百条 —— 丢新的那种（改动前的形状）留在队里的是这次突发的**最旧** 60 拍，
+    // 于是接下来整整一秒里，屏幕上的人物还在按好几秒前的输入走（"我松了手他还在走"）。
+    // 丢最旧的则相反：队里始终是**最新**的 60 拍，一秒之内就追上玩家的手。
+    // 两边都要付出"中间那几拍从来没被模拟过"的代价 —— 那个代价落在哪边是有对错的，
+    // 而"玩家现在在干什么"这一边显然更值钱。丢了多少要数（this.qDrop，见上面那一段）。
+    if (c.q.length >= INPUT_QUEUE) { c.q.shift(); this.qDrop++; }
+    c.q.push(inp); c.lastQueued = inp.tick; c.got = true;
   }
 
   step() {
@@ -719,6 +743,19 @@ export class NetRoom {
     R.kills++;
     const kc = killer ? this.byPlayer.get(killer) : null;
     const vc = victim ? this.byPlayer.get(victim) : null;
+    // ── 名字不是身份：把 cid 补到那条 kill 事件上 ──
+    // sim 编事件时只装得下名字（js/mp.js 那条路单机也在用，它没有 cid 这个概念），
+    // 而权威端这一侧手上正好有那两个**对象**（byPlayer 反查表就是干这个的）。
+    // 为什么非补不可：访客服上重名是允许的（不填呼号都叫"访客"，自报呼号也没有唯一性
+    // 约束），而下游有两处把这事件当身份用 —— pts/tags 的配对、客户端判"死的是不是我"。
+    // 只按名字配的后果不只是提示错行：**两台机器会同时弹死亡画面**，而真正的死者那一台
+    // 可能一个提示都没有。补上之后下游一律先认 cid，名字退成"老服务端 / Bot / 自杀"的兜底。
+    // 写法上刻意**带守卫地回填队尾那条事件**（而不是在这里另发一条）：另发一条就是两个
+    // 真相，两边迟早会分家；回填错了（队尾不是 kill）时守卫让这一步变成空操作。
+    {
+      const tail = this.game.events[this.game.events.length - 1];
+      if (tail && tail.e === 'kill') { tail.killerCid = kc ? kc.cid : null; tail.victimCid = vc ? vc.cid : null; }
+    }
     if (vc) { vc.deaths++; vc.book.onDeath(); this.pushStreakCharge(vc); }
     let pts = 0;
     // 这一杀挣了哪几条奖章（'head' / 'melee' / 'longshot' / 'revenge' / 'chain3'…），
@@ -802,7 +839,7 @@ export class NetRoom {
         x: drop.pos.x, y: drop.pos.y, z: drop.pos.z, mag: drop.mag, reserve: drop.reserve,
       });
     }
-    this.killExtra.push({ killer: killer && killer.name, victim: victim && victim.name, pts, tags });
+    this.killExtra.push({ killer: killer && killer.name, victim: victim && victim.name, killerCid: kc ? kc.cid : null, victimCid: vc ? vc.cid : null, pts, tags });
     if (this.killExtra.length > 16) this.killExtra.splice(0, this.killExtra.length - 16);
   }
 
@@ -1040,18 +1077,24 @@ export class NetRoom {
     if (!ev.length) return;
     for (const e of ev) {
       if (e.e === 'kill') {
-        // sim 的 kill 事件只带**名字**（定长快照装不下 id，事件也没带对象引用）。重名
-        // 的两个真人同房是允许的（访客自报呼号没有唯一性约束），只按名字找会把重生
-        // 计时安到活着的那个同名者头上，而真正死了的那位 respawnT 还是 0 —— 下一拍
-        // 就被复活，白拿 3 秒。幸存的判据现成就有：**死者才是 !alive 的那个**。
-        const victim = [...this.clients.values()].find(c => c.pl.name === e.victim && !c.pl.alive)
+        // 死者是谁：**先认 cid**（onKill 已经把权威端的身份补在事件上了，名字在访客服上
+        // 不唯一）。取不到 cid 的两条退路依次是：同名者里 `!alive` 的那个（真正的死者），
+        // 再不行就按名字取第一个 —— 那两条只在"事件没有 cid"（老服务端 / Bot 击杀）时生效。
+        const victim = (e.victimCid != null ? [...this.clients.values()].find(c => c.cid === e.victimCid) : null)
+          || [...this.clients.values()].find(c => c.pl.name === e.victim && !c.pl.alive)
           || [...this.clients.values()].find(c => c.pl.name === e.victim);
         if (victim) { victim.dead = true; victim.respawnT = RESPAWN_DELAY; }
         // 得分与奖章随行（上面 killExtra 那一段）。取不到就写 0 / 空表，而不是猜一个数 ——
         // 播报里那个 "+N" 与那几行奖章是要显示给人看的，宁可没有也不能错。
-        const i = this.killExtra.findIndex(k => k.victim === e.victim && k.killer === e.killer);
+        // 配对同一条纪律：只要这一次击杀的任一侧是真人（有 cid），就按 cid 配 ——
+        // 两个同名的人同房时，名字配对的形状是"甲的爆头奖章记到乙头上"。
+        // 两侧都没有 cid（Bot 杀 Bot）才退回名字，那是这条兜底唯一还能用上的场合。
+        const byCid = (e.victimCid != null || e.killerCid != null);
+        const i = this.killExtra.findIndex(k => byCid
+          ? (k.victimCid === (e.victimCid ?? null) && k.killerCid === (e.killerCid ?? null))
+          : (k.victim === e.victim && k.killer === e.killer));
         const extra = i >= 0 ? this.killExtra.splice(i, 1)[0] : null;
-        this.events.push({ e: 'kill', killer: e.killer, victim: e.victim, weapon: e.weapon, head: e.head, pts: extra ? extra.pts : 0, tags: extra ? extra.tags : [] });
+        this.events.push({ e: 'kill', killer: e.killer, victim: e.victim, killerCid: e.killerCid ?? null, victimCid: e.victimCid ?? null, weapon: e.weapon, head: e.head, pts: extra ? extra.pts : 0, tags: extra ? extra.tags : [] });
       }
     }
     ev.length = 0;

@@ -66,6 +66,10 @@ create table if not exists audit (
 // 所以这里不走脏集合、不走 250ms 批刷，一次 insert 落定。
 
 const MAX_BATCH = 200;          // 单批最多这么多行，见上面"雪崩"那段
+// 审计表在**磁盘上**留多少条（M8）。内存版是 5000（那一份只管内存），落盘那份要管 WAL 与文件大小：
+// 20000 条已经够任何一次纠纷的回溯（一次登录一行，一天几十行是常态），而它是个常数上界。
+const AUDIT_CAP = 20000;
+const AUDIT_PRUNE_EVERY = 500;  // 攒多少条裁一次（每次裁剪 = 一次 delete，见 audit()）
 
 // 把一条 users 记录拆成 SQL 参数。列名固定，所以这里也是白名单重建 ——
 // 不是把 rec 的所有字段塞进去。以后往 user 上加字段（比如解禁时间），
@@ -152,6 +156,11 @@ export class SqliteStore {
     this._delSess = this.db.prepare('delete from sessions where token = ?');
     this._delExp = this.db.prepare('delete from sessions where exp <= ?');
     this._insAudit = this.db.prepare('insert into audit (t,ev,name,ip) values (?,?,?,?)');
+    // 裁剪语句：删掉"除了最近 AUDIT_CAP 条之外"的所有行。
+    // 写成 `id <= max(id) - cap` 而不是 `limit/offset` —— 后者要先扫一遍再删，
+    // 而且 offset 版没有可用的索引；主键范围删是 O(删掉的行数)。
+    this._delAudit = this.db.prepare('delete from audit where id <= (select max(id) from audit) - ?');
+    this._auditN = 0;              // 距上次裁剪又插了几条（见 audit()）
     this._insMeta = this.db.prepare('insert into meta (k,v) values (?,?) on conflict(k) do update set v=excluded.v');
 
     this.timer = setInterval(() => { try { this.flush(); } catch { /* 由 stat.errors 记账 */ } }, this.idleMs);
@@ -188,8 +197,23 @@ export class SqliteStore {
   // 磁盘出问题时注册/登录该怎么样还怎么样，代价只在 stat.errors 上可见 ——
   // 静默丢审计当然不理想，但"审计失败挡住玩家进游戏"更不理想，两害取轻要留下字据。
   audit(ev, name, ip) {
-    try { this._insAudit.run(this.now(), String(ev), String(name || ''), String(ip || '')); }
-    catch { this.stat.errors++; }
+    try {
+      this._insAudit.run(this.now(), String(ev), String(name || ''), String(ip || ''));
+      // ── 上限（M8）──
+      // 内存版有 5000 条上限，SQLite 版原先**一条都不删**：文件头那句"频率天然被限流器压着"
+      // 站不住 —— 限流键是 IP，多 IP 慢速灌注册/登录照样能把这张表写成无限长，
+      // 而且它和账号库共用一个文件（WAL 一起长）。
+      // 裁剪不每次做（那会把一次 insert 变成两次写），攒够 AUDIT_PRUNE_EVERY 条再一刀 ——
+      // 于是表的规模上界是 AUDIT_CAP + AUDIT_PRUNE_EVERY，是个常数。
+      if (++this._auditN >= AUDIT_PRUNE_EVERY) { this._auditN = 0; this.pruneAudit(); }
+    } catch { this.stat.errors++; }
+  }
+  // 只留最近的 AUDIT_CAP 条。**不给调用方抛出**（与 audit 同一条契约：磁盘有问题不该挡住登录）。
+  pruneAudit() {
+    try { this._delAudit.run(AUDIT_CAP); } catch { this.stat.errors++; }
+  }
+  countAudit() {
+    try { return this.db.prepare('select count(*) as n from audit').get().n; } catch { this.stat.errors++; return -1; }
   }
   getAudit(limit = 50) {
     return this.db.prepare('select t, ev, name, ip from audit order by id desc limit ?').all(limit | 0);

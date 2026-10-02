@@ -220,9 +220,12 @@ export function recoveryMetaKey(key) { return `recov:${key}`; }
 // 退避的底数不写"每失败一次等 1 秒"：那是线性的，试 1000 次也就等 1000 秒，
 // 脚本完全等得起。指数退避让第 20 次失败要等 12 天 —— 撞库的时间预算直接爆炸。
 export class RateLimiter {
-  constructor({ windowMs = 60_000, max = 10, baseMs = 1000, maxBackoffMs = 900_000, maxKeys = 10_000 } = {}) {
+  constructor({ windowMs = 60_000, max = 10, baseMs = 1000, maxBackoffMs = 900_000, maxKeys = 10_000, failTtlMs = 24 * 3600_000 } = {}) {
     this.windowMs = windowMs; this.max = max;
     this.baseMs = baseMs; this.maxBackoffMs = maxBackoffMs; this.maxKeys = maxKeys;
+    // 退避条目活多久（M6）。24h 刻意远大于 maxBackoffMs 的上限（15 分钟）——
+    // 寿命要管的只是「这个键已经没人碰了」，不该顺手把还在挨打的键的计数清掉。
+    this.failTtlMs = failTtlMs;
     this.hits = new Map();     // key -> number[]（窗口内的时间戳）
     this.fails = new Map();    // key -> { n, until }
   }
@@ -235,7 +238,18 @@ export class RateLimiter {
       const keep = arr.filter(t => now - t < w);
       if (keep.length) this.hits.set(k, keep); else this.hits.delete(k);
     }
-    for (const [k, f] of this.fails) if (f.until <= now && f.n === 0) this.fails.delete(k);
+    // fails 那一边也要有**寿命**（M6）。改动前的条件是 `f.until <= now && f.n === 0`，
+    // 而 n 从 1 起就再也不会归零（只有 succeed() 会删）⇒ 一次失败登录的条目**永驻**：
+    // 多 IP 慢速灌登录（每个 IP 只试一次错密码）就能把这张表撑成内存放大器，
+    // 而 prune 每次还要全表遍历 —— CPU 跟着一起涨，两样都不报错。
+    // 为什么不写成「until 一到就删」：那等于「等完惩罚就从零开始」，指数退避被削成一次性的，
+    // 而它正是这条防线里唯一挡得住慢速撞库的东西。这里按**最后一次失败**算寿命：
+    // 还在惩罚窗口里的照旧留着；窗口过了、并且整整 failTtlMs 没再失败，才回收。
+    // 对方只要还在试，lastAt 就一直在刷新 —— 这条回收动不了正在进行的攻击。
+    for (const [k, f] of this.fails) {
+      if (f.until > now) continue;
+      if (now - (f.lastAt || 0) > this.failTtlMs) this.fails.delete(k);
+    }
     if (this.hits.size + this.fails.size > this.maxKeys) {
       // 超上限时清掉最早的窗口记录（不是清退避 —— 退避是安全属性，窗口是成本属性）
       const it = this.hits.keys();
@@ -265,7 +279,11 @@ export class RateLimiter {
   }
 
   fail(key, now = Date.now()) {
-    const f = this.fails.get(key) || { n: 0, until: 0 };
+    const f = this.fails.get(key) || { n: 0, until: 0, lastAt: 0 };
+    // lastAt 是上面那条回收的依据，记的是**最后一次**失败而不是第一次：
+    // 用第一次的话，一个持续挨打的键会在 TTL 到点那一刻被回收，
+    // 而那正好是攻击者最想要的那个时刻。
+    f.lastAt = now;
     f.n += 1;
     // 前 3 次不惩罚：正常的自己人也会打错密码，第 4 次才开始等。
     const steps = Math.max(0, f.n - 3);
@@ -308,7 +326,10 @@ export class Accounts {
     this.sessionTtlMs = sessionTtlMs;
     // 可见的计数：和 lag / streak 那两组一样，这些失效**全是静默的**，
     // 运维只能从 /healthz 上看见。regs=0 尤其要留意：那说明注册这条路根本没人走通。
-    this.stat = { regs: 0, logins: 0, recover: 0, rejects: {}, rateLimited: 0, busy: 0, scryptMs: 0, scryptN: 0 };
+    // auditSkipped：因为"这次请求是被限流挡下的"而**没写审计**的次数（M8）。
+    // 它必须是个能看见的数：审计少了一行在事后是查不出来的（那一行本来也不该有），
+    // 而"该写的没写"与"不该写的没写"在结果上一模一样。
+    this.stat = { regs: 0, logins: 0, recover: 0, rejects: {}, rateLimited: 0, busy: 0, scryptMs: 0, scryptN: 0, auditSkipped: 0 };
     // 每呼号一把的串行链（_keyChain），见下面那段说明。
     this._keyLocks = new Map();
   }
@@ -357,6 +378,12 @@ export class Accounts {
   // 截到 32 字 —— 日记的读者（人/脚本）不该被一个超长字符串或换行打进来的一行
   // 伪造记录糊弄。密码永远不进审计：它根本不在写进去的参数里。
   _audit(ev, name, ip) {
+    // ── 被限流的结局**不落库**（M8）──
+    // 理由不是省事，是这条链的性质：限流这道闸的全部意义就是"不让这次请求变成工作"，
+    // 而它后面每一条 429 都在写一次盘 —— 于是"挡住洪水"和"给每一条洪水记账"变成同一件事，
+    // 审计表与 WAL 一起长。而被拒的次数本来就有计数（stat.rateLimited，全内存），
+    // 取证要看的是"谁登录过 / 谁的密码被撞过"，不是"某个 IP 被限了多少次"。
+    if (/:too_many$/.test(ev)) { this.stat.auditSkipped++; return; }
     this.store.audit(ev, String(name == null ? '' : name).replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, 32), ip || '-');
   }
 
@@ -391,7 +418,7 @@ export class Accounts {
         const r = await this._throttled(() => hashPassword(password, this.scrypt));
         if (r === 'busy') return this._reject('busy');
         rec = r;
-      } catch (e) { return this._reject('hash_failed'); }
+      } catch (e) { return this._reject('hashing_failed'); }
       this.stat.scryptMs += this.now() - t0; this.stat.scryptN++;
 
       const user = {
@@ -423,12 +450,16 @@ export class Accounts {
     const key = nameKey(n);
     // 三条限流，顺序有讲究：**先问退避，再记窗口**。
     // 反过来的话，一个处于退避中的对手只要继续发请求，就能靠撞窗口把自己"洗"成正常。
-    const b1 = this.loginLimit.blocked(`login-ip:${ip}`, now);
-    const b2 = this.loginLimit.blocked(`login-name:${key}`, now);
+    // 键名与恢复码那一侧**完全同一份**（auth-ip / auth-name，见 _recoverImpl）：
+    // 这条纪律的全部意义就是「登录与恢复共用一个额度」—— 前缀分开（login-* / recov-*）时
+    // hit() 是按 key 算的，同一 IP 实际拿到两份 12 次/5 分钟，攻击者一边撞密码一边撞恢复码
+    // 额度当场翻倍，而注释里写着「共用」。
+    const b1 = this.loginLimit.blocked(`auth-ip:${ip}`, now);
+    const b2 = this.loginLimit.blocked(`auth-name:${key}`, now);
     const blocked = !b1.ok ? b1 : (!b2.ok ? b2 : null);
     if (blocked) { this.stat.rateLimited++; return { ok: false, error: 'too_many', retryAfterMs: blocked.retryAfterMs }; }
-    const w1 = this.loginLimit.hit(`login-ip:${ip}`, now);
-    const w2 = this.loginLimit.hit(`login-name:${key}`, now);
+    const w1 = this.loginLimit.hit(`auth-ip:${ip}`, now);
+    const w2 = this.loginLimit.hit(`auth-name:${key}`, now);
     const over = !w1.ok ? w1 : (!w2.ok ? w2 : null);
     if (over) { this.stat.rateLimited++; return { ok: false, error: 'too_many', retryAfterMs: over.retryAfterMs }; }
 
@@ -449,13 +480,13 @@ export class Accounts {
       // 再把撞库火力集中到这些账号上。
       // （上面 verifyPassword 在 user 为 null 时也会跑一次真哈希，所以耗时也一样。）
       if (!user || !okPw) {
-        this.loginLimit.fail(`login-ip:${ip}`, now);
-        const f = this.loginLimit.fail(`login-name:${key}`, now);
+        this.loginLimit.fail(`auth-ip:${ip}`, now);
+        const f = this.loginLimit.fail(`auth-name:${key}`, now);
         return { ok: false, error: 'bad_credentials', retryAfterMs: f.retryAfterMs };
       }
 
-      this.loginLimit.succeed(`login-ip:${ip}`);
-      this.loginLimit.succeed(`login-name:${key}`);
+      this.loginLimit.succeed(`auth-ip:${ip}`);
+      this.loginLimit.succeed(`auth-name:${key}`);
       this.stat.logins++;
       const { token, hash } = newToken();
       this.store.createSession(hash, key, now + this.sessionTtlMs);
@@ -463,9 +494,31 @@ export class Accounts {
     });
   }
 
+  // 杀掉**这一枚**令牌。语义刻意停在"一枚"上：判据 B8/B9 量的是"令牌作废"，
+  // 而 B9 专门钉住"不会误伤别人的令牌"。要"这个身份别再有任何活着的凭证"的调用方
+  // （HTTP 的 /api/logout）用下面的 logoutUser，不要把这个方法改成清场。
   async logout(token) {
     if (token) this.store.deleteSession(tokenHash(token));
     return { ok: true };
+  }
+
+  // 登出（M11）：把**这个身份的全部会话**作废，不只是递进来的这一枚。
+  // 为什么必须这样：同一份令牌会被写进两枚 cookie，同一个账号在别的标签页/别的设备上
+  // 还可能有别的会话行 —— 只杀一枚的话，其余副本**仍然是可用的凭证**，一直活到 TTL，
+  // 而用户已经说了"我登出去了"。它在玩家侧完全静默（没有任何反馈说"其实还留着"）。
+  // 代价写清楚、并且是**有意的**：同账号在别处会一起下线。别的账号不受影响 ——
+  // 那一条必须单独有判据（写成"清全场会话"也能让"这一枚死了"变绿）。
+  //
+  // killed = 这次真的删掉了几行（调用方把它记进 /healthz 的 auth.logoutRevoked）。
+  // 认不出来（过期 / 伪造 / 已经清过）也返回 ok：登出必须**幂等** ——
+  // 报错的话"再点一次登出"会给玩家一句他无法处理的红字，而状态其实已经是对的了。
+  async logoutUser(token) {
+    if (!token) return { ok: true, killed: 0 };
+    const s = this.store.getSession(tokenHash(token));
+    if (!s) return { ok: true, killed: 0 };
+    const before = this.store.countSessions();
+    this.store.deleteUserSessions(s.key);
+    return { ok: true, killed: Math.max(0, before - this.store.countSessions()) };
   }
 
   // 令牌 → 用户。这是所有"我是谁"的唯一入口。
@@ -518,12 +571,12 @@ export class Accounts {
     const key = nameKey(n);
     // 与登录**共用同一张限流表**（key 前缀分开）。分成两张表的话，攻击者可以
     // 一边撞密码一边撞恢复码，等于把额度直接翻倍。
-    const b1 = this.loginLimit.blocked(`recov-ip:${ip}`, now);
-    const b2 = this.loginLimit.blocked(`recov-name:${key}`, now);
+    const b1 = this.loginLimit.blocked(`auth-ip:${ip}`, now);
+    const b2 = this.loginLimit.blocked(`auth-name:${key}`, now);
     const blocked = !b1.ok ? b1 : (!b2.ok ? b2 : null);
     if (blocked) { this.stat.rateLimited++; return { ok: false, error: 'too_many', retryAfterMs: blocked.retryAfterMs }; }
-    const w1 = this.loginLimit.hit(`recov-ip:${ip}`, now);
-    const w2 = this.loginLimit.hit(`recov-name:${key}`, now);
+    const w1 = this.loginLimit.hit(`auth-ip:${ip}`, now);
+    const w2 = this.loginLimit.hit(`auth-name:${key}`, now);
     const over = !w1.ok ? w1 : (!w2.ok ? w2 : null);
     if (over) { this.stat.rateLimited++; return { ok: false, error: 'too_many', retryAfterMs: over.retryAfterMs }; }
 
@@ -552,8 +605,8 @@ export class Accounts {
         if (ok && hit < 0) hit = i;
       }
       if (hit < 0) {
-        this.loginLimit.fail(`recov-ip:${ip}`, now);
-        const f = this.loginLimit.fail(`recov-name:${key}`, now);
+        this.loginLimit.fail(`auth-ip:${ip}`, now);
+        const f = this.loginLimit.fail(`auth-name:${key}`, now);
         // 和登录**同一句话**：不区分"这个呼号不存在"、"他没有恢复码"、"码抄错了"。
         // 分开写的话这个接口就是一个账号枚举器（而且比登录那个更好用：它不需要密码）。
         return { ok: false, error: 'bad_recovery', retryAfterMs: f.retryAfterMs };
@@ -564,14 +617,14 @@ export class Accounts {
         const r = await this._throttled(() => hashPassword(password, this.scrypt));
         if (r === 'busy') return this._reject('busy');
         rec = r;
-      } catch { return this._reject('hash_failed'); }
+      } catch { return this._reject('hashing_failed'); }
 
       this.store.patchUser(key, rec);
       // 会话跟着密码一起作废：重设密码的**动机**通常正是"这号可能已经被人进去了"，
       // 而留着旧会话等于把进来的人留在屋里 —— 他能安稳用到 30 天后自然过期。
       this.store.deleteUserSessions(key);
-      this.loginLimit.succeed(`recov-ip:${ip}`);
-      this.loginLimit.succeed(`recov-name:${key}`);
+      this.loginLimit.succeed(`auth-ip:${ip}`);
+      this.loginLimit.succeed(`auth-name:${key}`);
       // 用掉一张 = 换一整叠（见上面第 2 条）。
       const recovery = await this._mintRecovery(key);
       this.stat.recover++;

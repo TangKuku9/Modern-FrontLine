@@ -21,7 +21,7 @@
 ## 0. 先把自己关在门外看一遍（改代码之后必跑）
 
 ```bash
-npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / net-journal / codec / lagcomp / mp-rules / accounts / progress / hardening / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / heli-armor / optic / state-leak
+npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / net-journal / codec / lagcomp / mp-rules / accounts / progress / hardening / service-guards / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / net-audit / heli-armor / optic / state-leak
                   # 其中要一个真浏览器的那几份，名单见 README《验收》（从源码推的，别在这儿抄第二份）
 npm run test:all  # 再加三个真浏览器测试（net-play 对打、net-drop 掉线、tab-session 同源双标签页）
 ```
@@ -67,6 +67,7 @@ HOST=127.0.0.1 \
 目录文件，每台把自己的房间行自报进去（心跳 + TTL，一台崩了它的行在 TTL 内自然消失）；
 任何一台上打开的大厅都列全部台的房（带"另一台"标记与那台的地址），点击就跨台加入；
 要账号的部署凭**一次性入场票**跨台（玩家登录的那台发票、目标台握手时消费 —— 账号账本仍各台私有）。
+残余风险（有意不改，记档于 `docs/net-sync-audit.md`）：这张票走 ws 握手 URL 的 `?ticket=` query —— 跨台握手没有别的可信可用通道，代价是必然落反向代理 access log 与浏览器历史，泄露面比 HttpOnly cookie 大一截（反代侧可把 access log 的 query 脱敏收窄这块面）。
 
 ```bash
 ROOMS_DB=/data/rooms.db PUBLIC_URL=http://游戏域:8091 MAP=yard  SEED=20260925 … node server/net-server.mjs 8091

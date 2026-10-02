@@ -17,17 +17,18 @@
 // 这一层只把服务端报回来的 canStart/why 画出来 —— 客户端自己再算一遍的话，
 // 就会出现"按钮能点但服务端说不能开"，而那是这一轮要消灭的那类静默失效。
 import { decodeSnapshot } from '../../server/codec.mjs';
-import { tabNonce } from '../account.js';
+import { openSocket, tabNonce } from '../account.js';
+import { viewSettingsOf } from '../player.js';
 
 const TIMEOUT_MS = 12000;
 
 export class LobbyClient {
   constructor(game, opts = {}) {
     this.game = game;
-    // 同 NetClient：本台默认连接带 ?tab=（握手带不了自定义头）；跨台的 url 由调用方给，
-    // 身份由那张票钉死，不需要也不该再带本台的选择器。
-    const tab = tabNonce();
-    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${tab ? '?tab=' + encodeURIComponent(tab) : ''}`;
+    // 同 NetClient：选择器走 **WebSocket 子协议**（openSocket），不再进 URL（M11）；
+    // 跨台的 url 由调用方给，身份由那张票钉死，不需要也不该再带本台的选择器。
+    this.tab = opts.url ? '' : tabNonce();
+    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
     this.name = opts.name || '士兵';
     this.onRooms = opts.onRooms || (() => {});       // 列表 / 在线人数变了
     this.onRoom = opts.onRoom || (() => {});         // 房间状态变了（含局末回房）
@@ -35,6 +36,11 @@ export class LobbyClient {
     this.onError = opts.onError || (() => {});
     this.onBegin = opts.onBegin || (() => {});       // (welcome) => 起这一局
     this.onNote = opts.onNote || (() => {});
+    // 已经连上之后再断（含服务端优雅下线）：大厅这一层原来**一个出口都没有**（M9）。
+    // 给它一个回调，而不是让 main.js 去轮询 —— 轮询的间隔就是"玩家看着没反应的时长"。
+    this.onClose = opts.onClose || (() => {});
+    this.lost = null;                                 // 'closed' | null（与 NetClient 同一套语义）
+    this.lostReason = '';
     this.connected = false;
     this.rooms = [];
     this.online = 0;
@@ -48,8 +54,11 @@ export class LobbyClient {
   // 当场 reject —— 让调用方能在加载页上说明原因，而不是停在一个空列表前。
   connect() {
     return new Promise((res, rej) => {
-      if (this.ws && this.ws.readyState <= 1) { res(this); return; }
-      const ws = this.ws = new WebSocket(this.url);
+      // 只有 OPEN 才算"这条连接已经在手上"。原来写的是 `readyState <= 1`（CONNECTING 也算），
+      // 于是调用方一拿到 resolve 就发帧，而 socket 还在 CONNECTING —— 浏览器抛
+      // InvalidStateError，玩家看到的是原始异常文案（低危那一组，与 M9 同一处收口）。
+      if (this.ws && this.ws.readyState === 1) { res(this); return; }
+      const ws = this.ws = openSocket(this.url, this.tab);
       ws.binaryType = 'arraybuffer';
       let done = false;
       const finish = (err) => { if (done) return; done = true; clearTimeout(timer); err ? rej(err) : res(this); };
@@ -57,8 +66,19 @@ export class LobbyClient {
       ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'lobby' })); } catch { /* 立刻断了 */ } };
       ws.onerror = () => finish(new Error('连接出错（服务是否在跑、地址对不对）'));
       ws.onclose = (ev) => {
+        // 「连上之后断」与「压根没连上」是两件事，通知的面也不同（M9）：
+        // 后者由 connect() 的 reject 说清楚（调用方在加载页上写原因），前者必须**广播出去**。
+        // 改动前这里只落一个 closedInfo、一个回调都不发 —— 症状是房表不再刷、按钮静默失灵、
+        // "正在进入大厅…"这句文案在已经断线时继续撒谎，而"正在进房…"那一层全屏加载更是
+        // 永久卡死（唯一出路 F5）。对局层早有 netLostUi + Enter 重连，大厅层一直什么都没有。
+        const wasUp = this.connected;
         this.connected = false;
         this.closedInfo = { code: ev && ev.code, reason: (ev && ev.reason) || '', wasClean: !!(ev && ev.wasClean) };
+        if (!this._closing && wasUp) {                 // 自己拆的（leaveOnline / 换台）不算"掉线"
+          this.lost = this.lost || 'closed';
+          this.lostReason = this.closedInfo.reason;
+          this.onClose(this.closedInfo);
+        }
         finish(this._closing ? new Error('已关闭') : new Error('大厅连接被断开' + (ev && ev.reason ? '：' + ev.reason : '')));
       };
       ws.onmessage = (m) => {
@@ -77,13 +97,26 @@ export class LobbyClient {
       name: this.name,
       loadout: g.buildNetLoadout ? g.buildNetLoadout(g.profile.classes[g.profile.selClass || 0]) : null,
       streaks: Array.isArray(g.profile.streaks) ? [...g.profile.streaks] : null,
+      // 视角设置（每人一份）随每一次建房 / 进房 / 准备交上去。深拷贝一份：
+      // 直接引用 game.settings 的话，玩家在房间里改滑条会就地改掉"已经发出去的那一份"
+      // 的语义（服务端那边早就存下了一个副本，而这边看起来"改了就生效"，其实没有）。
+      view: { ...viewSettingsOf(g) },
     };
   }
-  send(o) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(o)); }
+  // 返回值 = "这一帧真的发出去了吗"。改动前是**静默丢帧**（readyState≠1 时什么都不做、
+  // 也不说话）：大厅还没连上（或刚断）时点"创建房间"，帧没了，而 onRoomFrame 与 onlineError
+  // 都不会来 —— 人就被扣在"正在进房…"那一屏上，唯一出路是 F5（M9）。
+  // 三处进房入口（menu 的 onlineCreate / onlineQuick / onlineJoin）现在拿这个返回值当闸。
+  send(o) {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== 1) return false;
+    try { ws.send(JSON.stringify(o)); return true; }
+    catch { return false; }                          // send 自己抛了（缓冲满/连接正在关）也算没发出去
+  }
 
-  createRoom(o = {}) { this.send({ t: 'createRoom', ...this._id(), ...o }); }
-  joinRoom(room) { this.send({ t: 'joinRoom', ...this._id(), room }); }
-  quickRoom(o = {}) { this.send({ t: 'quickRoom', ...this._id(), ...o }); }
+  createRoom(o = {}) { return this.send({ t: 'createRoom', ...this._id(), ...o }); }
+  joinRoom(room) { return this.send({ t: 'joinRoom', ...this._id(), room }); }
+  quickRoom(o = {}) { return this.send({ t: 'quickRoom', ...this._id(), ...o }); }
   leaveRoom() { this.send({ t: 'leaveRoom' }); }
   // 准备那一格顺手把**当前的配装**一起交出去：从"编辑装备"回房间屏的时候这一句会重发，
   // 于是"改了枪但没把新枪带进对局"那种错位没有机会发生（服务端只在开局那一刻读它）。

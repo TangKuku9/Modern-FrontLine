@@ -712,6 +712,166 @@ console.log(sec('K 一次性恢复码（忘了密码的唯一出路）'));
     `${d1.ok ? 'ok' : d1.error}/${d2.ok ? 'ok' : d2.error}`);
 }
 
+// ══════════ M 限流表自己的寿命（M6）══════════
+console.log(sec('M 限流表自己的寿命'));
+{
+  // 改动前的形状：fails 里的条目只有 `until <= now && n === 0` 才删，而 n 从 1 起就再也不会
+  // 归零（只有 succeed() 会删）⇒ **一次**失败登录就留下一条永驻记录。多 IP 慢速灌登录
+  // （每个 IP 只试一次错密码）能把这张表撑成内存放大器，而 prune 每次还要全表遍历 ——
+  // 内存和 CPU 一起涨，两样都不报错、不影响功能。
+  const rl = new RateLimiter({ windowMs: 300_000, max: 12, baseMs: 1000, maxBackoffMs: 900_000 });
+  const T0 = 1_700_000_000_000;
+  rl.fail('auth-ip:1.1.1.1', T0);
+  chk(rl.size === 1, 'M1【先决】一次失败登录在退避表里真的留了一条记录（不留的话下面每条都在量空气）', `size=${rl.size}`);
+  // 反证臂①：**不许**在退避一到点就删 —— 那等于"等完惩罚就从零开始"，指数退避被削成
+  // 一次性的，而它正是这条防线里唯一挡得住"慢速撞库"的东西。
+  rl.prune(T0 + 2000);
+  chk(rl.size === 1, 'M2【反证臂】"退避时间到了"不等于"这个键没人碰了"：条目还在', `size=${rl.size}`);
+  // 命门：整整 failTtlMs 没再失败，才回收。
+  rl.prune(T0 + 24 * 3600_000 + 1000);
+  chk(rl.size === 0, 'M3 一天没动静的条目被回收（这才是"表只会长大"那一半的解药）', `size=${rl.size}`);
+}
+{
+  // 反证臂②：**正在挨打的键不许被回收**。按"第一次失败"算寿命的话，一场持续 100 小时的
+  // 慢速撞库会在 TTL 到点那一刻被清零 —— 攻击者只要够耐心，退避就永远从头开始。
+  // 每步 20 分钟：**先 fail 再 prune，而且 prune 的时刻在那次退避（≤900s）之后、
+  // 又离它很近**。这个取时刻的方式是有讲究的——反证臂要压住的是"按第一次失败算寿命"，
+  // 而那需要 prune 真正走到"这个键还在不在"那一步（退避里的一律 continue，审不到）。
+  const rl = new RateLimiter({ windowMs: 300_000, max: 12, baseMs: 1000, maxBackoffMs: 900_000 });
+  let t = 1_700_000_000_000, n = 0;
+  for (let i = 0; i < 300; i++) { t += 1_200_000; n = rl.fail('auth-name:victim', t).n; rl.prune(t + 1_000_000); }
+  chk(rl.size === 1 && n === 300, 'M4【反证臂】持续失败 100 小时的键一次也没被回收：计数 1 → 300 连续',
+    `size=${rl.size} · n=${n}`);
+  chk(rl.blocked('auth-name:victim', t).ok === false, 'M5【反证臂】而且它一直处在退避中（回收没顺手把它放行）');
+  // 反证臂③：寿命是**闲置**时间，不是"总时长"。上面那 300 次里 lastAt 一直在刷新 ——
+  // 拿第一次失败当依据的实现会在 M4 上红（那时 size=0、n=1）。
+  t += 24 * 3600_000 + 1000;                                  // 这一次真的没人碰了
+  rl.prune(t);
+  chk(rl.size === 0, 'M6 打完收工之后照样会被回收（反过来也成立：回收看的是"闲着多久"）', `size=${rl.size}`);
+}
+{
+  // 回收是**渐进**的，不靠 maxKeys 兜底（那个只裁 hits，见 prune 里的注释）。
+  const rl = new RateLimiter({ windowMs: 60_000, max: 5, maxKeys: 100_000 });
+  for (let i = 0; i < 2000; i++) rl.fail('name-' + i, 1_700_000_000_000 + i * 10);
+  rl.prune(1_700_000_000_000 + 2000 * 10 + 24 * 3600_000 + 1000);
+  chk(rl.size === 0, 'M7 2000 个一次性失败的键在寿命到点后整批回收', `size=${rl.size}`);
+}
+{
+  // ── M8/M9 登录与恢复**共用**同一副额度 ──
+  // 注释里一直写着"与登录共用同一张限流表"，而实现里前缀是分开的（login-* / recov-*）——
+  // hit() 的上限按 key 算，于是同一 IP 实际拿到 2×12 次/5 分钟：攻击者一边撞密码
+  // 一边撞恢复码，额度当场翻倍，而两边的注释都写着"共用"。
+  const { acc } = mk({ loginMax: 3 });
+  await acc.register({ name: '共额', password: PW, code: 'SESAME', ip: '10.8.0.1' });
+  const bad = [];
+  for (let i = 0; i < 3; i++) bad.push((await acc.login({ name: '共额', password: 'wrong-pw-xxxx', ip: '10.8.9.9' })).error);
+  chk(bad.every(e => e === 'bad_credentials'), 'M8【先决】前 3 次登录是"密码不对"（额度还没用完，下面那条才量得到额度）',
+    JSON.stringify(bad));
+  const over = await acc.login({ name: '共额', password: PW, ip: '10.8.9.9' });
+  chk(over.error === 'too_many', 'M9 第 4 次登录撞上窗口（先把额度本身钉住）', JSON.stringify(over));
+  // 命门：同一个 IP 换一条**接口**（恢复码）接着来，额度必须已经用完。
+  // 前缀分开的写法在这里会返回 bad_recovery —— 那就等于"放行去做了真验证"，额度翻倍。
+  const rec = await acc.recover({ name: '共额', code: 'AAAA-AAAA-AAAA', password: PW, ip: '10.8.9.9' });
+  chk(rec.error === 'too_many', 'M10【命门】登录用掉的额度对"恢复码"这条接口同样有效（否则同一 IP 拿两份额度）',
+    JSON.stringify(rec));
+  clock = 1_700_000_000_000;
+}
+
+// ══════════ N 审计表只写不删（M8）══════════
+console.log(sec('N 审计表只写不删'));
+{
+  // 改动前的形状：内存版有 5000 条上限（auditLog.shift()），SQLite 版 audit() 里**只有一句 insert**
+  // —— 一条都不删。store.mjs 文件头给的理由（"它的频率天然被限流器压着"）站不住：
+  // 限流键是 IP，换 IP 慢速灌注册/登录照样能把这张表写成无限长，而 audit 和账号共用同一个文件
+  // （连 WAL 一起长）。症状是"上线几个月之后磁盘满了"，中间一个报错都没有。
+  //
+  // 一起收的还有另一头：**被限流的结局不落库**。那道闸的全部意义是"不让这次请求变成工作"，
+  // 而每一条 429 都在写一次盘 —— 等于一边挡洪水一边给洪水记账；挡下多少次已经有全内存的计数。
+  //
+  // 两个方向各要有判据，也各要有反证臂：只写"表不再涨"的话，把 audit() 改成空函数也全绿。
+  const CAP = 20000;   // = store.mjs 的 AUDIT_CAP。**故意写死**：从源码读的话，把 cap 调成 1e9
+                       // 也能让下面那条"上界"通过（代价只是得先写十亿行）—— 那这句承诺就没有判据了。
+  const EVERY = 500;   // = AUDIT_PRUNE_EVERY
+  let DatabaseSync = null;
+  try { ({ DatabaseSync } = await import('node:sqlite')); } catch { /* 与 H / J 段同一处理 */ }
+  if (!DatabaseSync) {
+    chk(true, 'N 段跳过：这个 Node 没有 node:sqlite（同 H / J 段）');
+  } else {
+    const dir = join(tmpdir(), `mf-auditcap-${process.pid}-${Date.now()}`);
+    const file = join(dir, 'acc.db');
+    const cleanup = () => {
+      for (const s of ['', '-wal', '-shm']) { try { rmSync(file + s, { force: true }); } catch { /* */ } }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
+    };
+    try {
+      const s = new SqliteStore({ file, idleMs: 3600_000, DatabaseSync, now });
+      // ── N1 先决：尺子活着 ──
+      // countAudit() 是本段唯一的读数。它要是在读失败那条路上恒返回 -1，
+      // "上界 ≤ CAP + EVERY"会**恒真**（-1 小于任何正数），而"表真的在长"就没人量了。
+      chk(s.countAudit() === 0, 'N1【先决】空表的 countAudit() 是 0（不是 -1：-1 是"读不到"，拿它比大小等于恒真）',
+        `n=${s.countAudit()}`);
+      for (let i = 0; i < 3; i++) s.audit('n:ok', 'u' + i, '10.30.0.1');
+      chk(s.countAudit() === 3, 'N1b【先决】写 3 条之后数得到 3 —— 这把尺子量的是盘上的行数', `n=${s.countAudit()}`);
+
+      // ── N2 命门：规模上界 ──
+      // 裁剪是"攒够 EVERY 条一刀"，所以表的大小在 [CAP, CAP+EVERY) 之间摆 —— 写得多也只是摆，
+      // 不会单调涨。CAP + 1000 条足以跨过好几次裁剪。上下界都要钉：
+      // 只钉上界的话，"每次裁剪把表清空"也绿，而那等于没有审计。
+      const total = CAP + 1000;
+      for (let i = 3; i < total; i++) s.audit('n:ok', 'u' + i, '10.30.0.1');
+      const n2 = s.countAudit();
+      chk(n2 <= CAP + EVERY && n2 >= CAP,
+        `N2【命门】写 ${total} 条之后表停在上界内（改动前这一格是 ${total}，且会一直涨）`,
+        `n=${n2} ∈ [${CAP}, ${CAP + EVERY}]`);
+      chk(s.stat.errors === 0,
+        'N2b 裁剪没被 catch 吞掉：stat.errors 保持 0（它红了说明那条 delete 本身不合法，而 catch 让它静默了）',
+        `errors=${s.stat.errors}`);
+      const newest = s.getAudit(1)[0];
+      chk(newest && newest.name === 'u' + (total - 1),
+        'N3 裁的是**最旧**的：最后写进去的那条还在（改成清空或裁最新的话，出了纠纷查不到刚刚那一次）',
+        JSON.stringify(newest || null));
+      const kept = s.getAudit(CAP * 2);
+      // ⚠ 空表也要**报红**，不许抛异常：第一版这里写的 `kept[kept.length - 1].name`，
+      // 而"裁过头"那条反证臂（m8wipe）会把表清空 ⇒ 判据自己 TypeError 了。
+      // 异常不是判决 —— 反证臂要看的是这一格红，不是这一份文件崩。
+      const oldest = kept.length ? kept[kept.length - 1].name : '(空表)';
+      chk(kept.length === n2 && kept.length > 0 && oldest !== 'u0',
+        'N3b 最先写的那一批真的被裁掉了（不是"数对了但内容没动"，也不是把表清空）',
+        `留下 ${kept.length} 条 · 最旧一条是 ${oldest}`);
+      // 稳态：再灌一轮同样多，表**不许**跟着涨（一次性的裁剪在这一格会露馅：那它只挡住了第一次）。
+      for (let i = 0; i < CAP; i++) s.audit('n:ok', 'w' + i, '10.30.0.2');
+      const n4 = s.countAudit();
+      chk(n4 <= CAP + EVERY && n4 >= CAP, 'N4 再灌一轮还是停在上界内（裁剪是周期性的，不是一次性的）', `n=${n4}`);
+      s.close();
+    } finally { cleanup(); }
+  }
+
+  // ── N5 起：被限流的结局不落库 ──
+  // 这一条量的是 accounts.mjs 的 _audit 分支，与后端无关 ⇒ 用 MemoryStore（auditLog 的长度是现成读数）。
+  const { store, acc } = mk({ loginMax: 3 });
+  await acc.register({ name: '闸下', password: PW, code: 'SESAME', ip: '10.31.0.1' });
+  chk(store.auditLog.length === 1, 'N5【先决】注册成功落了 1 行（"不落库"那一半要有东西可数）',
+    `n=${store.auditLog.length}`);
+  const wrongs = [];
+  for (let i = 0; i < 3; i++) wrongs.push((await acc.login({ name: '闸下', password: 'wrong-pw-xxxx', ip: '10.31.9.9' })).error);
+  const afterOk = store.auditLog.length;
+  chk(wrongs.every(e => e === 'bad_credentials') && afterOk === 4,
+    'N6【反证臂】**没被限流**的结局照旧落库：3 次坏密码 = 3 行 —— "不落库"不许扩成"什么都不记"',
+    `errs=${JSON.stringify(wrongs)} n=${afterOk}`);
+  let denied = 0;
+  for (let i = 0; i < 5; i++) if ((await acc.login({ name: '闸下', password: PW, ip: '10.31.9.9' })).error === 'too_many') denied++;
+  chk(denied === 5, 'N7【先决】后 5 次确实全部撞在闸上（否则下面量的是没被限流的那条路）', `denied=${denied}`);
+  chk(store.auditLog.length === afterOk && acc.stat.auditSkipped === 5,
+    'N8【命门】被限流的 5 次一条都没落库，而"挡下了几次"仍然数得出来（auditSkipped，全内存）',
+    `行数 ${afterOk} → ${store.auditLog.length} · auditSkipped=${acc.stat.auditSkipped}`);
+  chk(!store.auditLog.some(r => /:too_many$/.test(r.ev)),
+    'N8b 表里没有任何 ":too_many" 事件（改动前这里会有 5 行）',
+    JSON.stringify(store.auditLog.map(r => r.ev)));
+  chk(acc.stat.rateLimited >= 5,
+    'N8c 拒绝没有连计数一起丢：stat.rateLimited 记了（它不落盘，正是为了这件事）',
+    `rateLimited=${acc.stat.rateLimited}`);
+}
+
 console.log('');
 if (fails) { console.log(`RED  ${checks - fails}/${checks} 通过，${fails} 条失败`); process.exit(1); }
 console.log(`GREEN  账号与防护：${checks}/${checks} 通过`);

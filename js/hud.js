@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { KILLSTREAKS } from './data.js';
 import { fmtTime, clamp } from './util.js';
 import { parseChatCommand, toggleMute, chatRowHtml, isImeKey } from './net/chat.mjs';
+import { escHtml } from './escape.js';
 
 const $ = id => document.getElementById(id);
 const _v = new THREE.Vector3();
@@ -78,8 +79,13 @@ export class HUD {
     const kf = $('killfeed');
     const cls = e => !e ? '' : e.isPlayer ? 'me' : this.game.mode && this.game.mode.ffa ? 'B' : (e.team === this.game.player.team ? 'A' : 'B');
     const d = document.createElement('div'); d.className = 'kf';
-    const kn = killer && killer !== victim ? `<span class="${cls(killer)}">${killer.name}</span>` : '';
-    d.innerHTML = `${kn}<span class="w">${weapon || '击杀'}${head ? ' ✹' : ''}</span><span class="${cls(victim)}">${victim.name}</span>`;
+    // 三格都在这**一处**过 escHtml（M10）：两个呼号来自别的玩家，weapon 来自服务端事件，
+    // 而这里是拼 innerHTML 的地方。改动前 weapon 由调用方转义、两个名字裸着 ——
+    // 一半转一半不转看着像"已经处理过了"，实际上 victim.name 就是那条注入路（呼号白名单
+    // 眼下把 `<` 压死了，所以属纵深防御：白名单一放宽就是存储型 XSS）。
+    // 转义**放在拼 innerHTML 的那一处**是刻意的：放调用方的话，多一个调用点就多一次"忘了"。
+    const kn = killer && killer !== victim ? `<span class="${cls(killer)}">${escHtml(killer.name)}</span>` : '';
+    d.innerHTML = `${kn}<span class="w">${escHtml(weapon) || '击杀'}${head ? ' ✹' : ''}</span><span class="${cls(victim)}">${escHtml(victim.name)}</span>`;
     kf.prepend(d);
     while (kf.children.length > 6) kf.lastChild.remove();
     setTimeout(() => d.remove(), 6000);
@@ -185,7 +191,10 @@ export class HUD {
   }
   announce(title, sub = '', dur = 3) {
     const a = $('announce');
-    a.innerHTML = title + (sub ? `<small>${sub}</small>` : '');
+    // 这里也是 innerHTML 的拼接点，所以两格都过 escHtml（M10）。`sub` 尤其重要：
+    // 掉线说明与大厅 note 帧（都来自服务端）就是走这一格上来的 ——
+    // 原来它们裸着进 innerHTML，而同一个页面另一处（打开背包那种）却是转义的。
+    a.innerHTML = escHtml(title) + (sub ? `<small>${escHtml(sub)}</small>` : '');
     a.style.opacity = 1; this.announceT = dur;
   }
   subtitle(speaker, text, dur) {

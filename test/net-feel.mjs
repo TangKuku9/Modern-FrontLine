@@ -1038,6 +1038,9 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
 // （js/net/idle-ruler.mjs），但**必须**配两条族群臂：下限不许吃掉真信号（AA2）、
 // 走动的窗口仍按自己的步长量（AA3/AA4）—— 否则下限一放大，判据就成了恒真绿灯。
 // 附十四记的现成样本直接当夹具用（0.0004 m 步长 / 2~4 mm 残差）。
+// 第 11 轮审计的低危账又在这把尺子上找出两处：① 判决用的是**严格大于**，
+// 于是"残差恰好等于一拍位移"（那正是漏补一拍的形状）落在相等那一侧的样本一律报绿；
+// ② 退路那一支硬编码 /60，服务端拍频一改就静默失准。AA7 与 AA8 各自钉一条。
 {
   // 旧尺子：client.mjs 改掉之前的那句，原样抄在这儿 —— 反证臂拿它证明
   // 下面的夹具真的分得开新旧两种判决，AA1 的绿不是恒绿。
@@ -1064,9 +1067,41 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   ok('AA6 退路+下限合流的那格（速度 0、取不到步长）与 AA1 同判：噪声不红、floored 记账',
     foldJudge({ corrected: 0.004, stepMeasured: null, speed: 0 }).floored === true
     && foldJudge({ corrected: 0.004, stepMeasured: null, speed: 0 }).bad === false);
-  ok('AA7 边界：残差恰好等于尺子不红（判据是严格大于）—— 贴线的量化噪声不该记一笔',
-    foldJudge({ corrected: IDLE_FLOOR, stepMeasured: null, speed: 0 }).bad === false
-    && foldJudge({ corrected: IDLE_FLOOR + 1e-9, stepMeasured: null, speed: 0 }).bad === true);
+  // AA7 换过判据（低危账）：旧的写的是"残差恰好等于尺子**不**红（判据是严格大于）"——
+  // 那条把"漏补一拍"的形状当成了正常。现在反过来钉两边：等于 ⇒ **必须红**，略小 ⇒ 不红。
+  ok('AA7 边界：残差恰好等于尺子**必须红**（"等于一拍位移"正是漏补一拍这个形状本身）',
+    foldJudge({ corrected: IDLE_FLOOR, stepMeasured: null, speed: 0 }).bad === true);
+  ok('AA7b【反证臂】略小于尺子不红（阈值没有变成"一律红"，那和恒红一样没用）',
+    foldJudge({ corrected: IDLE_FLOOR - 1e-9, stepMeasured: null, speed: 0 }).bad === false);
+  // AA8 拍频从外面来（低危账：写死 60 的话，服务端一改拍频这把退路尺子就静默失准）。
+  // 同一个速度下拍频减半 ⇒ 一拍位移翻倍 ⇒ 尺子跟着翻倍，**判决也跟着翻** ——
+  // 只比 step 的数值不算数（那只证明它读了这个参数），要的是它真的改了结论。
+  const hz60 = foldJudge({ corrected: 0.09, stepMeasured: null, speed: 4.46, tickHz: 60 });
+  const hz30 = foldJudge({ corrected: 0.09, stepMeasured: null, speed: 4.46, tickHz: 30 });
+  ok('AA8 退路尺子按传入的拍频折算（30Hz 的一拍位移是 60Hz 的两倍，判决随之翻面）',
+    Math.abs(hz60.step * 2 - hz30.step) < 1e-9 && hz60.bad === true && hz30.bad === false,
+    `60Hz 尺子 ${hz60.step.toFixed(4)}（红）· 30Hz 尺子 ${hz30.step.toFixed(4)}（不红）`);
+}
+
+// ───────────────────────── AB. 网络读数的类型守卫（第 11 轮低危账）─────────────────────────
+// `pong` 的 c 是服务端原样回抄的客户端时间戳。不校验的话，一枚坏值（字符串 / 缺失 /
+// 被中间改过）会让 `performance.now() - c` 得 NaN —— 而 rtt 是平滑过的读数，一枚 NaN
+// 把它永久弄脏，记分板上从此印 "ping NaN ms"，看不出是哪一端的问题。
+// 直接喂假的控制帧：`onControl` 是纯方法（test/net-drop.mjs 也这么用）。
+{
+  const mk = () => ({ rtt: 12.5, pingGot: 0, pingBad: 0 });
+  const good = mk(); NetClient.prototype.onControl.call(good, { t: 'pong', c: performance.now() - 30 });
+  const badS = mk(); NetClient.prototype.onControl.call(badS, { t: 'pong', c: 'oops' });
+  const badM = mk(); NetClient.prototype.onControl.call(badM, { t: 'pong' });
+  const badN = mk(); NetClient.prototype.onControl.call(badN, { t: 'pong', c: NaN });
+  ok('AB1【先决】正常的一枚 pong 真的更新了 rtt（这条通路被驱动了，不是没进分支）',
+    good.pingGot === 1 && good.rtt > 0 && good.rtt < 200, `rtt=${good.rtt.toFixed(1)}`);
+  ok('AB2【命门】坏掉的 c 不污染 rtt（字符串 / 缺失 / NaN 三种都保留旧值）',
+    badS.rtt === 12.5 && badM.rtt === 12.5 && badN.rtt === 12.5,
+    JSON.stringify({ str: badS.rtt, miss: badM.rtt, nan: badN.rtt }));
+  ok('AB3【反证臂】坏的那几枚各自计一笔 pingBad（"丢掉"这件事本身可数）',
+    badS.pingBad === 1 && badM.pingBad === 1 && badN.pingBad === 1 && good.pingBad === 0,
+    JSON.stringify([badS.pingBad, badM.pingBad, badN.pingBad]));
 }
 
 // ───────────────────────── 收口 ─────────────────────────

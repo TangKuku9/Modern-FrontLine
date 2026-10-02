@@ -6,10 +6,13 @@
 // 症状就是玩家报的"A 在大厅说话，显示成 B 发的言"。
 //
 // 这一条必须在**真浏览器**里量（与 test/hardening.mjs 的分工：那边用裸 HTTP/WS 量
-// cookie 语义本身，这边量"sessionStorage 里的标签页选择器 → x-tab 头 / ?tab= 参数"
+// cookie 语义本身，这边量"sessionStorage 里的标签页选择器 → x-tab 头 / WebSocket 子协议"
 // 这段客户端接线真的接上了）：两个 page 放进**同一个 context** —— cookie 罐共享、
 // sessionStorage 各自一份 —— 那正是真实用户的处境。分开的 context 各有一个 cookie 罐，
 // 那是 multi-account-probe 的形状，量不到这个 bug。
+//
+// M11 之后选择器走**子协议**而不是 URL 参数：T5b/T5c 量那件事，T6/T7 量它的后果
+//（子协议一旦没接上，归属会当场错到别人头上）。
 //
 //   node test/tab-session.mjs    自己起临时服务，不需要事先手起 8080
 import { chromium } from 'playwright';
@@ -81,6 +84,21 @@ try {
   ok('T4 标签页 1 连上大厅', !!con1);
   const con2 = await p2.evaluate(() => game.onlineLobby().then(() => true)).catch(e => { console.log('  p2 大厅连接失败: ' + e.message); return false; });
   ok('T5 标签页 2 连上大厅', !!con2);
+
+  // ── M11：选择器**不许**进 URL，要走 WebSocket 子协议 ──
+  // 这两条只能在真浏览器里量：node 侧只看得到源码形状（形状守卫在 test/service-guards.mjs 的 G8），
+  // 而"子协议到底协商成没成"只有浏览器知道 —— 服务端不回显的话浏览器会直接判握手失败，
+  // 那种失败的样子是"登录之后连不上"，跟选择器一点关系都看不出来。
+  const lurl = await p1.evaluate(() => (game.lobby && game.lobby.url) || '');
+  ok('T5b 大厅连接的 URL 里没有标签页选择器（那个位置会落进代理访问日志与浏览器历史）',
+    !/tab=/.test(lurl), lurl);
+  const proto = await p1.evaluate(() => ({
+    neg: (game.lobby && game.lobby.ws && game.lobby.ws.protocol) || '',
+    stored: sessionStorage.getItem('mf_tab') || '',
+  }));
+  ok('T5c 握手协商出来的子协议就是本标签页那个选择器（两个来源独立：协商值 vs sessionStorage）',
+    !!proto.neg && proto.neg === proto.stored && /^[a-z0-9]{6,16}$/.test(proto.neg),
+    JSON.stringify(proto));
 
   await p1.evaluate(() => game.lobby.send({ t: 'say', ch: 'lobby', text: 'hello-from-A' }));
   const seenA = await until(() => p2.evaluate(() => {

@@ -51,13 +51,23 @@ create table if not exists tickets (
 `;
 
 export class RoomDirectory {
-  constructor({ file, url, boot, ttlMs = 8000, ticketTtlMs = 30000, now = Date.now, DatabaseSync = NodeDatabaseSync } = {}) {
+  constructor({ file, url, boot, ttlMs = 8000, ticketTtlMs = 30000, now = Date.now, DatabaseSync = NodeDatabaseSync, sweepMinMs = 1000 } = {}) {
     if (!file) throw new Error('RoomDirectory 需要 file');
     this.url = url;
     this.boot = boot || randomBytes(8).toString('hex');
     this.ttlMs = ttlMs;
     this.ticketTtlMs = ticketTtlMs;
     this.now = now;
+    // ── 隐式扫描的最小间隔（M7）──
+    // list() 会顺手扫一遍库（"谁路过谁扫"），而 list() 正是 **/api/rooms** 的底层调用，
+    // 那个接口在访客服上是**匿名可达**的：一个脚本每秒几百次 GET /api/rooms，就等于
+    // 每秒几百对 DELETE 打在这个**跨进程共享**的 SQLite 文件上。WAL 下写者串行，
+    // 别台的心跳会一起排队变慢 —— 那台玩家看到的是"大厅刷新很慢/房间凭空消失"，
+    // 而从它自己的服务上完全看不出原因。
+    // 超时的粒度本来就是 ttlMs（秒级），所以按最小间隔扫一次就够了：
+    // 代价是"死行最多多显示 sweepMinMs 毫秒"，换来的是把写放大钉成常数。
+    this.sweepMinMs = sweepMinMs;
+    this._lastSweep = 0;
     this.db = new DatabaseSync(file);
     this.db.exec('pragma journal_mode = wal; pragma synchronous = normal;');
     // 多进程并发写同一文件：WAL 下写者串行，撞上时等而不是抛 —— 目录的每笔都小，等得起。
@@ -104,7 +114,7 @@ export class RoomDirectory {
 
   // 别台的行（自己的除外）。sweep 负责新鲜度，这里只读。
   list() {
-    this.sweep();
+    this.sweepIfDue();
     return this.db.prepare('select * from rooms where boot != ? order by beat desc').all(this.boot)
       .map(r => ({
         id: r.id, title: r.title, map: r.map, mode: r.mode, players: r.players, max: r.max,
@@ -116,10 +126,21 @@ export class RoomDirectory {
   ownCount() { return this.db.prepare('select count(*) as n from rooms where boot = ?').get(this.boot).n; }
 
   // 超时没心跳的行，谁路过谁扫 —— 一台崩溃，它的行在任何一台的下一次心跳里消失。
+  // 显式调用**永远真的扫**（心跳那条路要走的就是它）；只有 list() 那条隐式路径受间隔管。
   sweep() {
-    const dead = this.now() - this.ttlMs;
+    const n = this.now();
+    this._lastSweep = n;
+    const dead = n - this.ttlMs;
     this.db.prepare('delete from rooms where beat < ?').run(dead);
-    this.db.prepare('delete from tickets where exp < ?').run(this.now());
+    this.db.prepare('delete from tickets where exp < ?').run(n);
+  }
+
+  // 隐式扫描：距上次（显式或隐式）扫描不足 sweepMinMs 就直接返回。
+  // 返回"这次扫没扫"，判据拿它当读数（也方便以后有人想问"到底写没写库"）。
+  sweepIfDue() {
+    if (this.now() - this._lastSweep < this.sweepMinMs) return false;
+    this.sweep();
+    return true;
   }
 
   // ── 一次性跨台入场券 ──

@@ -17,6 +17,13 @@ export const J_WS = ['state', 'stateT', 'stateDur', 'adsT', 'cool', 'cycleT', 't
 export const J_EXCLUDE = {
   // —— Player ——
   game: '环境引用', ws: '由 J_WS + ammo + cur 覆盖', isPlayer: '常量', name: '常量', team: '常量',
+  // 视角设置（每人一份，见下面 sanitizeViewSettings）。**不进日记本**：它是进场时定的
+  // 常量，回滚重放跑的是同一个 pl 对象、读的是同一份 sens，重演出来的 yaw 增量逐位相同。
+  // 把它记进 J_PL 反而有害 —— applyJournal 会在每次回滚时把它拨回"那一拍的旧值"，
+  // 而它在对局中根本不该变（中途改设置会走另一条路重发 join，不是靠日记本）。
+  sens: '进场时定（每人一份），对局中不变',
+  adsSens: '同上',
+  invertY: '同上',
   maxHp: '常量', perks: '装备时定，对局中不变', stats: '服务端裁决，客户端只显示计数',
   lastAttacker: '对象引用，只用于 HUD', radius: '常量',
   rng: '私有流实例（对象本身不可复制），要存的是游标 —— 走 j.rngState',
@@ -57,6 +64,41 @@ const _mute = { audio: { n: 0 }, hud: { n: 0 } };
 const _muteProxy = { audio: muteSink(_mute.audio), hud: muteSink(_mute.hud) };
 export const muteCounts = _mute;
 
+// ── 视角设置：**每人一份**，而且必须进协议 ──────────────────────────────────
+// 视角积分在两端跑的是同一份代码（下面 _sim 里那两行），而它乘的是 `sens`。
+// 以前这份 sens 只有一个来源：`game.settings`，而服务端的 HeadlessGame 用的是硬编码
+// 默认值 `{sens:1.0, adsSens:0.9, invertY:false}` —— NetRoom 建它时不传设置、join 帧
+// 也不带设置。于是调过滑条的玩家在联机里被钉死在 1.0：本地按自己的 sens 预测、
+// 服务端按 1.0 积分、快照每 20Hz 把 yaw/pitch 覆盖回来（js/net/predict.mjs），
+// 表现为持续的"甩枪被弹回"；invertY 用户更糟 —— 本地上下反转、权威端不反转，垂直瞄准打架。
+//
+// 为什么不能把 sens 挂到 game.settings 上：那是**房间**级别的一份（一个进程一份
+// HeadlessGame），而一个房间里两个人的灵敏度可以不同 —— 挂上去就是"先来的人改掉了
+// 后来者的手感"，而且这种改动不会报错，只会让某个人莫名其妙打不准。
+//
+// 范围与 js/menu.js 的两个滑条逐字一致（sens 0.2~3.0、adsSens 0.3~1.5）。服务端只认
+// 这一份清洗结果（客户端报什么就信什么的话，一个 sens=1e9 的客户端能把视角积分炸成 NaN，
+// 而 NaN 会顺着快照传回给所有渲染它的人）。这里不拒绝非法值 —— 夹进合法区间比
+// "因为一个人填了怪数值就把他的设置整个丢掉"更接近玩家的意图，且代价有上界。
+export const VIEW_LIMITS = { sens: [0.2, 3.0], adsSens: [0.3, 1.5] };
+export function sanitizeViewSettings(raw) {
+  const src = (raw && typeof raw === 'object') ? raw : {};
+  const num = (v, d, lo, hi) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
+  return {
+    sens: num(src.sens, 1.0, VIEW_LIMITS.sens[0], VIEW_LIMITS.sens[1]),
+    adsSens: num(src.adsSens, 0.9, VIEW_LIMITS.adsSens[0], VIEW_LIMITS.adsSens[1]),
+    invertY: src.invertY === true,
+  };
+}
+
+// 客户端那一侧：从 game.settings 取一份要交给服务端的视角设置。
+// 与 sanitizeViewSettings 成对 —— 客户端交、服务端收并重建。两处各写一遍形状的话，
+// 改一处的症状是"新设置项在服务端永远是默认值"，而那看起来像"这个功能没做"。
+export function viewSettingsOf(game) {
+  const s = (game && game.settings) || {};
+  return { sens: s.sens, adsSens: s.adsSens, invertY: !!s.invertY };
+}
+
 export class Player {
   constructor(game, opts) {
     this.game = game;
@@ -66,6 +108,9 @@ export class Player {
     this.pos = opts.pos.clone();
     this.vel = new THREE.Vector3();
     this.yaw = opts.yaw || 0; this.pitch = 0;
+    // 视角设置：null = "没给过我一份，用房间默认那份"（单机与老客户端走这条）。
+    // 联机进房时由 server/room.mjs:addClient 用 sanitizeViewSettings 从 join 帧重建后挂上。
+    this.sens = null; this.adsSens = null; this.invertY = null;
     this.maxHp = 100; this.hp = 100; this.alive = true;
     this.crouchT = 0; this.crouching = false; this.sprinting = false; this.sliding = false; this.slideT = 0;
     this.onGround = true; this.eyeH = 1.62; this.eyeSmooth = this.pos.y + 1.62;
@@ -216,9 +261,12 @@ export class Player {
     // 插值曲线必须跟 updateCamera 里的相机 zoom 一致（同用 adsT²）：不一致时开镜过程中
     // 视野还没收到位、灵敏度已经先降了，手感是"手比眼慢"。
     const zoom = lerp(1, ws.w ? ws.w.stats.zoom : 1, ws.adsT * ws.adsT);
-    const sens = game.settings.sens * 0.0022 * (ws.adsT > 0.5 ? game.settings.adsSens / Math.pow(zoom, 0.85) : 1);
+    // 每人一份的视角设置，`??` 退回房间默认那份（单机 / 没带设置的客户端）。
+    // 为什么 fallback 必须在**读的那一刻**发生而不是在构造时定死：单机与联机共用这一个类，
+    // 联机那份设置是 addClient 从 join 帧重建后挂上来的（在那之前构造函数已经跑过了）。
+    const sens = (this.sens ?? game.settings.sens) * 0.0022 * (ws.adsT > 0.5 ? (this.adsSens ?? game.settings.adsSens) / Math.pow(zoom, 0.85) : 1);
     this.yaw -= input.mdx * sens;
-    this.pitch -= input.mdy * sens * (game.settings.invertY ? -1 : 1);
+    this.pitch -= input.mdy * sens * ((this.invertY ?? game.settings.invertY) ? -1 : 1);
     this.pitch = clamp(this.pitch, -1.5, 1.5);
     // 姿态
     if (input.crouchPressed) {

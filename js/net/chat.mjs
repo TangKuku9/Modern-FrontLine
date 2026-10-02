@@ -5,6 +5,11 @@
 // 这里只做**判定**，不做 IO：发什么帧归上层（js/net/client.mjs / js/net/lobby.mjs），
 // 画成什么样归各屏自己的渲染。判定和接线分开，才测得起"哪一条会被屏蔽"这件事本身。
 
+// 转义器只有一份（js/escape.js，M10）。这一份原来是全仓最全的那一份，另外两处
+// （js/main.js / js/menu.js）各是它的一个**缺斤少两的副本** —— 收成一份之后这里
+// 只留一个别名，行的形状与内容一个字节都不变。
+import { escHtml as esc } from '../escape.js';
+
 // 输入法保护（差距 44）：中文/日文选词时的回车是"上屏"，不是"发送"。isComposing 是
 // 标准信号，keyCode 229 是部分旧 IME/浏览器唯一的回退信号。少这一句就会把半成品发出去 ——
 // 而"打一句中文发出去变成一串拼音"这种问题，玩家只会怪自己手快。
@@ -29,9 +34,6 @@ export const emoteByWord = (w) => EMOTES.find(e => e.id === w || e.words.include
 // "大厅里有时间戳、对局里没有"这种只在两个界面之间才看得见的差异。
 // muted 时返回**空串**：屏蔽是渲染侧的事（名单不上行，见 toggleMute 的注释），
 // 所以"看不见"只有这一个实施点，漏一处就是"屏蔽了还能看见他说话"。
-function esc(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
 export function chatRowHtml(x, opts = {}) {
   if (!x) return '';
   if (!x.sys && isMuted(x.from || x.name, opts.muted)) return '';

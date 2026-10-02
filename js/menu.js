@@ -6,6 +6,7 @@ import { buildGun } from './gunmodel.js';
 import { createSoldierModel, animateSoldier } from './soldier.js';
 import { mat, camoSwatch } from './materials.js';
 import { damp, fmtTime } from './util.js';
+import { escHtml } from './escape.js';
 // 经验 → 等级这一条公式现在住在 js/progress.mjs（与"账号那一半 / 本地那一半"同一处：
 // 等级按两半之和算，档案卡那一行文案也在那儿）。在存档卡、结算面板、房间座位栏里
 // 各画一份的话，换算法就要改三处，而漏掉那处只会显示出一个偏低的等级，没人会报错。
@@ -47,7 +48,9 @@ function fxList(fx) {
   }
   return out.join('');
 }
-const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// 转义器只有一份（js/escape.js，M10）：本地这版**不转单引号** —— 用 '...' 包属性值的
+// 那一格就漏了，而"哪一处用的是哪一份"没人说得清。名字仍叫 esc，调用点一个都不用改。
+const esc = escHtml;
 
 // 输入法保护：中文/日文选词时的回车是"**上屏**"，不是"提交 / 发送"。
 // `isComposing` 是标准信号，`keyCode === 229` 是部分旧 IME / 浏览器唯一给得出来的回退信号
@@ -544,6 +547,7 @@ export class Menu {
     if (A0.requireAccount && !A0.loggedIn) { this.showOnlineGate(); return; }
     this.setCam('lobby');
     const L = this.lobby, P = this.game.profile;
+    const LB = this.game.lobby;          // 断线时它身上有 lost / lostReason（M9）
     const cls = P.classes[P.selClass || 0];
     const inp = 'width:100%;box-sizing:border-box;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
     const seg = (id, vals, labels, cur) => `<div class="seg" id="${id}">${vals.map((v, i) => `<div data-v="${v}" class="${cur == v ? 'sel' : ''}">${labels ? labels[i] : v}</div>`).join('')}</div>`;
@@ -553,7 +557,7 @@ export class Menu {
         <div class="lobby-body">
           <div class="lobby-col lb-left">
             <div class="panel lb-rooms">
-              <div class="lb-hd"><span>房间</span><span id="lbNote">正在进入大厅…</span></div>
+              <div class="lb-hd"><span>房间</span><span id="lbNote">正在进入大厅…</span><button class="btn small" id="lbRe" data-a="relobby" style="display:none">重新连接</button></div>
               <div id="lbRows" class="lb-rows"></div>
             </div>
             <div class="panel"><div class="opts">
@@ -589,10 +593,17 @@ export class Menu {
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('online'));
     this.on(r, '[data-a=quick]', () => this.onlineQuick());
     this.on(r, '[data-a=create]', () => this.onlineCreate());
+    this.on(r, '[data-a=relobby]', () => this.onlineRelobby());
     this.bindChat(r, 'lobby');
     this.renderIdentity(r, L);
     this.renderRooms();
     this.renderChat(r, 'lobby');
+    // 断线那一格（M9）：把「重新连接」摆出来。它是"零反馈"那件事的最后一环 ——
+    // 只看得到"连接已断开"而没有任何出路的话，玩家能做的还是只有 F5。
+    if (!LB || LB.lost) {
+      const re = r.querySelector('#lbRe'); if (re) re.style.display = '';
+      this.lobbyNote(r, LB ? '大厅连接已断开' : '还没连上大厅');
+    }
     this.mountRecoveryPanel();   // 刚注册/刚重设的人：那一叠码补挂在这一屏顶端
     // 连接是这条路的入口：进不来就把原因写在这一屏上（而不是把人踢回主菜单 ——
     // 他什么都不知道，只会以为"这按钮点了没用"）。
@@ -607,20 +618,42 @@ export class Menu {
   // 换回一条玩家在联机界面上无从解释的拒绝。这里刻意不改 L.mode —— 那是别人的偏好，
   // 玩家回到单人对战时理应当看见他上次选的那个。
   onlineMode() { const m = this.lobby.mode; return ONLINE_MODES.some(x => x.id === m) ? m : ONLINE_MODES[0].id; }
+  // 进房三件套共用的一道闸（M9）。三处各写一遍 `if (!lb.connected) return;` 的话，
+  // 漏一处就是一条静默的"点了没反应"（更糟：那条路上还会盖上"正在进房…"的加载层，
+  // 而它的唯一出路是 F5）—— 所以收成一个函数，并且**返回值**就是"这一帧发出去了吗"。
+  lobbyAsk(fn) {
+    const lb = this.game.lobby;
+    if (!lb || !lb.connected) { this.onlineError('还没连上大厅，稍等一下（或点「重新连接」）'); return false; }
+    if (fn && !fn(lb)) { this.onlineError('大厅连接刚刚断了，这一句没发出去'); return false; }
+    return true;
+  }
+  // 重连大厅：扔掉断了的那条连接，重新走一遍 onlineLobby()。**不刷新页面** ——
+  // 这一页上还有房名、地图、装备选择与聊天框里没发完的字，F5 会把它们全丢掉。
+  onlineRelobby() {
+    const g = this.game;
+    if (g.lobby) { g.lobby.close(); g.lobby = null; }   // close() 会立 _closing ⇒ 不再报一次"断开"
+    this.showLoadingOverlay('正在重新进入大厅…');
+    Promise.resolve(g.onlineLobby())
+      .then(() => this.showOnlineLobby())
+      .catch(e => { this.showOnlineLobby(); this.onlineError('还是连不上：' + ((e && e.message) || e)); });
+  }
   onlineCreate() {
-    const L = this.lobby, lb = this.game.lobby;
-    if (!lb) return;
+    const L = this.lobby;
     const title = String((this.el.querySelector('#roomTitle') || {}).value || '').trim().slice(0, 24);
     L.title = title;
     this.syncLobbyName();
     const safe = title.replace(/[^A-Za-z0-9_.-]/g, '');
     const room = (safe && safe === title) ? title.slice(0, 32) : ('r' + Date.now().toString(36).slice(-6));
-    lb.createRoom({ room, title, map: L.map, mode: this.onlineMode(), minutes: L.minutes, scoreLimit: L.score });
+    // 发帧前先过闸：没连上**不许**盖那一层"正在进房…"（盖了就没人再把它收掉了）。
+    if (!this.lobbyAsk(lb => lb.createRoom({ room, title, map: L.map, mode: this.onlineMode(), minutes: L.minutes, scoreLimit: L.score }))) return;
     this.game.showRoomSoon();
   }
   onlineQuick() {
     const lb = this.game.lobby; if (!lb) return;
     this.syncLobbyName();
+    // 没连上时**先拦在这里**：`lb.rooms` 这时候是空的，下面那段"本台有没有可进的房"
+    // 会一路判到 quickRoom —— 而那一帧发不出去，症状与点「创建房间」一模一样。
+    if (!this.lobbyAsk()) return;
     // 快速加入的偏好顺序：本台有可进的等待房 → 交给服务端的 quick（它挑本台的）；
     // 本台没有而目录里登记了别台的房 → 跨台加入；都没有 → 本台新建（原行为）。
     // 让服务端先挑本台是刻意的：少一次换台的连接抖动，玩家对"我在哪台"也少一次困惑。
@@ -629,7 +662,7 @@ export class Menu {
       const row = (lb.rooms || []).find(x => x.remote && x.url && x.state === 'waiting' && x.players < x.max);
       if (row) { this.remoteJoin(row); return; }
     }
-    lb.quickRoom({ title: '', map: this.lobby.map, mode: this.onlineMode(), minutes: this.lobby.minutes, scoreLimit: this.lobby.score });
+    if (!this.lobbyAsk(x => x.quickRoom({ title: '', map: this.lobby.map, mode: this.onlineMode(), minutes: this.lobby.minutes, scoreLimit: this.lobby.score }))) return;
     this.game.showRoomSoon();
   }
   onlineJoin(room, title) {
@@ -638,7 +671,7 @@ export class Menu {
     // 远端行（房间目录里别台的房）：走跨台那条路 —— row.url 告诉我们该连哪台。
     const row = (lb.rooms || []).find(x => x.id === room);
     if (row && row.remote && row.url) { this.remoteJoin(row); return; }
-    lb.joinRoom(room);
+    if (!this.lobbyAsk(x => x.joinRoom(room))) return;
     this.game.showRoomSoon();
   }
   // 跨台加入：换台 = 换一条连接（大厅 → 房间 → 对局 都在同一条 ws 上，这是
@@ -686,7 +719,15 @@ export class Menu {
     const lb = this.game.lobby;
     const note = this.el.querySelector('#lbNote'), on = this.el.querySelector('#lbOnline');
     if (on) on.textContent = lb ? String(lb.online) : '—';
-    if (!lb || !lb.connected) { rows.innerHTML = '<div class="note-wide">正在进入大厅…</div>'; return; }
+    if (!lb || !lb.connected) {
+      // 三种状态三句话（M9）：「断线了」说成「正在进入大厅…」是一句会一直说下去的谎，
+      // 而这一行是玩家唯一能看到"发生了什么、接下来该干嘛"的地方。lost 由 LobbyClient 的
+      // onclose 立起来（改动前那一格根本不存在，所以这里只能一直画"正在进入大厅…"）。
+      rows.innerHTML = (lb && lb.lost)
+        ? `<div class="note-wide">大厅连接已断开${lb.lostReason ? '：' + esc(lb.lostReason) : ''} · 点右上角「重新连接」</div>`
+        : '<div class="note-wide">正在进入大厅…</div>';
+      return;
+    }
     const list = lb.rooms || [];
     if (note) note.textContent = list.length + ' 间';
     if (!list.length) { rows.innerHTML = '<div class="note-wide">还没有房间 · 起一间，或点快速加入</div>'; return; }

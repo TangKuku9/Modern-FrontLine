@@ -16,7 +16,7 @@
 import '../server/browser-shim.mjs';
 import * as THREE from 'three';
 import { makeStubs } from '../server/stubs.mjs';
-import { Heli, HELI_ARMOR, HELI_HITBOXES } from '../js/mp.js';
+import { Heli, Sentry, HELI_ARMOR, HELI_HITBOXES } from '../js/mp.js';
 import { fireHitscan, explode, Projectile } from '../js/combat.js';
 import { NetRoom, HELI_HP_EVERY } from '../server/room.mjs';
 import { WEAPONS } from '../js/data.js';
@@ -226,6 +226,31 @@ sec('E. 敌我与"谁有权裁决"');
   // 反证臂：权威那一个在同一姿势下打得中（A3 已证明），两者必须不一样。
   ok('E6【反证】权威那一个在同一姿势下打得中（E5 的绿不是"直升机本来就打不中"）',
     spawn(gc).hitTest(P(0, 10, 0), D(0, 1, 0), 400) !== null);
+
+  // ── 哨戒机枪：**同一口径**（第 11 轮审计的低危账点名的那格）──
+  // 两类实体曾经两种写法：Heli 判了 dumb，Sentry 无条件 push。这不是"少写一行"，
+  // 是两个症状，而且都不报错：
+  //   · 本地子弹能把**别人**的机枪"假打死"（本地爆炸 + popup），而权威那台还活着，
+  //     随后 gone 事件又带回一份 popup ⇒ 同一件事弹两次；
+  //   · 它进了 entities 就等于进了 enemiesOf() 的名单，Bot 会朝一台打不死的机枪开枪。
+  // 它照样转、照样有枪口火光：那一路走的是 NetClient.turrets 那张表，与 entities 无关。
+  const OWN = { team: 'A', isPlayer: false, alive: true, yaw: 0, name: 'owner' };
+  const gs = stubGame();
+  const realTurret = new Sentry(gs, new THREE.Vector3(0, 0, 0), OWN);
+  ok('E7 权威哨戒机枪进实体表（本地要打得到它、也要杀得掉它）',
+    gs.entities.includes(realTurret) && realTurret.alive);
+  // 反证臂：同一枪打在权威那台上是中的 —— 否则 E9 的绿可能是"机枪本来就打不中"。
+  const hitReal = fireHitscan(gs, { team: 'B', isPlayer: true }, P(0, 1.0, -6), D(0, 0, 1), m4, M4.name);
+  ok('E8【反证】同一枪打在**权威**那台上是中的（E9 的绿不是"哨戒机枪本来就打不中"）',
+    hitReal.ent === realTurret, JSON.stringify(hitReal && hitReal.ent && 'hit'));
+  const gd = stubGame();
+  const dumbTurret = new Sentry(gd, new THREE.Vector3(0, 0, 0), OWN, { dumb: true });
+  ok('E9【命门】哑副本**不进**实体表 —— 与 Heli 同一口径（旧写法无条件 push ⇒ 这条红）',
+    !gd.entities.includes(dumbTurret));
+  const hp0 = dumbTurret.hp;
+  const hitDumb = fireHitscan(gd, { team: 'B', isPlayer: true }, P(0, 1.0, -6), D(0, 0, 1), m4, M4.name);
+  ok('E10 本地子弹从哑机枪身上穿过去（画面上中了，血在服务端扣）',
+    hitDumb.ent === null && dumbTurret.hp === hp0, `ent=${hitDumb.ent === null ? 'null' : '命中'} · hp=${dumbTurret.hp}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

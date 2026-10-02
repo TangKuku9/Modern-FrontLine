@@ -188,6 +188,48 @@ const res = await page.evaluate(async () => {
       `${ws2.slots[0].mag}/${ws2.slots[0].stats.mag}`);
   }
 
+  // ---------- ④ 别的玩家/服务端给的字符串进 innerHTML 之前必须转义（M10）----------
+  // 性质：**纵深防御**。服务端的呼号白名单（NAME_RE）眼下把 `<` 压死了，所以它在真机上
+  // 一次都触发不了 —— 而"永远触发不了"的东西最容易被下一次重构顺手删掉（看起来没人用）。
+  // 所以判据直接在真 DOM 上打一枪，看两件事：
+  //   (a) 有没有**真的多出一个元素**（注入成功的话这里会出现 <img>）；
+  //   (b) 屏幕上是不是**原样**显示那串字。
+  // 只写 (b) 不行（把内容整个删掉也读不出那串字）；只写 (a) 也不行（内容改成空串就没有 <img>）。
+  // 谁是拼 innerHTML 的那一处，转义就归谁 —— 所以 HUD 这两处（killfeed / announce）
+  // 现在是**自己**转，调用方不再转（调用方转的话会显示成 `&lt;`）。
+  {
+    const XSS = '<img src=x onerror="window.__xssHud=1"><b>粗</b>';
+    const XSS2 = '<script>window.__xssHud=2</script>';
+    delete window.__xssHud;
+    g.hud.killfeed({ name: XSS, isPlayer: false, team: 'B' }, { name: XSS2, isPlayer: true, team: 'A' }, XSS, false);
+    const kf = document.querySelector('#killfeed .kf');
+    ok('X1 击杀提示里的两个呼号 + 武器名都不许被当成标签解析（改动前 weapon 由调用方转义、两个名字裸着）',
+      !!kf && !kf.querySelector('img, script, b') && kf.textContent.includes('<img src=x'),
+      kf ? JSON.stringify(kf.innerHTML.slice(0, 120)) : '没有 .kf 行');
+    ok('X2 而且它们必须**原样**显示出来（反证臂：把内容整个删掉也能让 X1 成立）',
+      !!kf && kf.textContent.includes('<script>window.__xssHud=2</script>'),
+      kf ? JSON.stringify(kf.textContent.slice(0, 120)) : '');
+    g.hud.announce(XSS, XSS2, 3);
+    const an = document.getElementById('announce');
+    ok('X3 开局播报的 title / sub 两格同样要转 —— sub 那一格是**可能来自服务端**的（掉线说明、大厅 note 帧）',
+      !an.querySelector('img, script, b') && an.textContent.includes('<img src=x'),
+      JSON.stringify(an.innerHTML.slice(0, 120)));
+    // onerror 是**异步**的（图片加载失败要等一轮网络）—— 不等一小会儿再读的话，
+    // 注入真的发生了这条也照样绿：X1 红了而 X4 还是 ✅（第一版就是这样）。
+    // 判据自己要先站到"能看见"的时刻上，否则它只是一句好听的断言。
+    await new Promise(r => setTimeout(r, 90));
+    ok('X4 注入确实没有得手（onerror 一次都没跑）', window.__xssHud === undefined, 'window.__xssHud=' + window.__xssHud);
+    // X5 先决：**这套判据自己活着**。同一串字（只摘掉触发那一格，标签形状留着）裸着进
+    // innerHTML 必须真的多出一个元素 —— 它红了说明 X1/X3 量的是空气（比如 #killfeed 里
+    // 根本没有我们那一行、或者 announce 被别的东西盖着）。
+    const probe = document.createElement('div');
+    probe.innerHTML = XSS.replace(/onerror="[^"]*"/, '');
+    probe.style.display = 'none'; document.body.appendChild(probe);
+    ok('X5【先决】同一串字裸着进 innerHTML 真的会多出一个元素（这条红了 = X1/X3 是空断言）',
+      !!probe.querySelector('img'), JSON.stringify(probe.innerHTML.slice(0, 80)));
+    probe.remove();
+  }
+
   g.composer.render = realRender;
   g.clock = realClock; realClock.getDelta();
   return out;

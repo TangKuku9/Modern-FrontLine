@@ -137,7 +137,16 @@ try {
   const h2 = await health(base);
   ok('/healthz 里这间成了在跑的 sim，两个人在册',
     h2.rooms === 1 && h2.per.some(x => x.id === 'hall' && x.clients === 2), JSON.stringify(h2.per.map(x => x.id + ':' + x.clients)));
-  ok('大厅清单跟着变成"对局中"', (await apiRooms(base)).find(x => x.id === 'hall')?.state === 'playing');
+  const rowLive = (await apiRooms(base)).find(x => x.id === 'hall') || {};
+  ok('大厅清单跟着变成"对局中"', rowLive.state === 'playing');
+  // 而且它与等待态那一行**同形状**（低危账）：两边各写一份字段表的话，客户端在"等着的房"
+  // 和"已经开打的房"上拿到的是两种对象，缺的那几格只表现为界面上一格空白 —— 不报错。
+  // host 拿的是**房主名**（'阿甲'）而不是空串：这一格是"有没有接上大厅那份名单"的读数，
+  // 写死一个 '' 也能让"键存在"这类形状判据绿。
+  ok('live 房那一行与等待态同形状（bots / time / score 三格是数、host 是房主名）',
+    typeof rowLive.bots === 'number' && typeof rowLive.time === 'number'
+    && typeof rowLive.score === 'number' && rowLive.host === '阿甲'
+    && rowLive.time > 0 && rowLive.score > 0, JSON.stringify(rowLive));
 
   console.log('\n── D：绕过房间的那几条口 ──');
   const c = client(wsUrl, '丙');
@@ -252,6 +261,11 @@ try {
   ok('开一个**不存在**的模式会被当场拒（而不是悄悄建成团队死斗）', !!errD && /conquest/.test(errD.msg || ''), JSON.stringify(errD && errD.msg));
   ok('被拒之后这间不在清单上（没说出口的接受等于假房）',
     !(await apiRooms(srv3.base)).some(x => x.id === 'cap'), JSON.stringify((await apiRooms(srv3.base)).map(x => x.id)));
+  // 两次建房之间要歇一下（M7）：建房是"房间生命周期"那一档，同一条连接上两帧挨得太近的话
+  // 第二帧会被回"操作太快了，缓一下" —— 那是**设计**（server/lobby.mjs 的 HEAVY_MIN_FRAMES），
+  // 不是这一条要量的东西。人手也不可能 250 ms 内点两次"创建房间"。
+  // 歇在这里而不是把闸放宽：判据的前提要跟着被测对象的语义走，别为让它绿去改源码。
+  await sleep(300);
   h.send({ t: 'createRoom', room: 'cap', name: '壬1', mode: 'dom' });
   const rH = await h.until(j => j.t === 'room' && j.room && j.room.id === 'cap', 6000);
   ok('三种模式都开得起来（tdm / ffa / dom 的胜负权威端都判得了）', !!rH && rH.room.mode === 'dom', JSON.stringify(rH && rH.room.mode));

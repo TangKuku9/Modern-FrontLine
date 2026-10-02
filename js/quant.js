@@ -5,7 +5,26 @@
 export const POS_STEP = 0.01;                       // 1 cm；i16 量程 ±327 m，地图 80 m 见方
 export const YAW_SCALE = 65536 / (Math.PI * 2);     // yaw 折叠到 [0,2π) 后用满 u16
 export const PITCH_STEP = 1e-4;                     // i16 ⇒ ±3.27 rad，够用（clamp 在 ±1.5）
-export const LOOK_STEP = 0.01;                      // 上行鼠标位移，单位是"像素计数"的原值
+// 上行鼠标位移（mdx/mdy），单位是"像素计数"的原值。
+//
+// LOOK_STEP 与 LOOK_MAX 是**一对**，两个数必须一起看：i16 只有 ±32767 格，而
+// 一格代表多少计数同时决定精度（越小越准）和量程（32767 × LOOK_STEP = 每拍最多报多少计数）。
+// 改动前是 0.01 ⇒ 量程 ±327.67 计数/拍，高 DPI 鼠标一次用力甩枪轻松超过，而客户端本地
+// 预测用的是**没被钳过**的那份 mdx（服务端拿钳后的值积分）—— 快甩时本地转到位、
+// 20Hz 快照再拽回来，表现为持续的"甩枪弹回"橡皮筋，且灵敏度越低越明显（乘出来更小）。
+//
+// 量程按"每拍最大角速度"折算：最慢一档灵敏度 0.2（js/player.js:VIEW_LIMITS）× 0.0022
+// （player._sim 里那个常数）= 4.4e-4 rad/计数。取 1000 计数/拍 ⇒ 0.44 rad/拍 = 26.4 rad/s
+// ≈ 1513°/s —— 比任何真人甩枪都快一个量级，正常操作一辈子碰不到这个上限。
+// 精度那一半：1/32 计数恰好是二进制可精确表示的数（0.03125），乘灵敏度之后远小于
+// 一像素对应的角位移；而且 `unpackLook(packLook(v))` 因此是**逐位精确**的，
+// 客户端本地用它的读数与服务端解出来的读数不会差半个 ULP。
+export const LOOK_STEP = 1 / 32;                    // 计数/格（i16 ⇒ ±1023.97 计数）
+export const LOOK_MAX = 1000;                       // 每拍最多上报多少计数（±），见上面那段折算
+// i16 那一格的上限（LOOK_MAX / LOOK_STEP = 32000 ≤ 32767）。单独写出来是因为
+// "在哪个单位上夹"这件事错过一次：把计数钳制写成对**格数**钳制，量程会塌成
+// LOOK_MAX × LOOK_STEP = 31.25 计数/拍 —— 比改动前的 327.67 还小十倍，而它不报错。
+export const LOOK_CODE_MAX = Math.floor(LOOK_MAX / LOOK_STEP);
 export const VEL_STEP = 0.01;                       // 速度 1 cm/s，客户端用来推步态与外插
 
 export const Q = {
@@ -17,7 +36,7 @@ export const Q = {
   unpackPitch: (n) => n * PITCH_STEP,
   packHp: (v) => Math.max(0, Math.min(255, Math.round(v))),
   unpackHp: (n) => n,
-  packLook: (v) => clampQ(Math.round(v / LOOK_STEP), 32767),
+  packLook: (v) => Math.round(clampQ(v, LOOK_MAX) / LOOK_STEP),
   unpackLook: (n) => n * LOOK_STEP,
   packVel: (v) => clampQ(Math.round(v / VEL_STEP), 32767),
   unpackVel: (n) => n * VEL_STEP,
@@ -26,6 +45,14 @@ export const Q = {
 };
 
 function clampQ(n, m) { return n > m ? m : n < -m ? -m : n; }
+
+// 客户端本地预测要用的**就是上线的那一个数**。
+//
+// 为什么必须共用这一句：本地用全量、线上用钳后值，两边的 yaw 就会在每一次大位移上分家，
+// 而快照每 20Hz 把权威 yaw 覆盖回来 —— 症状是"快甩弹回"，不报错、不崩，只是手感坏。
+// 判据在 test/net-audit.mjs 的 E 段（往返等于本地读值，且大位移被夹到同一个上限）。
+// 只对有限数做（输入对象可能是 `unpackInput` 出来的整份，也可能是别处手工拼的）。
+export const roundLook = (v) => (Number.isFinite(v) ? Q.unpackLook(Q.packLook(v)) : v);
 
 // 实体姿态位
 export const FLAG = {

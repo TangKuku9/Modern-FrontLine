@@ -7,16 +7,18 @@
 // 权威侧不碰渲染。重放时把世界侧副作用（命中、特效、噪声）关掉，只重跑自身状态。
 import * as THREE from 'three';
 import { NetPlayer, INTERP_DELAY } from './remote.mjs';import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
-import { packInput, teamId, weaponId, FLAG, WORLD, uavBit } from '../quant.js';
+import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
 import { uavFromFlags } from '../match-rules.js';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { foldJudge } from './idle-ruler.mjs';
 import { clamp } from '../util.js';
+import { viewSettingsOf } from '../player.js';
+import { escHtml } from '../escape.js';
 import { addAccountXp, addLocalXp } from '../progress.mjs';
 import { Sentry, Heli, flagMesh } from '../mp.js';
 import { Projectile } from '../combat.js';
-import { tabNonce } from '../account.js';
+import { openSocket, tabNonce } from '../account.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
 // 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
@@ -24,11 +26,12 @@ const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Sprint | FLAG.OnGround | 
 export class NetClient {
   constructor(game, opts = {}) {
     this.game = game;
-    // 握手带不了 x-tab 头，本台默认连接把标签页选择器放进 URL（?tab=，与跨台票
-    // ?ticket= 同一个先例）—— 要账号的服靠它在握手那一刻认出"这个标签页是谁"。
-    // 跨台的 url 由调用方给（身份由票钉死），不走这条默认拼接。
-    const tab = tabNonce();
-    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${tab ? '?tab=' + encodeURIComponent(tab) : ''}`;
+    // 握手带不了 x-tab 头，本台默认连接把标签页选择器放进 **WebSocket 子协议**
+    // （openSocket）—— 要账号的服靠它在握手那一刻认出"这个标签页是谁"。
+    // M11 之前这里把它拼在 URL 上（?tab=）：那个位置会落进反向代理的访问日志与浏览器历史。
+    // 跨台的 url 由调用方给（身份由票钉死），不带本台的选择器。
+    this.tab = opts.url ? '' : tabNonce();
+    this.url = opts.url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
     this.name = opts.name || '士兵';
     this.team = opts.team === 'B' ? 'B' : 'A';
     // 房间的显示名（联机大厅"创建房间"带来）。可选：不带就是"没起名"，
@@ -86,7 +89,7 @@ export class NetClient {
 
   connect() {
     return new Promise((res, rej) => {
-      const ws = this.ws = new WebSocket(this.url);
+      const ws = this.ws = openSocket(this.url, this.tab);
       ws.binaryType = 'arraybuffer';
       // res/rej/timer 挂在实例上而不是只留在闭包里：进场失败有四个来源，其中"服务端拒绝"
       // 发生在 onControl 里 —— 那是个类方法，看不见 Promise 执行函数的作用域。曾经直接在
@@ -99,7 +102,7 @@ export class NetClient {
         this._opened = true;
         const j = this._join;
         if (j) { clearTimeout(j.timer); j.timer = setTimeout(() => this.settleJoin(new Error('连接超时：8 秒没等到进场应答')), 8000); }
-        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout, streaks: this.streaks, title: this.title || undefined }));
+        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout, streaks: this.streaks, title: this.title || undefined, view: viewSettingsOf(this.game) }));
       };
       ws.onmessage = (m) => {
         if (typeof m.data === 'string') { this.onControl(JSON.parse(m.data)); return; }
@@ -189,8 +192,16 @@ export class NetClient {
       if (!this.welcome) this.settleJoin(new Error('服务端：' + j.msg));
       else this.events.push({ e: 'serverError', msg: j.msg });
     } else if (j.t === 'pong') {
-      this.rtt = performance.now() - j.c;
-      this.pingGot = (this.pingGot || 0) + 1;
+      // c 是服务端原样回抄的客户端时间戳，**要校验类型**：缺失 / 是字符串 / 被中间改过时
+      // `performance.now() - c` 得 NaN，而 rtt 是平滑过的读数 —— 一枚 NaN 会把它永久弄脏，
+      // 记分板那一行从此印 "ping NaN ms"（低危账点名的那格）。丢弃并计数，别让它进 rtt。
+      const c = j.c;
+      if (typeof c === 'number' && Number.isFinite(c)) {
+        this.rtt = performance.now() - c;
+        this.pingGot = (this.pingGot || 0) + 1;
+      } else this.pingBad = (this.pingBad || 0) + 1;
+      // 服务端每秒一次把"权威端认为你还剩几颗"顺这一路带下来（见 _reconcileNades）。
+      if (j.nades) this._reconcileNades(j.nades);
     } else if (j.t === 'note') {
       // 服务端优雅下线时给的那句话 —— 比"连接断了"有用得多，玩家知道是维护不是自己网卡
       this.serverNote = String(j.msg || '');
@@ -212,6 +223,39 @@ export class NetClient {
 
   sendPing() {
     if (this.ws && this.ws.readyState === 1) { this.pingSent = (this.pingSent || 0) + 1; this.ws.send(JSON.stringify({ t: 'ping', c: performance.now() })); }
+  }
+
+  // ── 投掷物数量的自愈（低危账最后一格：它两端各记各的，分歧后当局不自愈）──
+  // 背景：本地预测在 `beginThrow` 那一拍就把 count-- 扣掉了（js/weapon-state.js），而服务端
+  // 只在**真的消费到那一拍输入**时才扣。输入队列溢出时丢的正是最旧那拍（server/room.mjs:
+  // applyInput），于是客户端认为自己已经没有雷了（按 4 没反应、HUD 显示 0），权威端其实还有。
+  // 服务端每一秒顺 pong 把自己的数给下来一次（server/net-server.mjs:nadeCountsOf）。怎么校、
+  // 由下面三个方向性决定：
+  //  // ① **只补不扣**。服务端那一格是**滞后**的读数（最坏相差一个 RTT，且它记的是服务端
+  //    已经消化到的那一拍）。双向覆盖的形状是：本地刚按 Q 扣到 2 ⇒ 服务端那份滞后的 3
+  //    立刻把 2 拽回 3 ⇒ 下一份又回到 2 —— HUD 自己闪一下，比不分歧更像 bug。只填"客户端
+  //    偏少"这一侧，而那正是输入丢失唯一造得出来的方向（服务端比客户端少，意味着同一条
+  //    beginThrow 被服务端算了两次，那条路不存在）。
+  // ② **出手途中不许改**。beginThrow 已经扣了、releaseGrenade 还没发生的那一小段窗口里，
+  //    服务端的读数必然是旧值 —— 此刻补回去，玩家会看到雷的数量自己加回来、出手时又扣掉。
+  //    这里按 ws.grenade / cook / use 那几个状态判"手上有没有正在出手的东西"。
+  // ③ **改了要留数**（this.nadeResync）。这条链的失效是全静默的：它会自己好起来，玩家只会
+  //    觉得"刚才好像点击没反应"。不计数的话它就再也不会被看见第二次。
+  _reconcileNades(nades) {
+    const pl = this.game && this.game.player;
+    if (!pl) return;
+    const ws = pl.ws;
+    if (ws && (ws.grenade || ws.cooking)) return;                       // ② 已经捏在手上
+    if (ws && ws.state !== 'idle' && ws.state !== 'reload') return;     // ② 正在投掷/使用
+    const fix = (inv, auth) => {
+      if (!inv || typeof auth !== 'number' || !Number.isFinite(auth)) return false;
+      const v = Math.max(0, Math.min(Math.floor(auth), inv.max));       // ① 只补：客户端偏多的一侧不动
+      if (v <= inv.count) return false;
+      inv.count = v; return true;
+    };
+    const a = nades ? fix(pl.lethal, nades.lethal) : false;
+    const b = nades ? fix(pl.tactical, nades.tactical) : false;
+    if (a || b) this.nadeResync = (this.nadeResync || 0) + 1;           // ③
   }
 
   // 对局内聊天与举报（差距 43/45）走**这条连接**：房间开出来的局它是大厅那条 socket，
@@ -271,6 +315,14 @@ export class NetClient {
       if (!inp.fire) this.suppressFireUntilRelease = false;
       inp.firePressed = false; inp.fire = false;
     }
+    // ── 视角位移：本地要先量化成**上行的那一个数** ──
+    // 这条是"甩枪弹回"的另一半成因（另一半是钳制上限太窄，见 js/quant.js:LOOK_STEP 那段）。
+    // 上行经 encodeInput 会把 mdx 压到 i16 的格子上；本地若拿原始全量积分，两边 yaw
+    // 每拍都差一点，而快照每 20Hz 把权威 yaw 覆盖回来 —— 表现为大位移时"甩过去又被拽回"。
+    // 就地改这一份 `inp`：main.js 的顺序是 recordInput → pl.update(dt, inp)（同一个对象），
+    // 所以本地预测与日记本里存的（回滚重放会重跑它）都跟着变成同一个数。
+    // 只对有限数做：调用方可能手工拼一份输入（判据里就有）。
+    inp.mdx = roundLook(inp.mdx); inp.mdy = roundLook(inp.mdy);
     const t16 = tick & 0xffff;
     // 报给服务端的"我看到哪一拍"。时钟口径是**服务端拍号**，不是本机 tick —— 两者差着一个
     // 任意的起点偏移，把它混进延迟补偿会让回溯量整体偏掉一个常数（而那个常数随每个人
@@ -312,6 +364,16 @@ export class NetClient {
   }
 
   onSnapshot(snap, now) {
+    // 服务端的**拍频**用它自己的拍号量：两次快照之间的 tick 差 ÷ 墙钟差。
+    // 尺子退路那一支要用它（js/net/idle-ruler.mjs:foldJudge 的 tickHz），写死 60 的话
+    // 服务端一改拍频就静默失准。间隔 0.15 s 以上才采（太密的话 tick 差只有几拍、相对误差大），
+    // 并用指数平滑吸收"到达时刻"的抖动；tick 是 16 位回绕的，差值被限幅挡掉。
+    if (Number.isFinite(now) && this._tickAt !== undefined && now - this._tickAt > 0.15) {
+      const dTick = (snap.tick - this._tickAtTick) >>> 0;
+      const hz = dTick / (now - this._tickAt);
+      if (Number.isFinite(hz) && hz > 5 && hz < 240) this.tickHz = this.tickHz ? this.tickHz * 0.8 + hz * 0.2 : hz;
+    }
+    if (Number.isFinite(now)) { this._tickAt = now; this._tickAtTick = snap.tick; }
     this.snaps++; this.snapGap = 0; this.serverTick = snap.tick;
     // 到达时刻是渲染时刻的坐标原点（remote.mjs 的插值也用它），所以流水在这里记。
     this.snapLog.push({ t: now, tick: snap.tick });
@@ -685,7 +747,7 @@ export class NetClient {
         const a = this.history.find(h => h.j && h.tick === start);
         const b2 = this.history.find(h => h.j && h.tick === ((start + 1) & 0xffff));
         const stepMeasured = a && b2 ? Math.hypot(b2.j.pos[0] - a.j.pos[0], b2.j.pos[2] - a.j.pos[2]) : null;
-        const fj = foldJudge({ corrected: r.corrected, stepMeasured, speed: Math.hypot(pl.vel.x, pl.vel.z) });
+        const fj = foldJudge({ corrected: r.corrected, stepMeasured, speed: Math.hypot(pl.vel.x, pl.vel.z), tickHz: this.tickHz || 60 });
         this.foldN = (this.foldN || 0) + 1;
         if (fj.floored) this.foldFloor = (this.foldFloor || 0) + 1;
         if (stepMeasured === null) this.foldVel = (this.foldVel || 0) + 1;
@@ -829,7 +891,13 @@ export class NetClient {
       this.events.push(ev);
       if (ev.e === 'kill') {
         const g = this.game;
-        if (ev.victim === (g.player && g.player.name)) { g.onNetDeath && g.onNetDeath(ev); }
+        // "死的是不是我"必须**先认 cid**。按名字判的形状是：同名的两个人同房时，
+        // 一个死了两台机器一起弹死亡画面，而真正死了的那一台可能什么都没弹。
+        // cid 拿不到（老服务端 / Bot 击杀）才退回名字 —— 那条路是兜底，不是主路。
+        const iAmVictim = ev.victimCid != null
+          ? ev.victimCid === this.cid
+          : ev.victim === (g.player && g.player.name);
+        if (iAmVictim) { g.onNetDeath && g.onNetDeath(ev); }
         g.onNetKill && g.onNetKill(ev);
       } else if (ev.e === 'respawn' && ev.cid === this.cid) {
         // 重生是服务端发起的整体重置：本地那一拍之前的 journal/待重放输入全部作废，
@@ -1330,8 +1398,12 @@ export class NetClient {
   }
 
   scoreboardHTML() {
+    // `r.name` 是**别的玩家**的呼号，而这里拼的是 innerHTML —— 于是它必须过 escHtml（M10）。
+    // 另外几格都是服务端算出来的数字，插进模板里本来就到不了"当标签解析"那一步。
+    // 眼下服务端的呼号白名单（NAME_RE）把 `<` 压死了，所以这条路够不到：属纵深防御 ——
+    // 白名单一放宽、换个服、或者以后接上跨服房间目录，它就是存储型 XSS。
     const row = (r) => `<tr class="${r.cid === this.cid ? 'me ' : ''}${r.alive === false ? 'dead' : ''}">`
-      + `<td>${r.rank || ''}</td><td>${r.name}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>${r.a || 0}</td></tr>`;
+      + `<td>${r.rank || ''}</td><td>${escHtml(r.name)}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>${r.a || 0}</td></tr>`;
     const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>#</th><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
     const rows = (this.board && this.board.rows) || [];
     // 自由混战：一张表按名次排（与单机 MPMatch.scoreboardHTML 同形）—— 分两队的表

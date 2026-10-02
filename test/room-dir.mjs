@@ -245,6 +245,32 @@ console.log('\n── D. 门票（要账号的服）：验会话才发票 / 目�
   await sleep(100);
 }
 
+// ───────────────────────── V. 隐式扫描的间隔（M7）─────────────────────────
+console.log('\n── V. list() 的隐式扫描有最小间隔（写放大）──');
+{
+  // list() 是 /api/rooms 的底层调用，而那个接口在访客服上**匿名可达**：
+  // 每次 list 都扫一遍库 = 每次 GET 两笔 DELETE 打在这个跨进程共享的 SQLite 上。
+  // 代价与收益都写在这里，判据量的是两端：间隔内不许写库、间隔一到照旧扫掉。
+  let clock = 5_000_000;
+  const file = tmpDb('sweep');
+  const mkDir = (url, boot) => new RoomDirectory({ file, url, boot, ttlMs: 1000, ticketTtlMs: 500, now: () => clock, sweepMinMs: 5000 });
+  const a = mkDir('http://a:1', 'boot-a');
+  const b = mkDir('http://b:2', 'boot-b');
+  a.publishAll([{ id: 'r1', title: '房一', map: 'yard', mode: 'tdm', players: 1, max: 16, ready: 0, time: 10, score: 75, state: 'waiting', host: '甲' }]);
+  clock += 10;
+  b.sweep();                       // 显式扫描：把"上次扫过"钉在 T0
+  ok('V1【先决】显式 sweep 之后 sweepIfDue 说"不用扫"（心跳那条路不受间隔影响）', b.sweepIfDue() === false);
+  clock += 1500;                   // 越过 TTL（1000ms），但离上次扫描只有 1500ms < 5000
+  ok('V2 间隔内 list() **不写库**：死行还在（这就是换来"每次 GET 都不写库"的那点代价）',
+    b.list().length === 1, `rows=${b.list().length}（TTL=1000 · 间隔=5000）`);
+  ok('V3 而且"这次没扫"是能被读出来的（否则分不清"没扫"与"扫了但没人死"）', b.sweepIfDue() === false);
+  clock += 4000;                   // 累计 5500 > 5000
+  ok('V4 间隔一过，list() 照旧把死行扫掉 —— 陈旧上限就是 sweepMinMs，不是"永远不扫"',
+    b.list().length === 0, `rows=${b.list().length}`);
+  ok('V5 这段时间里 list() 一共只写了一次库（调用次数与写库次数解耦）',
+    b.sweepIfDue() === false, '刚扫过：再调一次也不写');
+}
+
 console.log('');
 if (bad) { console.log(`RED  ${n - bad}/${n} 通过，${bad} 条失败`); process.exit(1); }
 console.log(`GREEN  跨进程房间目录：${n}/${n} 通过`);

@@ -38,6 +38,24 @@ export const ROOM_CHAT_HIST = 40;
 // 聊天速率：稳态每 600 ms 一条，另给 10 秒窗口内 6 条的突发余量。
 // 正常打字快的人一秒也就两三条；不限的话"进对局"就变成"谁的刷屏赢"。
 export const SAY_MIN_MS = 600, SAY_BURST = 6, SAY_BURST_MS = 10000;
+// ── "重帧"的按连接限额（M7）──
+// 与聊天那一套同一个形状，但管的是另一件事：createRoom / joinRoom / leaveRoom / botAdd…
+// 每一种都要付真金白银 —— 一次全大厅广播，开着目录的部署还多一次跨进程写。
+// 总闸（net-server 的 wsMsgPerSec=240/s）是**不分帧型**的，所以一条连接 240 帧/秒地
+// 建房→退房就能把所有人的大厅拖慢，而玩家侧看到的只是"刷新很慢"。
+// 哪几条帧要**付钱**（一次全大厅广播；开着目录的部署还多一次跨进程写）。
+// 放在 lobby 而不是 net-server：付钱的是这一层，也只有这一层分得清"改设置"和"发一句话"。
+export const HEAVY_FRAMES = new Set(['createRoom', 'joinRoom', 'quickRoom', 'leaveRoom', 'botAdd', 'botDel', 'roomCfg']);
+// 分**两档**（这是判据逼出来的，不是先验的）：
+//   · 最小间隔只套在"房间生命周期"那一档 —— 每次成功都要建/删座位、广播、写目录，
+//     而人一分钟也做不了几次；
+//   · 突发额度套在所有重帧上。
+// 起初我把最小间隔套在全部七条帧上，`test/room-flow.mjs` 当场红了两段：房主连点
+// "+ Bot"（20 连发）与连着改设置（两句 roomCfg 挨着发）都是**正常操作**，套上 250 ms
+// 之后它们全被回"操作太快了，缓一下" —— 那是把正常操作当攻击。
+// 但配置帧的洪水照样要挡（一次 roomCfg 也是一次全大厅广播），所以那一档的额度不动。
+export const HEAVY_MIN_MS = 250, HEAVY_BURST = 40, HEAVY_BURST_MS = 10000;
+export const HEAVY_MIN_FRAMES = new Set(['createRoom', 'joinRoom', 'quickRoom', 'leaveRoom']);
 // 空的等待房间留多久。比 live 那份的 ROOM_IDLE_MS(60s) 长得多是有意的：
 // 大厅里"刚建好、还差一个人"的房，是会被别人过几分钟才点进来的。
 export const WAIT_IDLE_MS = 5 * 60 * 1000;
@@ -81,7 +99,11 @@ export function flat(s, n) {
 }
 // 房号沿用 live 那一份的白名单（net-server:pickRoom）。中文房名当房号会被洗成空串，
 // 症状是"建了个房，人却进了别人的房间" —— 所以房名与房号是两格，各洗各的。
-const roomId = (raw) => String(raw == null ? '' : raw).slice(0, 32).replace(/[^A-Za-z0-9_.-]/g, '');
+// 房号的白名单与长度上限**只有这一处**（低危账：net-server 的 pickRoom 曾经自己写了一份
+// 48 —— 两处各截各的，于是同一个房号在两处会截成两个键）。
+export const ROOM_ID_MAX = 32;
+export const ROOM_ID_BAD = /[^A-Za-z0-9_.-]/g;
+export const roomId = (raw) => String(raw == null ? '' : raw).slice(0, ROOM_ID_MAX).replace(ROOM_ID_BAD, '');
 
 // 一张等待态房间。刻意不做成类：它没有行为，行为全在下面的 Lobby 里 ——
 // 分两处放的话"改一处的规则"会在另一处漏掉，而这类漏掉都不会报错。
@@ -127,12 +149,19 @@ export class Lobby {
     // 而原因（不是房主 / 有人没准备 / 刷屏被限流 / 房间号撞了）完全不同，只能从这里分辨。
     this.stat = {
       say: 0, sayRate: 0, sayEmpty: 0, sayNoRoom: 0,
+      // 重帧被限速的次数（M7）。和 sayRate 一样：限速生效的样子在玩家侧只是
+      // "点了没反应"，不数出来就只能靠猜。
+      heavyRate: 0,
       // 举报：来了多少条、多少条找不到人、多少条是自己举报自己。后两者都是"报了但没用"——
       // 与 streak.rejected 同一性质的读数：没生效的举报在玩家侧只表现为"石沉大海"。
       report: 0, reportNoTarget: 0, reportSelf: 0,
+      // 重名导致的拒绝（M3）。它**不是**"找不到人"：人是有的，只是不止一个。
+      // 合成一格的话，"玩家说举报了但没生效"就分不清是名字打错了还是重名 ——
+      // 而这两件事的修法完全不同（一个是打字，一个是让重名的人改呼号）。
+      reportAmbiguous: 0,
       // 私聊与表情：同样把"发了但没用"单列（找不到人 / 私聊自己 / 没有这个表情），
       // 否则它们和正常发言混在一格里，谁也归不了因。
-      whisper: 0, whisperNoTarget: 0, whisperSelf: 0,
+      whisper: 0, whisperNoTarget: 0, whisperSelf: 0, whisperAmbiguous: 0,
       emote: 0, emoteBad: 0,
       join: 0, full: 0, playing: 0, dupId: 0, badId: 0, quota: 0, badMode: 0,
       badMode: 0,
@@ -240,8 +269,12 @@ export class Lobby {
     this.rooms.set(id, room);
     return room;
   }
-  _seat(ws, name, loadout, xp, account, streaks) {
-    return { sid: sidOf(ws), name, team: 'A', ready: false, xp: xp | 0, account: account || null, ws, loadout: loadout || null, streaks: Array.isArray(streaks) ? streaks : null };
+  _seat(ws, name, loadout, xp, account, streaks, view) {
+    // view = 这个人的视角设置（sens/adsSens/invertY）。它**只是过一手**：这里不校验也不清洗
+    // （清洗在 server/room.mjs:addClient，那是权威端唯一认这份数据的地方），
+    // 开局时由 net-server:beginLive 原样交给 enterMatch。不存它的话，"从房间开出来的局"
+    // 会拿服务端默认的 1.0 积分视角，而"直连的局"用的是客户端那份 —— 两个入口两种手感。
+    return { sid: sidOf(ws), name, team: 'A', ready: false, xp: xp | 0, account: account || null, ws, loadout: loadout || null, streaks: Array.isArray(streaks) ? streaks : null, view: view || null };
   }
   _total(room) { return room.seats.size + (room.bots ? room.bots.size : 0); }
   _teamCount(room, t) {
@@ -352,7 +385,7 @@ export class Lobby {
     const room = this._mkRoom(id, flat(msg.title, 24), MAP_IDS.has(msg.map) ? msg.map : 'yard',
       mode, cleanMinutes(msg.minutes), cleanScore(msg.scoreLimit, mode));
     room.hostKey = hostKey;
-    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks);
+    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks, msg.view);
     seat.ready = true;                      // 房主不用点准备：他按下开始就是他的准备
     room.hostSid = seat.sid;
     if (!this._place(room, seat)) { this.rooms.delete(id); this.stat.full++; return { ok: false, message: '房间已满' }; }
@@ -367,7 +400,7 @@ export class Lobby {
     const room = this.rooms.get(id);
     if (!room) { this.stat.badId++; return { ok: false, message: '那间房已经不在了' }; }
     if (room.stage !== 'waiting') { this.stat.playing++; return { ok: false, message: '那间房正在对局中，等它打完或在列表里另找一间' }; }
-    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks);
+    const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks, msg.view);
     // 满了而补人开着：先让一个 Bot 站起来（真人优先），再放座位。
     const yielded = this._makeRoomForHuman(room);
     if (!this._place(room, seat)) {
@@ -424,6 +457,9 @@ export class Lobby {
     // 连杀选单搭同一句车（同一条理由）：从"编辑装备"回房间屏时重发的这一句把它一起刷新。
     // 只存不洗：开局那一刻 room.addClient 的 resolveStreaks 会白名单重建，非法项在那一关被换掉。
     if (Array.isArray(msg.streaks)) seat.streaks = msg.streaks;
+    // 视角设置同样搭这一句车（同一条理由）：玩家在设置里调完灵敏度之后回到房间屏，
+    // ready 会重发一次，这一格跟着刷新 —— 不用退出房间再进来。
+    if (msg.view && typeof msg.view === 'object') seat.view = msg.view;
     if (room.stage !== 'waiting') return;         // 开局之后这一格没有意义
     // 房主恒为已准备（见 createRoom）。让他"取消准备"会造出一个自相矛盾的状态：
     // 判据要求人人准备，而唯一能让它不成立的那个人正是能按开始的那个人。
@@ -614,6 +650,25 @@ export class Lobby {
   // 速率与长度都在这里判，一条都不交给客户端 —— 客户端那些只是回车键的体验。
   // 公开给 net-server 的对局内聊天用（matchSay）：限流是**按连接**的账，
   // 大厅一条、对局一条各数各的就等于给了刷屏双倍额度 —— 所以两个入口共这一个闸。
+  // 重帧的闸（M7）。与 allowSay 同一张 WeakMap，但**两个桶各数各的** ——
+  // 合成一个桶的话，一个在大厅聊天的人会顺手把自己的建房额度吃掉（反之亦然），
+  // 而那两条限额挡的根本不是同一件事。
+  // minGated = 这一帧是不是"房间生命周期"那一档（调用方按 HEAVY_MIN_FRAMES 判）。
+  // 只有它会推 r.hLast：配置帧若也推，房主连点"+ Bot"就会把自己后面那句 leaveRoom
+  // 一起挡掉 —— 两档各记各的账，混用一个时间戳等于让一档吃掉另一档的额度。
+  // 默认 true 是**故意**的：漏传参数的那一档落回更严的那边，而不是落回不设防。
+  allowHeavy(ws, now, minGated = true) {
+    let r = this.rate.get(ws);
+    if (!r) { r = { last: 0, burst: [], hLast: 0, hBurst: [] }; this.rate.set(ws, r); }
+    if (!r.hBurst) { r.hLast = 0; r.hBurst = []; }
+    if (minGated && now - r.hLast < HEAVY_MIN_MS) return false;
+    r.hBurst = r.hBurst.filter(t => now - t < HEAVY_BURST_MS);
+    if (r.hBurst.length >= HEAVY_BURST) return false;
+    r.hBurst.push(now);
+    if (minGated) r.hLast = now;
+    return true;
+  }
+
   allowSay(ws, now) {
     let r = this.rate.get(ws);
     if (!r) { r = { last: 0, burst: [] }; this.rate.set(ws, r); }
@@ -686,7 +741,10 @@ export class Lobby {
     let waiting = 0, playing = 0;
     for (const r of this.rooms.values()) (r.stage === 'playing' ? playing++ : waiting++);
     return { ...this.stat, conns: this.conns.size, rooms: this.rooms.size, waiting, playing,
-      maxSeats: MAX_SEATS, sayMinMs: SAY_MIN_MS, sayBurst: SAY_BURST };
+      maxSeats: MAX_SEATS, sayMinMs: SAY_MIN_MS, sayBurst: SAY_BURST,
+      // 额度本身要可读（运维得看得见自己在跑什么档）。最小间隔那一档要**点名**是哪几条帧：
+      // 只报数字的话，"配置帧到底受不受这条约束"在 /healthz 上根本分不出来。
+      heavyMinMs: HEAVY_MIN_MS, heavyBurst: HEAVY_BURST, heavyMinFrames: [...HEAVY_MIN_FRAMES] };
   }
 }
 
