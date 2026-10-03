@@ -200,6 +200,10 @@ export class WeaponState {
       // mirror：告诉权威端"投掷者本地预测了这一颗"——它的 proj 事件据此带 self，
       // 投掷者的客户端不再为它建副本（否则眼前两枚火箭）。
       if (!replay) game.projectiles.push(new Projectile(game, 'rocket', origin.clone().addScaledVector(fwd, 0.8), fwd.clone().multiplyScalar(55), pl, 10, { mirror: true }));
+      // 发射器同样要给视图模型一份 shot 事件：枪口火光、顶枪、枪口烟都从它来。
+      // 以前只有 hitscan 那条路发事件 —— FLASH_BY_TYPE 里的 launcher 档是死配置，
+      // RPG 击发时枪模毫无反应，后坐只剩相机 punch 在硬扛。
+      if (wantFx) this.sink({ kind: 'shot', tracers: [], fwd, recoilV: st.recoilV, suppressed: st.suppressed, flashHide: st.flashHide, shell: null });
     } else {
       // 散布一定要算、随机数一定要抽，哪怕这一发不去打世界
       const spread = this.currentSpread() * DEG * 0.5;

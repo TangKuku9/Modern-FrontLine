@@ -175,6 +175,9 @@ export function createSoldierModel(styleName, weaponId, attachments = {}, camo =
   gun.position.set(0.08, 0.4, -0.3);
   torso.add(gun);
   parts.gun = gun; parts.muzzle = gunInfo.muzzle;
+  // RPG 弹头：第三人称也要跟着膛内弹药走（打出去就离膛）——可见性由调用方经
+  // animateSoldier 的 s.rocket 位驱动（Bot 读 mag，NetPlayer 在开火/装填间翻转）。
+  parts.warhead = gunInfo.warhead || null;
   parts.gunHome = gun.position.clone();
   parts.gunBaseRotX = gun.rotation.x;
   const gripOff = new THREE.Vector3(0, -0.03, 0.04);
@@ -295,6 +298,9 @@ export function animateSoldier(p, s, dt) {
       if (sp > 0) p.gun.position.lerp(GUN_SPRINT, sp);
     }
   }
+  // 弹头可见性两个分支共用：膛里有火箭才坐在筒口。s.rocket 缺省算"有"——
+  // 不传这个位的调用点（菜单预览）看到的永远是装填完毕的那把枪。
+  if (p.warhead) p.warhead.visible = s.rocket !== false;
   // 手臂(两个分支共用):肩固定、手在枪上,两骨 IK 解肘。靶点经 gunPoint 跟着枪的
   // 当下转角走 —— 活人枪没转,退化为 gun.position + offset;死人枪转了 -π/2,靶点落在
   // 贴胸那把枪的握把/护木上,落成"搂着枪倒下"。旧写法四根胶囊建模时摆死,这就是

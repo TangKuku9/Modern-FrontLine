@@ -392,6 +392,96 @@ const play = await page.evaluate(async () => {
     `Δ=${arm.handMesh.position.distanceTo(arm.leftHome).toFixed(4)}`);
   ok('H1 换弹结算弹药', ws.state === 'idle' && ws.w.mag === ws.w.stats.mag, `state=${ws.state} mag=${ws.w.mag}`);
 
+  // —— R 组：分件的"名实相符"。弹头不是弹匣、待装壳不常驻机匣、左轮装弹要甩巢。
+  // 判据量的是网格自己的位置与可见性，不是动画曲线 —— 旧版这三处都是"info.mag
+  // 指着不该指的东西"：RPG 弹头吃"拔弹匣"动画（往下拽 25cm、隐身半程、再从下面
+  // 插回来）而击发时弹头纹丝不动；m870 的待装壳平时就贴在装弹口上；左轮拿 1mm
+  // 假弹匣让手对着不动的弹巢做完整套换弹戏。
+  // R1 RPG 弹头生命周期：击发离膛（天上那枚 Projectile 接替），装填从筒口**前方**
+  // 沿筒轴往后捅进膛（真机的前插装填）。
+  ws.replaceSlot(0, { id: 'rpg', att: {}, camo: 'none' }, 1, 3);
+  frames(60); ws.cool = 0; ws.cycleT = 0;
+  let rh = vm.groups[ws.cur];
+  ok('R1 RPG 没有弹匣、有弹头', !rh.info.mag && !!rh.info.warhead, `mag=${!!rh.info.mag} warhead=${!!rh.info.warhead}`);
+  ok('R1 满膛时弹头坐在筒口', rh.info.warhead.visible, 'visible=' + rh.info.warhead.visible);
+  shot();
+  const rFlash = vm.flashT, rKick = vm.vmKick;
+  frames(2);
+  ok('R1 击发后弹头离膛（跟天上那枚火箭走）', !rh.info.warhead.visible && ws.w.mag === 0,
+    `visible=${rh.info.warhead.visible} mag=${ws.w.mag}`);
+  ok('R1 发射器击发有火光与顶枪（launcher 档不再是死配置）', rFlash > 0 && rKick > 0,
+    `flashT=${rFlash.toFixed(4)} kick=${rKick.toFixed(4)}`);
+  ws.startReload();
+  let emptyHidden = true, visLate = true, minZ = 9, minReturnY = 9, handAway = 0, rn = 0;
+  const rArm = rh.arms;
+  for (let i = 0; i < 400 && ws.state === 'reload'; i++) {
+    frames(1); rn++;
+    const wh = rh.info.warhead, k = ws.stateT / ws.stateDur;
+    if (k < 0.4) emptyHidden = emptyHidden && !wh.visible;   // 空膛就是空膛：不再坐着装样子
+    if (k > 0.5) visLate = visLate && wh.visible;            // 新火箭兜上来之后全程可见
+    minZ = Math.min(minZ, wh.position.z);
+    // 入膛段（k>0.62）弹头沿筒轴回来：y 不许低于基座 —— 旧弹匣规则是从下方 25cm
+    // 一路插回来的，y 一度低于基座 0.25；前插装填的高度差只有尾段对中的 1cm。
+    if (k > 0.62 && wh.userData.base) minReturnY = Math.min(minReturnY, wh.position.y - wh.userData.base.y);
+    if (rArm.handMesh.position.distanceTo(rArm.leftHome) > 0.06) handAway++;
+  }
+  frames(10);
+  ok('R1 空膛装填前 40% 弹头不可见（旧规则坐着等拔）', emptyHidden, `帧数=${rn}`);
+  ok('R1 装填后半程弹头可见（新手火箭被兜进来）', visLate, '');
+  ok('R1 装填中弹头到过筒口前方（前插装填）', minZ < -0.75, `最前 ${minZ.toFixed(3)} m（基座 z=${rh.info.warhead.userData.base.z.toFixed(3)}）`);
+  ok('R1⁻ 反证：入膛段沿筒轴回来，不从下方插回（旧弹匣规则 -25cm）', minReturnY >= -0.06, `入膛段最低 ${minReturnY.toFixed(3)} m`);
+  ok('R1 装填时副手离位去取弹', handAway > 10, `离位 ${handAway}/${rn} 帧`);
+  ok('R1 装填完弹头归位、膛内 +1', ws.state === 'idle' && ws.w.mag === 1 && rh.info.warhead.visible &&
+    rh.info.warhead.position.distanceTo(rh.info.warhead.userData.base) < 1e-6,
+    `state=${ws.state} mag=${ws.w.mag}`);
+  ws.replaceSlot(0, { id: 'm4', att: {}, camo: 'none' }, 30, 150);
+  frames(60);
+  cur = vm.groups[ws.cur];
+
+  // R2 霰弹枪待装壳：只在逐发装填的装弹窗口露面（gunmodel 把它摆在装弹口位），
+  // 平时端着枪不再有一发弹"贴"在机匣侧面。
+  ws.replaceSlot(0, { id: 'm870', att: {}, camo: 'none' }, 2, 20);
+  frames(60); ws.cool = 0; ws.cycleT = 0;
+  const rMag = vm.groups[ws.cur].info.mag;
+  const idleShell = rMag.visible;
+  ws.startReload();
+  let sawShell = false, sawGap = false;
+  for (let i = 0; i < 500 && ws.state === 'reload'; i++) {
+    frames(1);
+    if (rMag.visible) sawShell = true; else sawGap = true;
+  }
+  frames(10);
+  ok('R2 待装壳平时不露面', !idleShell, `idle visible=${idleShell}`);
+  ok('R2 逐发装填时待装壳按窗口露面', sawShell && sawGap, `见壳=${sawShell} 有空窗=${sawGap}`);
+  ok('R2 逐发装填结算满膛', ws.state === 'idle' && ws.w.mag === 6, `state=${ws.state} mag=${ws.w.mag}`);
+  ws.replaceSlot(0, { id: 'm4', att: {}, camo: 'none' }, 30, 150);
+  frames(60);
+  cur = vm.groups[ws.cur];
+
+  // R3 左轮装弹 = 甩巢：弹巢绕前铰接点甩出、倒壳、收回。旧版是 1mm 假弹匣带着
+  // 手对固定弹巢做"拔匣-押匣-插匣"，弹巢全程一动不动。
+  ws.replaceSlot(0, { id: 'revolver', att: {}, camo: 'none' }, 2, 18);
+  frames(60); ws.cool = 0; ws.cycleT = 0;
+  const rInfo = vm.groups[ws.cur].info;
+  ok('R3 左轮没有假弹匣、有甩巢组', !rInfo.mag && !!rInfo.cylPivot, `mag=${!!rInfo.mag} pivot=${!!rInfo.cylPivot}`);
+  let maxSwing = 0, dumps = 0;
+  const realShell3 = g.effects.shell;
+  g.effects.shell = (pos, dir, kind) => { if (kind === 'pistol') dumps++; };
+  ws.startReload();
+  for (let i = 0; i < 400 && ws.state === 'reload'; i++) {
+    frames(1);
+    maxSwing = Math.max(maxSwing, Math.abs(rInfo.cylPivot.rotation.y));
+  }
+  frames(10);
+  g.effects.shell = realShell3;
+  ok('R3 装弹时弹巢甩出（绕前铰点 ≥0.4 rad ≈ 真实开巢 34°）', maxSwing >= 0.4, `最大甩角 ${maxSwing.toFixed(2)} rad`);
+  ok('R3 甩满时倒壳（5 发 pistol 壳从甩开的弹巢退掉）', dumps >= 5, `倒壳 ${dumps} 发`);
+  ok('R3 装弹完弹巢收回、弹药结算', ws.state === 'idle' && ws.w.mag === 6 && Math.abs(rInfo.cylPivot.rotation.y) < 1e-9,
+    `state=${ws.state} mag=${ws.w.mag}`);
+  ws.replaceSlot(0, { id: 'm4', att: {}, camo: 'none' }, 30, 150);
+  frames(60);
+  cur = vm.groups[ws.cur];
+
   g.composer.render = realRender;
   g.clock = realClock; realClock.getDelta();
   return { out, shots: { bare: bare.flash.scale.x, hider: flashHider.flash.scale.x } };

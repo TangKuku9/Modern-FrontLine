@@ -31,7 +31,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   const root = new THREE.Group();
   // eject 是**抛壳口**的锚点：弹壳从这里出来，不是从枪口后方 0.4 m 的固定点。
   // 它必须是挂在枪上的 Object3D（跟 muzzle 一样），否则枪一动弹壳就落在旧位置。
-  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Object3D(), optic: 'iron', reticle: null, slide: null, bolt: null, pump: null, cylinder: null, grip: null, laserMod: null };
+  const info = { group: root, muzzle: new THREE.Object3D(), sight: new THREE.Vector3(), mag: null, warhead: null, leftHand: new THREE.Vector3(0, 0, -0.2), eject: new THREE.Object3D(), optic: 'iron', reticle: null, slide: null, bolt: null, pump: null, cylinder: null, cylPivot: null, grip: null, laserMod: null };
   root.add(info.eject);
   const low = !!opts.low;
 
@@ -50,6 +50,10 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     add(cgeo(0.042, 0.042, 0.95), furn, 0, 0.06, -0.15);
     add(cgeo(0.05, 0.05, 0.25), mat('gunWood'), 0, 0.06, -0.05);
     add(cgeo(0.06, 0.03, 0.14), metal, 0, 0.06, 0.37);
+    // 弹头（PG-7V）**不是弹匣**：击发时它跟着世界里那枚 Projectile 离膛，装填是把
+    // 新火箭从筒口前方捅进膛（viewmodel 的 warhead 分支）。它必须单独挂 info.warhead
+    // —— 旧版直接 info.mag = wh，于是换弹吃到"拔弹匣"动画：弹头往下拽 25cm、隐身、
+    // 再从下面装回来，而击发时弹头纹丝不动地坐在筒口。
     const wh = new THREE.Group(); wh.position.set(0, 0.06, -0.62); root.add(wh);
     add(cgeo(0.04, 0.045, 0.12), mat('gunGreen'), 0, 0, 0, 0, 0, 0, wh);
     add(new THREE.ConeGeometry(0.07, 0.25, 14).rotateX(-Math.PI / 2), mat('gunGreen'), 0, 0, -0.18, 0, 0, 0, wh);
@@ -58,7 +62,7 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     add(bgeo(0.03, 0.1, 0.04), mat('gunPoly'), 0, -0.03, -0.2, 0.1);
     add(bgeo(0.02, 0.05, 0.02), metal, 0, 0.12, -0.1);
     add(bgeo(0.02, 0.04, 0.02), metal, 0, 0.12, 0.08);
-    info.mag = wh;
+    info.warhead = wh;
     info.muzzle.position.set(0, 0.06, -0.8);
     info.sight.set(0, 0.14, 0.14);
     info.leftHand.set(0, -0.02, -0.2);
@@ -71,13 +75,20 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     if (M.revolver) {
       add(bgeo(0.028, 0.035, 0.16), body, 0, 0.055, -0.1);
       add(cgeo(0.011, 0.011, 0.2), body, 0, 0.06, -0.14);
-      info.cylinder = add(cgeo(0.028, 0.028, 0.05, 12), metal, 0, 0.05, -0.02);   // 弹巢：每发转一格
+      // 弹巢：每发绕自身轴转一格（info.cylinder）；装弹时整巢绕**前端铰接点**向左
+      // 甩出（crane 摆出，info.cylPivot，viewmodel 的甩巢分支）。铰点在巢体前缘、
+      // 巢网格偏回 +0.025 —— 旋转才会把巢尾扫出枪侧，绕巢心转只是原地自转。
+      // 旧版没有甩巢，拿一个 1mm 的假弹匣塞在弹巢位当 info.mag：手对着纹丝不动的
+      // 弹巢做完整套"拔匣-押匣-插匣"。
+      const cylPivot = new THREE.Group(); cylPivot.position.set(0, 0.05, -0.045); root.add(cylPivot);
+      info.cylPivot = cylPivot;
+      info.cylinder = add(cgeo(0.028, 0.028, 0.05, 12), metal, 0, 0, 0.025, 0, 0, 0, cylPivot);
       add(bgeo(0.03, 0.1, 0.045), mat('gunWood'), 0, -0.02, 0.04, 0.3);
       add(bgeo(0.004, 0.012, 0.01), metal, 0, 0.078, -0.23);
       info.muzzle.position.set(0, 0.06, -0.25);
       info.sight.set(0, 0.083, 0.02);
       info.eject.position.set(0.034, 0.05, -0.02);   // 弹巢与底把之间的缝，装弹时才打开
-      info.mag = add(bgeo(0.001, 0.001, 0.001), metal, 0, 0.05, -0.02);
+      // info.mag 留空：左轮没有弹匣，装弹走 cylPivot 甩巢
     } else {
       info.slide = add(bgeo(0.03, 0.032, 0.2), body, 0, 0.05, -0.07);   // 套筒：击发时后坐、空仓挂机
       add(bgeo(0.028, 0.025, 0.16), metal, 0, 0.022, -0.06);

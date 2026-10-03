@@ -192,6 +192,66 @@ export class Viewmodel {
         // 逐发装填：副手每一发去装弹口递一发（k 每发走一轮，stateT 在 weapon-state.js:121 被清零）
         _belt.set(0, -0.05, -0.02);
         _hand.copy(arms.leftHome).lerp(_belt, k < 0.25 ? smooth01(k / 0.25) : k < 0.62 ? 1 : 1 - smooth01((k - 0.62) / 0.38));
+        // 待装的那发霰弹只在手到装弹口的窗口露面。以前它常驻机匣侧面 —— 平时端着枪
+        // 也有一发弹"贴"在装弹口上（gunmodel 的 tube 分支把它摆在装弹口位）。
+        if (cur.info.mag) {
+          const m = cur.info.mag;
+          if (!m.userData.base) m.userData.base = m.position.clone();
+          m.visible = k > 0.22 && k < 0.66;
+        }
+      } else if (cur.info.warhead) {
+        // RPG 装填：弹头不是弹匣（gunmodel 里它单独挂 info.warhead）。空膛从击发那
+        // 一刻就开始（弹头跟着世界里那枚 Projectile 飞了），手从背后弹袋兜一发新的，
+        // 绕到筒口**前方**握着尾喷段，沿筒轴往后捅进膛 —— 真机的前插装填，不是把
+        // 弹头往下拽 25cm 再插回来的"弹匣动画"。
+        const m = cur.info.warhead;
+        if (!m.userData.base) m.userData.base = m.position.clone();
+        // 手：护木待位 → 后背取弹 → 托到筒下前位（臂展极限，IK 会自然截短）→ 回位
+        if (k < 0.16) _hand.copy(arms.leftHome);
+        else if (k < 0.42) _hand.copy(arms.leftHome).lerp(_belt.set(0.04, -0.26, 0.12), smooth01((k - 0.16) / 0.26));
+        else if (k < 0.62) _hand.copy(_belt.set(0.04, -0.26, 0.12)).lerp(_magOff.set(-0.01, -0.03, -0.42), smooth01((k - 0.42) / 0.2));
+        else if (k < 0.9) _hand.copy(_magOff.set(-0.01, -0.03, -0.42));
+        else _hand.copy(_magOff.set(-0.01, -0.03, -0.42)).lerp(arms.leftHome, smooth01((k - 0.9) / 0.1));
+        // 弹头：膛里有（未打完就换弹）就坐到手低头取弹那一刻；空膛则藏到手把新火箭
+        // 兜上来。提弹偏移把手放在火箭尾段（握的是发动机段，战斗部前伸）。
+        if (k < 0.42) {
+          m.visible = w.mag > 0;
+          m.position.copy(m.userData.base);
+        } else if (k < 0.62) {
+          m.visible = true;
+          m.position.copy(_hand).add(_shellP.set(0.02, 0.08, -0.45));
+        } else if (k < 0.9) {
+          m.visible = true;
+          m.position.copy(_hand).add(_shellP.set(0.02, 0.08, -0.45)).lerp(m.userData.base, smooth01((k - 0.62) / 0.28));
+        } else {
+          m.visible = true;
+          m.position.copy(m.userData.base);
+        }
+      } else if (cur.info.cylPivot) {
+        // 左轮装弹：甩巢 → 手到位倒壳 → 压弹 → 收巢。以前 info.mag 是个 1mm 的假
+        // 弹匣，手对着纹丝不动的弹巢做完整套"拔匣-押匣-插匣"。甩角 0.6 rad（34°）
+        // 是真实开巢的量级 —— 甩到 1.0 弹巢就快脱出铰架了。
+        const c = cur.info.cylPivot;
+        const o = k < 0.18 ? 0 : k < 0.32 ? smooth01((k - 0.18) / 0.14) : k < 0.72 ? 1 : k < 0.86 ? 1 - smooth01((k - 0.72) / 0.14) : 0;
+        c.rotation.y = -0.6 * o;
+        // 抓握点跟着甩出角走（甩满时巢尾扫到枪左侧），手全程贴着它
+        _shellP.set(-0.015 - 0.028 * o, 0.02, -0.01);
+        if (k < 0.16) _hand.copy(arms.leftHome);
+        else if (k < 0.32) _hand.copy(arms.leftHome).lerp(_shellP, smooth01((k - 0.16) / 0.16));
+        else if (k < 0.46) _hand.copy(_shellP);
+        else if (k < 0.58) _hand.copy(_shellP).lerp(_belt.set(0.04, -0.26, 0.12), smooth01((k - 0.46) / 0.12));
+        else if (k < 0.7) _hand.copy(_belt.set(0.04, -0.26, 0.12)).lerp(_shellP, smooth01((k - 0.58) / 0.12));
+        else if (k < 0.86) _hand.copy(_shellP);
+        else _hand.copy(_shellP).lerp(arms.leftHome, smooth01((k - 0.86) / 0.14));
+        // 甩满那拍倒壳：弹壳从**甩开的弹巢**（巢网格世界位）掉出去，不走抛壳窗 ——
+        // 左轮开火不抛壳（弹壳留在弹巢里），装弹时才一次退空（weapon-state 的 shell 注）
+        if (!cur.cylDumped && k > 0.44) {
+          cur.cylDumped = true;
+          const right = _v2.set(1, 0, 0).applyQuaternion(game.camera.quaternion);
+          this.pivot.updateMatrixWorld(true);
+          const p = cur.info.cylinder.getWorldPosition(_shellP);   // 抓握点已用完，临时向量让给壳位
+          for (let i = 0; i < 5; i++) game.effects.shell(p, right, 'pistol');
+        }
       } else {
         const e = Math.sin(k * Math.PI);
         rz += e * 0.55; rx += e * 0.25; pos.y -= e * 0.05; pos.x -= e * 0.03;
@@ -217,8 +277,22 @@ export class Viewmodel {
       arms.poseLeft(_hand);
       this.handDirty = true;
     } else if (this.handDirty) { arms.poseLeft(arms.leftHome); this.handDirty = false; }
-    if (ws.state !== 'reload' && cur.info.mag && cur.info.mag.userData.base) {
-      cur.info.mag.position.copy(cur.info.mag.userData.base); cur.info.mag.visible = true;
+    if (ws.state !== 'reload') {
+      cur.cylDumped = false;
+      if (cur.info.cylPivot) cur.info.cylPivot.rotation.y = 0;   // 甩巢被近战/切枪打断：收回来，别一直张着
+      if (cur.info.warhead) {
+        // RPG 弹头的生命周期锚在权威弹匣上：膛里有火箭（mag>0）才坐在筒口。击发扣
+        // 弹的下一帧就空膛 —— 弹头"离膛"交给天上那枚 Projectile，而不是继续挂在
+        // 筒口假装没打出去。位置常归位，可见性随弹匣走。
+        const m = cur.info.warhead;
+        if (m.userData.base) m.position.copy(m.userData.base);
+        m.visible = w.mag > 0;
+      } else if (cur.info.mag) {
+        // 位置归位只在动画记过基准之后才有意义；可见性不依赖它 —— 管装霰弹的
+        // 待装壳从上枪那一刻就得藏着（只在装填窗口露面），不能等第一次换弹才生效。
+        if (cur.info.mag.userData.base) cur.info.mag.position.copy(cur.info.mag.userData.base);
+        cur.info.mag.visible = !st.shellReload;
+      }
     }
     if (ws.state === 'switch') { const e = 1 - k; pos.y -= e * 0.3; rx -= e * 0.6; }
     if (ws.state === 'melee') { const e = Math.sin(k * Math.PI); pos.z -= e * 0.15; pos.x -= e * 0.1; ry += e * 0.8; rz -= e * 0.4; }

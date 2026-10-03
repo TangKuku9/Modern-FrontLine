@@ -369,6 +369,10 @@ export class Bot {
     A.slide = damp(A.slide, this.slideT > 0 ? 1 : 0, 12, dt);     // 与 NetPlayer 的滑铲平滑同一档
     this.sprinting = sprinting;
     A.sprint = damp(A.sprint, sprinting ? 1 : 0, 10, dt);         // 冲刺姿态:前倾+枪口上抬(soldier.js 通道)
+    // RPG 弹头位（soldier.js 通道）：膛里有货才坐在筒口。目前 BOT_WEAPONS 不含
+    // 发射器，这行是给契约留的座 —— 哪天 bot 拿上 RPG，第三人称不会回到
+    // "弹头永远挂着"的旧病。
+    A.rocket = this.mag > 0 && this.reloadT <= 0;
     animateSoldier(this.model, A, dt);
     this.model.root.position.copy(this.pos);
     this.model.root.rotation.y = this.yaw;

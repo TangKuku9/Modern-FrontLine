@@ -75,7 +75,7 @@ export class NetPlayer {
     this.model.root.position.copy(this.pos);
     game.scene.add(this.model.root);
     this.tag = null; this.buildTag();
-    this.anim = { speed: 0, phase: 0, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0, sprint: 0, air: 0 };
+    this.anim = { speed: 0, phase: 0, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0, sprint: 0, air: 0, rocket: true };
     // —— 表现层账本（见文件头）——
     this.fireCool = 0;                              // 下一发枪声还要等多久
     this.stepDist = 0;                              // 从上一声脚步起走了多少米
@@ -268,6 +268,9 @@ export class NetPlayer {
     const wid = WEAPON_IDS[s.weapon ?? 0];
     if (wid && wid !== this.weaponId) this.swapWeapon(wid);
     const st = WEAPONS[this.weaponId] || WEAPONS.m4;
+    // RPG 弹头的 _rpgHold 兜底倒计时（见下面 Reloading 块）：快照断流时旗位不动，
+    // 按装填时长把弹头放回筒口，宁可猜错也别永久空膛
+    if (this._rpgHold > 0 && (this._rpgHold -= dt) <= 0) this.anim.rocket = true;
 
     const m = this.model.root;
     m.position.copy(this.pos);
@@ -323,12 +326,16 @@ export class NetPlayer {
     this.fireCool = Math.max(0, this.fireCool - dt);
     if (this.alive && (s.flags & FLAG.Firing) && this.fireCool <= 0) {
       this.fireCool = Math.max(0.055, 60 / (st.rpm || 600));
+      // 发射器击发：弹头离膛（不再坐在筒口），装填位/兜底倒计时负责放回
+      if (st.type === 'launcher') { this.anim.rocket = false; this._rpgHold = (st.reload || 3) + 0.5; }
       const muzzle = this.model.muzzle ? this.model.muzzle.getWorldPosition(_m) : _m.copy(this.pos);
       const cp = Math.cos(this.pitch);
       const dir = _v.set(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
       // 曳光画到枪口前方 TRACER_LEN 米。**不**在这里 raycast：命中是权威端的活，
       // 本地 raycast 出来的终点（不带回溯）只会多画一条假弹道。观感上够用。
-      this.game.effects.tracer(muzzle, _e.copy(muzzle).addScaledVector(dir, TRACER_LEN), [1.5, 1.0, 0.5]);
+      // 发射器不画曳光：那颗火箭本体（proj 事件的 dumb 副本）就飞在同伴位置，
+      // 再叠一条曳光就是一根直棍穿过弹头。
+      if (st.type !== 'launcher') this.game.effects.tracer(muzzle, _e.copy(muzzle).addScaledVector(dir, TRACER_LEN), [1.5, 1.0, 0.5]);
       this.game.audio.shot(st.sound, this.pos, st.suppressed);
       if (Math.random() < 0.25) this.game.effects.flashLight(muzzle, 0xffb060, 2.5, 0.05, 7);
       if (!st.suppressed) this.game.effects.muzzle(muzzle, dir, 1, false);   // 枪口烟/火星（与单机同一套）
@@ -361,7 +368,13 @@ export class NetPlayer {
     // 正好对上本机那条链的三段音（weapon-state.js 的 out / in）。带 this.pos：别人的
     // 换弹要有距离与声像 —— 不带的话那串"咔哒"会以满音量从正中来，分不清是谁在换。
     const rl = this.alive && !!(s.flags & FLAG.Reloading);
-    if (rl !== this.reloading) { this.game.audio.reload(rl ? 'out' : 'in', this.pos); this.reloading = rl; }
+    if (rl !== this.reloading) {
+      this.game.audio.reload(rl ? 'out' : 'in', this.pos);
+      this.reloading = rl;
+      // RPG 弹头随装填位离手/回膛：战术换弹（没打空就装）没有击发沿可用，靠这段
+      // 让"装填整段=膛空"；收回的精确时机就是装填位落下的那一拍。
+      if (this.model.warhead && st.type === 'launcher') this.anim.rocket = !rl;
+    }
     // mag 的消费点：霰弹枪是**一发一发**装的，单机那边每入膛一发响一声（weapon-state.js
     // 的 audio.reload('shell')），而 Reloading 位只有"开始/结束"两个跳变 —— m870 的装弹声
     // 在联机里因此整段只剩两声。mag 每 +1 就是一发入膛，正好把中间那几声补回来。
@@ -374,6 +387,7 @@ export class NetPlayer {
     // 上一把枪的弹匣读数不许跨枪比较：新枪第一包 mag 若恰好比旧枪的最后一包大 1，
     // 会替霰弹枪多响一声装填。置空让它从"没有上一格"重新开始。
     this.lastMag = undefined;
+    this.anim.rocket = true;                   // 新枪新弹膛，RPG 弹头位作废重来
     this.game.scene.remove(this.model.root);
     this.model = this.buildModel();          // 配件/迷彩按 kits 表走（差距 29）
     applyFlashTex(this.model);
