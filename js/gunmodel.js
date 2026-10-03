@@ -411,7 +411,11 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     magG.position.set(0, -0.02, -0.03);
     add(bgeo(0.02, 0.012, 0.03), mat('brass'), 0, 0, 0, 0, 0, 0, magG);
   }
-  // 枪托
+  // 枪托。两处通病（探针实拍）：① ak/fixed 分支的 rotation.x 取负——托尾反而**上翘**
+  // 6~7°，而真枪托是往肩部**下沉**的，全体改正角下沉；② 托身是不随形的方砖、托底板
+  // 四周比托身探出一圈（垫圈感）、狙击托的颊托轨浮在托身上方 2.5mm。重做要点：托底板
+  // 与托身同角度同截面（沿托轴嵌进托尾，只宽 2mm），深化靠 ≤13mm 的小台阶（大了就是
+  // 旧版那种楼梯错位），上缘全线连续。
   const st = att.stock || null;
   const sz = zRear;
   if (st === 'none') {
@@ -420,28 +424,48 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     const kind = st === 'heavy' ? 'heavy' : st === 'tac' ? 'tac' : M.stock;
     const sm = furn;
     if (kind === 'm4' || kind === 'tac') {
+      // 伸缩托：缓冲管 + 随管下挂的楔形托身（顶面咬住管下半，管在托口里走 85mm），
+      // 管下的调节卡笋是 M4 伸缩托的名片件；tac 加骑在托背上的贴腮板。
+      const r4 = 0.06;
       add(cgeo(0.016, 0.016, 0.2), metal, 0, 0.03, sz + 0.1);
-      add(bgeo(0.045, 0.09, 0.14), sm, 0, 0.005, sz + 0.2);
-      add(bgeo(0.047, 0.1, 0.02), mat('rubber'), 0, 0.0, sz + 0.28);
-      if (kind === 'tac') add(bgeo(0.03, 0.03, 0.1), sm, 0, 0.06, sz + 0.2);
+      add(bgeo(0.046, 0.082, 0.14), sm, 0, -0.004, sz + 0.185, r4);
+      add(bgeo(0.048, 0.082, 0.018), mat('rubber'), 0, -0.004 - Math.sin(r4) * 0.078, sz + 0.185 + Math.cos(r4) * 0.078, r4);
+      add(bgeo(0.026, 0.012, 0.05), sm, 0, 0.012, sz + 0.09);
+      if (kind === 'tac') add(bgeo(0.038, 0.012, 0.1), sm, 0, 0.0385, sz + 0.19, r4);
     } else if (kind === 'ak' || kind === 'fixed') {
-      const g = new THREE.Group(); g.position.set(0, 0.015, sz); g.rotation.x = kind === 'ak' ? -0.12 : -0.06; root.add(g);
-      add(bgeo(0.042, 0.06, 0.2), sm, 0, 0, 0.1, 0, 0, 0, g);
-      add(bgeo(0.044, 0.11, 0.12), sm, 0, -0.02, 0.24, 0, 0, 0, g);
-      add(bgeo(0.046, 0.12, 0.015), mat('gunPoly'), 0, -0.02, 0.305, 0, 0, 0, g);
+      // 木托：整组下沉（ak 0.10 / 固定托 0.06），三段上缘齐平、逐段向下深 10mm——
+      // 组旋转给出 comb→heel 的 drop，小台阶给出托深，互不抢戏。
+      const g = new THREE.Group(); g.position.set(0, 0.015, sz); g.rotation.x = kind === 'ak' ? 0.1 : 0.06; root.add(g);
+      if (kind === 'ak') {
+        add(bgeo(0.042, 0.06, 0.16), sm, 0, 0, 0.085, 0, 0, 0, g);
+        add(bgeo(0.044, 0.07, 0.11), sm, 0, -0.005, 0.215, 0, 0, 0, g);
+        add(bgeo(0.046, 0.08, 0.016), mat('gunPoly'), 0, -0.009, 0.273, 0, 0, 0, g);
+      } else {
+        add(bgeo(0.042, 0.055, 0.16), sm, 0, 0, 0.085, 0, 0, 0, g);
+        add(bgeo(0.044, 0.065, 0.1), sm, 0, -0.005, 0.21, 0, 0, 0, g);
+        add(bgeo(0.046, 0.07, 0.015), mat('gunPoly'), 0, -0.007, 0.265, 0, 0, 0, g);
+      }
     } else if (kind === 'mp5') {
-      add(bgeo(0.008, 0.008, 0.22), metal, -0.02, 0.04, sz + 0.11);
-      add(bgeo(0.008, 0.008, 0.22), metal, 0.02, 0.04, sz + 0.11);
-      add(bgeo(0.05, 0.08, 0.02), metal, 0, 0.02, sz + 0.22);
+      // 伸缩托：双杆 + 托板 + 橡胶贴肩垫（垫比板小一圈，收进板内——旧版垫比板大）。
+      add(bgeo(0.01, 0.01, 0.22), metal, -0.02, 0.038, sz + 0.11);
+      add(bgeo(0.01, 0.01, 0.22), metal, 0.02, 0.038, sz + 0.11);
+      add(bgeo(0.05, 0.075, 0.022), metal, 0, 0.008, sz + 0.225);
+      add(bgeo(0.052, 0.068, 0.01), mat('rubber'), 0, 0.006, sz + 0.239);
     } else if (kind === 'scar') {
-      add(bgeo(0.045, 0.06, 0.12), sm, 0, 0.035, sz + 0.06);
-      add(bgeo(0.045, 0.11, 0.1), sm, 0, 0.01, sz + 0.17);
-      add(bgeo(0.048, 0.12, 0.02), mat('rubber'), 0, 0.01, sz + 0.23);
+      // SCAR：托身经**上桥**连接、桥下透空（SCAR 托的招牌剪影），贴腮板骑在桥顶，
+      // 托身与托底板随垂角 0.05。
+      const rs = 0.05;
+      add(bgeo(0.028, 0.026, 0.14), sm, 0, 0.03, sz + 0.09);
+      add(bgeo(0.046, 0.07, 0.11), sm, 0, 0.008, sz + 0.21, rs);
+      add(bgeo(0.038, 0.012, 0.08), sm, 0, 0.049, sz + 0.2, rs);
+      add(bgeo(0.048, 0.074, 0.018), mat('rubber'), 0, 0.0049, sz + 0.2719, rs);
     } else if (kind === 'sniper' || kind === 'heavy') {
-      add(bgeo(0.05, 0.07, 0.26), sm, 0, 0.01, sz + 0.13);
-      add(bgeo(0.05, 0.13, 0.12), sm, 0, -0.01, sz + 0.24);
-      add(bgeo(0.04, 0.025, 0.14), sm, 0, 0.06, sz + 0.16);
-      add(bgeo(0.052, 0.14, 0.02), mat('rubber'), 0, -0.01, sz + 0.31);
+      // AI 式整体楔：托身整体随垂角 0.10 下沉——comb→heel 的 drop 本来就是这种托的
+      // 主特征；顶上骑贴腮板，托底板沿托轴嵌到托尾。
+      const r10 = 0.1, hw = kind === 'heavy' ? 0.006 : 0;
+      add(bgeo(0.05 + hw, 0.085 + hw, 0.27), sm, 0, 0.002, sz + 0.14, r10);
+      add(bgeo(0.054 + hw, 0.02, 0.1), sm, 0, 0.0525, sz + 0.13, r10);
+      add(bgeo(0.052 + hw, 0.089 + hw, 0.018), mat('rubber'), 0, 0.002 - Math.sin(r10) * 0.142, sz + 0.14 + Math.cos(r10) * 0.142, r10);
     }
   }
   root.add(info.muzzle);
