@@ -1,88 +1,91 @@
 // 游戏数据：武器、配件、Perk、连杀奖励、投掷物、地图列表
 
+// sound = 声纹键，指向 js/audio.js 的 SHOT_PRESETS。每把枪一个键，不再按"族"共用
+// —— AK/SCAR/SKS、MP5/VECTOR 以前听起来完全一样。新加武器记得在这里给独立的
+// 声纹键（或确认复用是有意的）。
 export const WEAPONS = {
   m4: {
     name: 'M4A1', cls: '突击步枪', type: 'ar', slot: 'primary',
     dmg: [28, 21], range: [28, 55], rpm: 800, mag: 30, reserve: 150, reload: 2.1, ads: 0.24,
     recoil: [0.9, 0.45], spread: 3.2, mobility: 0.95, fire: 'auto', headMul: 1.45, sprintFire: 0.22,
-    sound: 'rifle', model: { recv: 0.28, barrel: 0.28, hand: 0.26, stock: 'm4', mag: 'straight', magZ: -0.095, color: 'black', grip: 'ar' },
+    sound: 'm4', model: { recv: 0.28, barrel: 0.28, hand: 0.26, stock: 'm4', mag: 'straight', magZ: -0.095, color: 'black', grip: 'ar' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'under', 'mag', 'rear'],
   },
   ak: {
     name: 'AK-47', cls: '突击步枪', type: 'ar', slot: 'primary',
     dmg: [36, 26], range: [30, 60], rpm: 600, mag: 30, reserve: 150, reload: 2.4, ads: 0.27,
     recoil: [1.35, 0.8], spread: 3.6, mobility: 0.93, fire: 'auto', headMul: 1.4, sprintFire: 0.25,
-    sound: 'rifle_heavy', model: { recv: 0.3, barrel: 0.3, hand: 0.22, stock: 'ak', mag: 'curved', magZ: -0.115, color: 'wood', grip: 'ak' },
+    sound: 'ak', model: { recv: 0.3, barrel: 0.3, hand: 0.22, stock: 'ak', mag: 'curved', magZ: -0.115, color: 'wood', grip: 'ak' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'under', 'mag', 'rear'],
   },
   scar: {
     name: 'SCAR-H', cls: '突击步枪', type: 'ar', slot: 'primary',
     dmg: [40, 30], range: [35, 70], rpm: 560, mag: 20, reserve: 120, reload: 2.3, ads: 0.29,
     recoil: [1.5, 0.55], spread: 3.6, mobility: 0.92, fire: 'auto', headMul: 1.4, sprintFire: 0.26,
-    sound: 'rifle_heavy', model: { recv: 0.32, barrel: 0.26, hand: 0.28, stock: 'scar', mag: 'straight', magZ: -0.105, color: 'tan', grip: 'ar' },
+    sound: 'scar', model: { recv: 0.32, barrel: 0.26, hand: 0.28, stock: 'scar', mag: 'straight', magZ: -0.105, color: 'tan', grip: 'ar' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'under', 'mag', 'rear'],
   },
   mp5: {
     name: 'MP5', cls: '冲锋枪', type: 'smg', slot: 'primary',
     dmg: [26, 16], range: [12, 30], rpm: 850, mag: 30, reserve: 180, reload: 1.9, ads: 0.18,
     recoil: [0.65, 0.5], spread: 2.4, mobility: 1.05, fire: 'auto', headMul: 1.3, sprintFire: 0.14,
-    sound: 'smg', model: { recv: 0.22, barrel: 0.12, hand: 0.16, stock: 'mp5', mag: 'curved_small', magZ: -0.075, color: 'black', grip: 'ar' },
+    sound: 'mp5', model: { recv: 0.22, barrel: 0.12, hand: 0.16, stock: 'mp5', mag: 'curved_small', magZ: -0.075, color: 'black', grip: 'ar' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'under', 'mag', 'rear'],
   },
   vector: {
     name: 'VECTOR .45', cls: '冲锋枪', type: 'smg', slot: 'primary',
     dmg: [24, 14], range: [10, 25], rpm: 1100, mag: 25, reserve: 175, reload: 1.8, ads: 0.17,
     recoil: [0.55, 0.6], spread: 2.4, mobility: 1.06, fire: 'auto', headMul: 1.3, sprintFire: 0.13,
-    sound: 'smg', model: { recv: 0.24, barrel: 0.1, hand: 0.14, stock: 'm4', mag: 'pistol_long', magZ: 0.035, color: 'tan', grip: 'ar' },
+    sound: 'vector', model: { recv: 0.24, barrel: 0.1, hand: 0.14, stock: 'm4', mag: 'pistol_long', magZ: 0.035, color: 'tan', grip: 'ar' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'under', 'mag', 'rear'],
   },
   pkm: {
     name: 'PKM', cls: '轻机枪', type: 'lmg', slot: 'primary',
     dmg: [36, 29], range: [40, 75], rpm: 650, mag: 100, reserve: 200, reload: 5.8, ads: 0.42,
     recoil: [1.1, 0.7], spread: 5.5, mobility: 0.84, fire: 'auto', headMul: 1.35, sprintFire: 0.38,
-    sound: 'lmg', model: { recv: 0.34, barrel: 0.36, hand: 0.18, stock: 'ak', mag: 'box', magZ: -0.13, color: 'wood', grip: 'ak' },
+    sound: 'pkm', model: { recv: 0.34, barrel: 0.36, hand: 0.18, stock: 'ak', mag: 'box', magZ: -0.13, color: 'wood', grip: 'ak' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'under', 'rear'],
   },
   m870: {
     name: 'M870 霰弹枪', cls: '霰弹枪', type: 'shotgun', slot: 'primary',
     dmg: [16, 6], range: [7, 16], rpm: 72, mag: 6, reserve: 30, reload: 0.55, ads: 0.25, pellets: 9,
     recoil: [3.8, 1.2], spread: 5, adsSpread: 4.2, mobility: 1.0, fire: 'pump', headMul: 1.2, sprintFire: 0.2, shellReload: true,
-    sound: 'shotgun', model: { recv: 0.26, barrel: 0.32, hand: 0.18, stock: 'fixed', mag: 'tube', color: 'black', grip: 'ak' },
+    sound: 'm870', model: { recv: 0.26, barrel: 0.32, hand: 0.18, stock: 'fixed', mag: 'tube', color: 'black', grip: 'ak' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'rear'],
   },
   sks: {
     name: 'SKS', cls: '射手步枪', type: 'marksman', slot: 'primary',
     dmg: [62, 50], range: [45, 90], rpm: 360, mag: 10, reserve: 60, reload: 2.6, ads: 0.3,
     recoil: [2.1, 0.6], spread: 5, mobility: 0.93, fire: 'semi', headMul: 1.9, sprintFire: 0.26,
-    sound: 'rifle_heavy', model: { recv: 0.3, barrel: 0.36, hand: 0.26, stock: 'fixed', mag: 'box10', magZ: -0.09, color: 'wood', grip: 'ak' },
+    sound: 'sks', model: { recv: 0.3, barrel: 0.36, hand: 0.26, stock: 'fixed', mag: 'box10', magZ: -0.09, color: 'wood', grip: 'ak' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'mag', 'rear'],
   },
   l115: {
     name: 'L115A3', cls: '狙击步枪', type: 'sniper', slot: 'primary',
     dmg: [115, 105], range: [80, 150], rpm: 44, mag: 5, reserve: 30, reload: 3.2, ads: 0.48,
     recoil: [4.5, 0.8], spread: 9, mobility: 0.88, fire: 'bolt', headMul: 2.0, sprintFire: 0.35, defaultOptic: 'sniper',
-    sound: 'sniper', model: { recv: 0.34, barrel: 0.5, hand: 0.26, stock: 'sniper', mag: 'box5', magZ: -0.085, color: 'green', grip: 'sniper' },
+    sound: 'l115', model: { recv: 0.34, barrel: 0.5, hand: 0.26, stock: 'sniper', mag: 'box5', magZ: -0.085, color: 'green', grip: 'sniper' },
     slots: ['muzzle', 'barrel', 'laser', 'optic', 'stock', 'mag', 'rear'],
   },
   m1911: {
     name: 'M1911', cls: '手枪', type: 'pistol', slot: 'secondary',
     dmg: [38, 22], range: [10, 25], rpm: 450, mag: 8, reserve: 48, reload: 1.5, ads: 0.14,
     recoil: [1.6, 0.4], spread: 2, mobility: 1.1, fire: 'semi', headMul: 1.5, sprintFire: 0.1,
-    sound: 'pistol', model: { pistol: true, color: 'black' },
+    sound: 'm1911', model: { pistol: true, color: 'black' },
     slots: ['muzzle', 'laser', 'optic', 'mag'],
   },
   revolver: {
     name: '.357 左轮', cls: '手枪', type: 'pistol', slot: 'secondary',
     dmg: [62, 40], range: [14, 30], rpm: 190, mag: 6, reserve: 36, reload: 2.4, ads: 0.16,
     recoil: [3.4, 0.6], spread: 2.4, mobility: 1.08, fire: 'semi', headMul: 1.6, sprintFire: 0.12,
-    sound: 'pistol_heavy', model: { pistol: true, revolver: true, color: 'steel' },
+    sound: 'revolver', model: { pistol: true, revolver: true, color: 'steel' },
     slots: ['laser', 'optic'],
   },
   rpg: {
     name: 'RPG-7', cls: '发射器', type: 'launcher', slot: 'secondary',
     dmg: [150, 150], range: [0, 0], rpm: 30, mag: 1, reserve: 3, reload: 3.0, ads: 0.4,
     recoil: [5, 1], spread: 4, mobility: 0.9, fire: 'semi', headMul: 1, sprintFire: 0.4, projectile: 'rocket',
-    sound: 'rocket', model: { rpg: true, color: 'green' },
+    sound: 'rpg', model: { rpg: true, color: 'green' },
     slots: [],
   },
 };

@@ -15,6 +15,32 @@ export function pickZhVoices(voices) {
   return { primary: ranked[0] || null, fallback: ranked.find(v => v.localService) || ranked[0] || null };
 }
 
+// 每把枪一条声纹（data.js 的 sound 字段直接指向这里的键）。以前按"族"共用
+// （rifle_heavy/smg…）的结果是 AK、SCAR、SKS 听起来像同一支枪 —— 声音是玩家区分
+// 口径/威胁等级的最直接线索。旧族名经 SHOT_ALIASES 兜底，哨戒机枪仍传 'turret'。
+// 字段：f/q/dec = 主体爆裂的低通起点/谐振/衰减；crk/cv/cd = 枪口超压的高频破裂层；
+// thump/tv = 低频冲击的频率/音量；tail/tlv = 大口径余音尾（低频回响）；grit = 软削波
+// 过载量（实录枪声的"毛边"）；vol = 总音量。狙击/霰弹/机枪三档明显重于突击步枪。
+const SHOT_PRESETS = {
+  m4:       { f: 1900, q: 0.8,  dec: 0.13, crk: 3400, cv: 0.8,  cd: 0.022, thump: 100, tv: 0.8,  tail: 0,    tlv: 0,    grit: 0.18, vol: 0.68 },
+  ak:       { f: 1250, q: 0.7,  dec: 0.19, crk: 2600, cv: 0.7,  cd: 0.028, thump: 78,  tv: 1.05, tail: 0.18, tlv: 0.25, grit: 0.3,  vol: 0.78 },
+  scar:     { f: 1100, q: 0.65, dec: 0.22, crk: 2400, cv: 0.75, cd: 0.03,  thump: 66,  tv: 1.2,  tail: 0.3,  tlv: 0.3,  grit: 0.32, vol: 0.82 },
+  mp5:      { f: 2500, q: 0.9,  dec: 0.09, crk: 4200, cv: 0.7,  cd: 0.018, thump: 125, tv: 0.55, tail: 0,    tlv: 0,    grit: 0.15, vol: 0.52 },
+  vector:   { f: 1500, q: 0.85, dec: 0.12, crk: 3000, cv: 0.6,  cd: 0.022, thump: 95,  tv: 0.85, tail: 0,    tlv: 0,    grit: 0.2,  vol: 0.6 },
+  pkm:      { f: 950,  q: 0.6,  dec: 0.24, crk: 2200, cv: 0.8,  cd: 0.03,  thump: 60,  tv: 1.25, tail: 0.35, tlv: 0.3,  grit: 0.42, vol: 0.85 },
+  m870:     { f: 850,  q: 0.5,  dec: 0.3,  crk: 1800, cv: 0.7,  cd: 0.04,  thump: 52,  tv: 1.4,  tail: 0.4,  tlv: 0.35, grit: 0.4,  vol: 0.95 },
+  sks:      { f: 1350, q: 0.7,  dec: 0.18, crk: 2800, cv: 0.8,  cd: 0.025, thump: 82,  tv: 1.05, tail: 0.25, tlv: 0.25, grit: 0.3,  vol: 0.8 },
+  l115:     { f: 750,  q: 0.55, dec: 0.5,  crk: 3100, cv: 1.1,  cd: 0.03,  thump: 44,  tv: 1.6,  tail: 0.6,  tlv: 0.45, grit: 0.5,  vol: 1.1 },
+  m1911:    { f: 2100, q: 0.9,  dec: 0.1,  crk: 3600, cv: 0.7,  cd: 0.018, thump: 110, tv: 0.7,  tail: 0,    tlv: 0,    grit: 0.15, vol: 0.55 },
+  revolver: { f: 1400, q: 0.75, dec: 0.18, crk: 2900, cv: 0.9,  cd: 0.025, thump: 85,  tv: 1.05, tail: 0.2,  tlv: 0.2,  grit: 0.28, vol: 0.85 },
+  rpg:       { f: 480,  q: 0.4,  dec: 0.7,  crk: 0,    cv: 0,    cd: 0,     thump: 38,  tv: 1.0,  tail: 0.8,  tlv: 0.4,  grit: 0.2,  vol: 0.9 },
+  turret:   { f: 1700, q: 0.8,  dec: 0.12, crk: 3200, cv: 0.6,  cd: 0.02,  thump: 88,  tv: 0.7,  tail: 0,    tlv: 0,    grit: 0.2,  vol: 0.6 },
+};
+const SHOT_ALIASES = {
+  rifle: 'm4', rifle_heavy: 'ak', smg: 'mp5', lmg: 'pkm', sniper: 'l115',
+  shotgun: 'm870', pistol: 'm1911', pistol_heavy: 'revolver', rocket: 'rpg',
+};
+
 // WebAudio 程序化音效
 export class Audio {
   constructor() {
@@ -46,6 +72,10 @@ export class Audio {
     this.brown = c.createBuffer(1, nl, c.sampleRate);
     const bd = this.brown.getChannelData(0); let last = 0;
     for (let i = 0; i < nl; i++) { const w = Math.random() * 2 - 1; last = (last + 0.02 * w) / 1.02; bd[i] = last * 3.5; }
+    // 软削波曲线：枪声主体的预增益推进这里，得到实录枪声那种过载"毛边"
+    const ds = 1024, dc = new Float32Array(ds);
+    for (let i = 0; i < ds; i++) { const x = (i / (ds - 1)) * 2 - 1; dc[i] = Math.tanh(x * 2.5) / Math.tanh(2.5); }
+    this.clip = dc;
   }
   setVolume(v) { this.volume = v; if (this.master) this.master.gain.value = v; }
   setListener(p, yaw) { this.listener.x = p.x; this.listener.y = p.y; this.listener.z = p.z; this.listener.yaw = yaw; }
@@ -82,39 +112,62 @@ export class Audio {
     // 已经弱到像隔壁楼层，而那正是最需要靠听觉补情报的距离。
     const sp = this.spatial(pos, 0.55);
     if (sp.gain < 0.01) return;
-    const P = {
-      rifle: { f: 1800, q: 0.8, dec: 0.16, thump: 90, tv: 0.9, vol: 0.7 },
-      rifle_heavy: { f: 1300, q: 0.7, dec: 0.22, thump: 70, tv: 1.0, vol: 0.8 },
-      smg: { f: 2400, q: 0.9, dec: 0.11, thump: 110, tv: 0.6, vol: 0.55 },
-      lmg: { f: 1200, q: 0.7, dec: 0.2, thump: 65, tv: 1.0, vol: 0.8 },
-      sniper: { f: 900, q: 0.6, dec: 0.5, thump: 50, tv: 1.3, vol: 1.0 },
-      shotgun: { f: 800, q: 0.5, dec: 0.35, thump: 55, tv: 1.3, vol: 1.0 },
-      pistol: { f: 2200, q: 0.9, dec: 0.12, thump: 120, tv: 0.6, vol: 0.55 },
-      pistol_heavy: { f: 1500, q: 0.7, dec: 0.25, thump: 70, tv: 1.0, vol: 0.85 },
-      rocket: { f: 500, q: 0.4, dec: 0.8, thump: 40, tv: 0.8, vol: 0.9 },
-      turret: { f: 1600, q: 0.8, dec: 0.12, thump: 80, tv: 0.7, vol: 0.6 },
-    }[type] || { f: 1800, q: 0.8, dec: 0.16, thump: 90, tv: 0.9, vol: 0.7 };
-    let vol = P.vol * sp.gain;
-    let fc = P.f;
+    const P = SHOT_PRESETS[type] || SHOT_PRESETS[SHOT_ALIASES[type]] || SHOT_PRESETS.m4;
+    // 每发抖动：连发不该是一段循环采样 —— 频率/音量/低频各自随机偏一点，
+    // 同一把枪打 30 发才是 30 发略有差异的枪声。
+    const wob = (a = 0.12) => 1 - a / 2 + Math.random() * a;
     const far = Math.min(1, sp.dist / 80);
-    if (suppressed) { vol *= 0.28; fc *= 1.6; }
-    fc *= 1 - far * 0.7;
-    const o = this.out(vol, sp.pan, 0.25 + far * 0.6);
-    // 噪声爆裂
+    let vol = P.vol * wob(0.2) * sp.gain;
+    if (suppressed) vol *= 0.3;
+    // 大口径与远处的枪声多送混响：尾音拖得长，也是"距离感"的来源
+    const o = this.out(vol, sp.pan, 0.25 + far * 0.6 + (P.tail ? 0.08 : 0));
+    // ① 主体爆裂：枪声的" bark "，个性主要在这一层。远处高频衰减最快（fc 下压）
+    const fc = P.f * wob() * (1 - far * 0.6) * (suppressed ? 1.5 : 1);
+    const dec = P.dec * (suppressed ? 0.55 : 1);
     const n = this.noiseSrc();
-    const bp = c.createBiquadFilter(); bp.type = 'lowpass'; bp.frequency.setValueAtTime(fc * 3, t); bp.frequency.exponentialRampToValueAtTime(fc * 0.4, t + P.dec);
+    const bp = c.createBiquadFilter(); bp.type = 'lowpass'; bp.frequency.setValueAtTime(fc * 3, t); bp.frequency.exponentialRampToValueAtTime(fc * 0.4, t + dec);
     bp.Q.value = P.q;
-    const ng = c.createGain(); ng.gain.setValueAtTime(0.0001, t); ng.gain.exponentialRampToValueAtTime(1.0, t + 0.002); ng.gain.exponentialRampToValueAtTime(0.001, t + P.dec * (suppressed ? 0.5 : 1));
-    n.connect(bp); bp.connect(ng); ng.connect(o);
-    n.start(t); n.stop(t + P.dec + 0.05);
-    // 低频冲击
-    if (!suppressed || sp.dist < 5) {
-      const os = c.createOscillator(); os.type = 'sine';
-      os.frequency.setValueAtTime(P.thump * 2.2, t); os.frequency.exponentialRampToValueAtTime(P.thump * 0.5, t + 0.12);
-      const og = c.createGain(); og.gain.setValueAtTime(P.tv * (1 - far * 0.5), t); og.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-      os.connect(og); og.connect(o); os.start(t); os.stop(t + 0.2);
+    const ng = c.createGain(); ng.gain.setValueAtTime(0.0001, t); ng.gain.exponentialRampToValueAtTime(1.0, t + 0.003); ng.gain.exponentialRampToValueAtTime(0.001, t + dec);
+    n.connect(bp); bp.connect(ng);
+    let out = ng;
+    if (P.grit > 0) { // 毛边：预增益推进软削波，大口径的过载"劈"感
+      const pre = c.createGain(); pre.gain.value = 1 + P.grit * 1.6;
+      const ws = c.createWaveShaper(); ws.curve = this.clip;
+      ng.connect(pre); pre.connect(ws); out = ws;
     }
-    // 机械声
+    out.connect(o);
+    n.start(t); n.stop(t + dec + 0.05);
+    // ② 破裂音：枪口超压的高频瞬态（"啪"）。消音器整个吃掉它；距离上它衰减也最快 ——
+    // 远处的枪声只剩低频的"咚"，这本身就是听距的线索。
+    if (P.crk && !suppressed) {
+      const k = this.noiseSrc();
+      const kf = c.createBiquadFilter(); kf.type = 'bandpass'; kf.frequency.value = P.crk * wob(0.08); kf.Q.value = 1.2;
+      const kg = c.createGain(); kg.gain.setValueAtTime(0.0001, t); kg.gain.exponentialRampToValueAtTime(P.cv * (1 - far * 0.75), t + 0.001); kg.gain.exponentialRampToValueAtTime(0.001, t + P.cd);
+      k.connect(kf); kf.connect(kg); kg.connect(o); k.start(t); k.stop(t + P.cd + 0.02);
+    }
+    // ③ 低频冲击：膛压的"咚"，距离衰减最慢（狙击/霰弹这一层拖得更低更久）
+    if (!suppressed || sp.dist < 5) {
+      const th = P.thump * wob(0.14);
+      const os = c.createOscillator(); os.type = 'sine';
+      os.frequency.setValueAtTime(th * 2.2, t); os.frequency.exponentialRampToValueAtTime(th * 0.5, t + 0.12);
+      const og = c.createGain(); og.gain.setValueAtTime(P.tv * wob(0.2) * (1 - far * 0.5) * (suppressed ? 0.5 : 1), t); og.gain.exponentialRampToValueAtTime(0.001, t + 0.18 + P.tv * 0.06);
+      os.connect(og); og.connect(o); os.start(t); os.stop(t + 0.3);
+    }
+    // ④ 余音：大口径枪声在环境里的低频尾巴 —— 狙击枪"轰……"的分量主要在这
+    if (P.tail && !suppressed) {
+      const tn = this.noiseSrc(this.brown);
+      const tf = c.createBiquadFilter(); tf.type = 'lowpass'; tf.frequency.setValueAtTime(600, t); tf.frequency.exponentialRampToValueAtTime(90, t + P.tail);
+      const tg = c.createGain(); tg.gain.setValueAtTime(0.001, t); tg.gain.exponentialRampToValueAtTime(P.tlv * (1 - far * 0.3), t + 0.02); tg.gain.exponentialRampToValueAtTime(0.001, t + P.tail);
+      tn.connect(tf); tf.connect(tg); tg.connect(o); tn.start(t); tn.stop(t + P.tail + 0.05);
+    }
+    // ⑤ 消音的"噗"：高压气体泄出的短促低噪 —— 消音枪声不该只是"变小"
+    if (suppressed) {
+      const pn = this.noiseSrc(this.brown);
+      const pf = c.createBiquadFilter(); pf.type = 'bandpass'; pf.frequency.value = 500; pf.Q.value = 0.8;
+      const pg = c.createGain(); pg.gain.setValueAtTime(0.0001, t); pg.gain.exponentialRampToValueAtTime(0.5, t + 0.008); pg.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+      pn.connect(pf); pf.connect(pg); pg.connect(o); pn.start(t); pn.stop(t + 0.12);
+    }
+    // 机械声（只有本机自己的枪有 —— 别人的枪只能听到枪口的声音）
     if (!pos) {
       const cl = this.noiseSrc();
       const hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 4000;
