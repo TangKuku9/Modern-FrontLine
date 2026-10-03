@@ -238,8 +238,11 @@ export class HUD {
     const ws = pl.ws, w = ws.w;
     // 准星
     const ch = $('crosshair');
-    // 死了就不许再挂瞄具遮罩（scoped 加 alive 防护的原因见下面 scope 那一段）
-    const scoped = !!(pl.alive && game.scopeState);
+    // 死了就不许再挂瞄具遮罩（scoped 加 alive 防护的原因见下面 scope 那一段）。
+    // 注意这里**不能**再拿 `!!` 压成布尔：下面 scope 那段拿它跟 'sniper' 比对、并
+    // 原样赋给 #scope 的 className —— 压平之后 .scope.acog/.scope.thermal 的 CSS
+    // 永远挂不上（optic.mjs C 组全红的出处，2026-10-03）。
+    const scoped = pl.alive && game.scopeState;
     const hideCross = ws.adsT > 0.4 || pl.sprinting || !pl.alive || (w && w.stats.type === 'sniper');
     ch.style.display = hideCross ? 'none' : 'block';
     if (w && !hideCross) {
