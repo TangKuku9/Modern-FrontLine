@@ -54,9 +54,14 @@ function clampQ(n, m) { return n > m ? m : n < -m ? -m : n; }
 // 只对有限数做（输入对象可能是 `unpackInput` 出来的整份，也可能是别处手工拼的）。
 export const roundLook = (v) => (Number.isFinite(v) ? Q.unpackLook(Q.packLook(v)) : v);
 
-// 实体姿态位
+// 实体姿态位。
+// 原本是一个字节（Alive..Reloading 八位正好排满），趴姿进来时它已经没有空位了 ——
+// 于是 flags 在快照里从 u8 加宽到 u16（server/codec.mjs:ENTITY_SIZE 25→26），Prone
+// 排在 bit 8。位序一旦两边不一致，症状是"对面的人在抖/姿态乱闪"而不是报错，
+// 所以仍然只有这一份定义。
 export const FLAG = {
   Alive: 1, Crouch: 2, Sprint: 4, Ads: 8, OnGround: 16, Sliding: 32, Firing: 64, Reloading: 128,
+  Prone: 256,
 };
 // 上行按键位（与 js/main.js 的 input 字段一一对应）
 export const KEY = {
@@ -67,6 +72,8 @@ export const KEY = {
   // 权威端停在主武器上连发步枪，客户端自己演的是手枪，快照再把权威的后坐喂回来。
   // keys 是 u16，排到 InteractPressed(2048) 后还剩 4096/8192 两格，恰好放下。
   Slot1: 4096, Slot2: 8192,
+  // 趴姿（Z）。keys 的最后一格（32768）仍然空着 —— 下一个新按键就得考虑加宽 keys 了。
+  Prone: 16384,
 };
 export const BTN = {
   Fire: 1, Ads: 2, FirePressed: 4, AdsPressed: 8, SwapNext: 16, SwapPrev: 32,
@@ -104,6 +111,7 @@ export const unpackStreak = (n) => (n === STREAK_NONE ? -1 : n);
 const KEYMAP = [
   ['Fwd', 'fwd'], ['Back', 'back'], ['Left', 'left'], ['Right', 'right'],
   ['Sprint', 'sprint'], ['Jump', 'jumpPressed'], ['Crouch', 'crouchPressed'],
+  ['Prone', 'pronePressed'],
   ['Reload', 'reloadPressed'], ['Interact', 'interact'], ['InteractPressed', 'interactPressed'],
   ['NVG', 'nvgPressed'], ['Melee', 'meleePressed'],
   // 数字键直选武器。漏掉它们的症状见 KEY.Slot1 的注释 —— codec 自测的按键往返表
@@ -129,6 +137,7 @@ export function packInput(inp) {
 export function unpackInput(keys, buttons) {
   const inp = {
     fwd: false, back: false, left: false, right: false, sprint: false, jumpPressed: false, crouchPressed: false,
+    pronePressed: false,
     fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
     meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
     interact: false, interactPressed: false, nvgPressed: false, streak: -1,

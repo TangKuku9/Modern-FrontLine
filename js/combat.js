@@ -14,16 +14,35 @@ const _p = new THREE.Vector3(), _q = new THREE.Vector3();
 // 这里要是蹭用了别人的临时向量，症状会是"偶发的火星喷向奇怪的方向"而没人查得到。
 const _n = new THREE.Vector3();
 
-// 玩家命中盒的解析定义（头球 + 躯干 AABB）。**一处定义，五处用**：
+// 玩家命中盒的解析定义（站/蹲：头球 + 躯干 AABB；趴：沿体轴的球链）。**一处定义，五处用**：
 // 本机玩家的当下裁决（js/player.js:hitTest）、远端玩家的即时反馈（js/net/remote.mjs:hitTest）、
 // Bot 的裁决（js/ai.js:hitTest，2026-10-02 收编——此前私盒半宽 0.27 比这里窄 3cm，
 // 是"本地中、权威不中"的第三层来源）、
 // 服务端按历史姿态的回溯裁决（延迟补偿，server/room.mjs:shotRewind → traceBullet 的 rewind 回调）、
 // 以及判据里"这一枪该不该中"的预测（test/lagcomp.mjs 调的就是它）。
-// 参数抽成 (x,y,z,eye) 四个标量而不是整个 Player，是因为延迟补偿每拍要存的就只是这四个量
-// （见 server/lagcomp.mjs:PoseRing）—— 命中盒依赖什么，缓冲里就该存什么，多存是浪费，
+// 参数抽成 (x,y,z,eye,yaw,prone) 六个标量而不是整个 Player，是因为延迟补偿每拍要存的就只是
+// 这六个量（见 server/lagcomp.mjs:PoseRing）—— 命中盒依赖什么，缓冲里就该存什么，多存是浪费，
 // 少存就是"回溯过去的盒子"和"当时的盒子"不是同一个，而那种错只会表现为偶尔打不中。
-export function hitTestPlayer(x, y, z, eye, o, d, maxT) {
+// yaw 与 prone 是趴姿加的：趴下的身体沿朝向平摊出去 ~1.6 m，只靠 (x,z) 一个 0.6 m 的方块
+// 盖不住，而"脚在哪个方向"没有 yaw 答不出来。
+export function hitTestPlayer(x, y, z, eye, yaw, prone, o, d, maxT) {
+  if (prone) {
+    // 趴姿盒子 = 沿体轴的四颗球（与 soldier.js 的趴姿模型对位：脚跟在身后 ~0.85 m、
+    // 头在身前 ~0.78 m，俯卧时躯干中心高 ~0.24 m）。躯干三颗 r 0.30（盖住肩宽 0.285 与
+    // 背上的背包），相邻球心距 0.5 < 直径 0.6 —— 球链不留缝，射线从两球之间钻不过去；
+    // 头球照旧 r 0.145，坐在躯干链最前端。脚段那颗判 'legs'（伤害 ×0.85），其余 'body'。
+    const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
+    let best = -1, part = null;
+    let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x + fx * 0.78, y + 0.34, z + fz * 0.78, 0.145);
+    if (t >= 0 && t < maxT) { best = t; part = 'head'; }
+    t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x + fx * 0.5, y + 0.24, z + fz * 0.5, 0.30);
+    if (t >= 0 && t < maxT && (best < 0 || t < best)) { best = t; part = 'body'; }
+    t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x, y + 0.24, z, 0.30);
+    if (t >= 0 && t < maxT && (best < 0 || t < best)) { best = t; part = 'body'; }
+    t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x - fx * 0.5, y + 0.24, z - fz * 0.5, 0.30);
+    if (t >= 0 && t < maxT && (best < 0 || t < best)) { best = t; part = 'legs'; }
+    return best >= 0 ? { t: best, part } : null;
+  }
   // 与外观贴合:头球 0.145 ≈ 盔体 0.135 + 1cm 容差(旧 0.16 比盔大一圈,贴着盔边擦过也算爆头);
   // 躯干半宽 0.30 盖住肩球 0.285(旧 0.28,打肩球边缘不判中)。改这里同时影响本机/远端/
   // Bot/服务端回溯四路裁决与 test/lagcomp.mjs 的判据线。
@@ -56,7 +75,7 @@ export function traceBullet(game, shooter, o, d, maxDist = 400, rewind = null) {
     if (e === shooter || !e.alive) continue;
     if (shooter && e.team === shooter.team) continue;
     const p = rewind ? rewind(e) : null;
-    const h = p ? hitTestPlayer(p[0], p[1], p[2], p[3], o, d, best) : e.hitTest(o, d, best);
+    const h = p ? hitTestPlayer(p[0], p[1], p[2], p[3], p[4], p[5], o, d, best) : e.hitTest(o, d, best);
     if (h && h.t < best) { best = h.t; ent = e; part = h.part; }
   }
   const point = new THREE.Vector3().copy(o).addScaledVector(d, best);

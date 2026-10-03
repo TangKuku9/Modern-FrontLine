@@ -872,7 +872,7 @@ sec('Q. FFA 的队键全链保真（独立队不许在快照/客户端/Bot 三�
     qBots.every(b => b.team === 'P' + b.netId) && QA.team === 'P' + QA.cid);
   roomQ.step();
   const qBack = decodeSnapshot(encodeSnapshot({ ...roomQ.snapshot(), seq: 1 }).view);
-  ok('Q5 快照 25 字节通道里全部实体走 P 通道（字节=2；敌我键以 roster/事件原始串为准）',
+  ok('Q5 快照实体通道里全部实体走 P 通道（字节=2；敌我键以 roster/事件原始串为准）',
     qBack.entities.length === 9 && qBack.entities.every(e => e.team === 2), qBack.entities.map(e => e.team).join(','));
 
   // —— Bot 敌我（"抱团"的根：同营互不为敌 → 两营各抱一团、共同猎真人）——

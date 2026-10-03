@@ -74,7 +74,7 @@ try {
   const { Player } = await import('../js/player.js');
   seedGameplayRng(4242);
   const mk = (o) => Object.assign({
-    fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false,
+    fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false, pronePressed: false,
     fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
     meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
     interact: false, interactPressed: false, nvgPressed: false, streak: -1,

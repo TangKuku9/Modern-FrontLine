@@ -53,7 +53,7 @@ export class NetPlayer {
     // 小地图的幽灵过滤靠它（hud.drawMinimap 里的 hasPerk('ghost')）—— 协议里没有逐人
     // 技能字段，也不该有：技能跟着装备走，装备的真相在服务端，跟着那三处事件走就够。
     this.perks = Array.isArray(o.perks) ? o.perks.slice() : [];
-    this.crouchT = 0; this.onGround = true; this.sprinting = false; this.sliding = false;
+    this.crouchT = 0; this.proneT = 0; this.onGround = true; this.sprinting = false; this.sliding = false;
     this.revealT = 0; this.dmgT = 99; this.stealthy = false;
     this.radius = 0.35;
     this.lastAttacker = null;
@@ -75,7 +75,7 @@ export class NetPlayer {
     this.model.root.position.copy(this.pos);
     game.scene.add(this.model.root);
     this.tag = null; this.buildTag();
-    this.anim = { speed: 0, phase: 0, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0, sprint: 0, air: 0, rocket: true };
+    this.anim = { speed: 0, phase: 0, crouch: 0, prone: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0, sprint: 0, air: 0, rocket: true };
     // —— 表现层账本（见文件头）——
     this.fireCool = 0;                              // 下一发枪声还要等多久
     this.stepDist = 0;                              // 从上一声脚步起走了多少米
@@ -172,16 +172,17 @@ export class NetPlayer {
     if (this.buf.length > 24) this.buf.shift();
   }
 
-  curEye() { return lerp(1.62, 1.05, this.crouchT); }
+  curEye() { return lerp(lerp(1.62, 1.05, this.crouchT), 0.45, this.proneT); }
   eyePos(out) { return out.set(this.pos.x, this.pos.y + this.curEye(), this.pos.z); }
   chestPos(out) { return out.set(this.pos.x, this.pos.y + this.curEye() - 0.4, this.pos.z); }
   forward(out) { return out.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)); }
 
   // 命中盒与权威裁决**共用一处定义**（js/combat.js:hitTestPlayer）。本机这份只影响"打到了"
   // 的即时反馈（真值在服务端），但盒子必须是同一个：抄一份的症状是"改了常数之后本地反馈说中、
-  // 权威说没中"，而两边都不报错。延迟补偿的缓冲里存的也正是这个函数的四个入参。
+  // 权威说没中"，而两边都不报错。延迟补偿的缓冲里存的也正是这个函数的六个入参。
+  // yaw 用权威值不用 yawSm：裁决不迟于权威，平滑只是给观众看的。
   hitTest(o, d, maxT) {
-    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), o, d, maxT);
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, this.proneT > 0.5 ? 1 : 0, o, d, maxT);
   }
   // 客户端不裁决伤害：只记下"我这一枪大概打掉多少"用于反馈，真值等服务器快照。
   // 返回值是**本地预测**的"这一枪会不会打死他"：它只驱动红叉与击杀音
@@ -257,6 +258,7 @@ export class NetPlayer {
     if (!s) return;
     this.hp = s.hp; this.alive = !!(s.flags & FLAG.Alive);
     this.crouchT = (s.flags & FLAG.Crouch) ? 1 : 0;
+    this.proneT = (s.flags & FLAG.Prone) ? 1 : 0;
     this.sprinting = !!(s.flags & FLAG.Sprint);
     this.onGround = !!(s.flags & FLAG.OnGround);
     this.sliding = !!(s.flags & FLAG.Sliding);
@@ -286,6 +288,9 @@ export class NetPlayer {
     const spd = Math.hypot(this.vel.x, this.vel.z);
     const a = this.anim;
     a.crouch = this.crouchT;
+    // 趴姿通道与冲刺/滞空同一套：位来自快照，按帧平滑（10/s）交给 animateSoldier。
+    // 直接跳变会让模型"啪"地拍在地上 —— 这人趴下时尤其明显，整个身位都在转。
+    a.prone = lerp(a.prone, this.proneT, Math.min(1, dt * 10));
     // 同理：俯仰不加负号（本地 AI 是 `A.pitch = this.pitch`，ai.js:329）。
     a.pitch = this.pitch;
     a.speed = spd;
@@ -359,7 +364,7 @@ export class NetPlayer {
       if (this.stepDist > (this.sprinting ? 2.0 : 1.6)) {
         this.stepDist = 0;
         const surf = (this.game.world && this.game.world.def && this.game.world.def.surface) || 'dirt';
-        this.game.audio.step(this.pos, surf, this.crouchT > 0.5 ? 0.1 : this.sprinting ? 0.38 : 0.24);
+        this.game.audio.step(this.pos, surf, this.proneT > 0.5 ? 0.07 : this.crouchT > 0.5 ? 0.1 : this.sprinting ? 0.38 : 0.24);
       }
     } else if (!this.alive) this.stepDist = 0;
 

@@ -137,7 +137,7 @@ const simrun = await stage('5 Player + WeaponSystem 在无渲染器进程里跑 
   pl.equip({ primary: { id: 'm4', att: { optic: 'holo', under: 'vgrip', muzzle: 'comp' } }, secondary: { id: 'm1911', att: {} }, lethal: 'frag', tactical: 'flash', perks: ['sleight', 'doubletime'] });
   game.player = pl;
 
-  const base = { fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false, fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false, meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false, interact: false, interactPressed: false, nvgPressed: false, streak: -1, firePressed: false, adsPressed: false, mdx: 0, mdy: 0 };
+  const base = { fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false, pronePressed: false, fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false, meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false, interact: false, interactPressed: false, nvgPressed: false, streak: -1, firePressed: false, adsPressed: false, mdx: 0, mdy: 0 };
   const DT = 1 / 60;
   const trace = [];
   for (let i = 0; i < 240; i++) {

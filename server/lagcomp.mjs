@@ -29,20 +29,25 @@ export const LAG_MAX_TICKS = 60;
 // 环形缓冲长度：1.6 s。要比上限多出余量 —— 判据端能查到的最旧拍号是
 // lastSent − LAG_MAX_TICKS，而 lastSent 最旧可以落后当前拍 SNAP_EVERY−1 拍。
 export const LAG_HIST = 96;
-export const POSE_FIELDS = 4;                       // x, y, z, eye
+// x, y, z, eye, yaw, prone —— 后两个是趴姿加的：趴下的命中盒沿体轴平摊出去 ~1.6 m
+// （js/combat.js:hitTestPlayer），"脚跟朝哪"没有 yaw 答不出来，"是否已经趴下"没有
+// prone 答不出来。盒子依赖什么，缓冲里就得存什么。
+export const POSE_FIELDS = 6;
 
 // 一个玩家的姿态环形缓冲。拍号单调递增，按下标取模写入；lo/hi 记窗口，
 // 于是"这一拍还在不在缓冲里"是个可判定的问题，而不是靠调用方自己算。
 export class PoseRing {
   constructor(n = LAG_HIST) { this.n = n; this.d = new Float64Array(n * POSE_FIELDS); this.lo = 0; this.hi = -1; }
-  // pl 只要有 pos 与 curEye() —— Player 与 NetPlayer 都有这两个（命中盒的定义在 js/combat.js）。
+  // pl 要有 pos / curEye() / yaw / proneT —— Player 与 NetPlayer 都有这四个（命中盒的定义在
+  // js/combat.js）。Bot 没有 proneT（它们不趴），读出来是 undefined，与 0 同义。
   record(tick, pl) {
     const i = (tick % this.n) * POSE_FIELDS, d = this.d;
     d[i] = pl.pos.x; d[i + 1] = pl.pos.y; d[i + 2] = pl.pos.z; d[i + 3] = pl.curEye();
+    d[i + 4] = pl.yaw; d[i + 5] = pl.proneT > 0.5 ? 1 : 0;
     if (this.hi < this.lo) { this.lo = this.hi = tick; }        // 第一笔
     else { this.hi = tick; this.lo = Math.max(this.lo, tick - this.n + 1); }
   }
-  // 把 tick 那一拍的 [x,y,z,eye] 交出来；不在窗口里返回 null。
+  // 把 tick 那一拍的 [x,y,z,eye,yaw,prone] 交出来；不在窗口里返回 null。
   // 返回**新数组**而不是复用一个 scratch：核弹级的坑是"交错对象静默毒化下游"——
   // 这里每次裁决也就几次分配，不值得为它冒那个险。
   at(tick) {
@@ -87,7 +92,7 @@ if (typeof process !== 'undefined' && isDirectRun(process.argv[1], import.meta.u
     if (!ok) bad++;
     console.log(`  ${ok ? '✅' : '❌'} ${label}  ${JSON.stringify(got)}${ok ? '' : ' ≠ ' + JSON.stringify(want)}`);
   };
-  const fake = (x) => ({ pos: { x, y: 0, z: 0 }, curEye: () => 1.62 });
+  const fake = (x) => ({ pos: { x, y: 0, z: 0 }, curEye: () => 1.62, yaw: 0.5, proneT: 0 });
   const r = new PoseRing(8);
   eq(r.at(3), null, '空缓冲取任何一拍都是 null');
   for (let t = 100; t < 108; t++) r.record(t, fake(t));

@@ -94,10 +94,10 @@ export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
   // 与快照同一时刻"。那个前提在 deficit>0 的空跑窗里**不成立**（基态比权威端早 deficit 拍），
   // 于是这条断言在那些窗里量的是两件不同的事。现在重建已经把 deficit 补掉，基态真的落在
   // 权威那一刻上，前提失而复得。
-  const baseState = hit ? { alive: pl.alive, crouchT: pl.crouchT, sprinting: pl.sprinting, onGround: pl.onGround, sliding: pl.sliding } : null;
+  const baseState = hit ? { alive: pl.alive, crouchT: pl.crouchT, proneT: pl.proneT, sprinting: pl.sprinting, onGround: pl.onGround, sliding: pl.sliding } : null;
   // 只有服务端**有权改动**的那几维用权威值覆盖：位置（碰撞纠正）、视线（它裁决的后坐）、
   // 生命与存活（别人打的）。
-  // 姿态类布尔（crouch/slide/sprint/onGround）刻意**不**覆盖 —— 它们完全由我自己的输入
+  // 姿态类布尔（crouch/prone/slide/sprint/onGround）刻意**不**覆盖 —— 它们完全由我自己的输入
   // 推出来，服务端那边只是一份 1 bit 的量化影子（>0.5 才为真）；拿信息量更少的版本去
   // 覆盖信息量更多的那份，是在往预测里灌误差：蹲伏过渡中 crouchT=0.6 被硬拉成 1，
   // 视线高度就从 lerp(1.62,1.05,0.6) 跳到 1.05，而 journal 里本来是对的。
@@ -125,7 +125,7 @@ export function rollback(game, pl, win, startTick, e, rngState, opts = {}) {
   //   而"上一包重建出来的那一刻"按定义就是"和上一份快照同一时刻"，也就是下一窗的基态；
   //   它是**同一时刻的直接传递**，不经过日记本那条逐代推的路径，因此不累积。
   // 取在权威覆盖**之后**：位置/速度/朝向/血这几维此刻就是权威读数，比重建值更准；
-  // 姿态类布尔（crouch/slide/sprint/onGround）与武器时间轴则由重演决定（上面刻意不覆盖）。
+  // 姿态类布尔（crouch/prone/slide/sprint/onGround）与武器时间轴则由重演决定（上面刻意不覆盖）。
   // 取在重演循环**之前**：循环会把 pl 推到 localTick，那不是"和快照同一时刻"了。
   const landed = hit ? pl.journal() : null;
   // ── 这一拍（win[0] / tick=start）的账本**不能**在这里写回 ─────────────────────────

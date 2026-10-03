@@ -35,12 +35,12 @@ function chk(ok, name, detail = '') {
   else console.log(`ok    ${name}${detail ? '  | ' + detail : ''}`);
 }
 
-// 一段覆盖所有被重演路径的输入脚本：走、冲刺、蹲→滑、跳、开镜、长短连发、换弹、切枪、近战
+// 一段覆盖所有被重演路径的输入脚本：走、冲刺、蹲→滑、趴、跳、开镜、长短连发、换弹、切枪、近战
 function script(i) {
   const inp = {
     fwd: false, back: false, left: false, right: false, jump: false, crouch: false, sprint: false,
     ads: false, fire: false, reload: false, swap: false, melee: false, nvg: false,
-    jumpPressed: false, crouchPressed: false, reloadPressed: false, swapPressed: false,
+    jumpPressed: false, crouchPressed: false, pronePressed: false, reloadPressed: false, swapPressed: false,
     meleePressed: false, slot1: false, slot2: false, lethalPressed: false, tacticalPressed: false,
     lethal: false, tactical: false, interactPressed: false, mdx: 0, mdy: 0,
   };
@@ -48,6 +48,8 @@ function script(i) {
   inp.sprint = i > 20 && i < 60 && inp.fwd;
   if (i === 40) inp.crouchPressed = true;             // 冲刺中按下蹲 → 滑行
   if (i === 58) inp.crouchPressed = true;
+  if (i === 150) inp.pronePressed = true;             // 开镜中趴下 → 视线/碰撞高度两层一起过渡
+  if (i === 170) inp.pronePressed = true;             // 起身：proneT/crouching 的回落也要逐拍重演一致
   inp.jumpPressed = (i === 90 || i === 180);
   inp.ads = i > 100 && i < 190;
   inp.mdx = (i % 7 === 0 ? 1 : 0) * 0.6;              // 一直有人在转视角

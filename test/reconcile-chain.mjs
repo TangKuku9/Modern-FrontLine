@@ -53,7 +53,7 @@ function inputAt(i) {
     fwd: (i % 13) < 9, back: false, left: (i % 29) < 12, right: (i % 37) < 15,
     jump: false, crouch: false, sprint: false, ads: false, fire: false, reload: false,
     swap: false, melee: false, nvg: false,
-    jumpPressed: false, crouchPressed: false, reloadPressed: false, swapPressed: false,
+    jumpPressed: false, crouchPressed: false, pronePressed: false, reloadPressed: false, swapPressed: false,
     meleePressed: false, slot1: false, slot2: false, lethalPressed: false, tacticalPressed: false,
     lethal: false, tactical: false, interactPressed: false,
     mdx: ((i % 7) - 3) * 0.31, mdy: ((i % 5) - 2) * 0.17,

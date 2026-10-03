@@ -2,7 +2,7 @@
   const log = [];
   await game.startGame('mp', { mode: 'tdm', map: 'yard', diff: 0, allies: 3, enemies: 4, scoreLimit: 50, timeLimit: 10 });
   game.renderer.setAnimationLoop(null);
-  const base = () => ({ fwd: false, back: false, left: false, right: false, sprint: false, jumpPressed: false, crouchPressed: false, fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false, meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false, interact: false, interactPressed: false, nvgPressed: false, streak: -1, firePressed: false, adsPressed: false, mdx: 0, mdy: 0 });
+  const base = () => ({ fwd: false, back: false, left: false, right: false, sprint: false, jumpPressed: false, crouchPressed: false, pronePressed: false, fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false, meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false, interact: false, interactPressed: false, nvgPressed: false, streak: -1, firePressed: false, adsPressed: false, mdx: 0, mdy: 0 });
   const step = (n, f) => { for (let i = 0; i < n; i++) { const inp = base(); f && f(inp, i); game.update(1 / 30, inp); } };
   const pl = game.player;
   step(20);
@@ -22,6 +22,12 @@
   step(60, (inp) => { inp.fwd = true; inp.sprint = true; });
   step(20, (inp, i) => { inp.crouchPressed = i === 0; inp.fwd = true; inp.sprint = true; });
   step(20, (inp, i) => { inp.jumpPressed = i === 0; });
+  // 趴姿：Z 趴下 → 视线/碰撞高度降下去、速度降到匍匐档；再按 Z 起身 → 回到站立视线。
+  // 起身走天花板分层（yard 开阔地必然升到站），冒起身失败的话 eye 会停在 1.05/0.45。
+  step(45, (inp, i) => { inp.pronePressed = i === 0; inp.fwd = i > 10; });
+  log.push(['prone', pl.proning, pl.curEye().toFixed(2), pl.crouchT.toFixed(2), pl.proneT.toFixed(2)]);
+  step(45, (inp, i) => { inp.pronePressed = i === 0; });
+  log.push(['unprone', pl.proning, pl.curEye().toFixed(2), pl.crouchT.toFixed(2), pl.proneT.toFixed(2)]);
   log.push(['moved', pl.pos.x.toFixed(1), pl.pos.z.toFixed(1), pl.alive]);
   // streaks
   const M = game.mode;

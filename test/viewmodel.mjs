@@ -1,6 +1,6 @@
 // P0-2 拆分接缝的功能回归：枪模要跟着瞄准走、换弹要动弹匣、切枪要换模型、
-// 高倍镜要遮罩、拾取要重建。这些正是"把视图模型拆出去"最容易弄断的东西，
-// 而帧率测试（test/fps.mjs）和确定性闸门（server/gate.mjs）都盖不住它们。
+// 高倍镜要遮罩、拾取要重建、满镜换弹要打断 ADS。这些正是"把视图模型拆出去"最容易
+// 弄断的东西，而帧率测试（test/fps.mjs）和确定性闸门（server/gate.mjs）都盖不住它们。
 import { chromium } from 'playwright';
 import { withServer } from './with-server.mjs';
 
@@ -116,6 +116,29 @@ const res = await page.evaluate(async () => {
   ok('高倍镜下枪模隐藏', vm.holder.visible === false);
   frames(40);
   ok('收镜后 scopeState 归 null 且枪模重现', g.scopeState === null && vm.holder.visible === true);
+
+  // 6) 满镜换弹：ADS 必须被换弹打断（weapon-state.js 的 wantAds 排除表里有 'reload'）。
+  //    旧症状：按住右键能把 adsT 顶满整个装填过程 —— scope 遮罩挂着、枪模被 scoped
+  //    藏掉，"既在开镜又在换弹"。判据：换弹中 adsT 收到 0、遮罩清掉、枪模重现，
+  //    装填完按着右键还能自然回镜。
+  frames(90, () => { g.input.buttons = 4; });
+  ok('满镜前置', ws.adsT > 0.9 && g.scopeState === 'sniper' && vm.holder.visible === false,
+    `adsT=${ws.adsT.toFixed(3)} scope=${g.scopeState}`);
+  ws.w.mag = 0;    // 第 5 节 replaceSlot 给的是满匣（l115 弹匣就 5 发），满匣起不了换弹
+  ws.startReload();
+  let adsBroken = false, scopeCleared = false, gunBack = false;
+  for (let i = 0; i < 240 && ws.state === 'reload'; i++) {
+    frames(1);
+    if (ws.adsT < 0.05) adsBroken = true;
+    if (ws.adsT < 0.85) { scopeCleared = scopeCleared || g.scopeState === null; gunBack = gunBack || vm.holder.visible === true; }
+  }
+  ok('换弹走完', ws.state === 'idle', 'state=' + ws.state);
+  ok('换弹中 adsT 收零（ADS 被打断）', adsBroken, 'adsT=' + ws.adsT.toFixed(3));
+  ok('换弹中 scope 遮罩清掉', scopeCleared, 'scope=' + g.scopeState);
+  ok('换弹中枪模重现', gunBack);
+  frames(90, () => { g.input.buttons = 4; });
+  ok('装填完按住右键回镜', ws.adsT > 0.9 && g.scopeState === 'sniper', `adsT=${ws.adsT.toFixed(3)} scope=${g.scopeState}`);
+  g.input.buttons = 0;
 
   g.composer.render = realRender;
   g.clock = realClock; realClock.getDelta();

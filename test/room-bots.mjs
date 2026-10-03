@@ -14,7 +14,7 @@
 // 每条都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。
 import { NetRoom, DT } from '../server/room.mjs';
-import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
+import { encodeSnapshot, decodeSnapshot, HEADER_SIZE, ENTITY_SIZE } from '../server/codec.mjs';
 import { killMedals, LONGSHOT_DIST } from '../js/match-rules.js';
 import * as THREE from 'three';
 
@@ -23,12 +23,13 @@ const ok = (label, cond, extra = '') => { checks.push([!!cond, label + (extra ? 
 const sec = (t) => console.log('\n── ' + t + ' ──');
 
 // 快照里的实体数。**从包长反推**，不读服务端的对象：
-// 包长是定死的 11 + n×25（server/codec.mjs），所以"多一个 Bot"必须让包长正好多 25 字节。
+// 包长是定死的 HEADER_SIZE + n×ENTITY_SIZE（server/codec.mjs，趴姿那轮起实体 26 B），
+// 所以"多一个 Bot"必须让包长正好多一个实体。
 // 直接读 room.game.bots.length 的那种判据量的是服务端自己那一侧 —— Bot 进了 sim
 // 却没编进快照时它照样是绿的，而那正是这一项最要命的失效形状。
 const entsInPacket = (room) => {
   const { byteLength } = encodeSnapshot(room.snapshot());
-  return (byteLength - 11) / 25;
+  return (byteLength - HEADER_SIZE) / ENTITY_SIZE;
 };
 const stepN = (room, n) => { for (let i = 0; i < n; i++) room.step(); };
 
@@ -42,8 +43,8 @@ sec('A. 量具自证：这把尺子在"没有 Bot"的时候必须读出 0');
 // ═══════════════════════════════════════════════════════════════════════════
 ok('A1 没加 Bot 时，快照里恰好是 2 个真人（包长反推，不是读对象）',
   entsInPacket(room) === 2, `实体数 ${entsInPacket(room)}`);
-ok('A2 包长确实是 11 + 2×25（这条红了说明量具自己算错了，下面每一条都不可信）',
-  encodeSnapshot(room.snapshot()).byteLength === 11 + 2 * 25,
+ok('A2 包长确实是 HEADER_SIZE + 2×ENTITY_SIZE（这条红了说明量具自己算错了，下面每一条都不可信）',
+  encodeSnapshot(room.snapshot()).byteLength === HEADER_SIZE + 2 * ENTITY_SIZE,
   `${encodeSnapshot(room.snapshot()).byteLength} 字节`);
 ok('A3 房间里的 Bot 名单是空的（起点干净）', (room.game.bots || []).length === 0);
 
@@ -56,13 +57,13 @@ ok('B1 spawnBot 造出一个活的 Bot，并且带上了同步用的 netId',
 ok('B2 它进了权威端的实体表（会被子弹打得到、也会被白磷弹烧到）',
   room.game.entities.includes(b1) && room.enemiesOf('A').includes(b1));
 // ── 这一节的命门 ──
-ok('B3 快照里**多出一行**：包长从 2×25 变成 3×25（Bot 没编进快照的话这里是 2，而它照样在开枪）',
+ok('B3 快照里**多出一行**：实体从 2 个变成 3 个（Bot 没编进快照的话这里是 2，而它照样在开枪）',
   entsInPacket(room) === 3, `实体数 ${entsInPacket(room)}`);
 const ents = room.snapshot().entities;
 const row1 = ents.find(e => e.id === b1.netId);
 ok('B4 那一行的数据是它自己的（id/队伍/坐标对得上）',
   !!row1 && row1.team === 1 && Math.abs(row1.x - b1.pos.x) < 0.02, JSON.stringify(row1 && { id: row1.id, team: row1.team, x: +row1.x.toFixed(2) }));
-ok('B5 快照往返不失真（Bot 那一行与真人同形状，25 字节能原样解回来）',
+ok('B5 快照往返不失真（Bot 那一行与真人同形状，整行能原样解回来）',
   !!row1 && decodeSnapshot(encodeSnapshot(room.snapshot()).view).entities.some(e => e.id === b1.netId));
 
 // ═══════════════════════════════════════════════════════════════════════════

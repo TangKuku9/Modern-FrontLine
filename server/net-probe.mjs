@@ -165,7 +165,8 @@ const expect = HEADER_SIZE + 2 * ENTITY_SIZE;
 ok(`2 人快照 ${per.toFixed(0)} B/包（协议算出 ${expect}）`, Math.abs(per - expect) < 1);
 // 带宽闸要按**边际成本**算，不是按"这包摊到每人多少"：头部那 11 B 摊在 2 人头上是 5.5 B/人，
 // 摊在 16 人头上是 0.7 B/人，所以"29.5 B/人"这种数会随人数变，拿它当阈值是挂错量具。
-// 真正随人数线性增长的是 ENTITY_SIZE，规格就钉在它身上：一个人 24 B，16 人 20Hz ≤ 100 kbps。
+// 真正随人数线性增长的是 ENTITY_SIZE，规格就钉在它身上：一个人 26 B（flags 是 u16，
+// 趴姿位占 bit 8），16 人 20Hz ≤ 100 kbps。
 const kbps16 = (HEADER_SIZE + 16 * ENTITY_SIZE) * 20 * 8 / 1000;
 ok(`16 人 @20Hz 下行 ${kbps16.toFixed(1)} kbps ≤ 规格 100 kbps`, kbps16 <= 100);
 ok(`每多一人的边际成本 ${ENTITY_SIZE} B ≤ 规格 28 B`, ENTITY_SIZE <= 28);

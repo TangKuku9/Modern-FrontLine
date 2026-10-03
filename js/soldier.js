@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { mat } from './materials.js';
 import { buildGun } from './gunmodel.js';
 import { textTexture } from './textures.js';
+import { lerp } from './util.js';
 
 export const STYLES = {
   ally: { fab: 'fab_ally', vest: 0x5e5440, helmet: 0x5a513d, head: 'helmet', nvg: true, face: 'skin' },
@@ -66,6 +67,11 @@ function gunPoint(p, off, out) {
 }
 // 冲刺持枪的枪位:收向胸口,枪口上抬(rotation.x 由 animateSoldier 按 sprint 通道抬)。
 const GUN_SPRINT = new THREE.Vector3(0.10, 0.33, -0.22);
+// 趴姿持枪的枪位(torso 局部):贴体侧。prone 通道把枪绕 X 抬 +π/2 —— torso-local -Z
+// (枪口原方向)转到 +Y(体轴向头的方向),再被 root 的 -π/2 整体带着指向前方。与死亡那把
+// (GUN_DEAD,-π/2,枪口转向脚尖)正好相反:活人趴着要射击,死人才搂着枪。
+const GUN_PRONE = new THREE.Vector3(0.10, 0.30, -0.14);
+const _gh = new THREE.Vector3();
 
 // —— 几何缓存:每兵要 new ~45 份几何,而换枪(remote.mjs:swapWeapon)是整模重建 ——
 // 全部按参数走模块级缓存后,重建与 Bot 成批刷出都不再分配几何/GPU 缓冲。
@@ -101,6 +107,11 @@ export function createSoldierModel(styleName, weaponId, attachments = {}, camo =
   const vest = vestMat(st.vest);
   const helm = vestMat(st.helmet);
   const root = new THREE.Group();
+  // 旋转序 YXZ（偏航内层、俯仰外层）：趴姿/死亡要把人绕**自身** X 轴放倒 —— 头倒向朝向的
+  // 前方、髋的垫高（root-local +Z）才是世界 +Y。默认 XYZ 下 rotation.x 绕的是世界 X 轴，
+  // 任何 yaw ≠ 0 的人都朝世界 −Z 侧翻（数值验证过：体轴恒映射到世界 −Z），与命中盒
+  // （趴姿头球在朝向前方 ~0.78 m，js/combat.js:hitTestPlayer）对不上。站姿 x=z=0，不受影响。
+  root.rotation.order = 'YXZ';
   const hips = new THREE.Group(); hips.position.y = 0.95; root.add(hips);
   const parts = { root, hips };
   // detail:距离细节档要裁的小件(LOD),同时它们不投影(见文件尾的阴影裁剪)
@@ -234,23 +245,31 @@ export function makeNameTag(text, color) {
 
 // 动画状态机
 export function animateSoldier(p, s, dt) {
-  // s: {speed, phase, crouch(0..1), pitch, dead, deadT, fallDir, fallRoll, recoil, ads, slide}
+  // s: {speed, phase, crouch(0..1), prone(0..1), pitch, dead, deadT, fallDir, fallRoll, recoil, ads, slide}
   if (s.dead) {
     const k = Math.min(1, s.deadT / 0.55);
     const e = 1 - Math.pow(1 - k, 3);
-    p.root.rotation.x = e * (Math.PI / 2) * s.fallDir;
+    // 死前正趴着的人从趴姿继续倒（root 已经在 -π/2），不要先弹回站立再倒 —— 那一下
+    // 弹跳在画面上是"人先站起来又摔下去"。fallDir=-1（向前扑）本来就是同一个角度，无缝；
+    // fallDir=+1（向后倒）则顺势滚半圈躺平,落地姿态与站着死时相同。
+    const pr0 = s.prone || 0;
+    p.root.rotation.x = e * (Math.PI / 2) * s.fallDir - (1 - e) * pr0 * (Math.PI / 2);
     p.root.rotation.z = e * s.fallRoll;
-    p.hips.position.y = 0.95 - e * 0.75;
+    p.hips.position.y = 0.95 - e * 0.75 - pr0 * (1 - e) * 0.85;
     // 趴倒(root 转 -90°)时躯干的 -Z 半边(脸、胸、枪)指向世界下方,不垫就是半截埋进地里;
     // 沿 root-local +Z(= 世界 +Y)抬 0.16,身体落在胸口那个面上。仰倒埋进去的是背包,看不见,不用抬。
-    p.hips.position.z = s.fallDir < 0 ? e * 0.16 : 0;
+    // 趴姿起点自带这 0.16 的垫高,随倒地进度退掉（仰倒）或保住（俯卧,同一个垫子）。
+    p.hips.position.z = (s.fallDir < 0 ? e * 0.16 : 0) + pr0 * (1 - e) * 0.16;
     p.legL.leg.rotation.x = e * 0.3; p.legR.leg.rotation.x = -e * 0.2;
-    p.torso.rotation.x = 0;
+    // 撑起的胸腔（活人趴姿的 0.42）随倒地拍平 —— 不写的话 e=0 那一帧胸口一沉。
+    p.torso.rotation.x = (1 - e) * pr0 * 0.42;
     // 枪贴到身上:位置收到 GUN_DEAD、枪口转向脚尖。手是枪的子件、手臂 IK 的靶点跟着枪,
-    // 于是落成"搂着枪倒下",而不是站姿的胳膊平摊在两边。
+    // 于是落成"搂着枪倒下",而不是站姿的胳膊平摊在两边。趴姿起点的枪位/转角从 GUN_PRONE
+    // 那一套接过来 —— 不接的话 e=0 那一帧枪会瞬移回站立枪位。
     if (p.gun && p.gunHome) {
-      p.gun.position.lerpVectors(p.gunHome, GUN_DEAD, e);
-      p.gun.rotation.x = p.gunBaseRotX - e * Math.PI / 2;
+      _gh.copy(p.gunHome).lerp(GUN_PRONE, pr0);
+      p.gun.position.lerpVectors(_gh, GUN_DEAD, e);
+      p.gun.rotation.x = p.gunBaseRotX + pr0 * (1 - e) * (Math.PI / 2) - e * Math.PI / 2;
     }
   } else {
     const c = s.crouch;
@@ -260,8 +279,12 @@ export function animateSoldier(p, s, dt) {
     // 放在 animateSoldier 里而不是各调用点:调用点有三处（本机预测不画、Bot、NetPlayer），
     // 漏掉任何一处都会在那一路上复现。ai.js 的 respawn 里那句 rotation.set(0,yaw,0) 保留 ——
     // 它管的是同一帧就位，这里管的是"之后每一帧都不会被旧姿态污染"。
-    p.root.rotation.x = 0; p.root.rotation.z = 0;
-    // 滑铲/举枪/冲刺/滞空是四个**只给模型**的姿态通道（0..1）。源头是权威状态位
+    // 趴姿(prone 通道)复用死亡那一套几何:root 绕 X 转 -π/2(俯卧,脸朝下)、髋沿 root-local
+    // +Z(=世界 +Y)抬 0.16(不垫半截埋进地里)。与死亡的区别只在"活人要把上半身撑起来、
+    // 枪口朝前" —— 见下面 torso 与枪的两段。
+    const pr = s.prone || 0;
+    p.root.rotation.x = -Math.PI / 2 * pr; p.root.rotation.z = 0;
+    // 滑铲/举枪/冲刺/滞空/趴姿是五个**只给模型**的姿态通道（0..1）。前四个的源头是权威状态位
     // （FLAG.Sliding / FLAG.Ads / FLAG.Sprint / FLAG.OnGround），由 NetPlayer 平滑后递进来；
     // 本地 Bot 产生其中冲刺/滑铲两位（js/ai.js），举枪与滞空不产，缺省 0。本机玩家是
     // 第一人称，这些姿态在单机里体现在相机上（滑铲降 0.25 m、侧倾 0.06，js/player.js:331,357），
@@ -270,33 +293,49 @@ export function animateSoldier(p, s, dt) {
     const sp = s.sprint || 0, air = s.air || 0;
     // 同理要复位的还有:枪的倒地转角、趴倒垫高的髋 —— 都是死亡分支写过、活人分支曾放任不管的。
     // 冲刺在复位之上叠一个枪口上抬(gunPoint 会带着手靶一起转,手仍扣在枪上)。
-    if (p.gun) p.gun.rotation.x = p.gunBaseRotX + sp * 0.5;
-    p.hips.position.z = 0;
+    if (p.gun) p.gun.rotation.x = p.gunBaseRotX + sp * 0.5 + pr * (Math.PI / 2);
+    p.hips.position.z = pr * 0.16;
     const moving = s.speed > 0.3;
     const sw = moving ? Math.sin(s.phase) : 0;
-    const amp = Math.min(1, s.speed / 5) * (1 - c * 0.5) * (1 + sp * 0.35);
+    // 趴着不再迈步:摆幅随 pr 收掉（crawl 的腿型换到下面腿那段单独给）。
+    const amp = Math.min(1, s.speed / 5) * (1 - c * 0.5) * (1 + sp * 0.35) * (1 - pr);
     // 蹲姿三数(髋降/大腿/小腿)是按腿长反推的配套:膝在髋下 0.44、踝在膝下 0.49,
     // 大腿 1.08 + 小腿 -2.0 时脚正好踩地、臀落在 ≈0.52 高 —— 单独动一个就"坐在空气凳上",
     // 旧值(1.25/-1.7/降0.36)就是那个症状:臀悬空、大腿尖戳进肚囊。
     const baseThigh = c * 1.08 + sl * 0.85, baseKnee = -c * 2.0 - sl * 0.55;
     // 滞空(air):前腿抬、后腿伸、双膝收 —— 没有这一档,跳起来的人保持最后一步的迈步定格。
-    p.legL.leg.rotation.x = baseThigh + sw * (0.55 + sp * 0.3) * amp + air * 0.55;
-    p.legR.leg.rotation.x = baseThigh - sw * (0.55 + sp * 0.3) * amp - air * 0.3;
-    p.legL.knee.rotation.x = baseKnee - Math.max(0, -Math.cos(s.phase)) * 0.9 * amp - air * 0.8;
-    p.legR.knee.rotation.x = baseKnee - Math.max(0, Math.cos(s.phase)) * 0.9 * amp - air * 0.8;
-    p.hips.position.y = 0.95 - c * 0.43 - sl * 0.3 + (moving ? Math.abs(Math.cos(s.phase)) * 0.04 * (1 + sp * 0.8) * amp : 0);
-    // 冲刺前倾;站立时呼吸微晃(performance.now 是纯表现时钟,不进任何玩法流)
+    // 趴姿腿型:身体转平后腿沿体轴伸向正后方,大腿收平、膝只留一点弯,爬行时两腿交替小幅
+    // 打水（速度由 amp 管不到这里,单独按 phase 摆）。
+    const crawl = moving ? Math.sin(s.phase) * 0.22 * Math.min(1, s.speed / 1.5) : 0;
+    p.legL.leg.rotation.x = lerp(baseThigh + sw * (0.55 + sp * 0.3) * amp + air * 0.55, -0.04 + crawl, pr);
+    p.legR.leg.rotation.x = lerp(baseThigh - sw * (0.55 + sp * 0.3) * amp - air * 0.3, -0.04 - crawl, pr);
+    p.legL.knee.rotation.x = lerp(baseKnee - Math.max(0, -Math.cos(s.phase)) * 0.9 * amp - air * 0.8, -0.18, pr);
+    p.legR.knee.rotation.x = lerp(baseKnee - Math.max(0, Math.cos(s.phase)) * 0.9 * amp - air * 0.8, -0.18 - crawl, pr);
+    // 髋的落点:站/蹲/滑照旧;趴下时整个人沿体轴往回挪 0.85(hips.local +Y 就是体轴向头的
+    // 方向) —— 不挪的话身体从脚尖起向前平摊 1.7 m,与命中盒(以 pos 为中心)和相机都对不上。
+    p.hips.position.y = lerp(
+      0.95 - c * 0.43 - sl * 0.3 + (moving ? Math.abs(Math.cos(s.phase)) * 0.04 * (1 + sp * 0.8) * amp : 0),
+      0.10, pr);
+    // 冲刺前倾;站立时呼吸微晃(performance.now 是纯表现时钟,不进任何玩法流)。
+    // 趴姿把上半身撑起来(0.42 ≈ 肘撑地、视线离地 ~0.3 m,与命中盒的头球同高),随 pitch 微调。
     const swT = performance.now() * 0.001;
-    p.torso.rotation.x = s.pitch * 0.8 - c * 0.32 - sp * 0.22 + sl * 0.3 + (s.recoil || 0) * 0.12
-      + (moving ? 0 : Math.sin(swT * 1.8 + p.swayPhase * 1.7) * 0.006);
+    p.torso.rotation.x = lerp(
+      s.pitch * 0.8 - c * 0.32 - sp * 0.22 + sl * 0.3 + (s.recoil || 0) * 0.12
+        + (moving ? 0 : Math.sin(swT * 1.8 + p.swayPhase * 1.7) * 0.006),
+      0.42 + s.pitch * 0.55 + (s.recoil || 0) * 0.12, pr);
     p.torso.rotation.y = moving ? sw * 0.06 : Math.sin(swT * 1.3 + p.swayPhase) * 0.014;
     p.neck.rotation.x = s.pitch * 0.2;
     // 举枪：枪从持枪位收到肩/眼线上（GUN_ADS 是终点，ad=0 时恰好回到 createSoldierModel
-    // 摆的那一位 —— 所以不传 ads 的调用点一个字都不会变）。冲刺另收向胸口(GUN_SPRINT)。
+    // 摆的那一位 —— 所以不传 ads 的调用点一个字都不会变）。冲刺另收向胸口(GUN_SPRINT)，
+    // 趴姿收向体侧、枪口顺体轴转向前方(GUN_PRONE + 上面那 +π/2)。
     if (p.gun && p.gunHome) {
       p.gun.position.lerpVectors(p.gunHome, GUN_ADS, ad);
       if (sp > 0) p.gun.position.lerp(GUN_SPRINT, sp);
+      if (pr > 0) p.gun.position.lerp(GUN_PRONE, pr);
     }
+    // 名牌挂在 root 上(ai.js / remote.mjs):root 转平后 local (0,2.15,0) 会被甩到身前贴地。
+    // 把它收进 root-local +Z(=趴姿的世界上方,与死亡垫髋同一句几何),保持在身体正上方。
+    if (p.tag) p.tag.position.set(0, 2.15 * (1 - pr), pr);
   }
   // 弹头可见性两个分支共用：膛里有火箭才坐在筒口。s.rocket 缺省算"有"——
   // 不传这个位的调用点（菜单预览）看到的永远是装填完毕的那把枪。

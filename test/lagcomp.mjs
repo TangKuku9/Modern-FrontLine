@@ -137,10 +137,11 @@ function shoot(L, aim, view) {
   // ① 预测：服务端会按哪一拍的盒子判？
   const eff = rewindTick(v, cur, ca.lastSnapSent);
   const usePast = eff >= 0;
-  const pose = usePast ? posePast : cb.pose.at(room.tick) || [T.pos.x, T.pos.y, T.pos.z, T.curEye()];
+  const pose = usePast ? posePast
+    : cb.pose.at(room.tick) || [T.pos.x, T.pos.y, T.pos.z, T.curEye(), T.yaw, T.proneT > 0.5 ? 1 : 0];
   // ② 世界那个盒子会不会先被墙挡下 —— 和 traceBullet 同一套语义（best 从墙距起算）
   const wh = W0.raycast(ro, rd, 400);
-  const box = hitTestPlayer(pose[0], pose[1], pose[2], pose[3], ro, rd, wh ? wh.t : 1e9);
+  const box = hitTestPlayer(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5], ro, rd, wh ? wh.t : 1e9);
   const predicted = !!box;
 
   // ③ 实测
@@ -244,7 +245,7 @@ for (const c of cells) {
     const ro = S.eyePoint(new THREE.Vector3());
     const rd = S.aimDir(new THREE.Vector3());
     const wh = W0.raycast(ro, rd, 400);
-    const predicted = !!hitTestPlayer(posePast[0], posePast[1], posePast[2], posePast[3], ro, rd, wh ? wh.t : 1e9);
+    const predicted = !!hitTestPlayer(posePast[0], posePast[1], posePast[2], posePast[3], posePast[4], posePast[5], ro, rd, wh ? wh.t : 1e9);
     const perpNow = +perpTo(ro, rd, bot.pos.x, bot.pos.z).toFixed(3);
     const perpPast = +perpTo(ro, rd, posePast[0], posePast[2]).toFixed(3);
     const dist = +Math.hypot(posePast[0] - ro.x, posePast[2] - ro.z).toFixed(2);

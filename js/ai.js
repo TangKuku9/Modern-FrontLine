@@ -62,8 +62,9 @@ export class Bot {
     this.dmgTaken = new Map();
   }
   get crouch() { return this.anim.crouch; }
-  // 命中盒的第四个入参（js/combat.js:hitTestPlayer）。延迟补偿的 pose 环存的就是
-  // (x, y, z, curEye()) 这四个量 —— 盒子依赖什么，缓冲里就得存什么。
+  // 命中盒的入参（js/combat.js:hitTestPlayer）。延迟补偿的 pose 环存的就是
+  // (x, y, z, curEye(), yaw, prone) 这六个量 —— 盒子依赖什么，缓冲里就得存什么。
+  // Bot 不趴（prone 恒 0），但它有 yaw：参数列齐全是为了与真人/远端走同一个入口。
   curEye() { return 1.6 - this.anim.crouch * 0.5; }
   eyePos(out) { return out.set(this.pos.x, this.pos.y + this.curEye(), this.pos.z); }
   chestPos(out) { return out.set(this.pos.x, this.pos.y + 1.2 - this.anim.crouch * 0.4, this.pos.z); }
@@ -75,7 +76,7 @@ export class Bot {
   // 单机联机从此一个手感。改盒子的同时必须记得 test/lagcomp.mjs 的规格注释。
   hitTest(o, d, maxT) {
     if (!this.alive) return null;
-    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), o, d, maxT);
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, 0, o, d, maxT);
   }
   takeDamage(dmg, info) {
     if (!this.alive) return false;
@@ -148,7 +149,9 @@ export class Bot {
       if (stealthCheck) {
         // 警戒值累积：距离越近、越显眼，发现越快
         let detect = dist < 7 ? 1 : Math.pow(7 / dist, 2);
-        if (e.crouchT > 0.5 || e.crouch > 0.5) detect *= 0.5;
+        // 蹲伏减半；趴伏更贴地、轮廓更扁，再压一档（与消音同级的隐匿收益）。
+        if (e.proneT > 0.5) detect *= 0.35;
+        else if (e.crouchT > 0.5 || e.crouch > 0.5) detect *= 0.5;
         if (e.stealthy) detect *= 0.5;
         if (game.world.def.night) detect *= 0.6;
         if (e.revealT > 0) detect = Math.max(detect, 0.5);

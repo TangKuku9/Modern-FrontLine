@@ -136,8 +136,11 @@ export class WeaponState {
       if (this.state === 'throw' && this.grenade && this.stateT > 0.22) this.releaseGrenade();
       if (this.stateT >= this.stateDur) this.state = 'idle';
     }
-    // 瞄准
-    const wantAds = input.ads && !sprinting && !['switch', 'melee', 'throw', 'cook', 'use'].includes(this.state);
+    // 瞄准。ADS 是连续量不是状态，换弹从 idle 起手 —— 'reload' 不排除的话，按住右键
+    // 能把 adsT 顶满整个装填过程：scope 遮罩挂着、FOV 收着、枪贴在瞄点位上押弹匣，
+    // 高倍镜下整个枪模还被 scoped 藏掉。换弹打断 ADS（adsT 往 0 收，枪放下），
+    // 装填结束后按着右键自然回镜。
+    const wantAds = input.ads && !sprinting && !['switch', 'melee', 'throw', 'cook', 'use', 'reload'].includes(this.state);
     this.adsT = clamp(this.adsT + (wantAds ? dt / st.ads : -dt / (st.ads * 0.8)), 0, 1);
     this.sprintT = damp(this.sprintT, sprinting ? 1 : 0, 10, dt);
     // 走路摆动：写进相机 y 与横滚（player.js:214/219），所以归玩法管
@@ -173,10 +176,12 @@ export class WeaponState {
   currentSpread() {
     const pl = this.owner, st = this.w.stats;
     const spd = Math.hypot(pl.vel.x, pl.vel.z);
-    let hip = st.hip * (1 + spd / 6 * 0.6) * (pl.onGround ? 1 : 2.2) * (pl.crouchT > 0.5 ? 0.8 : 1);
+    // 姿态加成：蹲 0.8、趴 0.65 —— 趴下是稳定度的最高档（架得住枪）。
+    let hip = st.hip * (1 + spd / 6 * 0.6) * (pl.onGround ? 1 : 2.2)
+      * (pl.proneT > 0.5 ? 0.65 : pl.crouchT > 0.5 ? 0.8 : 1);
     hip *= 1 + Math.min(this.shotsInRow, 10) * 0.03;
     const ads = st.adsSpread * (1 + spd / 6 * (st.type === 'sniper' ? 6 : 1.2));
-    return lerp(hip, ads, this.adsT);
+    return lerp(hip, ads, this.adsT) * (pl.proneT > 0.5 ? 0.9 : 1);
   }
 
   fire() {
@@ -247,7 +252,9 @@ export class WeaponState {
     game.makeNoise(pl.pos, st.suppressed ? 12 : 70, pl.team);
     if (!st.suppressed) pl.revealT = 1.5;
     // 后坐力：pitch/yaw/punch 进相机，属于裁决；vmKick/vmRot 只动枪模，属于视图模型
-    const adsMul = lerp(1, 0.75, this.adsT) * (pl.crouchT > 0.5 ? 0.85 : 1);
+    // 姿态减档与散布同一张表：蹲 0.85、趴 0.75 —— 趴下时枪几乎架死在地面上。
+    const adsMul = lerp(1, 0.75, this.adsT)
+      * (pl.proneT > 0.5 ? 0.75 : pl.crouchT > 0.5 ? 0.85 : 1);
     const kick = st.recoilV * 0.55 * DEG * adsMul;
     // 横向抖动刻意偏向一侧（-0.4 而非 -0.5），且走玩法随机流：它直接写进 pl.yaw
     const side = (pl.rng.next() - 0.4) * st.recoilH * 0.5 * DEG * adsMul;

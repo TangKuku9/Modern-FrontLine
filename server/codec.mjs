@@ -7,17 +7,20 @@ import { Q, FLAG, packInput, unpackInput, packStreak, unpackStreak, STREAK_NONE,
 
 export { Q, FLAG };
 
-// 每个实体固定 25 字节：id2 + xyz6 + yaw2 + pitch2 + hp1 + flags1 + weapon1 + mag1
+// 每个实体固定 26 字节：id2 + xyz6 + yaw2 + pitch2 + hp1 + flags2 + weapon1 + mag1
 //                              + phase1 + vel4 + team1 + ack2 + rep1
 // rep = 服务端在 ack 那一拍之后又拿同一份输入折叠了几拍（队列空时的人肉按住）。
 // 少了它，客户端重建的输入序列就比权威端少 rep 拍 —— 见 server/room.mjs:step 的注释。
+//
+// flags 原本是 u8，八位排满后趴姿（FLAG.Prone，bit 8）进不来 —— 加宽到 u16，实体
+// 25→26 字节。20Hz 下每人多 16 bit ≈ 0.32 kbps（16 人 6.4 kbps），换一档完整姿态，值。
 //
 // phase（步态相位）**在编解码这一层就折叠成角度**（Q.packPhase/unpackPhase），而不是把
 // 弧度截成整数塞进 u8。以前是后者：服务端把 0..2π 的浮点直接 `& 0xff`，客户端拿这个整数
 // 当弧度用 —— 于是每包相位跳一个整数（≈0.0246 rad），低速时干脆归零，腿部一直在抖/打滑。
 // 折在这一层（而不是"服务端记得 pack、客户端记得 unpack"）的理由和 yaw 一样：
 // 少写一处不会报错，只会让人物走路不像走路。
-export const ENTITY_SIZE = 25;
+export const ENTITY_SIZE = 26;
 // 头部 11 字节：tick4 + seq1 + count1 + worldFlags1 + rngState4
 // rngState 是权威端玩法随机流的当前内部状态：客户端回滚重放必须把流也拨回同一拍，
 // 否则重放多抽的那几次会让两边永久错开（js/rng.js 的 state/setState 就是为它准备的）。
@@ -42,7 +45,7 @@ export function encodeSnapshot(snap, scratch = new DataView(new ArrayBuffer(HEAD
     view.setUint16(o, Q.packYaw(e.yaw), true); o += 2;
     view.setInt16(o, Q.packPitch(e.pitch), true); o += 2;
     view.setUint8(o, Q.packHp(e.hp), true); o += 1;
-    view.setUint8(o, e.flags & 0xff, true); o += 1;
+    view.setUint16(o, e.flags & 0xffff, true); o += 2;
     view.setUint8(o, e.weapon & 0xff, true); o += 1;
     view.setUint8(o, e.mag & 0xff, true); o += 1;
     view.setUint8(o, Q.packPhase(e.phase || 0), true); o += 1;
@@ -79,15 +82,15 @@ export function decodeSnapshot(buf) {
       yaw: Q.unpackYaw(view.getUint16(o + 8, true)),
       pitch: Q.unpackPitch(view.getInt16(o + 10, true)),
       hp: Q.unpackHp(view.getUint8(o + 12)),
-      flags: view.getUint8(o + 13),
-      weapon: view.getUint8(o + 14),
-      mag: view.getUint8(o + 15),
-      phase: Q.unpackPhase(view.getUint8(o + 16)),
-      vx: Q.unpackVel(view.getInt16(o + 17, true)),
-      vz: Q.unpackVel(view.getInt16(o + 19, true)),
-      team: view.getUint8(o + 21),
-      ack: view.getUint16(o + 22, true),
-      rep: view.getUint8(o + 24),
+      flags: view.getUint16(o + 13, true),
+      weapon: view.getUint8(o + 15),
+      mag: view.getUint8(o + 16),
+      phase: Q.unpackPhase(view.getUint8(o + 17)),
+      vx: Q.unpackVel(view.getInt16(o + 18, true)),
+      vz: Q.unpackVel(view.getInt16(o + 20, true)),
+      team: view.getUint8(o + 22),
+      ack: view.getUint16(o + 23, true),
+      rep: view.getUint8(o + 25),
     });
     o += ENTITY_SIZE;
   }
@@ -156,7 +159,7 @@ if (isDirectRun()) {
   for (let i = 0; i < 16; i++) {
     ents.push({
       id: i + 1, x: -37.4123, y: 1.6184, z: 22.7719, yaw: 2.71828, pitch: -0.6,
-      hp: 87, flags: FLAG.Alive | FLAG.OnGround, weapon: 3, mag: 21, phase: i * 0.42, vx: 3.2, vz: -1.7,
+      hp: 87, flags: FLAG.Alive | FLAG.OnGround | FLAG.Prone, weapon: 3, mag: 21, phase: i * 0.42, vx: 3.2, vz: -1.7,
       team: i % 2, ack: i === 0 ? 65000 : i, rep: i === 0 ? 200 : i % 4,
     });
   }
@@ -229,12 +232,13 @@ if (isDirectRun()) {
     console.log(`  步态相位 u8 折叠：整圈最大误差 ${worst.toFixed(4)} rad ≤ 半格 ${(step / 2).toFixed(4)}；1.234 → ${got.toFixed(4)}（不是截断的 1）`);
   }
 
-  // 按键映射往返：sim 的 input 有 23 个布尔字段，打包再解包必须逐个原样回来。
+  // 按键映射往返：sim 的 input 有 24 个布尔字段，打包再解包必须逐个原样回来。
   // 这条是"按住右键掏手雷"那类错位的唯一防线 —— 位掩码写重了不会报错，只会手感怪。
   // slot1/slot2（数字键切枪）曾经不在打包表里也不在这张往返表里 —— 双双漏网，
   // 于是联机下按 1/2 服务端永远不知道（症状：手里是手枪、挨的是步枪的账）。
   // 两处要一起动：这里少列一个，协议丢一个字段就没人拦。
-  const fields = ['fwd', 'back', 'left', 'right', 'sprint', 'jumpPressed', 'crouchPressed', 'reloadPressed',
+  const fields = ['fwd', 'back', 'left', 'right', 'sprint', 'jumpPressed', 'crouchPressed', 'pronePressed',
+    'reloadPressed',
     'interact', 'interactPressed', 'nvgPressed', 'meleePressed', 'fire', 'ads', 'firePressed', 'adsPressed',
     'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical', 'slot1', 'slot2'];
   const bad = [];

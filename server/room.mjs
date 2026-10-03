@@ -723,7 +723,7 @@ export class NetRoom {
   addBot(bot) { this.game.addBot(bot); this.bots.set(bot, bot.group || null); return bot; }
   removeBot(bot) { this.game.removeBot(bot); this.bots.delete(bot); this.botPose.delete(bot); }
 
-  // Bot 的快照行。它和真人那一份**必须长成一个形状**（同样的 25 字节、同样的字段顺序）：
+  // Bot 的快照行。它和真人那一份**必须长成一个形状**（同样的 ENTITY_SIZE 字节、同样的字段顺序）：
   // 客户端只有一份 NetPlayer，按 id 取插值缓存，不区分对面是人还是 Bot。
   // 少了它的症状不是报错，是"房主加了一屋子 Bot，对面一个人也看不见" ——
   // 权威端的 Bot 照样在开枪、照样打死人（伤害是这一台机器算的），于是玩家被看不见的东西打死。
@@ -1167,6 +1167,7 @@ export class NetRoom {
       let flags = 0;
       if (pl.alive) flags |= FLAG.Alive;
       if (pl.crouchT > 0.5) flags |= FLAG.Crouch;
+      if (pl.proneT > 0.5) flags |= FLAG.Prone;   // 趴姿：与蹲同一口径（>0.5 过半才算姿态成立）
       if (pl.sprinting) flags |= FLAG.Sprint;
       if (ws.adsT > 0.5) flags |= FLAG.Ads;
       if (pl.onGround) flags |= FLAG.OnGround;

@@ -20,7 +20,7 @@ const MAP = 'yard';
 // edges=true 时加入蹲伏与跳跃两个边沿事件，用来把"边沿的离散化"单独隔离出来。
 function inputAt(t, DT, edges) {
   const s = {
-    fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false,
+    fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false, pronePressed: false,
     fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
     meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
     interact: false, interactPressed: false, nvgPressed: false, streak: -1,

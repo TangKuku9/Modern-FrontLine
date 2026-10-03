@@ -9,9 +9,9 @@ import { WEAPONS, LETHALS, TACTICALS } from './data.js';
 // 漏一个字段 = 那一维带着两边不同的初值继续分叉，而且没人会报错，只有手感怪。
 // test/net-journal.mjs 遍历 Player / WeaponState 的 own keys 检查覆盖率，新增字段
 // 要么登记进来，要么进 J_EXCLUDE 并写清理由。
-export const J_PL = ['yaw', 'pitch', 'hp', 'crouchT', 'slideT', 'eyeSmooth', 'dmgT', 'shakeT', 'shakeAmt',
+export const J_PL = ['yaw', 'pitch', 'hp', 'crouchT', 'proneT', 'slideT', 'eyeSmooth', 'dmgT', 'shakeT', 'shakeAmt',
   'punchV', 'landDip', 'stepDist', 'revealT', 'sprintLock', 'stunT', 'interactHold',
-  'alive', 'crouching', 'sprinting', 'sliding', 'onGround'];
+  'alive', 'crouching', 'proning', 'sprinting', 'sliding', 'onGround'];
 export const J_WS = ['state', 'stateT', 'stateDur', 'adsT', 'cool', 'cycleT', 'triggerHeld', 'rp', 'lastShot',
   'shotsInRow', 'bobPhase', 'sprintT', 'equipT', 'cooking', 'cookT', 'reloadStage', 'meleeHit'];
 export const J_EXCLUDE = {
@@ -112,7 +112,8 @@ export class Player {
     // 联机进房时由 server/room.mjs:addClient 用 sanitizeViewSettings 从 join 帧重建后挂上。
     this.sens = null; this.adsSens = null; this.invertY = null;
     this.maxHp = 100; this.hp = 100; this.alive = true;
-    this.crouchT = 0; this.crouching = false; this.sprinting = false; this.sliding = false; this.slideT = 0;
+    this.crouchT = 0; this.crouching = false; this.proneT = 0; this.proning = false;
+    this.sprinting = false; this.sliding = false; this.slideT = 0;
     this.onGround = true; this.eyeH = 1.62; this.eyeSmooth = this.pos.y + 1.62;
     // 视点与视线：updateCamera 每拍算一次，弹道从这里取。联机时每个玩家各有一份，
     // 所以它必须是玩家状态而不是"去看那块相机"。
@@ -150,7 +151,8 @@ export class Player {
   }
   respawn(pos, yaw) {
     this.pos.copy(pos); this.vel.set(0, 0, 0); this.yaw = yaw; this.pitch = 0;
-    this.hp = this.maxHp; this.alive = true; this.dmgT = 99; this.crouchT = 0; this.crouching = false; this.sliding = false;
+    this.hp = this.maxHp; this.alive = true; this.dmgT = 99;
+    this.crouchT = 0; this.crouching = false; this.proneT = 0; this.proning = false; this.sliding = false;
     this.eyeSmooth = pos.y + 1.62; this.stats.streak = 0;
     this.ws.fullAmmo();
     if (this.lethal) this.lethal.count = this.lethal.max;
@@ -163,12 +165,14 @@ export class Player {
   }
   eyePos(out) { return out.set(this.pos.x, this.pos.y + this.curEye(), this.pos.z); }
   chestPos(out) { return out.set(this.pos.x, this.pos.y + this.curEye() - 0.4, this.pos.z); }
-  curEye() { return lerp(1.62, 1.05, this.crouchT); }
+  // 视线高度三层：站 1.62 → 蹲 1.05 → 趴 0.45。proneT 是外层 —— 趴下时 crouching 也为真
+  // （两层同时过渡，视线走的是一条连续曲线而不是折线），所以趴这一层必须最后叠。
+  curEye() { return lerp(lerp(1.62, 1.05, this.crouchT), 0.45, this.proneT); }
   forward(out) { return out.set(-Math.sin(this.yaw) * Math.cos(this.pitch), Math.sin(this.pitch), -Math.cos(this.yaw) * Math.cos(this.pitch)); }
   // 命中盒在这里只剩"把当下姿态喂给公共定义"这一件事 —— 延迟补偿要拿历史姿态调同一个
   // 函数（js/combat.js:hitTestPlayer），所以它必须是纯函数而不是这个类的方法。
   hitTest(o, d, maxT) {
-    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), o, d, maxT);
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, this.proneT > 0.5 ? 1 : 0, o, d, maxT);
   }
   takeDamage(dmg, info) {
     if (!this.alive || this.game.godMode) return false;
@@ -199,6 +203,14 @@ export class Player {
   shake(a) { this.shakeAmt = Math.max(this.shakeAmt, a); this.shakeT = 0.6; }
   punch(a) { this.punchV += a; }
   cancelSprint() { this.sprinting = false; this.sprintLock = 0.25; }
+  // 趴姿起身：天花板决定起到哪一层 —— 站得起来就站，只够蹲就退到蹲，再低就留在趴姿
+  // （输入被礼貌地拒绝，不给反馈音）。阈值 = 目标姿态的碰撞高 + 5 cm 余量
+  // （站 1.8/蹲 1.25），与下面"蹲着不能站起"的检查同一把尺（world.ceilingHeight）。
+  tryRise() {
+    const c = this.game.world.ceilingHeight(this.pos.x, this.pos.z, this.pos.y, this.radius);
+    if (c >= this.pos.y + 1.85) { this.proning = false; this.crouching = false; }
+    else if (c >= this.pos.y + 1.3) { this.proning = false; this.crouching = true; }
+  }
 
   // —— 回滚重放：把"我自己"完整拨回某一拍 ——
   // 在 update 之前取，记的就是"这一拍开始时的我"，重放时才和当初逐字段同起点。
@@ -269,8 +281,25 @@ export class Player {
     this.pitch -= input.mdy * sens * ((this.invertY ?? game.settings.invertY) ? -1 : 1);
     this.pitch = clamp(this.pitch, -1.5, 1.5);
     // 姿态
+    // Z：趴/起。趴下永远允许（只会更低），起身走 tryRise 的天花板分层。
+    // 趴下时 crouching 一并置真 —— 视线与碰撞高度是两层 lerp 叠出来的，趴这层
+    // 建在蹲那层之上；起身时哪层退、哪层留全由 tryRise 一次性定好。
+    if (input.pronePressed) {
+      if (this.proning) this.tryRise();
+      else {
+        this.proning = true; this.crouching = true; this.sprinting = false;
+        this.sliding = false; this.slideT = 0;
+        game.audio.click(430, 0.25, 0.25);
+      }
+    }
     if (input.crouchPressed) {
-      if (this.sprinting && this.onGround && !this.sliding) {
+      if (this.proning) {
+        // 趴着按蹲：上一层到蹲。天花板不足蹲高（1.25 m + 余量）就留在趴姿 —— 同一处的
+        // 蹲伏起身检查只挡"蹲→站"，趴这一层的起身处境更苛刻，必须自己把关。
+        if (world.ceilingHeight(this.pos.x, this.pos.z, this.pos.y, this.radius) >= this.pos.y + 1.3) {
+          this.proning = false; this.crouching = true;
+        }
+      } else if (this.sprinting && this.onGround && !this.sliding) {
         this.sliding = true; this.slideT = 0.75; this.crouching = true;
         const f = new THREE.Vector3(this.vel.x, 0, this.vel.z).normalize();
         this.vel.x = f.x * 9.5; this.vel.z = f.z * 9.5;
@@ -285,7 +314,8 @@ export class Player {
     const fx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     const fz = (input.fwd ? 1 : 0) - (input.back ? 1 : 0);
     this.sprintLock = (this.sprintLock || 0) - dt;
-    const wantSprint = input.sprint && fz > 0 && this.sprintLock <= 0 && ws.adsT < 0.3 && !this.sliding;
+    // 趴着不冲刺：趴这层把冲刺整个关掉（匍匐是最低速的一档，Shift 在趴姿下没有意义）。
+    const wantSprint = input.sprint && fz > 0 && this.sprintLock <= 0 && ws.adsT < 0.3 && !this.sliding && !this.proning;
     if (wantSprint && !this.sprinting) { this.sprinting = true; this.crouching = false; if (ws.state === 'reload' && !this.hasPerk('sleight')) ws.state = 'idle'; }
     if (!wantSprint) this.sprinting = false;
     // 头顶空间检查（蹲伏时不能站起）
@@ -294,9 +324,12 @@ export class Player {
       if (c < this.pos.y + 1.85) this.crouching = true;
     }
     this.crouchT = damp(this.crouchT, this.crouching ? 1 : 0, 12, dt);
+    this.proneT = damp(this.proneT, this.proning ? 1 : 0, 9, dt);
     const mob = ws.w ? ws.w.stats.mobility : 1;
     let speed = 4.7 * mob;
     if (this.sprinting) speed = 7.1 * mob * (this.hasPerk('doubletime') ? 1.08 : 1);
+    // 趴这层先于蹲判：趴下时两层都在（proneT、crouchT 都 → 1），速度只能取更低的那档。
+    else if (this.proneT > 0.5) speed = 1.4 * mob;
     else if (this.crouchT > 0.5) speed = 2.4 * (this.hasPerk('doubletime') ? 1.3 : 1);
     speed *= lerp(1, 0.55, ws.adsT);
     if (this.stunT > 0) { this.stunT -= dt; speed *= 0.5; }
@@ -317,14 +350,15 @@ export class Player {
       this.vel.z += (wz * speed - this.vel.z) * k;
     }
     if (input.jumpPressed && this.onGround) {
-      if (this.crouching) this.crouching = false;
+      if (this.proning) this.tryRise();
+      else if (this.crouching) this.crouching = false;
       else { this.vel.y = 5.6; this.onGround = false; this.sliding = false; }
     }
     this.vel.y -= 18 * dt;
     // 积分与碰撞
     const px = this.pos.x, pz = this.pos.z;
     this.pos.x += this.vel.x * dt; this.pos.z += this.vel.z * dt;
-    const h = lerp(1.8, 1.25, this.crouchT);
+    const h = lerp(lerp(1.8, 1.25, this.crouchT), 0.55, this.proneT);
     world.collide(this.pos, this.vel, this.radius, h);
     this.pos.y += this.vel.y * dt;
     const g = world.groundHeight(this.pos.x, this.pos.z, this.pos.y - this.vel.y * dt, this.radius);
@@ -352,9 +386,10 @@ export class Player {
       if (this.stepDist > stride) {
         this.stepDist = 0;
         const quiet = this.hasPerk('ninja');
-        const vol = quiet ? 0.04 : this.crouchT > 0.5 ? 0.07 : this.sprinting ? 0.22 : 0.14;
+        // 匍匐的脚步比蹲伏再低一档：几乎贴着地面挪，也是噪声半径里最安静的一档（2 m）。
+        const vol = quiet ? 0.04 : this.proneT > 0.5 ? 0.05 : this.crouchT > 0.5 ? 0.07 : this.sprinting ? 0.22 : 0.14;
         game.audio.step(null, game.world.def.surface || 'dirt', vol);
-        const r = quiet ? 2 : this.crouchT > 0.5 ? 3 : this.sprinting ? 16 : 9;
+        const r = quiet ? 2 : this.proneT > 0.5 ? 2 : this.crouchT > 0.5 ? 3 : this.sprinting ? 16 : 9;
         game.makeNoise(this.pos, r, this.team, true);
       }
     }

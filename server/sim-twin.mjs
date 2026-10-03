@@ -11,7 +11,7 @@ export const DT = 1 / 60;
 // 输入脚本必须是 tick 的纯函数，且与任何随机流无关
 function inputAt(i) {
   const s = {
-    fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false,
+    fwd: 0, back: 0, left: 0, right: 0, sprint: false, jumpPressed: false, crouchPressed: false, pronePressed: false,
     fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
     meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
     interact: false, interactPressed: false, nvgPressed: false, streak: -1,

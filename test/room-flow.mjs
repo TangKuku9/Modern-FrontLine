@@ -11,6 +11,7 @@
 //   node test/room-flow.mjs
 import { WebSocket } from 'ws';
 import { withServer } from './with-server.mjs';
+import { HEADER_SIZE, ENTITY_SIZE } from '../server/codec.mjs';
 
 let bad = 0, n = 0;
 const ok = (label, cond, info = '') => {
@@ -32,7 +33,7 @@ function client(wsUrl, tag) {
     opened: new Promise(res => ws.on('open', res)),
     binary: () => bin.n,
     // 最近一份快照的**字节数**。Bot 有没有编进快照只能从包长看出来：
-    // 包是定长的（11 + n×25），所以"多一个 Bot"必须让这一格正好多 25。
+    // 包是定长的（HEADER_SIZE + n×ENTITY_SIZE），所以"多一个 Bot"必须让包长正好多一个实体。
     // 只数包数的话，Bot 进了 sim 却没进协议也能全绿 —— 而那正是最要命的失效形状
     //（房主加了一屋子 Bot，所有人进去一个也看不见，然后被看不见的东西打死）。
     lastBytes: () => bin.last,
@@ -383,13 +384,14 @@ try {
     botOthers.length > 0 && botOthers.every(o => kit1(o) && kit1(o).att && typeof kit1(o).camo === 'string'),
     JSON.stringify(botOthers[0] && botOthers[0].kits));
   await sleep(900);
-  // 包长反推实体数：11 + n×25。这条同时证明 Bot 编进了快照、且每实体仍是 25 字节。
-  const entN = p.lastBytes() ? (p.lastBytes() - 11) / 25 : -1;
+  // 包长反推实体数：HEADER_SIZE + n×ENTITY_SIZE。这条同时证明 Bot 编进了快照、
+  // 且每实体的字节数没有漂（趴姿那轮把实体从 25 加宽到 26 时,就是这两条先红的）。
+  const entN = p.lastBytes() ? (p.lastBytes() - HEADER_SIZE) / ENTITY_SIZE : -1;
   ok('快照里确实是 15 个实体（2 人 + 13 Bot，包长反推，不是读服务端的对象）',
     entN === 15, `${p.lastBytes()} 字节 → ${entN} 个实体`);
   // 反证臂：这条红了 = 快照里根本没有 Bot（或者每实体的字节数被改了）
-  ok('【反证】包长是整数个实体（11 + 15×25 = 386，不是被别的字段挤歪）',
-    p.lastBytes() === 11 + 15 * 25, `${p.lastBytes()} 字节`);
+  ok('【反证】包长是整数个实体（HEADER_SIZE + 15×ENTITY_SIZE，不是被别的字段挤歪）',
+    p.lastBytes() === HEADER_SIZE + 15 * ENTITY_SIZE, `${p.lastBytes()} 字节`);
   // 反证臂②：对局中不能再改名单 —— 那份名单在开局那一刻就被读进 sim 了，
   // 半路插人的症状是"场上凭空多一个人"，而客户端的名册是在 welcome 里一次性给的。
   p.send({ t: 'botAdd', team: 'A' });
