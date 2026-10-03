@@ -24,6 +24,32 @@ function tgeo(r1, r2, len, seg = 14) {
   if (!geoCache.has(k)) { const g = new THREE.CylinderGeometry(r1, r2, len, seg, 1, true); g.rotateX(Math.PI / 2); geoCache.set(k, g); }
   return geoCache.get(k);
 }
+function ogeo(r, tube, radSeg = 8, tubSeg = 20) {
+  const k = `o${r},${tube},${radSeg},${tubSeg}`;
+  if (!geoCache.has(k)) geoCache.set(k, new THREE.TorusGeometry(r, tube, radSeg, tubSeg));
+  return geoCache.get(k);
+}
+
+// 长筒镜共用的镜身：主筒 + 物镜喇叭（朝**枪口**张开）+ 口环 + 物镜片 + 目镜喇叭（朝**射手**
+// 张开）+ 调焦环 + 眼杯。tgeo(r1, r2, …) 的两个半径经 rotateX(π/2) 后 r1 落在 +Z（枪托侧）、
+// r2 落在 −Z（枪口侧），所以物镜必须写 tgeo(筒径, 物镜径) —— 旧版把两数写反，acog/thermal/
+// sniper 三支镜的喇叭口全部朝后冲着射手，侧看是一截掐腰花瓶（判据 test/optic.mjs 的 O10）。
+// 全部走开口管 + 双面壁：封盖落在光路上就是一堵墙（O1），单面壁从膛内看整圈消失（O2）。
+// low 档（第三人称/掉落物）镜身七件照出 —— 环就是轮廓本身；细碎件由各分支按 low 自裁。
+function tubeScope(add, o) {
+  const { y, z, tubeR, tubeLen, objR, objLen, eyeR, eyeLen } = o;
+  const seg = o.seg ?? 24, tf = z - tubeLen / 2, tr = z + tubeLen / 2;
+  add(tgeo(tubeR, tubeR, tubeLen, seg), mat('gunTube'), 0, y, z);
+  add(tgeo(tubeR, objR, objLen, seg), mat('gunTube'), 0, y, tf + 0.004 - objLen / 2);
+  add(tgeo(objR + 0.0008, objR + 0.0008, 0.007, seg), mat('gunMetal'), 0, y, tf + 0.004 - objLen + 0.0035);
+  // 物镜片收在口环内 8mm：飘到筒外就是"粘上去的盖片"（O7）
+  add(new THREE.CircleGeometry(objR - 0.0028, seg), mat('lensDark'), 0, y, tf - objLen + 0.012);
+  add(tgeo(eyeR, tubeR, eyeLen, seg), mat('gunTube'), 0, y, tr - 0.004 + eyeLen / 2);
+  // 调焦（变倍）环只有变倍镜该有：ACOG/热成像是定倍，装一圈银环就是名实不符
+  if (o.ring !== false) add(tgeo(eyeR + 0.0012, eyeR + 0.0012, 0.012, seg), mat('gunSteel'), 0, y, tr + eyeLen * 0.55);
+  // 眼杯：橡胶软圈，收口收成一道圆唇 —— 没有它目镜是一道纸一样薄的开口壳边
+  add(tgeo(eyeR - 0.001, eyeR - 0.004, 0.013, seg), mat('rubberTube'), 0, y, tr + eyeLen + 0.002);
+}
 
 export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
   const def = WEAPONS[weaponId];
@@ -229,26 +255,50 @@ export function buildGun(weaponId, att = {}, camo = 'none', opts = {}) {
     info.sight.set(0, sightY, oz + 0.12);
   } else if (optic === 'acog' || optic === 'thermal') {
     add(bgeo(0.03, 0.02, 0.05), metal, 0, railY + 0.02, oz);
-    // 主镜筒/物镜锥/目镜锥一律开口管：这三段原本都是实心 cgeo，从枪口方向看过去
-    // 从枪口方向看过去就是三根摞在一起的金属柱（镜身 + 物镜镯 + 目镜镯），
-    add(tgeo(0.019, 0.019, 0.12, 16), mat('gunTube'), 0, sightY + 0.005, oz);
-    add(tgeo(0.024, 0.019, 0.03, 16), mat('gunTube'), 0, sightY + 0.005, oz - 0.07);
-    add(tgeo(0.022, 0.019, 0.025, 16), mat('gunTube'), 0, sightY + 0.005, oz + 0.065);
-    if (optic === 'thermal') add(bgeo(0.03, 0.03, 0.05), mat('gunPoly'), 0.025, sightY + 0.005, oz + 0.02);
-    // 物镜片塞进物镜锥里（原来飘在锥口外 1mm）
-    add(new THREE.CircleGeometry(0.021, 16), mat('lensDark'), 0, sightY + 0.005, oz - 0.082);
-    info.sight.set(0, sightY + 0.005, oz + 0.14);
+    if (optic === 'acog') {
+      // TA31 轮廓：短粗等径筒 + 前后两圈小喇叭（tubeScope 里朝向已对正）
+      tubeScope(add, { y: sightY + 0.005, z: oz, tubeR: 0.019, tubeLen: 0.1, objR: 0.0235, objLen: 0.04, eyeR: 0.0225, eyeLen: 0.032, low, ring: false });
+      if (!low) {
+        // ACOG 的两张名片：TA51 座左侧两颗拇指螺丝（方柄 + 滚花圆头），顶部集光光纤
+        // （前块进光、琥珀导光条一直铺到镜身中段）。旋钮类一律盒/环 —— O1 的射线扇
+        // 只认 CylinderGeometry，竖轴圆柱撞上就是假红。
+        for (const dz of [-0.013, 0.013]) {
+          add(bgeo(0.007, 0.011, 0.011), mat('gunSteel'), -0.0215, railY + 0.02, oz + dz);
+          add(ogeo(0.0045, 0.002, 6, 12), mat('gunSteel'), -0.0255, railY + 0.02, oz + dz, 0, Math.PI / 2, 0);
+        }
+        // 光纤条半嵌进筒顶（只露 1.7mm 弧背），后端搭进进光块侧腹 —— 悬空或整根浮在
+        // 筒上都一眼假
+        add(bgeo(0.007, 0.009, 0.012), mat('gunPoly'), 0, sightY + 0.025, oz - 0.048);
+        add(bgeo(0.0022, 0.0022, 0.05), mat('fiberOptic'), 0, sightY + 0.0248, oz - 0.024);
+      }
+      info.sight.set(0, sightY + 0.005, oz + 0.14);
+    } else {
+      // 热成像：同一族轮廓，物镜换大口锗窗（热成像镜头是深色镜面），右侧挂电池盒
+      tubeScope(add, { y: sightY + 0.005, z: oz, tubeR: 0.019, tubeLen: 0.095, objR: 0.0255, objLen: 0.042, eyeR: 0.0225, eyeLen: 0.03, low, ring: false });
+      add(bgeo(0.026, 0.026, 0.05), mat('gunPoly'), 0.0245, sightY + 0.005, oz + 0.015);
+      if (!low) for (const dz of [-0.019, 0.019]) add(bgeo(0.0285, 0.0285, 0.006), mat('gunPoly'), 0.0245, sightY + 0.005, oz + 0.015 + dz);
+      info.sight.set(0, sightY + 0.005, oz + 0.13);
+    }
   } else if (optic === 'sniper') {
     const sy = sightY + 0.018;
-    add(bgeo(0.02, 0.03, 0.02), metal, 0, railY + 0.02, oz - 0.06);
-    add(bgeo(0.02, 0.03, 0.02), metal, 0, railY + 0.02, oz + 0.06);
-    add(tgeo(0.016, 0.016, 0.26, 16), mat('gunTube'), 0, sy, oz);
-    add(tgeo(0.028, 0.017, 0.08, 16), mat('gunTube'), 0, sy, oz - 0.15);
-    add(tgeo(0.022, 0.016, 0.05, 16), mat('gunTube'), 0, sy, oz + 0.14);
-    // 上方的调节旋钮：骑在筒顶，不许伸进通光孔 —— 老位置 sy+0.025 让它的底面戳进内壁 6mm，
-    // 于是从眼里斜穿镜筒的那条光路会被它挡住一格（test/optic.mjs 的 O1 就是靠这条发现的）
-    add(cgeo(0.02, 0.02, 0.03, 12), metal, 0, sy + 0.042, oz, Math.PI / 2);
-    add(new THREE.CircleGeometry(0.023, 16), mat('lensDark'), 0, sy, oz - 0.185);
+    // 主筒 0.017：O1 的射线扇最外圈探到轴线外 16mm，筒径与各段喇叭内缘都必须盖过它
+    // （旧版 0.0155 时目镜斜壁被外圈射线打中，O1⁺ 红）。
+    tubeScope(add, { y: sy, z: oz, tubeR: 0.017, tubeLen: 0.21, objR: 0.03, objLen: 0.085, eyeR: 0.0235, eyeLen: 0.052, low });
+    // 中段塔座 + 高低旋钮。旋钮底沿压在射线扇上探（+16mm）之上 9mm —— 竖轴圆柱一旦
+    // 探进扇里 O1 就假红；老版本旋钮底离筒顶悬空 6mm，看着像悬浮的烟灰缸。
+    add(bgeo(0.03, 0.024, 0.042), metal, 0, sy + 0.007, oz);
+    add(cgeo(0.019, 0.019, 0.026, 16), metal, 0, sy + 0.038, oz, Math.PI / 2);
+    add(ogeo(0.021, 0.0028), mat('gunSteel'), 0, sy + 0.022, oz, Math.PI / 2);
+    if (!low) {
+      add(bgeo(0.013, 0.015, 0.02), metal, 0.0235, sy + 0.005, oz);      // 风偏旋钮（右）
+      add(bgeo(0.01, 0.013, 0.017), metal, -0.0215, sy + 0.004, oz + 0.012); // 视差/照明（左）
+    }
+    // 两只镜环：底座顶进筒底 4.5mm、环箍包住筒壁 —— 老版本底座顶离筒底悬空 2mm，
+    // 整支镜浮在导轨上方（test/optic.mjs 的 O1 只管通透，悬空它管不着，肉眼管）
+    for (const dz of [-0.055, 0.055]) {
+      add(bgeo(0.02, 0.03, 0.022), metal, 0, railY + 0.027, oz + dz);
+      add(ogeo(0.018, 0.0035), mat('gunMetal'), 0, sy, oz + dz);
+    }
     info.sight.set(0, sy, oz + 0.2);
   }
   // 激光

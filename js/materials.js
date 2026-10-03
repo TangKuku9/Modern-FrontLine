@@ -113,6 +113,10 @@ function buildMaterials() {
   // 瞄具镜筒：开放性管，所以要双面 —— FrontSide 的话从膛内看过去整圈壁都被剔除，
   // 玩家看到的是"没有壁"，比实心还假。判据 test/optic.mjs（O2）
   MATS.gunTube = new THREE.MeshStandardMaterial({ color: 0x2a2d31, roughness: 0.4, metalness: 0.8, side: THREE.DoubleSide });
+  // 眼杯（橡胶）：同样从膛内看得见，双面；比镜筒更哑光
+  MATS.rubberTube = new THREE.MeshStandardMaterial({ color: 0x161616, roughness: 0.92, metalness: 0.05, side: THREE.DoubleSide });
+  // ACOG 顶上的集光光纤：白天给分划供亮的琥珀色导光管，微微自发光才读得出"是根导光条不是铁丝"
+  MATS.fiberOptic = new THREE.MeshStandardMaterial({ color: 0x3a1d02, emissive: 0xff9020, emissiveIntensity: 0.5, roughness: 0.35, metalness: 0.1 });
   // 镜片两面都要看得见：开放式瞄具从枪口方向看过去也该是一块玻璃，不是通心管
   MATS.lens = new THREE.MeshStandardMaterial({ color: 0x4a7a8a, roughness: 0.05, metalness: 0.9, transparent: true, opacity: 0.25, depthWrite: false, side: THREE.DoubleSide });
   MATS.lensDark = new THREE.MeshStandardMaterial({ color: 0x0a1418, roughness: 0.05, metalness: 1 });

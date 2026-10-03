@@ -321,6 +321,53 @@ const geo = await page.evaluate(async () => {
     ok('O9 名字里写的倍数 == fx.zoom', bad.length === 0,
       bad.length ? bad.join(' ') : ATTACHMENTS.optic.map(a => `${a.id}:${a.fx.zoom}x`).join(' '));
   }
+
+  // O10：长筒镜的喇叭口方向。tgeo(r1, r2, …) 的两个半径经 rotateX(π/2) 后 r1 落在
+  // +Z（枪托侧）、r2 落在 −Z（枪口侧），所以**物镜必须 front > rear、目镜必须 rear > front**。
+  // 2026-10-03 用户报"长圆筒瞄具建模急待改善"：旧版把两数写反，acog/thermal/sniper 三支镜
+  // 的物镜喇叭口全部朝后冲着射手，侧看是一截掐腰花瓶。方向是纯参数错，肉眼一眼的事，
+  // 立成判据让几何自己招供。
+  {
+    const flare = (info) => {
+      // 变径的开口管才算"喇叭"：等径主筒、口环/调焦环不算。瞄具轴线上的取（y 与 sight.y 重合）。
+      const segs = [];
+      info.group.traverse(o => {
+        if (!o.isMesh || o.geometry.type !== 'CylinderGeometry' || o.geometry.parameters.openEnded !== true) return;
+        if (Math.abs(o.position.y - info.sight.y) > 1e-6) return;
+        const { radiusTop, radiusBottom } = o.geometry.parameters;
+        if (radiusTop === radiusBottom) return;
+        segs.push({ z: o.position.z, rear: radiusTop, front: radiusBottom });
+      });
+      if (segs.length < 2) return { ok: false, why: '找不到两段变径管' };
+      segs.sort((a, b) => a.z - b.z);
+      const obj = segs[0], eye = segs[segs.length - 1];
+      return {
+        ok: obj.front > obj.rear && eye.rear > eye.front,
+        why: `物镜 front=${obj.front} rear=${obj.rear} 目镜 rear=${eye.rear} front=${eye.front}`,
+      };
+    };
+    const bad = [];
+    for (const optic of ['acog', 'thermal', 'sniper']) {
+      let info;
+      try { info = buildGun(optic === 'sniper' ? 'l115' : 'm4', { optic }, 'none', {}); } catch (e) { continue; }
+      if (!info || info.optic !== optic) continue;
+      const f = flare(info);
+      if (!f.ok) bad.push(`${optic}: ${f.why}`);
+    }
+    ok('O10⁺ 物镜喇叭朝枪口、目镜喇叭朝射手', bad.length === 0, bad.join(' | ') || 'acog/thermal/sniper 全部正向');
+    // O10⁻ 反证臂：照老写法（两半径对调）往枪口方向塞一截反口喇叭，判据要能闻出"反了"。
+    // 只写正向那一半的话，把所有喇叭删成等径筒也照样全绿。
+    {
+      const info = buildGun('m4', { optic: 'acog' }, 'none', {});
+      const clean = flare(info).ok;
+      const old = new THREE.Mesh(new THREE.CylinderGeometry(0.024, 0.019, 0.03, 16, 1, true).rotateX(Math.PI / 2), mats.mat('gunTube'));
+      old.position.set(0, info.sight.y, info.sight.z - 0.25);   // 比现有物镜更靠枪口，"最靠前"必须选中它
+      info.group.add(old);
+      const foul = flare(info).ok;
+      info.group.remove(old);
+      ok('O10⁻ 反证：喇叭口朝后的筒要报红', clean && !foul, `原样=${clean} 塞入反口后=${foul}`);
+    }
+  }
   return out;
 });
 
