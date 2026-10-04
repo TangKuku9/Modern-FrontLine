@@ -50,10 +50,12 @@ export class PoseRing {
   // 把 tick 那一拍的 [x,y,z,eye,yaw,prone] 交出来；不在窗口里返回 null。
   // 返回**新数组**而不是复用一个 scratch：核弹级的坑是"交错对象静默毒化下游"——
   // 这里每次裁决也就几次分配，不值得为它冒那个险。
+  // 必须交满 POSE_FIELDS 个：消费方（js/combat.js:traceBullet）按 p[4]/p[5] 读 yaw/prone，
+  // 少交一个就是"趴姿一律按站立盒裁决"的静默失真 —— 自测里有一条按长度钉死它。
   at(tick) {
     if (this.hi < this.lo || tick < this.lo || tick > this.hi) return null;
     const i = (tick % this.n) * POSE_FIELDS, d = this.d;
-    return [d[i], d[i + 1], d[i + 2], d[i + 3]];
+    return [d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5]];
   }
 }
 
@@ -65,7 +67,11 @@ export class PoseRing {
 // 和"客户端在撒谎"。
 export function rewindTick(view, cur, lastSent, max = LAG_MAX_TICKS) {
   if (lastSent <= 0) return -1;                     // 一份快照都还没发出去过：它不可能渲染过任何东西
-  let v = (cur & ~0xffff) | (view & 0xffff);        // 拿当前半圈把低 16 位拼回来
+  // 拿当前半圈把低 16 位拼回来。必须用纯算术而不是 `cur & ~0xffff`：那按 32 位**有符号**
+  // 折叠，cur 超过 2^31（60Hz 下约 414 天）之后结果变负，回溯从此永久拒绝、全部计入
+  // stale —— 房间有人在线就一直跑，不会自愈。`cur - cur % 0x10000` 对任何正数都等于
+  // "抹掉低 16 位"，语义同、没有位宽。
+  let v = cur - (cur % 0x10000) + (view & 0xffff);
   if (v > cur) v -= 0x10000;                        // 拍号翻过一圈：它其实在 cur 前面一点点
   if (v >= cur) return -1;                          // 看的就是当下（或已按速度外推）：没有可回溯的东西
   if (v > lastSent) return -1;                      // 报了一个我还没发出去的拍 —— 那不是"它看到了过去"
@@ -109,6 +115,18 @@ if (typeof process !== 'undefined' && isDirectRun(process.argv[1], import.meta.u
   eq(r2.at(10), null, '稀疏拍号：隔了 30 拍，老的那笔已被窗口挤掉');
   eq(r2.at(40)[0], 2, '稀疏拍号：新的那笔在');
 
+  // at() 必须交满 POSE_FIELDS 个字段：消费方（js/combat.js:traceBullet → hitTestPlayer）
+  // 按 p[4]/p[5] 读 yaw/prone。这里曾经只回 4 个 —— "能取到值"的判据照样全绿，而
+  // 趴姿在联机里一律按站立盒裁决（趴姿盒沿体轴平摊 ~1.6 m，yaw 答脚跟朝哪、prone 答
+  // 是否趴下）。所以长度要逐条断言，不能只比 [0]。
+  const prone = { pos: { x: 12, y: 0, z: 34 }, curEye: () => 0.6, yaw: 2.25, proneT: 1 };
+  const stand = { pos: { x: 56, y: 0, z: 78 }, curEye: () => 1.62, yaw: -1.5, proneT: 0 };
+  r2.record(50, prone); r2.record(51, stand);
+  const gotP = r2.at(50), gotS = r2.at(51);
+  eq(gotP.length, POSE_FIELDS, 'at() 交回来的字段数必须等于 POSE_FIELDS');
+  eq(JSON.stringify(gotP), JSON.stringify([12, 0, 34, 0.6, 2.25, 1]), '趴姿靶：位置/眼高/yaw/prone 逐字段原样（eq 比的是引用，数组要走 JSON）');
+  eq(JSON.stringify(gotS), JSON.stringify([56, 0, 78, 1.62, -1.5, 0]), '站姿靶：yaw 原样、prone 是 0');
+
   eq(rewindTick(990, 1000, 998), 990, '正常：报 10 拍前 → 回溯到 990');
   eq(rewindTick(995, 1000, 998), 995, '正常：报 5 拍前 → 回溯到 995');
   eq(rewindTick(999, 1000, 998), -1, '拒绝：报的比"我发过的最新快照"还新（= 它还没收到过）');
@@ -121,6 +139,15 @@ if (typeof process !== 'undefined' && isDirectRun(process.argv[1], import.meta.u
   eq(rewindTick(65534, 131075, 131073), 131070, 'u16 回绕：第二圈同样算得对');
   eq(rewindTick(1234, 1000, 998), -1, '拒绝：低 16 位拼回来是"上一圈的 1234"（落后 6.5 万拍）而不是"将来的 1234"');
   eq(rewindTick(990, 1000, 0), -1, '拒绝：这个客户端一份快照都还没发出去过');
+  // 2^31 之后位运算会变负（32 位有符号折叠）：60Hz 跑 414 天就到。这里曾经把
+  // `cur & ~0xffff` 用在无限增长的 JS Number 上 —— 结果是回溯永久拒绝、全部计入 stale，
+  // 且房间有人在线就一直跑，不会自愈。纯算术版对任何正数都对。
+  {
+    const cur = 2 ** 31 + 5000, lastSent = cur - 1;
+    eq(rewindTick((cur - 5) & 0xffff, cur, lastSent), cur - 5, '2^31 之后：回溯照样算得对（414 天炸弹的邻居）');
+    eq(rewindTick((cur - LAG_MAX_TICKS) & 0xffff, cur, lastSent), cur - LAG_MAX_TICKS, '2^31 之后：正好在上限上的那一拍仍然接受');
+    eq(rewindTick((cur - LAG_MAX_TICKS - 2) & 0xffff, cur, lastSent), -1, '2^31 之后：超上限的照样拒（闸门不因改写法而松）');
+  }
   console.log(bad ? `\n  ❌ lagcomp 自测 ${bad} 条红\n` : '\n  ✅ lagcomp 自测通过\n');
   process.exit(bad ? 1 : 0);
 }

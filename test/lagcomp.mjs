@@ -24,7 +24,7 @@
 //     那才是"不中"能说明问题的前提：不是墙挡住了、不是擦边、不是散布蒙的。
 import { HeadlessGame, preloadMaterials } from '../server/headless-game.mjs';
 import { NetRoom, DT, SNAP_EVERY, decodeInputBits } from '../server/room.mjs';
-import { rewindTick, LAG_MAX_TICKS, LAG_HIST } from '../server/lagcomp.mjs';
+import { rewindTick, LAG_MAX_TICKS, LAG_HIST, POSE_FIELDS } from '../server/lagcomp.mjs';
 import { encodeInput, decodeInput } from '../server/codec.mjs';
 import { hitTestPlayer } from '../js/combat.js';
 import { KEY, BTN } from '../js/quant.js';
@@ -134,11 +134,13 @@ function shoot(L, aim, view) {
     : view === 'now' ? cur
       : view === 'ancient' ? cur - (LAG_MAX_TICKS + 40) : 0;
 
-  // ① 预测：服务端会按哪一拍的盒子判？
+  // ① 预测：服务端会按哪一拍的盒子判？取不到那一拍就报错退出 —— 这里**不许有手写兜底**：
+  // 曾经写过一个 6 字段的 `|| [x,y,z,eye,yaw,prone]` 兜底，它让"at() 只回 4 个字段"
+  // （H1，趴姿按站立盒裁决的那颗雷）在判据里完美隐身 —— 兜底本身就是对的那个形状。
   const eff = rewindTick(v, cur, ca.lastSnapSent);
   const usePast = eff >= 0;
-  const pose = usePast ? posePast
-    : cb.pose.at(room.tick) || [T.pos.x, T.pos.y, T.pos.z, T.curEye(), T.yaw, T.proneT > 0.5 ? 1 : 0];
+  const pose = usePast ? posePast : cb.pose.at(room.tick);
+  if (!pose) return { err: `第 ${room.tick} 拍不在姿态缓冲里（不该发生：每一拍都在 record）` };
   // ② 世界那个盒子会不会先被墙挡下 —— 和 traceBullet 同一套语义（best 从墙距起算）
   const wh = W0.raycast(ro, rd, 400);
   const box = hitTestPlayer(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5], ro, rd, wh ? wh.t : 1e9);
@@ -280,6 +282,60 @@ for (const c of cells) {
   chk(!room.botPose.has(bot), 'Bot · 移除 Bot 连姿态环一起收掉（不留无主账本）');
 }
 
+// ── 趴姿靶：回溯裁决必须带上 yaw / prone（PoseRing.at 曾经只回 4 个字段 —— H1）──
+// 趴姿命中盒沿体轴平摊 ~1.6 m（js/combat.js:hitTestPlayer 的球链：腿球中心在体后 0.5 m），
+// 站立盒只是 (x,z)±0.30 的方块。于是"瞄趴姿目标**体后延伸段** + 报过去"这一枪：
+//   · 环里的 yaw/prone 都在 ⇒ 服务端按趴姿盒判 ⇒ 中；
+//   · at() 少交了那两格 ⇒ prone 对 undefined 恒假 ⇒ 按站立盒判 ⇒ 同一枪不中，且无任何报错。
+// 站立靶的二维矩阵量不出这个：站立盒不依赖那两格，4 个字段照样全绿。
+// 反证臂不必另跑一遍装置：同一条射线按**站立盒**（prone=0、eye=1.62）判必须不中 ——
+// 否则"中"就证明不了是趴姿盒（连同环里那两格）的功劳。
+{
+  const L = 20;                            // 回溯 20 拍：目标趴着不动，过去与当下位置相同，
+                                           // 唯一的变量是"裁决读不读环里那两格"
+  // 趴下并站定。三件实测得出的事，都别"优化"掉：
+  //   · 趴键是 keys 掩码里的 KEY.Prone（KEYMAP → pronePressed），喂 buttons 没有用；
+  //   · 出生后约 40 拍内开枪不出膛（部署保护）——矩阵里 W≥60 拍也是同一道坎，这里给 60；
+  //   · 瞄点取体后 0.70 m 而不是更近的 0.55：射线是浅角进场的，0.55 会在 z 向切片上
+  //     擦到站立盒的前缘（探针实测站立盒=true）—— 那样反证臂就废了。
+  reset();
+  for (let i = 0; i < 60; i++) {
+    room.applyInput(ca.cid, { tick: ++tickA, keys: 0, buttons: 0, mdx: 0, mdy: 0, view: 0 });
+    room.applyInput(cb.cid, { tick: ++tickB, keys: i === 0 ? KEY.Prone : 0, buttons: 0, mdx: 0, mdy: 0, view: 0 });
+    room.step();
+    if (room.tick % SNAP_EVERY === 0) room.snapshot();
+  }
+  chk(T.proneT > 0.5, '趴姿靶【先决】：目标真的趴下了（环记的就是 proneT>0.5 这一位）', `proneT=${T.proneT.toFixed(2)}`);
+  const ppNow = cb.pose.at(room.tick);
+  chk(ppNow && ppNow.length === POSE_FIELDS && ppNow[5] === 1,
+    '趴姿靶：姿态环交回的字段数 = POSE_FIELDS、prone 位 = 1（at() 只回 4 个时这条当场红）',
+    `length=${ppNow && ppNow.length} prone=${ppNow && ppNow[5]} yaw=${ppNow && ppNow[4]}`);
+  const past = room.tick + 2 - L;
+  const ppPast = cb.pose.at(past);
+  chk(!!ppPast, '趴姿靶：回溯目标那一拍在环里', `past=${past}`);
+  // 瞄点：腿球（中心 = 体后 0.5 m、高 0.24，r 0.30）内、站立盒（±0.30）外
+  const at = { x: ppPast[0] - 0.70, y: ppPast[1] + 0.26, z: ppPast[2] };
+  aimAt(at.x, at.y, at.z);
+  step({ b: { keys: 0 } });                // 瞄准拍（乙不挪窝）
+  const ro = S.eyePoint(new THREE.Vector3());
+  const rd = S.aimDir(new THREE.Vector3());
+  const wh = W0.raycast(ro, rd, 400);
+  const dist = +Math.hypot(at.x - ro.x, at.z - ro.z).toFixed(2);
+  chk(wh === null || wh.t > dist, '趴姿靶：目标在墙前面（中/不中都不是墙替它决定的）',
+    `墙距 ${wh === null ? null : +wh.t.toFixed(2)} / 目标距 ${dist}`);
+  chk(!hitTestPlayer(T.pos.x, T.pos.y, T.pos.z, 1.62, T.yaw, 0, ro, rd, wh === null ? 1e9 : wh.t),
+    '趴姿靶【反证臂】：同一射线按站立盒判不中（不然"中"证明不了趴姿盒的功劳）');
+  const eff = rewindTick(past, room.tick + 1, ca.lastSnapSent);
+  chk(eff === past, '趴姿靶：报过去过得了闸门（这条不红，"不中"才轮得到 H1 背锅）',
+    `eff=${eff} past=${past} lastSnapSent=${ca.lastSnapSent}`);
+  const predicted = !!hitTestPlayer(ppPast[0], ppPast[1], ppPast[2], ppPast[3], ppPast[4], ppPast[5], ro, rd, wh === null ? 1e9 : wh.t);
+  chk(predicted, '趴姿靶：生产函数（按环里的 yaw/prone）预测命中');
+  const hp0 = T.hp;
+  step({ a: { buttons: BTN.Ads | BTN.Fire, view: past }, b: { keys: 0 } });
+  chk(T.hp < hp0, '趴姿靶：瞄体后延伸段 + 报过去 ⇒ 命中（at() 丢 yaw/prone ⇒ 按站立盒裁决 ⇒ 这条红 —— H1 的主判据）',
+    `掉血 ${hp0 - T.hp} · part 应为 legs（×0.85）`);
+}
+
 // ── 闸门的边界：正好在上限上要接受，超一拍要拒绝 ──
 // 这一条量的是 rewindTick 那道窗的两端：右端是 lastSnapSent（服务端真发出去过的最新一拍），
 // 左端是它往前 LAG_MAX_TICKS 拍。探针把 W 取成 3 的倍数 ⇒ lastSnapSent = W，而回溯目标恒为
@@ -398,5 +454,5 @@ for (const c of cells) {
     `rewindTick(${Math.round(spec)}, ${last.tick + 1}, ${last.tick}) = ${rewindTick(Math.round(spec), last.tick + 1, last.tick)}`);
 }
 
-console.log(`\n  ${fails ? '❌' : '✅'} lagcomp：${checks - fails}/${checks} 项通过（${checks} 项断言，${cells.length} 格 × 3 档延迟 + 先决 + 客户端报值）`);
+console.log(`\n  ${fails ? '❌' : '✅'} lagcomp：${checks - fails}/${checks} 项通过（${checks} 项断言，${cells.length} 格 × 3 档延迟 + 先决 + 趴姿靶 + Bot + 客户端报值）`);
 process.exit(fails ? 1 : 0);
