@@ -62,7 +62,8 @@ export function fanout(room, evMsg, buf, backlogBytes) {
 //
 // 为什么搭 pong 而不是进快照：快照是全房共享的**同一块 buffer**（broadcast 一个字节不多地发
 // 给所有人），而"还剩几颗"是每人一份 —— 为它把快照改成 per-client 就得动 codec 那几条钉着
-// 包长的判据（test/room-bots.mjs 是按 `(len-11)/25` 反推实体数的）。pong 本来就是每连接一份、
+// 包长的判据（test/room-bots.mjs 按 `(len − HEADER_SIZE) / ENTITY_SIZE` 从包长反推实体数，
+// 两个量都是 server/codec.mjs 导出的常量，协议加宽不用改它）。pong 本来就是每连接一份、
 // 而且每秒都有一次，自愈窗口 ≤ 一秒，对这个症状够用。
 //
 // 这两个值按"可能不是数字"交给客户端：同一趟 pong 上的 `c` 就是这么处理的，理由也一样 ——

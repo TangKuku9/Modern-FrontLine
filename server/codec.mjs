@@ -21,11 +21,14 @@ export { Q, FLAG };
 // 折在这一层（而不是"服务端记得 pack、客户端记得 unpack"）的理由和 yaw 一样：
 // 少写一处不会报错，只会让人物走路不像走路。
 export const ENTITY_SIZE = 26;
-// 头部 11 字节：tick4 + seq1 + count1 + worldFlags1 + rngState4
+// 头部 12 字节：tick4 + seq1 + count2 + worldFlags1 + rngState4
 // rngState 是权威端玩法随机流的当前内部状态：客户端回滚重放必须把流也拨回同一拍，
 // 否则重放多抽的那几次会让两边永久错开（js/rng.js 的 state/setState 就是为它准备的）。
 // ack 是这个玩家最近一份被服务端真正消费的输入序号 —— 客户端拿它才知道"我哪些输入还没被吃"。
-export const HEADER_SIZE = 11;
+// count 是 **u16**：曾经是 u8，`setUint8(o, entities.length)` 对 256 个以上实体静默回绕
+// （300 实体解码出 44 个，其余凭空消失、不报错）。MAX_SEATS 兜得住人数是巧合不是护栏 ——
+// 协议自己的计数字段按自己的量程设防，u16 对真人+Bot 的任何配置都够。
+export const HEADER_SIZE = 12;
 
 export function encodeSnapshot(snap, scratch = new DataView(new ArrayBuffer(HEADER_SIZE + 64 * ENTITY_SIZE))) {
   const p = snap.entities.length;
@@ -34,7 +37,7 @@ export function encodeSnapshot(snap, scratch = new DataView(new ArrayBuffer(HEAD
   let o = 0;
   view.setUint32(o, snap.tick >>> 0, true); o += 4;
   view.setUint8(o, snap.seq & 0xff, true); o += 1;
-  view.setUint8(o, p, true); o += 1;
+  view.setUint16(o, p, true); o += 2;
   view.setUint8(o, snap.worldFlags, true); o += 1;
   view.setUint32(o, (snap.rngState ?? 0) >>> 0, true); o += 4;
   for (const e of snap.entities) {
@@ -69,7 +72,7 @@ export function decodeSnapshot(buf) {
   let o = 0;
   const tick = view.getUint32(o, true); o += 4;
   const seq = view.getUint8(o); o += 1;
-  const n = view.getUint8(o); o += 1;
+  const n = view.getUint16(o, true); o += 2;
   const worldFlags = view.getUint8(o); o += 1;
   const rngState = view.getUint32(o, true); o += 4;
   const entities = [];
@@ -168,6 +171,20 @@ if (isDirectRun()) {
   const back = decodeSnapshot(view);
   if (back.rngState !== 3735928559) throw new Error(`玩法流状态没原样回来：${back.rngState}`);
   if (back.entities[0].ack !== 65000 || back.entities[1].ack !== 1) throw new Error(`ack 往返失真：${back.entities[0].ack}/${back.entities[1].ack}`);
+  // count 字段的越界用例：它曾经是 u8，300 个实体回绕成 44 —— 解码端只读 44 个，
+  // 其余 256 个从世界上静默消失。计数/长度字段的判据必须有一条**超过一个量程**的往返，
+  // "精度对不对"量不出"溢出不溢出"。
+  {
+    const many = [];
+    for (let i = 0; i < 300; i++) {
+      many.push({ id: (i + 1) & 0xffff, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hp: 100, flags: 1, weapon: 0, mag: 30, phase: 0, vx: 0, vz: 0, team: i % 2, ack: i, rep: 0 });
+    }
+    const big = encodeSnapshot({ tick: 1, seq: 1, worldFlags: 0, rngState: 0, entities: many });
+    if (big.byteLength !== HEADER_SIZE + 300 * ENTITY_SIZE) throw new Error(`300 实体包长 ${big.byteLength} 与 ${HEADER_SIZE}+300×${ENTITY_SIZE} 不符`);
+    const bigBack = decodeSnapshot(big.view);
+    if (bigBack.entities.length !== 300) throw new Error(`300 实体只解回 ${bigBack.entities.length} 个（count 字段溢出）`);
+    if (bigBack.entities[299].ack !== 299) throw new Error('300 实体：末位实体内容错位');
+  }
   let maxPos = 0, maxYaw = 0, maxPitch = 0, maxVel = 0, maxPhase = 0;
   // 相位是**角度**、而且是周期量：服务端那边的 bobPhase 是一直往上加的（不取模），
   // 编解码把它折进 [0,2π)。所以只能按"角的差"比 —— 直接相减会把一整圈算成 6.28 的误差。

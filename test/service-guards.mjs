@@ -219,6 +219,30 @@ try {
     Number.isFinite(g.reJoinInLive) && Number.isFinite(g.ghostBlocked) && Number.isFinite(g.ghostEvicted)
     && g.reJoinInLive > 0, JSON.stringify(g));
 
+  // ⑤ 并发面（L1）：__cid 要到 enterMatch（真守卫）才置上，而 pickRoom 里面是真 await
+  //    （建房预加载材质是百毫秒级）—— 同一条 ws 的两条 join 帧可以同时滑过上面的检查、
+  //    各自把 pickRoom 走完。enterMatch 的二次守卫挡得住幽灵座，挡不住第二条 join 拿
+  //    **别的房号**把孤儿房建出来：访客建房不占 roomsPerUser 配额，可以反复触发，
+  //    MAX_ROOMS 被占到 sweeper 收为止，而客户端看到的只是一条 err。所以第二条 join
+  //    必须在发起 pickRoom **之前**就被拦下（ws.__joining 在 await 两侧同步置清）。
+  //    两条帧故意用不同房号 —— 同一条房号的话两间房根本不会都建出来，量的是空气。
+  const racer = client(wsUrl, '并发的');
+  await racer.opened;
+  const roomsBefore = (await health(base)).rooms;
+  racer.send({ t: 'join', room: 'race1', name: '并发的' });
+  racer.send({ t: 'join', room: 'race2', name: '并发的' });
+  const rw = await racer.until(j => j.t === 'welcome', 12000);
+  const re = await racer.until(j => j.t === 'err', 12000);
+  ok('A13【先决】并发 join：恰好一条 welcome、一条 err，err 来自进房闸（旧代码在这里抛的是 enterMatch 之后的 TypeError）',
+    !!rw && !!re && /已经进过房间/.test(re.msg || ''), JSON.stringify({ err: re && re.msg, room: rw && rw.room }));
+  ok('A14【命门】只建出一间房：第二条 join 没有把孤儿房建出来（没有 L1 闸的话 rooms 会 +2）',
+    (await health(base)).rooms === roomsBefore + 1,
+    `rooms ${roomsBefore} → ${(await health(base)).rooms}`);
+  // 用完就关：这台服的每 IP 名额只有 6（CONNS_PER_IP 默认），本段之前已开着 4 条，
+  // F 段还要连两条。racer 多占一个名额的话，F6 的 cfg 连接会在**握手**上被 429 拒掉
+  // —— 而 client() 的 opened 对错误也落地，那一整段只会以"cfgMade=0"的形状无声变红。
+  racer.close();
+
   // ═══════════════════════════════════════════════════════════════════════════
   sec('B. M2 输入队列溢出：这一件事在生产路径上真的看得见（/healthz 的 per[].qDrop）');
   // ═══════════════════════════════════════════════════════════════════════════

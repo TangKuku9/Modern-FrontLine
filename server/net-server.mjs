@@ -6,12 +6,12 @@
 // 所有可调项都只从环境读（下表见 README），代码里不给"必须改源码才能换端口"的东西留位置。
 //
 // 协议：
-//   上行 二进制 = 若干个 13 字节输入包（按 tick 打时间戳，攒一帧一起发）
+//   上行 二进制 = 若干个 16 字节输入包（server/codec.mjs:INPUT_SIZE，按 tick 打时间戳，攒一帧一起发）
 //        文本   = {t:'join'|'ping'} 控制帧
 //               | 对局内：{t:'loadout'|'respawn'|'streak'}（换配装 / 提前部署 / 集束选点确认）
 //               | 大厅与房间：{t:'lobby'|'say'|'createRoom'|'joinRoom'|'quickRoom'|
 //                 'leaveRoom'|'ready'|'team'|'roomCfg'|'start'|'report'}（判据在 server/lobby.mjs）
-//   下行 二进制 = 快照（server/codec.mjs 的定长格式）
+//   下行 二进制 = 快照（server/codec.mjs 的定长格式，头 12 B + 每实体 26 B）
 //        文本   = {t:'welcome'|'ev'|'err'|'pong'|'note'}
 //               | 大厅与房间：{t:'lobby'|'room'|'chat'}
 // 一条连接可以从大厅一路走到对局（'start' 之后服务端在同一条连接上发 welcome），
@@ -62,7 +62,7 @@ export const CFG = {
   seed: int(process.env.SEED, 20260925),
   maxRooms: int(process.env.MAX_ROOMS, 32),            // 每进程房间数上限（每房间一份完整 sim）
   maxClients: int(process.env.MAX_CLIENTS, 128),       // 每进程真人连接上限
-  maxPayload: int(process.env.MAX_PAYLOAD, 64 * 1024), // 单帧字节上限：正常一帧 ≤ 13×60 = 780 B
+  maxPayload: int(process.env.MAX_PAYLOAD, 64 * 1024), // 单帧字节上限：正常一帧 ≤ 16×60 = 960 B
   roomIdleMs: int(process.env.ROOM_IDLE_MS, 60000),    // 空房间多久收掉
   // 单条连接的下行积压上限（字节）。ws.send 只是往内核缓冲排队，TCP 零窗（手机切后台、
   // 断网挂起）时它会无限攒：一份快照 ~0.5 KB × 20 Hz ≈ 每小时 40 MB，全在进程内存里。
@@ -448,7 +448,9 @@ async function serveStatic(req, res) {
 // 判据当场退化成 `origin.endsWith('example.com')` —— `https://evilexample.com` 整体放行。
 // 现在按**主机边界**判：点（子域）或 `://`（裸域）必须正好落在域名前面。
 //   完整来源（带 scheme / 端口）  原样比
-//   *.example.com                 子域任意、裸域也算（endsWith('.example.com') 天然满足）
+//   *.example.com                 子域任意、裸域**不**算 —— 判据 test/service-guards.mjs C6
+//                                 把这条钉死为有意语义（通配只往上加一级，与 TLS 通配证书
+//                                 同口径）。要连裸域一起放，就把裸域自己写进白名单。
 //   example.com                   裸域与任意子域，但**不许**别的域名以它结尾
 // 不带 Origin 的调用方（curl、同级进程、健康探针）一律放行 —— 这一层拦的是
 // "别的网站的访客"，不是"攻击者"（脚本伪造 Origin 本来就容易，README 里没写成安全边界）。
@@ -1033,8 +1035,19 @@ function startRoomLoop(room, id) {
   tick();
 }
 
+// 快照编码的复用缓冲：encodeSnapshot 的默认 scratch 只按 64 实体定容，实体更多时
+// **每份快照**都 new 一块 ArrayBuffer（20Hz × 满员 = 一条稳定的 GC 压力曲线，玩家侧
+// 是帧率抖动、错过快照，进而放大延迟补偿窗口对不上的手感）。复用必须**按房间**各留
+// 一块，不能全进程共享：不同房间的 broadcast 可以落在同一次 timers 相位里先后执行，
+// 而 socket.write 排队的是 buffer 引用 —— 下一间房一编码就把上一间还没落盘的字节盖掉。
+// 同一间房的两份快照之间隔着 SNAP_EVERY 拍（≥50ms）与一轮 poll 相位，上一次的写早已落地。
+// 128 实体（真人 + Bot 的任何现实配置）足够；真超了 encodeSnapshot 自己会退回按需分配。
+function snapScratch(room) {
+  if (!room.__snapScratch) room.__snapScratch = new DataView(new ArrayBuffer(HEADER_SIZE + 128 * ENTITY_SIZE));
+  return room.__snapScratch;
+}
 function broadcast(room) {
-  const { view, byteLength } = encodeSnapshot({ ...room.snapshot(), seq: (room.seq = (room.seq || 0) + 1) });
+  const { view, byteLength } = encodeSnapshot({ ...room.snapshot(), seq: (room.seq = (room.seq || 0) + 1) }, snapScratch(room));
   // 一份 Buffer 发给这个房间的所有人：ws.send 不会改写传入的 Buffer，没必要每人再拷一次。
   const buf = Buffer.from(view.buffer, 0, byteLength);
   // 事件在这里一次排干（splice），再整份交给 fanout —— **顺序与去留的纪律在
@@ -1166,7 +1179,13 @@ wss.on('connection', (ws, req) => {
       if (msg.t === 'join') {
         // 一条连接只许进一个房间：反复 join 会往房间里塞出一串没人退出的玩家
         //（removeClient 只认最后那一份 ws.__cid），表现是"幽灵玩家"占着出生点。
-        if (ws.__cid != null) { ws.send(JSON.stringify({ t: 'err', msg: '这条连接已经进过房间了' })); return; }
+        // __joining 是同一个洞的**并发面**：__cid 要到 enterMatch（真守卫）才置上，
+        // 而 pickRoom 里面是真 await（建房预加载材质是百毫秒级）—— 同一条 ws 的两条
+        // join 帧可以同时滑过这道检查、各自把 pickRoom 走完。enterMatch 的二次守卫
+        // 挡得住幽灵座，挡不住另一条 join 拿**别的房号**把孤儿房建出来（访客建房不占
+        // roomsPerUser 配额，可以反复触发，MAX_ROOMS 会被占住到 sweeper 收为止）。
+        // 所以第二条 join 在这里就被拦下，让孤儿房根本建不出来。
+        if (ws.__cid != null || ws.__joining) { ws.send(JSON.stringify({ t: 'err', msg: '这条连接已经进过房间了' })); return; }
         // 反方向的同一个洞：这条连接在**等待房**里已经有座位了（从大厅建的/进的房），
         // 却绕过大厅直接 join 一个 live 房。它拿到 __cid 之后，等待房里那个座还在 ——
         // 房主一按开始（beginLive）就会往同一份名单里塞一个已经属于别的局的连接。
@@ -1190,7 +1209,12 @@ wss.on('connection', (ws, req) => {
         // 一间还在等人准备的房子里没有 sim。绕过大厅直接进的症状是"进了个空世界，
         // 谁也不在，也没有开始" —— 而这个人本来只需要在房间界面里等房主按一下。
         if (lobby.waitingRoom(msg.room)) { ws.send(JSON.stringify({ t: 'err', msg: '那间房还在等房主开始，请在房间界面里等' })); return; }
-        const room = await pickRoom(msg.room, user);
+        // __joining 只需要盖住 pickRoom 的 await 窗口：落地之后到 enterMatch 之间全是
+        // 同步代码（第二条帧插不进来），真守卫在那一边。finally 清 —— pickRoom 抛
+        // （MAX_ROOMS / 配额 / 下线）也要把这条路还给这条连接，否则它再也 join 不进来。
+        ws.__joining = true;
+        let room;
+        try { room = await pickRoom(msg.room, user); } finally { ws.__joining = false; }
         if (room.__closed) { ws.send(JSON.stringify({ t: 'err', msg: '那间房是房间大厅开出来的私人局，只接纳房里那些人' })); return; }
         // 房间的显示名：**只有建房那一次说了算**（room.title 还空着的时候）。
         // 后来的人改不掉房间名 —— 否则"挂个钓鱼名等别人点进来"就成了一个功能。
