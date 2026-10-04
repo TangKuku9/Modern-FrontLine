@@ -77,9 +77,12 @@ export const KEY = {
 };
 export const BTN = {
   Fire: 1, Ads: 2, FirePressed: 4, AdsPressed: 8, SwapNext: 16, SwapPrev: 32,
-  // 投掷物要"按住引信 / 松手投出"两段，所以按下与按住各占一位。
-  // 早先服务端把 lethal 错接成了 buttons&1（= 开火位），按住右键会掏手雷。
+  // 投掷物改 CS 制（2026-10-03）：按 4 切出、左键按住烹饪/松手投出。烹饪的"按住/松手"
+  // 直接复用已联网的 Fire/FirePressed 位，所以这里只需要一个"按 4"的按下沿。
+  // Lethal/Tactical 四位是旧 G/Q 直投键位的遗物：main.js 不再置位，但解码端保留
+  // 这两个字段（codec 自测的往返表还在列它们），旧的上行包照常能解。
   LethalPressed: 64, LethalHeld: 128, TacticalPressed: 256, TacticalHeld: 512,
+  GrenadePressed: 1024,
 };
 
 // 世界级位标志（快照头里的一个字节）。
@@ -96,7 +99,7 @@ export const WORLD = { Night: 1, UAV: 2, WhitePhosphorus: 4, MatchOver: 8, UAV_B
 export const uavBit = (team) => (team === 'B' ? WORLD.UAV_B : WORLD.UAV);
 
 // 连杀呼叫（上行输入包里那一个字节）。
-//   0 ... n-1 = 呼叫第几个槽（与 js/main.js 的 Digit3/4/5 对应）
+//   0 ... n-1 = 呼叫第几个槽（与 js/main.js 的 Digit5/6/7 对应；4 归了投掷物）
 //   0xff      = 这一拍没有请求
 // 为什么不是 u8 的 -1：装不下负数。为什么不是 3/4/5 直接当值：槽位下标是 0 起的，
 // 且服务端要能一眼区分"下标 0"与"没请求"这两件事。上限 8 是挡乱报用的 ——
@@ -118,13 +121,15 @@ const KEYMAP = [
   // （server/codec.mjs）把这两个字段也列了，谁再把它们从这张表里删掉当场就红。
   ['Slot1', 'slot1'], ['Slot2', 'slot2'],
 ];
-// 投掷物的"按下/按住"两位都在 buttons 里：keys 只剩 16 位且已排到 1024，
-// 再往里塞会把按住位和按下位重到同一个掩码上（写过一次，症状是手雷自己掏出来）。
+// 按位都挤在 buttons 里：keys 只剩 16 位且已排到 1024，往 keys 塞会把位重到同一个
+// 掩码上（写过一次，症状是手雷自己掏出来）。CS 制之后烹饪走 fire 位，这里只剩
+// GrenadePressed 一个按下沿。
 const BTNMAP = [
   ['Fire', 'fire'], ['Ads', 'ads'], ['FirePressed', 'firePressed'], ['AdsPressed', 'adsPressed'],
   ['SwapNext', 'swapPressed'],
   ['LethalPressed', 'lethalPressed'], ['LethalHeld', 'lethal'],
   ['TacticalPressed', 'tacticalPressed'], ['TacticalHeld', 'tactical'],
+  ['GrenadePressed', 'grenadePressed'],
 ];
 
 export function packInput(inp) {
@@ -140,6 +145,7 @@ export function unpackInput(keys, buttons) {
     pronePressed: false,
     fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
     meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
+    grenadePressed: false,
     interact: false, interactPressed: false, nvgPressed: false, streak: -1,
     firePressed: false, adsPressed: false, mdx: 0, mdy: 0,
   };

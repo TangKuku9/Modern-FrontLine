@@ -287,7 +287,7 @@ export class Menu {
       ${this.playerCard()}
       <div style="position:absolute;right:40px;bottom:30px;text-align:right;font-size:12px;color:#777;line-height:1.9">
         <div><span class="kbd">WASD</span>移动 <span class="kbd">Shift</span>冲刺 <span class="kbd">C</span>蹲/滑铲 <span class="kbd">Z</span>趴 <span class="kbd">空格</span>跳跃 <span class="kbd">R</span>换弹 <span class="kbd">V</span>近战</div>
-        <div><span class="kbd">G</span>致命装备 <span class="kbd">Q</span>战术装备 <span class="kbd">F</span>互动 <span class="kbd">N</span>夜视仪 <span class="kbd">3/4/5</span>连杀奖励 <span class="kbd">Tab</span>记分板</div>
+        <div><span class="kbd">4</span>投掷物（左键烹饪/投出） <span class="kbd">F</span>互动 <span class="kbd">N</span>夜视仪 <span class="kbd">5/6/7</span>连杀奖励 <span class="kbd">Tab</span>记分板</div>
         <div style="color:#555;margin-top:6px">v1.0</div>
       </div>`, 'dim', 'main');
     this.on(r, '[data-a]', el => {
@@ -1219,7 +1219,7 @@ export class Menu {
   pickSimple(ci, kind) {
     const c = this.game.profile.classes[ci];
     const list = kind === 'lethal' ? LETHALS : TACTICALS;
-    const d = this.picker(kind === 'lethal' ? '致命装备' : '战术装备', '按 ' + (kind === 'lethal' ? 'G' : 'Q') + ' 使用', `<div class="pick-grid">${list.map(x => `<div class="pick ${c[kind] === x.id ? 'sel' : ''}" data-id="${x.id}"><b>${x.name}</b><span>${x.desc}</span><span style="color:var(--acc)">携带数量 ×${x.count}</span></div>`).join('')}</div>`);
+    const d = this.picker(kind === 'lethal' ? '致命装备' : '战术装备', '按 4 切出 · 左键按住烹饪/松手投出', `<div class="pick-grid">${list.map(x => `<div class="pick ${c[kind] === x.id ? 'sel' : ''}" data-id="${x.id}"><b>${x.name}</b><span>${x.desc}</span><span style="color:var(--acc)">携带数量 ×${x.count}</span></div>`).join('')}</div>`);
     this.on(d, '.pick', el => { c[kind] = el.dataset.id; this.game.saveProfile(); this.showLoadouts(); });
   }
   pickPerks(ci) {
@@ -1340,9 +1340,9 @@ export class Menu {
           <div><b>Shift</b>战术冲刺</div><div><b>C / Ctrl</b>蹲伏 · 冲刺中滑铲</div>
           <div><b>Z</b>趴下 / 起身（天花板低时起到蹲）</div><div><b>空格</b>跳跃</div>
           <div><b>R</b>换弹</div><div><b>1 / 2 / 滚轮</b>切换武器</div>
-          <div><b>V / 鼠标侧键</b>近战</div><div><b>G</b>致命装备（按住烹饪）</div>
-          <div><b>Q</b>战术装备</div><div><b>F</b>互动 / 拾取武器</div>
-          <div><b>N</b>夜视仪（战役）</div><div><b>3 / 4 / 5</b>连杀奖励</div>
+          <div><b>V / 鼠标侧键</b>近战</div><div><b>4</b>切出投掷物（再按 4 换种）</div>
+          <div><b>左键</b>按住烹饪 / 松手投出</div><div><b>F</b>互动 / 拾取武器</div>
+          <div><b>N</b>夜视仪（战役）</div><div><b>5 / 6 / 7</b>连杀奖励</div>
           <div><b>Tab</b>记分板</div>
         </div>
         <div style="margin-top:24px;display:flex;gap:12px"><button class="btn" data-a="back">返回</button><button class="btn ghost small" data-a="resetp">重置存档</button></div>

@@ -672,10 +672,18 @@ try {
       w2.local === w2.srv && w2.local === want, `本地 ${w2.local} · 权威 ${w2.srv} · 副武器 ${want}`);
     await A.page.keyboard.press('Digit1');              // 把现场还给后面的用例
     await sleep(900);
-    // 自己扔一颗雷：自己屏幕上该只有一颗（本地预测那颗）。修复前服务端的 proj 回声没有
-    // 主人标记，客户端照单全收再建一颗哑副本 —— 扔一颗看见两颗（RPG 同病）。
-    const f0 = await A.page.evaluate(() => window.game.projectiles.filter(p => p.type === 'frag' && p.alive).length);
-    await A.page.keyboard.down('KeyG'); await sleep(180); await A.page.keyboard.up('KeyG');
+    // 自己扔一颗雷（CS 制：4 切出 → 左键按住烹饪 → 松手投出）：自己屏幕上该只有一颗
+    // （本地预测那颗）。修复前服务端的 proj 回声没有主人标记，客户端照单全收再建一颗
+    // 哑副本 —— 扔一颗看见两颗（RPG 同病）。
+    const f0 = await A.page.evaluate(() => {
+      // 鼠标事件只在指针"锁着"才算数（main.js），无头环境补一个锁面 —— 与下面选点段同一手法
+      const cv = document.querySelector('canvas');
+      if (!Object.getOwnPropertyDescriptor(document, 'pointerLockElement')) Object.defineProperty(document, 'pointerLockElement', { get: () => cv, configurable: true });
+      return window.game.projectiles.filter(p => p.type === 'frag' && p.alive).length;
+    });
+    await A.page.keyboard.press('Digit4');               // 切出致命装备（破片手雷）
+    await sleep(900);                                    // 切雷动画 ~0.55s 走完
+    await A.page.mouse.down({ button: 'left' }); await sleep(180); await A.page.mouse.up({ button: 'left' });
     await sleep(700);
     const f1 = await A.page.evaluate(() => window.game.projectiles.filter(p => p.type === 'frag' && p.alive).length);
     ok('自己扔的雷只有一颗（服务端回声不再生成副本）', f1 === f0 + 1, `扔前 ${f0} · 扔后 ${f1}`);
@@ -817,19 +825,19 @@ try {
     Number.isInteger(ss.flags), `flags=${ss.flags}`);
 
   await focus(A);
-  // 按 6 次 3：每一次都是一个**按下沿**（Digit3 只进 pressed 表，只在一拍为真）。
-  // 按住不放不会连发 —— 那正是"每拍都看一次 inp.streak"会犯的错，服务端那边
-  // 用 fresh（这一拍真的消费到新输入）挡住了。
-  for (let i = 0; i < 6; i++) { await A.page.keyboard.press('Digit3'); await sleep(200); }
+  // 按 6 次 5（连杀 1 号槽；4 让给了投掷物，连杀顺延到 5/6/7）：每一次都是一个**按下沿**
+  // （Digit5 只进 pressed 表，只在一拍为真）。按住不放不会连发 —— 那正是
+  // "每拍都看一次 inp.streak"会犯的错，服务端那边用 fresh（这一拍真的消费到新输入）挡住了。
+  for (let i = 0; i < 6; i++) { await A.page.keyboard.press('Digit5'); await sleep(200); }
   await sleep(400);
   const hzr2 = await (await fetch(srv.base + '/healthz')).json();
   const roomR2 = (hzr2.per || []).find(r => r.id === ROOM) || {};
   const s1 = roomR2.streak || {};
   console.log(`  服务端记账：收到呼叫 ${s1.calls} · 接受 ${s1.accepted} · 被拒 ${s1.rejected} ${JSON.stringify(s1.byId || {})}`);
-  // 这一条是这一节的核心：按 3 这件事**以前在联机里什么都不做** ——
+  // 这一条是这一节的核心：按 5 这件事**以前在联机里什么都不做** ——
   // main.js 把 streak 字段填进了输入对象，但那个字段根本不在协议里（codec 只搬
-  // keys/buttons），服务端连"有人按了 3"都不知道。calls > 0 就是它接通的凭证。
-  ok('按 3 真的走到了服务端（这一位以前根本不在协议里）', (s1.calls || 0) > 0, JSON.stringify(s1));
+  // keys/buttons），服务端连"有人按了连杀键"都不知道。calls > 0 就是它接通的凭证。
+  ok('按 5 真的走到了服务端（这一位以前根本不在协议里）', (s1.calls || 0) > 0, JSON.stringify(s1));
   // 恒等式而不是阈值：每一次呼叫都必须落在"接受"或"拒绝"里，没有第三种。
   // 它红了说明 callStreak 里有一条分支拿走了请求却没记账（那种洞只会让读数偏低，
   // 而偏低的读数看起来和"没人按"一模一样）。
@@ -854,9 +862,9 @@ try {
   });
   await focus(A);
   const calls0 = s1.calls | 0;
-  await A.page.keyboard.press('Digit4');
+  await A.page.keyboard.press('Digit6');
   await sleep(250);
-  ok('按 4（集束槽）进入**选点流程**，不是直接呼叫', await A.page.evaluate(() => !!window.game.net.targeting));
+  ok('按 6（集束槽）进入**选点流程**，不是直接呼叫', await A.page.evaluate(() => !!window.game.net.targeting));
   // 取消（右键）：退出选点，且一个请求都不许发出去 —— "取消不扣槽"的上行那一半
   await A.page.mouse.down({ button: 'right' }); await sleep(80); await A.page.mouse.up({ button: 'right' });
   await sleep(350);
@@ -866,7 +874,7 @@ try {
     !(await A.page.evaluate(() => window.game.net.targeting)) && callsC === calls0, `calls ${calls0} → ${callsC}`);
   // 确认（左键）：{t:'streak'} 真的到达服务端并记成一次呼叫。看一眼地面是环境条件 ——
   // 准星要 raycast 得着东西才有落点；瞄准本身不是这条链路的一部分。
-  await A.page.keyboard.press('Digit4');
+  await A.page.keyboard.press('Digit6');
   await sleep(250);
   await A.page.evaluate(() => { if (window.game.player) window.game.player.pitch = -0.45; });
   await sleep(300);                                          // 等 ack 走过，重放不会把俯仰拽回去

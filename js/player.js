@@ -43,6 +43,7 @@ export const J_EXCLUDE = {
   loadoutVersion: '视图模型的重建计数，不参与裁决', sink: '表现出口',
   aimAccum: '只喂视图模型摆动', vmKick: '视图模型', vmRot: '视图模型', fx: '视图模型',
   replay: '每次 update 开头按 opts 重设，不跨拍存活', grenade: 'journal 单独登记（j.grenade）',
+  nadeMode: 'journal 单独登记（j.nadeMode）—— CS 制投掷手上切出的雷种',
 };
 
 // 重放期间挂到 game 上的静音替身：把这一拍会碰的所有外部出口变成空操作。
@@ -215,7 +216,8 @@ export class Player {
   // —— 回滚重放：把"我自己"完整拨回某一拍 ——
   // 在 update 之前取，记的就是"这一拍开始时的我"，重放时才和当初逐字段同起点。
   journal() {
-    const ws = this.ws, j = { time: this.game.time, cur: ws.cur, grenade: ws.grenade ? ws.grenade.type : null };
+    const ws = this.ws, j = { time: this.game.time, cur: ws.cur, grenade: ws.grenade ? ws.grenade.type : null,
+      nadeMode: ws.nadeMode ? { kind: ws.nadeMode.kind, id: ws.nadeMode.id } : null };
     // 私有流的游标必须跟着日记本走：回滚重放会把后坐/散布那几发重新抽一遍，流不退回
     // 同一位置就重算不出服务端那一拍的数（这才是"每实体一条流"能被回滚用上的前提）。
     j.rngState = this.rng.state();
@@ -241,6 +243,7 @@ export class Player {
       ws.slots[i].mag = j.ammo[i][0]; ws.slots[i].reserve = j.ammo[i][1];
     }
     ws.grenade = j.grenade ? { type: j.grenade } : null;
+    ws.nadeMode = j.nadeMode ? { kind: j.nadeMode.kind, id: j.nadeMode.id } : null;
     if (this.lethal) this.lethal.count = j.lethal;
     if (this.tactical) this.tactical.count = j.tactical;
   }
@@ -407,9 +410,9 @@ export class Player {
     if (input.slot1) ws.switchTo(0);
     if (input.slot2) ws.switchTo(1);
     if (input.meleePressed) ws.melee();
-    if (input.lethalPressed && this.lethal) ws.beginThrow('lethal', this.lethal.id);
-    if (input.tacticalPressed && this.tactical) ws.beginThrow('tactical', this.tactical.id);
-    if (ws.state === 'cook' && !input.lethal && !input.tactical) ws.endThrow();
+    // CS 制投掷：4 = 在身上带着的雷种间循环切出；烹饪/松手投出走开火位，
+    // 在 ws.update 里裁决（'nade' 收 firePressed 拔销，'cook' 收 fire 掉了出手）。
+    if (input.grenadePressed) ws.cycleGrenade();
     ws.update(dt, input, opts);
     // 相机。replay（回滚重放，js/net/predict.mjs 调进来）只重建玩法状态、不表现视角：
     // updateCamera 前半段的 camPos/aimYaw/aimPitch 必须照算（弹道从它们取，重放要逐拍

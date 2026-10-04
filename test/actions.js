@@ -2,7 +2,7 @@
   const log = [];
   await game.startGame('mp', { mode: 'tdm', map: 'yard', diff: 0, allies: 3, enemies: 4, scoreLimit: 50, timeLimit: 10 });
   game.renderer.setAnimationLoop(null);
-  const base = () => ({ fwd: false, back: false, left: false, right: false, sprint: false, jumpPressed: false, crouchPressed: false, pronePressed: false, fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false, meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false, interact: false, interactPressed: false, nvgPressed: false, streak: -1, firePressed: false, adsPressed: false, mdx: 0, mdy: 0 });
+  const base = () => ({ fwd: false, back: false, left: false, right: false, sprint: false, jumpPressed: false, crouchPressed: false, pronePressed: false, fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false, meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false, grenadePressed: false, interact: false, interactPressed: false, nvgPressed: false, streak: -1, firePressed: false, adsPressed: false, mdx: 0, mdy: 0 });
   const step = (n, f) => { for (let i = 0; i < n; i++) { const inp = base(); f && f(inp, i); game.update(1 / 30, inp); } };
   const pl = game.player;
   step(20);
@@ -14,10 +14,24 @@
   step(30, (inp, i) => { inp.slot2 = i === 0; });
   log.push(['swap', pl.ws.cur, pl.ws.w && pl.ws.w.id]);
   step(30, (inp, i) => { inp.slot1 = i === 0; });
-  step(40, (inp, i) => { inp.lethal = i < 10; inp.lethalPressed = i === 0; });
-  log.push(['frag', pl.lethal.count, game.projectiles.length]);
-  step(40, (inp, i) => { inp.tactical = i < 3; inp.tacticalPressed = i === 0; });
-  log.push(['tac', pl.tactical.count]);
+  // CS 制投掷：4 切出（switch 动画 ~0.55s）→ 左键按住烹饪 → 松手投出 → 还有余雷留在手上。
+  step(2, (inp, i) => { inp.grenadePressed = i === 0; });
+  step(25);
+  log.push(['nade-equip', pl.ws.state, pl.ws.nadeMode && pl.ws.nadeMode.kind]);
+  step(4, (inp, i) => { inp.fire = i > 0; inp.firePressed = i === 1; });
+  log.push(['cook', pl.ws.state, pl.lethal.count]);
+  step(30);
+  log.push(['frag', pl.lethal.count, game.projectiles.length, pl.ws.state, pl.ws.nadeMode && pl.ws.nadeMode.kind]);
+  // 再按 4 换种：致命 → 战术，同一套烹饪/投出。
+  step(2, (inp, i) => { inp.grenadePressed = i === 0; });
+  step(25);
+  step(4, (inp, i) => { inp.fire = i > 0; inp.firePressed = i === 1; });
+  step(30);
+  log.push(['tac', pl.tactical.count, game.projectiles.length]);
+  // 收雷回枪（后面的近战/连杀段都在枪上做）
+  step(2, (inp, i) => { inp.slot1 = i === 0; });
+  step(25);
+  log.push(['nade-stow', pl.ws.state, pl.ws.nadeMode, pl.ws.cur]);
   step(30, (inp, i) => { inp.meleePressed = i === 0; });
   step(60, (inp) => { inp.fwd = true; inp.sprint = true; });
   step(20, (inp, i) => { inp.crouchPressed = i === 0; inp.fwd = true; inp.sprint = true; });

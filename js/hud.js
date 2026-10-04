@@ -220,7 +220,7 @@ export class HUD {
     if (!list) { el.innerHTML = ''; return; }
     el.innerHTML = list.map((s, i) => {
       const def = KILLSTREAKS.find(k => k.id === s.id);
-      return `<div class="stk ${s.ready ? 'ready' : ''}"><span>${s.ready ? `[${i + 3}] ` : ''}${def.name}</span><span class="k">${s.ready ? '就绪' : s.cost}</span><span class="ic">${def.icon}</span></div>`;
+      return `<div class="stk ${s.ready ? 'ready' : ''}"><span>${s.ready ? `[${i + 5}] ` : ''}${def.name}</span><span class="k">${s.ready ? '就绪' : s.cost}</span><span class="ic">${def.icon}</span></div>`;
     }).join('') + `<div class="stk"><span>连杀</span><span class="k">${kills}</span></div>`;
   }
 
@@ -281,14 +281,23 @@ export class HUD {
     // 警觉
     this.alertT -= dt;
     $('alertEdge').style.opacity = this.alertT > 0 ? 1 : 0;
-    // 弹药
-    if (w) {
+    // 弹药。切出雷时弹面板换成雷种与余数（CS 同款：武器名位置报雷名）。
+    if (w && ws.nadeMode) {
+      const inv = ws.nadeMode.kind === 'lethal' ? pl.lethal : pl.tactical;
+      $('weaponName').textContent = (inv && inv.name) || ws.nadeMode.id;
+      const m = $('ammoMag'); m.textContent = inv ? inv.count : 0; m.classList.toggle('low', !inv || inv.count <= 1);
+      $('ammoRes').textContent = '';
+    } else if (w) {
       $('weaponName').textContent = w.stats.name + (w.stats.suppressed ? ' · 消音' : '');
       const m = $('ammoMag'); m.textContent = w.mag; m.classList.toggle('low', w.mag <= Math.ceil(w.stats.mag * 0.25));
       $('ammoRes').textContent = '/ ' + w.reserve;
+    }
+    // 装备行：两种雷都挂在 4 上（按 4 在其间循环），切出中的那种点亮。
+    {
       let eq = '';
-      if (pl.lethal) eq += `<span>[G] ${pl.lethal.name}<b>×${pl.lethal.count}</b></span>`;
-      if (pl.tactical) eq += `<span>[Q] ${pl.tactical.name}<b>×${pl.tactical.count}</b></span>`;
+      const on = ws.nadeMode && ws.nadeMode.kind;
+      if (pl.lethal) eq += `<span${on === 'lethal' ? ' style="color:var(--acc)"' : ''}>[4] ${pl.lethal.name}<b>×${pl.lethal.count}</b></span>`;
+      if (pl.tactical) eq += `<span${on === 'tactical' ? ' style="color:var(--acc)"' : ''}>[4] ${pl.tactical.name}<b>×${pl.tactical.count}</b></span>`;
       if (game.mode && game.mode.nvgAvailable) eq += `<span>[N] 夜视仪</span>`;
       $('equipRow').innerHTML = eq;
     }

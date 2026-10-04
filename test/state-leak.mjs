@@ -83,7 +83,7 @@ const res = await page.evaluate(async () => {
   ok('D1ᶜ 死亡视角上没有瞄具遮罩', hidden('scope'), 'scopeless=' + hidden('scope'));
   ok('D1ᵈ 相机 FOV 回到腰射值', Math.abs(g.camera.fov - g.settings.fov) < 0.5, `${g.camera.fov.toFixed(1)}° vs ${g.settings.fov}°`);
   ok('D1ᵉ 死亡界面倒是该出来的', !hidden('deathScreen'), 'dead=' + g.dead);
-  ok('D1ᶠ 死亡时把手 Diane（状态机）松开', ws.state === 'idle' && !ws.cooking && ws.grenade === null, `state=${ws.state} cooking=${ws.cooking}`);
+  ok('D1ᶠ 死亡时把手 Diane（状态机）松开', ws.state === 'idle' && !ws.cooking && ws.grenade === null && ws.nadeMode === null, `state=${ws.state} cooking=${ws.cooking} nade=${ws.nadeMode && ws.nadeMode.kind}`);
 
   // D1⁻ 反证臂：清理不许过头 —— 重生了还得能开镜
   for (let i = 0; i < 600 && !pl.alive; i++) g.frame();

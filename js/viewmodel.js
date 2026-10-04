@@ -17,6 +17,50 @@ const MAG_GRAB_OFF = new THREE.Vector3(-0.03, 0.02, 0.02);
 const FLASH_BY_TYPE = { pistol: 0.15, smg: 0.17, ar: 0.21, marksman: 0.24, sniper: 0.26, lmg: 0.26, shotgun: 0.3, launcher: 0.34 };
 const smooth01 = (x) => { const t = clamp(x, 0, 1); return t * t * (3 - 2 * t); };
 
+// 手上那颗雷（CS 制投掷，第一人称）。几何口径与 combat.js 的抛射物一致 ——
+// 第一/第三人称看的是同一种雷，只是这里多了引信/握片这些手部细节。
+function buildNadeMesh(id) {
+  const g = new THREE.Group();
+  if (id === 'frag') {
+    g.add(new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 10), mat('gunGreen')));
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.02, 0.024, 8), mat('darkMetal'));
+    cap.position.y = 0.054; g.add(cap);
+    const spoon = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.055, 0.005), mat('steel'));
+    spoon.position.set(0.022, 0.03, 0.012); spoon.rotation.z = -0.55; g.add(spoon);
+  } else if (id === 'semtex') {
+    g.add(new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.05, 0.05), mat('yellowPaint')));
+    const lite = new THREE.Mesh(new THREE.SphereGeometry(0.013, 6, 5), new THREE.MeshBasicMaterial({ color: new THREE.Color(6, 0.3, 0.3) }));
+    lite.position.y = 0.031; g.add(lite);
+  } else if (id === 'molotov') {
+    g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.036, 0.15, 10), mat('glass')));
+    const fuel = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.03, 0.085, 10), mat('fire'));
+    fuel.position.y = -0.015; g.add(fuel);
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.018, 0.045, 8), mat('glass'));
+    neck.position.y = 0.095; g.add(neck);
+    const rag = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.05, 0.02), mat('clothRed'));
+    rag.position.set(0.012, 0.125, 0); rag.rotation.z = 0.4; g.add(rag);
+  } else if (id === 'flash' || id === 'smoke') {
+    const r = id === 'flash' ? 0.026 : 0.032, h = id === 'flash' ? 0.105 : 0.13;
+    g.add(new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 10), mat(id === 'flash' ? 'steel' : 'gunGreen')));
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.55, r * 0.7, 0.02, 8), mat('darkMetal'));
+    cap.position.y = h / 2 + 0.01; g.add(cap);
+    if (id === 'smoke') {
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(r * 0.4, 0.004, 6, 12), mat('rubber'));
+      ring.rotation.x = Math.PI / 2; ring.position.y = h / 2 + 0.022; g.add(ring);
+    }
+  } else {  // stim 兴奋剂：自动注射器
+    const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.011, 0.1, 8), mat('steel'));
+    g.add(tube);
+    const plunger = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.03, 8), mat('rubber'));
+    plunger.position.y = 0.06; g.add(plunger);
+    const needle = new THREE.Mesh(new THREE.CylinderGeometry(0.0022, 0.0022, 0.035, 6), mat('darkMetal'));
+    needle.position.y = -0.066; g.add(needle);
+    const dose = new THREE.Mesh(new THREE.CylinderGeometry(0.0115, 0.0115, 0.05, 8), new THREE.MeshBasicMaterial({ color: new THREE.Color(0.2, 2.6, 3.2), transparent: true, opacity: 0.85 }));
+    dose.position.y = 0.008; g.add(dose);
+  }
+  return g;
+}
+
 export class Viewmodel {
   constructor(game, owner, ws) {
     this.game = game; this.owner = owner; this.ws = ws;
@@ -36,6 +80,8 @@ export class Viewmodel {
     this.flashLamp = new THREE.PointLight(0xffb060, 0, 4, 2);
     game.vmScene.add(this.flashLamp);
     this.handDirty = false;   // 换弹结束后把副手放回护木一次
+    // CS 制投掷的持雷架：左右臂 + 雷体，按雷种懒建（枪模照旧建着，只是藏掉）
+    this.nadeRig = null; this.nadeBodyId = null;
   }
   dispose() {
     this.ws.sink = null;
@@ -43,6 +89,41 @@ export class Viewmodel {
     this.game.vmScene.remove(this.flashLamp);
     for (const s of this.groups) if (s && s.laserDot) this.game.scene.remove(s.laserDot);
     this.groups = [];
+    this.nadeRig = null;
+  }
+
+  // 持雷架：雷体 + 攥着它的两只手套件，全部挂在 body（雷体组）下 —— 手跟着雷一起动
+  // （烹饪抬起/出手前甩时不会脱手）。刻意不用 buildArms：它的右臂刚体坐标是按枪的
+  // 跨度调的，雷的持握位下那些胶囊会横穿近裁剪面，实拍里是一坨怼在镜头上的黑块。
+  ensureNade(id) {
+    if (!this.nadeRig) {
+      const glove = mat('glove'), sleeve = mat(this.game.playerSleeve || 'fab_ally');
+      const body = new THREE.Group();
+      body.position.set(0.012, -0.005, -0.03);
+      body.rotation.set(0.35, -0.25, 0.15);
+      const palm = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.06, 0.075), glove);
+      palm.position.set(0.005, -0.028, 0.04); body.add(palm);
+      const wrist = new THREE.Mesh(new THREE.CapsuleGeometry(0.03, 0.16, 4, 8), sleeve);
+      wrist.position.set(0.05, -0.11, 0.15);
+      wrist.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(-0.25, 0.55, -0.8).normalize());
+      body.add(wrist);
+      const lhand = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.07), glove);
+      lhand.position.set(-0.045, -0.04, 0.02); lhand.rotation.z = 0.5; body.add(lhand);
+      const group = new THREE.Group();
+      group.add(body);
+      group.traverse(o => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; } });
+      this.nadeRig = { group, body };
+    }
+    if (this.nadeBodyId !== id) {
+      // 换雷种只换雷体几何，手留着
+      const body = this.nadeRig.body, old = body.userData.nade;
+      if (old) body.remove(old);
+      const nade = buildNadeMesh(id);
+      body.add(nade);
+      body.userData.nade = nade;
+      this.nadeBodyId = id;
+    }
+    return this.nadeRig;
   }
 
   build(cfg) {
@@ -81,12 +162,22 @@ export class Viewmodel {
   }
   showCurrent() {
     this.syncLoadout();
+    const nadeOn = !!this.ws.nadeMode;
     this.groups.forEach((s, i) => {
       if (!s) return;
-      if (i === this.ws.cur) { if (!s.group.parent) this.holder.add(s.group); }
+      if (!nadeOn && i === this.ws.cur) { if (!s.group.parent) this.holder.add(s.group); }
       else if (s.group.parent) this.holder.remove(s.group);
       if (s.laserDot) s.laserDot.visible = false;
     });
+    // 持雷架与枪模互斥：切出雷时整个枪组从 holder 摘下，雷组挂上去。
+    // 出手的跟随段（throw 且雷已离手）只藏雷体 —— 手还是空的，摊在挥出位。
+    if (nadeOn) {
+      const rig = this.ensureNade(this.ws.nadeMode.id);
+      if (!rig.group.parent) this.holder.add(rig.group);
+      rig.body.visible = !(this.ws.state === 'throw' && !this.ws.grenade);
+    } else if (this.nadeRig && this.nadeRig.group.parent) {
+      this.holder.remove(this.nadeRig.group);
+    }
   }
   muzzleWorld(out) {
     const cur = this.groups[this.ws.cur];
@@ -170,6 +261,10 @@ export class Viewmodel {
     const extra = st.type === 'pistol' ? 0.26 : st.type === 'launcher' ? 0.12 : cur.info.optic === 'iron' ? 0.03 : 0.0;
     const ads = _v.set(-cur.info.sight.x, -cur.info.sight.y, -cur.info.sight.z - extra);
     const pos = hip.clone().lerp(ads, ae);
+    // 持雷时不走枪械的 hip/ADS 表：雷攥在胸前偏中。枪模的可见体积从原点向上延伸，
+    // 雷体却坐在原点上 —— 同一偏移会把小球推出画面右下（实拍校准过：52° FOV 下
+    // (0.16,-0.17,-0.26) 的雷心 NDC y≈-1.3，整个在画外）。
+    if (ws.nadeMode) pos.set(0.115, -0.075, -0.38);
     const bx = Math.sin(ws.bobPhase) * 0.012 * bobAmt, by = -Math.abs(Math.cos(ws.bobPhase)) * 0.012 * bobAmt;
     pos.x += bx + this.sway.x * (1 - ae * 0.8); pos.y += by + this.sway.y * (1 - ae * 0.8);
     pos.z += this.vmKick * (1 - ae * 0.5);
@@ -294,9 +389,35 @@ export class Viewmodel {
         cur.info.mag.visible = !st.shellReload;
       }
     }
-    if (ws.state === 'switch') { const e = 1 - k; pos.y -= e * 0.3; rx -= e * 0.6; }
+    // 切枪的下探-抬起：枪模从原点向上延伸，探 0.3 也只露个枪口；雷体坐在原点上，
+    // 探 0.3 = 整颗雷滑出画面 —— 持雷时浅探一半高度。
+    if (ws.state === 'switch') { const e = 1 - k; const dip = ws.nadeMode ? 0.12 : 0.3; pos.y -= e * dip; rx -= e * (ws.nadeMode ? 0.35 : 0.6); }
     if (ws.state === 'melee') { const e = Math.sin(k * Math.PI); pos.z -= e * 0.15; pos.x -= e * 0.1; ry += e * 0.8; rz -= e * 0.4; }
-    if (ws.state === 'throw' || ws.state === 'cook' || ws.state === 'use') {
+    // CS 制投掷的手部戏：动的是"雷体"而不是整架 —— 烹饪抬到眼前偏侧，出手向前下甩，
+    // 兴奋剂举针。手件挂在雷体组下，跟着一起走。
+    if (ws.nadeMode) {
+      const rig = this.ensureNade(ws.nadeMode.id);
+      const base = rig.body.userData.base || (rig.body.userData.base = rig.body.position.clone());
+      const b = rig.body;
+      if (ws.state === 'cook') {
+        const wgt = smooth01(clamp(ws.stateT / 0.25, 0, 1));
+        b.position.set(base.x + 0.005, base.y + 0.115 * wgt, base.z + 0.10 * wgt);
+        b.rotation.x = 0.35 + 0.45 * wgt;
+      } else if (ws.state === 'throw') {
+        const e = Math.sin(k * Math.PI);
+        b.position.set(base.x, base.y - 0.03 * e, base.z - 0.30 * e);
+        b.rotation.x = 0.35 - 0.8 * e;
+        rx -= e * 0.7; pos.z -= e * 0.06;
+      } else if (ws.state === 'use') {
+        const e = Math.sin(k * Math.PI);
+        b.position.set(base.x, base.y + 0.09 * e, base.z - 0.02 * e);
+        b.rotation.x = 0.35 - 0.5 * e;
+      } else {
+        b.position.copy(base);
+        b.rotation.x = 0.35;
+      }
+    } else if (ws.state === 'throw' || ws.state === 'cook' || ws.state === 'use') {
+      // 兜底（beginThrow 只从 nade 态进，理论到不了）：沿用枪模 dip 别把画面冻住。
       const e = ws.state === 'cook' ? 1 : Math.sin(k * Math.PI);
       pos.y -= e * 0.25; rx -= e * 0.5; pos.x += e * 0.05;
     }
@@ -325,7 +446,7 @@ export class Viewmodel {
     if (cur.laserDot) {
       const d = cam.getWorldDirection(_v2);
       const hit = game.world.raycast(cam.position, d, 60);
-      cur.laserDot.visible = !!hit && ws.adsT < 0.5 && ws.sprintT < 0.3;
+      cur.laserDot.visible = !!hit && ws.adsT < 0.5 && ws.sprintT < 0.3 && !ws.nadeMode;
       if (hit) cur.laserDot.position.copy(hit.point).addScaledVector(hit.normal, 0.02);
     }
   }

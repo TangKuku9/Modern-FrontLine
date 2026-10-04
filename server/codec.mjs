@@ -107,8 +107,8 @@ export function decodeSnapshot(buf) {
 // 于是服务端和客户端各有一份"延迟模型"，改一个忘一个的症状是"高延迟下总是差一点"；
 // 直接报拍号则不需要任何模型，而且能被 lastSnapSent 卡住上限（服务端真发过的那些拍）。
 // 顺带一个好处：它让"客户端到底看的是哪一拍"这件事在排障时是可读的，而不是一个差值。
-// streak（u8）：这一拍按了 3/4/5 里的哪一个（0/1/2），没按是 0xff。
-// 它必须是**按下沿**而不是"按住"：Digit3 只进 main.js 的 pressed 表，只在一拍为真，
+// streak（u8）：这一拍按了 5/6/7 里的哪一个（0/1/2），没按是 0xff（4 归了投掷物）。
+// 它必须是**按下沿**而不是"按住"：Digit5 只进 main.js 的 pressed 表，只在一拍为真，
 // 所以上行的每一条里最多有一条带请求 —— 服务端不需要自己做边沿检测，也就没有
 // "按住不放会一直呼叫"那种错。以前这个字段只存在于客户端（js/main.js:snapshotInput），
 // 从来没进过协议，于是联机下按 3 呼叫 UAV 是**真的什么都不做**。
@@ -240,7 +240,7 @@ if (isDirectRun()) {
   const fields = ['fwd', 'back', 'left', 'right', 'sprint', 'jumpPressed', 'crouchPressed', 'pronePressed',
     'reloadPressed',
     'interact', 'interactPressed', 'nvgPressed', 'meleePressed', 'fire', 'ads', 'firePressed', 'adsPressed',
-    'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical', 'slot1', 'slot2'];
+    'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical', 'grenadePressed', 'slot1', 'slot2'];
   const bad = [];
   for (const f of fields) {
     const src = {}; src[f] = true;

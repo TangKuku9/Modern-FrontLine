@@ -691,9 +691,9 @@ class Game {
       pronePressed: P.KeyZ,   // 趴/起（KEY.Prone,bit 16384 —— keys 的位还够,见 js/quant.js）
       fire: !!(I.buttons & 1), ads: !!(I.buttons & 4),
       reloadPressed: P.KeyR, swapPressed: I.wheel !== 0, slot1: P.Digit1, slot2: P.Digit2,
-      meleePressed: P.KeyV || P.Mouse3, lethalPressed: P.KeyG, lethal: K.KeyG, tacticalPressed: P.KeyQ, tactical: K.KeyQ,
+      meleePressed: P.KeyV || P.Mouse3, grenadePressed: P.Digit4,   // CS 制投掷：4 切雷，左键（fire/firePressed）烹饪/出手
       interact: K.KeyF, interactPressed: P.KeyF, nvgPressed: P.KeyN,
-      streak: P.Digit3 ? 0 : P.Digit4 ? 1 : P.Digit5 ? 2 : -1,
+      streak: P.Digit5 ? 0 : P.Digit6 ? 1 : P.Digit7 ? 2 : -1,      // 4 让给了投掷物，连杀顺延到 5/6/7
       firePressed: P.Mouse0, adsPressed: P.Mouse2,
       mdx: I.mdx, mdy: I.mdy,
     };

@@ -26,6 +26,9 @@ export class WeaponState {
     this.bobPhase = 0;                // 写进相机高度与横滚，所以是玩法量
     this.sprintT = 0; this.equipT = 1;
     this.grenade = null; this.cookT = 0; this.cooking = false;
+    // CS 制投掷：手上切出了哪一种雷（null = 手里是枪）。只在 state 'nade'/'cook'/'throw'
+    // 期间非空；烹饪的按住/松手走的是开火位（fire/firePressed），不再有独立的引信键。
+    this.nadeMode = null;
     this.reloadStage = 0;
     this.meleeHit = false;
     // 表现事件的出口。没接视图模型（权威服务端）时它是 null，
@@ -45,7 +48,7 @@ export class WeaponState {
     this.state = 'idle'; this.stateT = 0; this.stateDur = 0; this.reloadStage = 0;
     this.triggerHeld = false; this.meleeHit = false;
     // 手上有正在烹饪的手雷就让它消失：死了的人不该在自己看不见的审判空里继续炖雷
-    this.cooking = false; this.cookT = 0; this.grenade = null;
+    this.cooking = false; this.cookT = 0; this.grenade = null; this.nadeMode = null;
     // 高倍镜遮罩是 ws.update 每拍算出来挂在 game 上的（本文件末尾），这里一并摘掉，
     // 否则 HUD 的 #scope 会盖在死亡视角上（hud.js 就是照这个字段开关它的）
     if (this.game) this.game.scopeState = null;
@@ -73,7 +76,12 @@ export class WeaponState {
   }
   get w() { return this.slots[this.cur]; }
   switchTo(i) {
-    if (i === this.cur || !this.slots[i] || this.state === 'throw') return;
+    // 拔了销（cook）或已经出手（throw）就得把这颗雷扔完 —— CS 同款的"到手承诺"。
+    if (this.state === 'cook' || this.state === 'throw') return;
+    if (!this.slots[i]) return;
+    // 手上切着雷时按当前枪的槽位键 = 收雷回枪，也要放行（下面的 switch 动画照走）。
+    if (i === this.cur && !this.nadeMode) return;
+    this.nadeMode = null;
     this.cur = i;
     this.state = 'switch'; this.stateT = 0;
     this.stateDur = this.owner.hasPerk('amped') ? 0.3 : 0.55;
@@ -134,13 +142,22 @@ export class WeaponState {
     } else if (this.state === 'switch' || this.state === 'melee' || this.state === 'throw' || this.state === 'use') {
       if (this.state === 'melee' && !this.meleeHit && this.stateT > 0.12) { this.meleeHit = true; this.doMelee(); }
       if (this.state === 'throw' && this.grenade && this.stateT > 0.22) this.releaseGrenade();
-      if (this.stateT >= this.stateDur) this.state = 'idle';
+      if (this.stateT >= this.stateDur) {
+        // 出手/用药走完之后雷还有没有、该回枪还是切下一种，CS 制投掷里由 afterThrow 裁定；
+        // 切雷的 equip 动画走完则落进持雷态（nadeMode 为空 = 这次 switch 是回枪，落 idle）。
+        if ((this.state === 'throw' || this.state === 'use') && this.nadeMode) this.afterThrow();
+        else if (this.state === 'switch' && this.nadeMode) this.state = 'nade';
+        else this.state = 'idle';
+      }
+    } else if (this.state === 'nade') {
+      // 手上切着雷：左键按下沿拔销进 cook，松手（fire 掉了）由下面烹饪块出手。
+      if (input.firePressed && this.nadeMode) this.beginThrow(this.nadeMode.kind, this.nadeMode.id);
     }
     // 瞄准。ADS 是连续量不是状态，换弹从 idle 起手 —— 'reload' 不排除的话，按住右键
     // 能把 adsT 顶满整个装填过程：scope 遮罩挂着、FOV 收着、枪贴在瞄点位上押弹匣，
     // 高倍镜下整个枪模还被 scoped 藏掉。换弹打断 ADS（adsT 往 0 收，枪放下），
     // 装填结束后按着右键自然回镜。
-    const wantAds = input.ads && !sprinting && !['switch', 'melee', 'throw', 'cook', 'use', 'reload'].includes(this.state);
+    const wantAds = input.ads && !sprinting && !['switch', 'melee', 'throw', 'cook', 'use', 'reload', 'nade'].includes(this.state);
     this.adsT = clamp(this.adsT + (wantAds ? dt / st.ads : -dt / (st.ads * 0.8)), 0, 1);
     this.sprintT = damp(this.sprintT, sprinting ? 1 : 0, 10, dt);
     // 走路摆动：写进相机 y 与横滚（player.js:214/219），所以归玩法管
@@ -163,7 +180,8 @@ export class WeaponState {
     // 同的路径，连带把随机流的消耗次数错开，服务端与客户端就无法复现同一条轨迹。
     // 语义等价：原阈值 120ms → 0.12s。
     if (this.game.time - this.lastShot > 0.12) { this.rp = damp(this.rp, 0, 4, dt); this.shotsInRow = 0; }
-    // 手雷烹饪
+    // 手雷烹饪。CS 制里引信的开关就是开火位本身：松开左键 = 出手。
+    if (this.state === 'cook' && !input.fire) this.endThrow();
     if (this.cooking) {
       this.cookT += dt;
       if (this.grenade && this.grenade.type === 'frag' && this.cookT >= 3.0) { this.cooking = false; this.releaseGrenade(true); }
@@ -294,11 +312,11 @@ export class WeaponState {
     this.state = 'melee'; this.stateT = 0; this.stateDur = 0.55; this.meleeHit = false;
     this.game.audio.whoosh && this.game.audio.click(500, 0.12, 0.25);
   }
-  // 投掷
+  // 投掷。CS 制：雷先按 4 切到手上（nade 状态），这里只管"左键拔销起 cook"那一下。
   beginThrow(kind, id) {
     const pl = this.owner;
     const inv = kind === 'lethal' ? pl.lethal : pl.tactical;
-    if (!inv || inv.count <= 0 || (this.state !== 'idle' && this.state !== 'reload')) return false;
+    if (!inv || inv.count <= 0 || (this.state !== 'idle' && this.state !== 'reload' && this.state !== 'nade')) return false;
     if (id === 'stim') {
       inv.count--; pl.hp = pl.maxHp; pl.dmgT = 99;
       this.state = 'use'; this.stateT = 0; this.stateDur = 0.5;
@@ -318,6 +336,50 @@ export class WeaponState {
       this.state = 'throw'; this.stateT = 0; this.stateDur = this.owner.hasPerk('amped') ? 0.4 : 0.6;
     }
   }
+  // CS 制投掷：按 4 在身上还带着的雷种间循环切出（致命 → 战术 → …）。
+  // 一种都没有 = 空击反馈；只剩手上这一种 = 原地不动。烹饪/出手途中按 4 无效（拔了销就得扔）。
+  cycleGrenade() {
+    if (this.state === 'cook' || this.state === 'throw') return;
+    const pl = this.owner;
+    const kinds = ['lethal', 'tactical'];
+    const inv = (k) => (k === 'lethal' ? pl.lethal : pl.tactical);
+    const start = this.nadeMode ? kinds.indexOf(this.nadeMode.kind) : kinds.length - 1;
+    for (let s = 1; s <= kinds.length; s++) {
+      const k = kinds[(start + s) % kinds.length];
+      if (!inv(k) || inv(k).count <= 0) continue;
+      if (this.nadeMode && k === this.nadeMode.kind) break;
+      this.nadeMode = { kind: k, id: inv(k).id };
+      this.state = 'switch'; this.stateT = 0;
+      this.stateDur = this.owner.hasPerk('amped') ? 0.3 : 0.55;
+      this.game.audio.ui('equip');
+      this.adsT = Math.min(this.adsT, 0.3);
+      return;
+    }
+    if (!this.nadeMode) this.game.audio.click(700, 0.08, 0.4);
+  }
+  // 一颗雷出手（或兴奋剂用完）之后的归属：还有同种 → 留在手上；只剩另一种 → 切过去；
+  // 一颗不剩 → 收雷回枪。纯状态推导，不抽随机数 —— 回滚重放要逐拍复现这一步。
+  afterThrow() {
+    const pl = this.owner;
+    const inv = (k) => (k === 'lethal' ? pl.lethal : pl.tactical);
+    const cur = this.nadeMode ? this.nadeMode.kind : null;
+    const next = (cur && inv(cur) && inv(cur).count > 0) ? cur
+      : ['lethal', 'tactical'].find(k => k !== cur && inv(k) && inv(k).count > 0);
+    if (next) {
+      const equip = next !== cur;
+      this.nadeMode = { kind: next, id: inv(next).id };
+      this.state = equip ? 'switch' : 'nade';
+      this.stateT = 0;
+      if (equip) {
+        this.stateDur = this.owner.hasPerk('amped') ? 0.3 : 0.55;
+        this.game.audio.ui('equip');
+      }
+    } else {
+      this.nadeMode = null;
+      this.state = 'switch'; this.stateT = 0;
+      this.stateDur = this.owner.hasPerk('amped') ? 0.3 : 0.55;
+    }
+  }
   releaseGrenade(inHand = false) {
     const g = this.grenade; if (!g) return;
     this.grenade = null;
@@ -330,6 +392,6 @@ export class WeaponState {
     // mirror：同 fire() 的火箭那半 —— 投掷者本地预测了这一颗，服务端的 proj 事件
     // 据此带 self，投掷者的客户端不再建副本（否则扔一颗雷看见两颗）。
     if (!this.replay) game.projectiles.push(new Projectile(game, g.type, pos, vel, pl, fuse, { mirror: true }));
-    if (inHand) { this.state = 'idle'; }
+    if (inHand) { this.cooking = false; if (this.nadeMode) this.afterThrow(); else this.state = 'idle'; }
   }
 }

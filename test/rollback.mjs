@@ -42,7 +42,7 @@ function script(i) {
     ads: false, fire: false, reload: false, swap: false, melee: false, nvg: false,
     jumpPressed: false, crouchPressed: false, pronePressed: false, reloadPressed: false, swapPressed: false,
     meleePressed: false, slot1: false, slot2: false, lethalPressed: false, tacticalPressed: false,
-    lethal: false, tactical: false, interactPressed: false, mdx: 0, mdy: 0,
+    lethal: false, tactical: false, grenadePressed: false, interactPressed: false, mdx: 0, mdy: 0,
   };
   inp.fwd = i % 97 < 70;
   inp.sprint = i > 20 && i < 60 && inp.fwd;
