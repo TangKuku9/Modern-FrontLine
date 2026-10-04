@@ -1143,6 +1143,11 @@ export class NetRoom {
           : (k.victim === e.victim && k.killer === e.killer));
         const extra = i >= 0 ? this.killExtra.splice(i, 1)[0] : null;
         this.events.push({ e: 'kill', killer: e.killer, victim: e.victim, killerCid: e.killerCid ?? null, victimCid: e.victimCid ?? null, weapon: e.weapon, head: e.head, pts: extra ? extra.pts : 0, tags: extra ? extra.tags : [] });
+      } else if (e.e === 'pickupGone') {
+        // 地上枪收掉的第二条路：14 把上限的溢出（headless-game.spawnPickup）。它和 30 秒
+        // 过期（上面 pickupTick 里那条）必须走同一个事件型：客户端按 id 摘哑模型，
+        // 少了这条的话被挤掉的那把枪永远留在别人屏幕上，而且捡不到。
+        this.events.push(e);
       }
     }
     ev.length = 0;

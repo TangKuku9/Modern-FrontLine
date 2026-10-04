@@ -687,6 +687,39 @@ ok('M6 按 F 换枪：手上换成了 ak、take 事件带槽位与弹药、旧�
 ok('M7 换走的那把从场上消失（gone 由 take 语义覆盖：同一个 id 不再出现在地上）',
   !roomM.game.pickups.includes(pB2), `地上 ${roomM.game.pickups.map(p => p.weaponId).join(',')}`);
 
+// —— 14 把上限的溢出：被挤掉的那把必须回告（H2）——
+// 地上的枪有两条收掉的路：30 秒过期（M3）与 14 把上限的溢出。溢出曾经是**静默的**：
+// spawnPickup 里 shift() 掉最旧的一把、不回告 —— 客户端照 'pickup' 事件建的哑模型
+// 就永远留在别人屏幕上（走过去没提示、按键无反应），而且 pickupAction 的"身边有枪"
+// 提示还照它算，屏上的提示与实际能捡的东西从此对不上。
+// 落点放在甲脚边 8 m 外：同款 1.3 m 自动补弹、1.8 m 换枪（M4/M6 那两条路）都不许被踩响。
+{
+  const far = MA.pl.pos.clone().add(new THREE.Vector3(8, 0, 0));
+  const base = roomM.game.pickups.length;
+  roomM.events.length = 0;
+  const spawned = [];
+  for (let i = 0; i < 14 - base; i++) {
+    const p = roomM.game.spawnPickup('m4', {}, far, 10, 30);
+    p.netId = ++roomM.netIds;
+    spawned.push(p);
+  }
+  roomM.step();
+  ok('M8【反证】没到上限：一条 pickupGone 都不发（这条红了 = 事件滥发，溢出闸就没了信息量）',
+    roomM.game.pickups.length === 14 && !roomM.events.some(e => e.e === 'pickupGone'),
+    `地上 ${roomM.game.pickups.length} 把`);
+  // 顶掉的一定是**最旧**的那把（shift 从队首走），且事件同拍经 drainKillFeed 下发 ——
+  // 与 30 秒过期同一个事件型、同一个出口（id 都是权威端编的 netId）。
+  const oldest = roomM.game.pickups[0];
+  const p15 = roomM.game.spawnPickup('ak', {}, far, 15, 60);
+  p15.netId = ++roomM.netIds;
+  roomM.step();
+  const ov = roomM.events.find(e => e.e === 'pickupGone' && e.why === 'overflow');
+  ok('M8 溢出收掉最旧的一把：pickupGone(why=overflow) 带着它的 netId、同拍下发',
+    !!ov && ov.id === oldest.netId && !roomM.game.pickups.includes(oldest)
+      && roomM.game.pickups.includes(p15),
+    ov ? `gone id=${ov.id}（最旧=${oldest.netId}）` : '没有 overflow 事件');
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 sec('N. 自由混战进联机：独立队伍 / 杀到目标 / 名次判赢家');
 // ═══════════════════════════════════════════════════════════════════════════

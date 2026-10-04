@@ -141,7 +141,16 @@ export class HeadlessGame {
     this.scene.add(m);
     const p = { weaponId, att: att || {}, mesh: m, pos: m.position.clone(), mag, reserve, t: 0 };
     this.pickups.push(p);
-    if (this.pickups.length > 14) { const o = this.pickups.shift(); this.scene.remove(o.mesh); }
+    if (this.pickups.length > 14) {
+      const o = this.pickups.shift();
+      this.scene.remove(o.mesh);
+      // 溢出回收**必须回告**：客户端地上那把枪是照 'pickup' 事件建的哑模型，收掉却不发
+      // pickupGone 的话它就永远留在地上 —— 走过去没提示、按键无反应；而且它还参与
+      // pickupAction 的"身边有枪"提示计算，屏上的提示与实际能捡的东西从此对不上。
+      // 服务端在这里只编事件，转发与下发在 server/room.mjs 的 drainKillFeed（与 30 秒
+      // 过期是同一条出口、同一个事件型）。单机（main.js:798）不需要这一步：它自己是权威。
+      this.events.push({ e: 'pickupGone', id: o.netId, why: 'overflow' });
+    }
     return p;
   }
 
