@@ -128,18 +128,24 @@ export function encodeInput(inp) {
   v.setUint8(15, packStreak(inp.streak ?? -1), true);
   return v;
 }
-export function decodeInput(buf) {
+// out / byteOffset（性能审查 B1）：热路径上 net-server 会对一帧里的每个 16B 包各调一次
+// decodeInput。曾经每次都新分配一个 8 字段的中转对象、再为每个包 new 一个 DataView ——
+// 60 包/秒/连接 × 128 连接就是一条稳定的 young-gen 分配曲线。调用方传 out（一条连接复用
+// 一个 scratch 对象）与 byteOffset（一帧一个 view，按偏移读包）即可复用；不传时行为与
+// 从前逐字节相同（自测与判据都走这条默认路）。
+export function decodeInput(buf, out = null, byteOffset = 0) {
   const v = asDataView(buf);
-  return {
-    tick: v.getUint32(0, true),
-    mdx: Q.unpackLook(v.getInt16(4, true)),
-    mdy: Q.unpackLook(v.getInt16(6, true)),
-    keys: v.getUint16(8, true),
-    buttons: v.getUint16(10, true),
-    view: v.getUint16(12, true),
-    seq: v.getUint8(14),
-    streak: unpackStreak(v.getUint8(15)),
-  };
+  const o = byteOffset | 0;
+  const r = out || {};
+  r.tick = v.getUint32(o, true);
+  r.mdx = Q.unpackLook(v.getInt16(o + 4, true));
+  r.mdy = Q.unpackLook(v.getInt16(o + 6, true));
+  r.keys = v.getUint16(o + 8, true);
+  r.buttons = v.getUint16(o + 10, true);
+  r.view = v.getUint16(o + 12, true);
+  r.seq = v.getUint8(o + 14);
+  r.streak = unpackStreak(v.getUint8(o + 15));
+  return r;
 }
 
 // 自测：node server/codec.mjs —— 误差和包大小都必须是量出来的数。

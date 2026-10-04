@@ -81,6 +81,20 @@ export class RoomDirectory {
     this._delRoom = this.db.prepare('delete from rooms where dkey = ?');
     this._insTicket = this.db.prepare('insert into tickets (tok,uk,name,xp,exp) values (?,?,?,?,?)');
     this._delTicket = this.db.prepare('delete from tickets where tok = ?');
+    // 下面这几条曾经是"每次调用现场 prepare"。prepare 是一次真正的 SQL 编译，
+    // 心跳每 beat 一轮、list() 还挂在匿名可达的 /api/rooms 上 —— 现场编译是纯浪费，
+    // 且与上面四条进了构造函数的风格自相矛盾。
+    this._selMine = this.db.prepare('select dkey, players, state from rooms where boot = ?');
+    // 未变行的续约用**一条按 boot 的批量 UPDATE**，不再逐行 touch：满房时逐行版是
+    // 每 beat N 条语句，而它要做的事就是"这一台名下全部续约"一句话。beat 只被
+    // 自己这台写、list() 又只看别台的行，所以批量续约不构成任何可见的 changed。
+    this._touchBoot = this.db.prepare('update rooms set beat = ? where boot = ?');
+    this._selAll = this.db.prepare('select * from rooms where boot != ? order by beat desc');
+    this._cntOwn = this.db.prepare('select count(*) as n from rooms where boot = ?');
+    this._selTicket = this.db.prepare('select uk, name, xp, exp from tickets where tok = ?');
+    this._delMine = this.db.prepare('delete from rooms where boot = ?');
+    this._delStaleRooms = this.db.prepare('delete from rooms where beat < ?');
+    this._delExpTickets = this.db.prepare('delete from tickets where exp < ?');
   }
 
   // 本台的行 → 目录。返回"有没有增删改"——调用方拿它决定要不要把新名单推给自己大厅里的人。
@@ -90,10 +104,12 @@ export class RoomDirectory {
     const want = new Map();
     for (const r of rows) want.set(this.boot + ':' + r.id, r);
     let changed = false;
-    const mine = this.db.prepare('select dkey, players, state from rooms where boot = ?').all(this.boot);
+    const mine = this._selMine.all(this.boot);
     const have = new Map(mine.map(m => [m.dkey, m]));
     this.db.exec('begin');
     try {
+      // 没变的行也要续心跳：beat 是"这台还活着"的唯一证据。批量一条搞定（见构造函数）。
+      this._touchBoot.run(t, this.boot);
       for (const [dkey, r] of want) {
         const h = have.get(dkey);
         if (!h || h.players !== r.players || h.state !== r.state) {
@@ -101,9 +117,6 @@ export class RoomDirectory {
             r.players | 0, r.max | 0, r.ready | 0, r.time | 0, r.score | 0, String(r.state || 'waiting'),
             String(r.host || ''), this.url, this.boot, t);
           changed = true;
-        } else {
-          // 没变的行也要续心跳：beat 是"这台还活着"的唯一证据。
-          this.db.prepare('update rooms set beat = ? where dkey = ?').run(t, dkey);
         }
       }
       for (const [dkey] of have) if (!want.has(dkey)) { this._delRoom.run(dkey); changed = true; }
@@ -115,7 +128,7 @@ export class RoomDirectory {
   // 别台的行（自己的除外）。sweep 负责新鲜度，这里只读。
   list() {
     this.sweepIfDue();
-    return this.db.prepare('select * from rooms where boot != ? order by beat desc').all(this.boot)
+    return this._selAll.all(this.boot)
       .map(r => ({
         id: r.id, title: r.title, map: r.map, mode: r.mode, players: r.players, max: r.max,
         ready: r.ready, time: r.time, score: r.score, state: r.state, host: r.host,
@@ -123,7 +136,7 @@ export class RoomDirectory {
       }));
   }
 
-  ownCount() { return this.db.prepare('select count(*) as n from rooms where boot = ?').get(this.boot).n; }
+  ownCount() { return this._cntOwn.get(this.boot).n; }
 
   // 超时没心跳的行，谁路过谁扫 —— 一台崩溃，它的行在任何一台的下一次心跳里消失。
   // 显式调用**永远真的扫**（心跳那条路要走的就是它）；只有 list() 那条隐式路径受间隔管。
@@ -131,8 +144,8 @@ export class RoomDirectory {
     const n = this.now();
     this._lastSweep = n;
     const dead = n - this.ttlMs;
-    this.db.prepare('delete from rooms where beat < ?').run(dead);
-    this.db.prepare('delete from tickets where exp < ?').run(n);
+    this._delStaleRooms.run(dead);
+    this._delExpTickets.run(n);
   }
 
   // 隐式扫描：距上次（显式或隐式）扫描不足 sweepMinMs 就直接返回。
@@ -160,7 +173,7 @@ export class RoomDirectory {
   consumeTicket(tok) {
     if (!tok) return null;
     const t = String(tok);
-    const row = this.db.prepare('select uk, name, xp, exp from tickets where tok = ?').get(t);
+    const row = this._selTicket.get(t);
     if (!row) return null;
     if (row.exp <= this.now()) { this._delTicket.run(t); return null; }
     const r = this._delTicket.run(t);
@@ -180,8 +193,8 @@ export class RoomDirectory {
 
   // 正常下线：把自己的行拔掉（不是等 TTL）。崩溃才走 TTL 那条路。
   unpublishAll() {
-    this.db.prepare('delete from rooms where boot = ?').run(this.boot);
-    this.db.prepare('delete from tickets where exp < ?').run(this.now());
+    this._delMine.run(this.boot);
+    this._delExpTickets.run(this.now());
   }
 
   close() {

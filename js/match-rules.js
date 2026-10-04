@@ -153,8 +153,12 @@ export class MatchRules {
     this.tick++;
     this.clock.step(1);
     if (this.wpTicks > 0) this.wpTicks--;
-    for (const [t, n] of [...this.uav]) {
-      if (n - 1 > 0) this.uav.set(t, n - 1); else this.uav.delete(t);
+    // 直接迭代并删/改：Map 的迭代器对"删当前项、改当前项的值"都是安全的，
+    // 复制一份 [...this.uav]（每拍一次，绝大多数拍里 UAV 表是空的）是纯白工。
+    if (this.uav.size) {
+      for (const [t, n] of this.uav) {
+        if (n - 1 > 0) this.uav.set(t, n - 1); else this.uav.delete(t);
+      }
     }
   }
 
@@ -417,15 +421,21 @@ export function pickupsExpire(game, dt) {
 // apply=false 时只算"身边有什么"（联机客户端用它画提示 —— 它不许自己改状态，
 // 换没换成由权威端的事件说了算），为真时把弹药/换枪的变更当场做完。
 // 返回 { near, ammo: [{p, add, reserve}], swap: {p, idx, st, old, reserve} | null }。
+// 距离先行（性能审查 B3）：两档半径（补弹 1.3m、换枪 1.8m）都用**平方距离**比，
+// 1.8m 之外的枪在查槽位（slots.find）之前就跳过 —— 满地是枪、人是空手时，
+// 曾经每次调用都对每把枪白查一遍槽位。判定结果与逐字版本完全一致。
 export function pickupAction(game, pl, inp, apply = true) {
   const out = { near: null, ammo: [], swap: null };
-  let nd = 1.8;
+  if (!pl || !pl.alive) return out;
+  let nd2 = 1.8 * 1.8;
   for (let i = game.pickups.length - 1; i >= 0; i--) {
     const p = game.pickups[i];
-    if (!pl || !pl.alive) continue;
-    const d = Math.hypot(p.pos.x - pl.pos.x, p.pos.z - pl.pos.z);
+    const dx = p.pos.x - pl.pos.x, dz = p.pos.z - pl.pos.z;
+    const d2 = dx * dx + dz * dz;
+    if (d2 >= 1.8 * 1.8) continue;         // 两档距离之外：两个分支都不可能命中
     const slot = pl.ws.slots.find(s => s.id === p.weaponId);
-    if (slot && d < 1.3) {
+    if (slot) {
+      if (d2 >= 1.3 * 1.3) continue;
       if (slot.reserve >= slot.stats.reserve * 2) continue;
       if (apply) {
         const add = Math.max(5, Math.floor((p.reserve ?? slot.stats.mag) * 0.5 + (p.mag || 0)));
@@ -433,11 +443,9 @@ export function pickupAction(game, pl, inp, apply = true) {
         game.pickups.splice(i, 1);
         out.ammo.push({ p, add, reserve: slot.reserve });
       }
-      continue;
-    }
-    if (!slot && d < nd) { out.near = p; nd = d; }
+    } else if (d2 < nd2) { out.near = p; nd2 = d2; }
   }
-  if (out.near && apply && inp && inp.interactPressed && pl && pl.alive) {
+  if (out.near && apply && inp && inp.interactPressed) {
     const p = out.near, ws = pl.ws, def = p.weaponId;
     const isSecondary = ['m1911', 'revolver', 'rpg'].includes(def);
     let idx = ws.cur;

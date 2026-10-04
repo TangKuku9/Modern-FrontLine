@@ -21,7 +21,7 @@ import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gzipSync } from 'node:zlib';
+import { gzip as gzipCb } from 'node:zlib';
 import { WebSocketServer } from 'ws';
 import { NetRoom, DT, SNAP_EVERY, RESPAWN_DELAY } from './room.mjs';
 import { fanout, nadeCounts } from './fanout.mjs';
@@ -206,6 +206,10 @@ function publiclyServable(rel) {
 // 失效靠 mtime —— 改了文件下一个请求就重新读，不需要重启进程，也不需要构建步骤。
 const fileCache = new Map();
 const MAX_CACHED = 128;
+
+// 异步 gzip（promise 包装，serveStatic 用）：曾经是 gzipSync，同步压大文件会把
+// 主线程停几十毫秒 —— 满载时是"发个版本，全场掉拍一秒"。
+const gzip = (buf, opts) => new Promise((res, rej) => gzipCb(buf, opts, (err, b) => (err ? rej(err) : res(b))));
 
 async function cachedFile(file) {
   let e = fileCache.get(file);
@@ -432,11 +436,21 @@ async function serveStatic(req, res) {
   base['cache-control'] = 'no-cache';
   if (req.headers['if-none-match'] === e.etag) { res.writeHead(304, base).end(); return; }   // 不发包体
   // 压缩只对文本生效，且只压一次（结果挂在 fileCache 上）。小文件压了反而多几字节。
+  // 压缩走**异步**（性能审查 P2）：gzipSync 曾在主线程同步压 1.2MB 的 three.module.js
+  // （几十 ms，满载房间的拍一起掉）—— 撞上"发版本后第一个请求"必然发生。并发请求共享
+  // 同一份 in-flight promise，不重复压；压失败退回明文，下一请求可重试。
   if (GZIPPABLE.test(type) && e.size > 1024 && /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) {
-    if (!e.gz) e.gz = gzipSync(e.buf, { level: 6 });
-    base['content-encoding'] = 'gzip'; base['content-length'] = e.gz.length; base['vary'] = 'accept-encoding';
-    res.writeHead(200, base).end(e.gz);
-    return;
+    if (!e.gz) {
+      if (!e.gzJob) e.gzJob = gzip(e.buf, { level: 6 }).then(
+        b => { e.gz = b; e.gzJob = null; return b; },
+        () => { e.gzJob = null; return null; });
+      e.gz = await e.gzJob;
+    }
+    if (e.gz) {
+      base['content-encoding'] = 'gzip'; base['content-length'] = e.gz.length; base['vary'] = 'accept-encoding';
+      res.writeHead(200, base).end(e.gz);
+      return;
+    }
   }
   base['content-length'] = e.size;
   res.writeHead(200, base).end(e.buf);
@@ -562,15 +576,26 @@ const lobby = new Lobby({
     } catch { return []; }
   },
   saveChat: (rows) => {
-    try { auth.store.setMeta('chatLobby', JSON.stringify(rows.slice(-50))); } catch { /* store.stat.errors 留字据 */ }
+    // 攒批而不是直写（性能审查 P0）：全服频道曾经"每条消息一次同步 meta 写"，
+    // 128 个挂在大厅的连接 × 600ms 限流 ≈ 最坏 200 次同步写/秒，与 60Hz 的拍抢主线程。
+    // 损失写明：崩溃最多丢一个刷盘窗口（250ms）的聊天历史 —— 与账号写同一条已立账的损失。
+    try { auth.store.setMetaLazy('chatLobby', JSON.stringify(rows.slice(-50))); } catch { /* store.stat.errors 留字据 */ }
   },
   // 跨进程房间目录（开着才有内容）：推给大厅的清单里带上别台的行（带 remote:true + url）。
   // 大厅 ws 帧与 /api/rooms 必须是同一份名单 —— 分两处的症状与 roomList 注释里那件事同形。
   remoteRooms: () => (dir ? dir.list() : []),
-  // 本台名单一变（建房/进人/离开/开局……最终都会走 pushLobby）就自报一次目录。
-  // 目录那边的 diff 决定"有没有真的变"；这里不做节流 —— publishAll 里 diff 完不改就不写。
-  onChange: () => { publishRooms(); },
+  // 本台名单一变（建房/进人/离开/开局……最终都会走 pushLobby）通知一声外面 —— 房间目录拿它自报行。
+  // 性能审查 P0：这个钩子曾经**同步**跑一次 publishAll —— 一次跨进程 SQLite 事务直接落在
+  // 主线程上，共享库写锁被别台持有时 busy_timeout 最长等 2 秒，全部房间的拍一起掉。
+  // 现在只立脏标记，发布合并进 dirBeat 的心跳窗口（每 ROOMS_BEAT_MS 一次）：
+  // 跨台可见性从"即时"变成"最坏一个心跳周期"，这是文档里写明接受的取舍。
+  // 顺带说明为什么 publishAll 本身不需要再防抖：它自带 diff，没变的行只剩一次批量续约
+  // （见 room-dir.mjs），心跳那条路本来就必须每拍跑（beat 是"这台还活着"的唯一证据）。
+  onChange: () => { dirDirty = true; },
 });
+
+// 目录的脏标记。let 声明放在 Lobby 构造之后没有问题：钩子只在下行的 ws 帧里才被调用。
+let dirDirty = false;
 
 // ── 跨进程房间目录（可选）──
 // 没设 ROOMS_DB 时 dir 为 null，下面每一处对它的引用都退化成"什么都不做"：
@@ -592,12 +617,22 @@ function publishRooms() {
 }
 if (dir) {
   const dirBeat = setInterval(() => {
-    // 顺序：先扫别人的死行、再自报（续自己的心跳）、最后看**远端那半**有没有变 ——
-    // 本台的变由 pushLobby 的 onChange 钩子即时上报，这里补的是"别台的变"要落进本台清单。
-    dir.sweep();
-    const own = publishRooms();
-    const sig = JSON.stringify(dir.list());
-    if (own || sig !== (dirBeat.__sig || '')) { dirBeat.__sig = sig; lobby.pushLobby(); }
+    // 整个回调包住：publishAll 撞上跨进程写锁会以 SQLITE_BUSY 抛（busy_timeout 等满 2 秒
+    // 之后）。这里曾经是唯一没有 try/catch 的发布路径 —— 改成"全部发布都在心跳里"之后，
+    // 一次 busy 抛错 = uncaughtException = 整台进程死掉，比旧代码（ws 消息路径有
+    // try/catch 兜着）更脆。脏窗口里的变更下一拍重试即可：beat 是每拍续的，错一拍不丢台。
+    try {
+      // 顺序：先扫别人的死行、再自报（续自己的心跳 + 把脏窗口里的变更写出去）、
+      // 最后看**远端那半**有没有变 —— 本台的变由 pushLobby 的 onChange 钩子立脏标记，
+      // 这里统一落库；别台的变靠每拍读一次清单来发现。
+      dir.sweep();
+      const own = publishRooms();
+      dirDirty = false;
+      const sig = JSON.stringify(dir.list());
+      if (own || sig !== (dirBeat.__sig || '')) { dirBeat.__sig = sig; lobby.pushLobby(); }
+    } catch (e) {
+      console.error('[dir] 心跳发布失败（下一拍重试）: ' + (e && e.message || e));
+    }
   }, CFG.roomBeatMs);
   dirBeat.unref?.();
 }
@@ -1166,12 +1201,18 @@ wss.on('connection', (ws, req) => {
     try {
       if (isBinary) {
         if (ws.__cid == null) return;
-        const ab = data instanceof ArrayBuffer ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
         const room = ws.__room;
         if (!room) return;
-        // 一帧可以攒多个 tick 的输入包，按顺序落地，最后一条生效
-        for (let o = 0; o + INPUT_SIZE <= ab.byteLength; o += INPUT_SIZE) {
-          room.applyInput(ws.__cid, decodeInput(new DataView(ab, o, INPUT_SIZE)));
+        // 零拷贝（性能审查 B1）：ws 给的 Buffer 背后是它自己的池化 ArrayBuffer，而这份
+        // view 只在本帧内**同步**用完（applyInput 当场把字段抄进新建的输入对象），
+        // 直接按 byteOffset 架视图即可 —— 曾经每帧 buffer.slice() 整帧拷一次是白付的。
+        const view = data instanceof ArrayBuffer ? new DataView(data)
+          : new DataView(data.buffer, data.byteOffset, data.byteLength);
+        // 一帧可以攒多个 tick 的输入包，按顺序落地，最后一条生效。
+        // scratch 每条连接一个：decodeInput 把字段写进它，applyInput 只读不存它。
+        const scratch = ws.__inScratch || (ws.__inScratch = {});
+        for (let o = 0; o + INPUT_SIZE <= view.byteLength; o += INPUT_SIZE) {
+          room.applyInput(ws.__cid, decodeInput(view, scratch, o));
         }
         return;
       }

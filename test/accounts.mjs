@@ -872,6 +872,25 @@ console.log(sec('N 审计表只写不删'));
     `rateLimited=${acc.stat.rateLimited}`);
 }
 
+console.log(sec('O 恢复码过 scrypt 并发闸（性能审查 P0）'));
+{
+  const { acc } = mk();
+  // 占满 8 个并发名额：_throttled 的账是模块级的（MAX_INFLIGHT=8），这几只假任务
+  // 用真实 setTimeout 挂住名额 —— 让"recover 在闸前被拒"变成确定性的，而不是赌时序。
+  // 登录/注册/换码早就走这道闸，唯独 recover 的 5 连哈希曾经裸跑（多 IP 洪水时
+  // 并发 scrypt 无上界，libuv 池饱和 → 静态资源与 fs 全部变慢）。
+  const holds = [];
+  for (let i = 0; i < 8; i++) holds.push(acc._throttled(() => new Promise(r => setTimeout(r, 150))));
+  await new Promise(r => setTimeout(r, 5));          // 让 8 只假任务先真正占上名额
+  const busy = await acc.recover({ name: 'OO', code: 'XXXX-XXXX-XXXX', password: PW, ip: '10.7.0.1' });
+  chk(busy.error === 'busy' && acc.stat.busy >= 1,
+    'O1 并发满时 recover 当场被拒（busy）—— 不排队、不把线程池占穿', JSON.stringify({ e: busy.error, busy: acc.stat.busy }));
+  await Promise.all(holds);
+  const after = await acc.recover({ name: 'OO', code: 'XXXX-XXXX-XXXX', password: PW, ip: '10.7.0.2' });
+  chk(after.error === 'bad_recovery',
+    'O2【判别臂】名额释放后恢复照旧跑满 5 次验证（bad_recovery）—— 拒忙是当下的，不是永久的', after.error);
+}
+
 console.log('');
 if (fails) { console.log(`RED  ${checks - fails}/${checks} 通过，${fails} 条失败`); process.exit(1); }
 console.log(`GREEN  账号与防护：${checks}/${checks} 通过`);

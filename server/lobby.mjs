@@ -45,7 +45,10 @@ export const SAY_MIN_MS = 600, SAY_BURST = 6, SAY_BURST_MS = 10000;
 // 建房→退房就能把所有人的大厅拖慢，而玩家侧看到的只是"刷新很慢"。
 // 哪几条帧要**付钱**（一次全大厅广播；开着目录的部署还多一次跨进程写）。
 // 放在 lobby 而不是 net-server：付钱的是这一层，也只有这一层分得清"改设置"和"发一句话"。
-export const HEAVY_FRAMES = new Set(['createRoom', 'joinRoom', 'quickRoom', 'leaveRoom', 'botAdd', 'botDel', 'roomCfg']);
+// ready/team 也在这里（性能审查 P1）：ready 每次都是 pushRoom（每座位一份 JSON）+
+// pushLobby（全厅广播），team 是一次全座位重建 —— 只占**突发**档（它们不在
+// HEAVY_MIN_FRAMES 里，连点准备/换队是正常操作，不吃 250ms 最小间隔）。
+export const HEAVY_FRAMES = new Set(['createRoom', 'joinRoom', 'quickRoom', 'leaveRoom', 'botAdd', 'botDel', 'roomCfg', 'ready', 'team']);
 // 分**两档**（这是判据逼出来的，不是先验的）：
 //   · 最小间隔只套在"房间生命周期"那一档 —— 每次成功都要建/删座位、广播、写目录，
 //     而人一分钟也做不了几次；
@@ -59,6 +62,9 @@ export const HEAVY_MIN_FRAMES = new Set(['createRoom', 'joinRoom', 'quickRoom', 
 // 空的等待房间留多久。比 live 那份的 ROOM_IDLE_MS(60s) 长得多是有意的：
 // 大厅里"刚建好、还差一个人"的房，是会被别人过几分钟才点进来的。
 export const WAIT_IDLE_MS = 5 * 60 * 1000;
+// 全厅广播的合帧窗口（性能审查 P1）。50ms：人手操作的间隔远大于它（感觉不到合帧），
+// 而风暴形状（断线、批量进退房、刷重帧）在这一窗内全部并成一次。
+const LOBBY_COALESCE_MS = 50;
 
 const MAP_IDS = new Set(MP_MAPS.map(m => m.id));
 // 模式按 js/data.js 上那个 net 标记筛：房间能选的模式 = 服务端判得出胜负的那些。
@@ -196,32 +202,57 @@ export class Lobby {
   list() { return [...this.rooms.values()].map(r => this.brief(r)); }
 
   lobbyState() { return { t: 'lobby', online: this.conns.size, rooms: [...this.list(), ...this.remoteRooms()] }; }
+  // 全厅广播走 50ms 合帧（性能审查 P1）：断线风暴/批量进房时，每一次变动都是一次
+  // "重建全量清单 + stringify + 发给所有连接"，n 条连接的 n 次进出就是 O(n²)。
+  // 窗口内的多次变更只花最后一份的钱；对外形状 {t:'lobby', online, rooms} 不变，
+  // 客户端本来就要把每帧清单当"全量替换"处理，少几帧中间态没有任何语义。
   pushLobby() {
-    const m = JSON.stringify(this.lobbyState());
-    for (const ws of this.conns) this.send(ws, m);
-    if (this.onChange) this.onChange();
+    if (this.__lobbyTimer) return;
+    this.__lobbyTimer = setTimeout(() => {
+      this.__lobbyTimer = null;
+      const m = JSON.stringify(this.lobbyState());
+      for (const ws of this.conns) this.send(ws, m);
+      if (this.onChange) this.onChange();
+    }, LOBBY_COALESCE_MS);
   }
 
+  // 一间的公共状态：seats/bots/brief/chat 这些**每个接收者都一样**的部分只建一次。
+  // roomState（单人）与 pushRoom（全座位）都从这里出发 —— 曾经 pushRoom 对每个座位
+  // 各建一遍公共部分再各自 stringify，16 座位 = 16 份几乎相同的数组与拷贝。
+  roomShared(room) {
+    return {
+      brief: this.brief(room),
+      seats: [...room.seats.values()].map(s => ({
+        sid: s.sid, name: s.name, team: s.team, ready: !!s.ready,
+        isHost: s.sid === room.hostSid, xp: s.xp | 0,
+      })),
+      // Bot 单独一列而不是混进 seats：seats 那一格的语义是"一条连接"（下游到处假设
+      // seat.ws 存在、seat 能当房主），把 Bot 塞进去会让 _handover 有朝一日把房主交给一个 Bot，
+      // 而那种房间的开始按钮永远点不动，且不报错。
+      bots: room.bots ? [...room.bots.values()].map(b => ({ bid: b.bid, name: b.name, team: b.team, skill: b.skill })) : [],
+      botSkill: room.botSkill | 0,
+      fill: !!room.fill,
+      chat: room.chat.slice(),
+    };
+  }
   // 一间的完整状态。**每个接收者一份**：me 那一格是各人不同的（我是不是房主、我准备了没）。
   // canStart/why 也在这里算：置灰按钮的判据和放行开局的判据必须是同一个函数，
   // 分两处写的症状是"按钮能点但服务端说不能开"（或者反过来，永远点不动）。
   roomState(room, forSeat = null) {
-    const seats = [...room.seats.values()].map(s => ({
-      sid: s.sid, name: s.name, team: s.team, ready: !!s.ready,
-      isHost: s.sid === room.hostSid, xp: s.xp | 0,
-    }));
+    const sh = this.roomShared(room);
     const me = forSeat ? { sid: forSeat.sid, name: forSeat.name, team: forSeat.team, ready: !!forSeat.ready, isHost: forSeat.sid === room.hostSid } : null;
     const g = this.startGate(room, forSeat);
-    // Bot 单独一列而不是混进 seats：seats 那一格的语义是"一条连接"（下游到处假设
-    // seat.ws 存在、seat 能当房主），把 Bot 塞进去会让 _handover 有朝一日把房主交给一个 Bot，
-    // 而那种房间的开始按钮永远点不动，且不报错。
-    const bots = room.bots ? [...room.bots.values()].map(b => ({ bid: b.bid, name: b.name, team: b.team, skill: b.skill })) : [];
-    return { t: 'room', room: this.brief(room), me, seats, bots, botSkill: room.botSkill | 0,
-      fill: !!room.fill, canStart: g.ok, why: g.why, chat: room.chat.slice() };
+    return { t: 'room', room: sh.brief, me, seats: sh.seats, bots: sh.bots, botSkill: sh.botSkill,
+      fill: sh.fill, canStart: g.ok, why: g.why, chat: sh.chat };
   }
   pushRoom(room) {
+    const sh = this.roomShared(room);
     for (const s of room.seats.values()) {
-      if (s.ws) this.send(s.ws, JSON.stringify(this.roomState(room, s)));
+      if (!s.ws) continue;
+      const me = { sid: s.sid, name: s.name, team: s.team, ready: !!s.ready, isHost: s.sid === room.hostSid };
+      const g = this.startGate(room, s);
+      this.send(s.ws, JSON.stringify({ t: 'room', room: sh.brief, me, seats: sh.seats, bots: sh.bots,
+        botSkill: sh.botSkill, fill: sh.fill, canStart: g.ok, why: g.why, chat: sh.chat }));
     }
   }
 
@@ -235,10 +266,14 @@ export class Lobby {
   }
   attach(ws) {
     sidOf(ws);
+    // 幂等（性能审查 P1）：只有**新**连接才改变"在线"这件事。重复 attach（对着同一条
+    // 连接狂发 {t:'lobby'} 帧）曾经每次都触发一次全厅广播 —— 在开着目录的部署上还
+    // 各带一次跨进程写。已挂上的连接只回它自己一份状态，别人的清单不受影响。
+    const fresh = !this.conns.has(ws);
     this.conns.add(ws);
     this.send(ws, JSON.stringify(this.lobbyState()));
     if (this.chat.length) this.send(ws, JSON.stringify({ t: 'chat', ch: 'lobby', hist: this.chat.slice() }));
-    this.pushLobby();          // 在线人数变了，别人那份列表也要跟着变（不重推就永远少一个人）
+    if (fresh) this.pushLobby();          // 在线人数变了，别人那份列表也要跟着变（不重推就永远少一个人）
   }
   detach(ws) {
     // 按 **ws** 把每一间里的座位都退掉，不按 seatOf：seatOf 只指向最后一间，一旦哪条

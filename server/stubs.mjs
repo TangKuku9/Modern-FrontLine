@@ -7,6 +7,17 @@
 // 替身用 Proxy 而不是逐个手写方法名：漏掉一个方法就是运行时崩溃，
 // 而 Proxy 保证"任何被调用的东西都不抛"，同时把调用记下来供测试断言。
 
+// 记录的容量上界（性能审查 P2）：热路径上 audio/effects/hud 的每一次调用都会 push 一条
+// {t,k} 对象 + 拼一次路径字符串，而 stubLog 在生产代码里只写不读（唯一消费者是判据）。
+// 不设上界的话，一场 Bot 交火的对局能攒出几十万条 —— 每条都是一次分配，全进 GC。
+// 满了就整段清空重来：判据读的都是"最近这一小段动作"（单次开枪/一次回放的窗口），
+// 远小于这个上界；真要无限期累积的场景（dump 全程）应当走 STUB_LOG=0 关闭再另行落盘。
+export const STUB_LOG_CAP = 16384;
+function record(log, entry) {
+  if (log.length >= STUB_LOG_CAP) log.length = 0;
+  log.push(entry);
+}
+
 export function deepRecorder(name = '', log = [], overrides = {}) {
   const fn = function () {};
   const cache = new Map();
@@ -26,11 +37,11 @@ export function deepRecorder(name = '', log = [], overrides = {}) {
       return cache.get(path);
     },
     set(_, prop, value) {
-      log.push({ t: 'set', k: name + '.' + String(prop) });
+      record(log, { t: 'set', k: name + '.' + String(prop) });
       return true;
     },
     apply(_, __, args) {
-      log.push({ t: 'call', k: name, n: args.length });
+      record(log, { t: 'call', k: name, n: args.length });
       return overrides[name] && typeof overrides[name] === 'function' ? overrides[name](...args) : undefined;
     },
   });

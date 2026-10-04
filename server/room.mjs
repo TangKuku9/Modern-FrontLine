@@ -83,6 +83,10 @@ const DOWN = new THREE.Vector3(0, -1, 0);
 export function decodeInputBits(keys, buttons) {
   return unpackInput(keys, buttons);
 }
+// sim 对 input 的契约是**只读**：队列空时同一份 lastInput 会被连续折叠好几拍（step 里
+// rep 计数的定义就建立在它上面），从没有人往 input 上写过字段。所以"零输入"模块级一份：
+// 空房间的 main 输入与新 client 的 lastInput 都指它，省掉每拍/每人一次 28 字段的分配。
+const EMPTY_INPUT = decodeInputBits(0, 0);
 
 export class NetRoom {
   constructor(opts = {}) {
@@ -296,7 +300,7 @@ export class NetRoom {
     if (!this.game.player) this.game.player = pl;   // 第一个人占住"本机玩家"那个老位置，
     // 其余的人靠 NetRoom.step 传的 pairs 列表被推进。
     const c = {
-      cid, pl, name, team, loadout: lo, lastInput: decodeInputBits(0, 0), q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0,
+      cid, pl, name, team, loadout: lo, lastInput: EMPTY_INPUT, q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0,
       // —— 对局规则的簿记（每个人一份）——
       // streakDefs：他自带的三项。welcome 回显的就是这一份，HUD 按它画三个槽。
       // book：连杀槽。成本里含"强硬路线"的减 1 —— 那是装备带来的，所以要在装好装备之后
@@ -391,8 +395,14 @@ export class NetRoom {
     // 放在 game.step **之前**是为了让"这一拍排出来的炸弹"被这一拍的 projectiles.update
     // 推进 —— 排在世界前进之后的话，每颗弹都会晚一拍照面出现。
     this.rules.step();
-    // 每步从队列里取一条；取不到就沿用上一份 —— 掉包时人是站住的，而不是回零乱走
-    const inputs = [...this.clients.values()].map(c => {
+    // 每步从队列里取一条；取不到就沿用上一份 —— 掉包时人是站住的，而不是回零乱走。
+    // 收集进 scratch（性能审查 B2）：{c, inp, fresh} 包装与下面 game.step 的 {pl, inp}
+    // 曾经每拍各分配一整套（60Hz × 每人 × 每房，多房满员时每秒上万个小对象）。
+    // 它们只活这一拍且被同步消费，所以按人数复用槽位即可；人数回落后清掉多余槽的引用，
+    // 免得 scratch 把已经离开的 client/player 钉在内存里。
+    const ins = this.__ins || (this.__ins = []);
+    let n = 0;
+    for (const c of this.clients.values()) {
       const fromQ = c.q.length;
       const inp = fromQ ? c.q.shift() : c.lastInput;
       if (inp.tick !== undefined) c.ack = inp.tick;
@@ -410,9 +420,13 @@ export class NetRoom {
       // 这一拍生效的"看到了哪一拍"。取不到货（饿住）时沿用上一份输入的报值 —— 那是它最后
       // 一次真的告诉过我们的东西，而 rewindTick 的上界（lastSnapSent）会兜住它不许无限变旧。
       c.view = inp.view | 0;
-      return { c, inp, fresh: fromQ > 0 };
-    });
-    for (const { c, inp } of inputs) {
+      const it = ins[n] || (ins[n] = { c: null, inp: null, fresh: false });
+      it.c = c; it.inp = inp; it.fresh = fromQ > 0;
+      n++;
+    }
+    for (let i = n; i < ins.length; i++) { ins[i].c = null; ins[i].inp = null; }
+    for (let i = 0; i < n; i++) {
+      const c = ins[i].c;
       if (!c.pl.alive) {
         c.respawnT -= DT;
         if (c.respawnT <= 0) {
@@ -447,7 +461,15 @@ export class NetRoom {
         }
       }
     }
-    this.game.step(DT, inputs[0] ? inputs[0].inp : decodeInputBits(0, 0), inputs.map(({ c, inp }) => ({ pl: c.pl, inp })));
+    // {pl, inp} 对同样复用。game.step 同步遍历整个数组，所以数组长度必须**正好是 n**
+    // —— 人数回落时截断（对象随之弃掉，再生时重建），churn 只发生在人数变化的那一拍。
+    const pairs = this.__pairs || (this.__pairs = []);
+    for (let i = 0; i < n; i++) {
+      const pr = pairs[i] || (pairs[i] = { pl: null, inp: null });
+      pr.pl = ins[i].c.pl; pr.inp = ins[i].inp;
+    }
+    pairs.length = n;
+    this.game.step(DT, n ? ins[0].inp : EMPTY_INPUT, pairs);
     // Bot 的重生。单机那一半长在 MPMatch.update 的 respawns 队列里（js/mp.js:317，
     // 死了的人按 4 + rng.next()*2 秒排队），而联机权威端没有那份名单 ——
     // 少了它的症状是"Bot 死一个少一个"：一局打到后半段场上只剩真人，
@@ -500,8 +522,11 @@ export class NetRoom {
     for (const p of pickupsExpire(this.game, DT)) {
       this.events.push({ e: 'pickupGone', id: p.netId, why: 'expire' });
     }
-    for (const { c, inp } of inputs) {
-      const r = pickupAction(this.game, c.pl, inp);
+    // 拾取判定按"地上有没有枪"门控（性能审查 B3）：没有地上枪时，曾经每拍对每个玩家
+    // 各跑一遍 pickupAction —— 里面对每次调用都分配结果对象、对每把枪做槽位查找。
+    if (this.game.pickups.length) for (let i = 0; i < n; i++) {
+      const c = ins[i].c;
+      const r = pickupAction(this.game, c.pl, ins[i].inp);
       for (const a of r.ammo) {
         this.events.push({ e: 'pickupAmmo', cid: c.cid, id: a.p.netId, weapon: a.p.weaponId, add: a.add, reserve: a.reserve });
       }
@@ -540,9 +565,10 @@ export class NetRoom {
         this.events.push({ e: 'heliHp', netId: a.netId, hp, maxHp: Math.round(a.maxHp) });
       }
     }
+    let anyGone = false;
     for (const a of this.active) {
       if (a.alive || a.__gone) continue;
-      a.__gone = true;
+      a.__gone = true; anyGone = true;
       this.events.push({ e: 'gone', netId: a.netId, kind: a.isTurret ? 'sentry' : 'heli' });
       // 被**打**下来的那一种要另发两句话：自然到点离场不该被念成"xxx 被击落"。
       // （Heli.downed 只由 takeDamage 那条路置上，见 js/mp.js:Heli.destroy。）
@@ -555,14 +581,17 @@ export class NetRoom {
         if (kc) this.events.push({ e: 'popup', cid: kc.cid, text: '摧毁' + kind });
       }
     }
-    this.active = this.active.filter(a => a.alive);
+    // 只有真的死了实体才重建数组（性能审查 B2）：active 空或全活时 filter 是每拍一个
+    // 新数组的白工。anyGone 蕴含"至少一个 !alive"，过滤结果与无条件版完全一致。
+    if (anyGone) this.active = this.active.filter(a => a.alive);
     this.tick++;
     // 连杀呼叫的生效。**只在真的消费到一条新输入的那一拍**处理：饥饿时服务端拿手里那份
     // 空跑（rep 期间同一份输入会被跑好几拍），而那一份里可能还留着上一次的请求 ——
     // 按"每拍都看一次 inp.streak"写的话，一个槽会被连点，症状是"按一次 UAV 出来三架"。
     // 客户端的按下沿保证了一条带请求的输入只会被**消费**一次，所以这里是安全的。
-    for (const { c, inp, fresh } of inputs) {
-      if (fresh && inp.streak >= 0 && c.pl.alive) this.callStreak(c, inp.streak);
+    for (let i = 0; i < n; i++) {
+      const it = ins[i];
+      if (it.fresh && it.inp.streak >= 0 && it.c.pl.alive) this.callStreak(it.c, it.inp.streak);
     }
     // 记分板与比分。走**事件**而不是快照：快照是定长的（每实体 25 B），塞不下一张
     // 变长的表；而记分板本来也不需要 20Hz 的精度 —— 每 2 秒一份足够。

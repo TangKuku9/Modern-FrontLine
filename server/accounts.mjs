@@ -260,7 +260,10 @@ export class RateLimiter {
 
   // 返回 { ok, retryAfterMs }。ok=false 时调用方**不许**继续做事（这里不退化成放行）。
   hit(key, now = Date.now()) {
-    this.prune(now);
+    // prune 是全表遍历（性能审查 P2）：key 数膨胀之后（反代下按 IP 计）每个只读请求
+    // 都背一次 O(表)。按时间节流到每 250ms 最多一次 —— 条目的回收本来就以秒/分钟计，
+    // 晚这零点几秒没有任何影响，而风暴形状（每秒几百个不同 key）的 prune 成本被钉成常数。
+    if (now - (this._lastPrune || 0) >= 250) { this._lastPrune = now; this.prune(now); }
     const arr = (this.hits.get(key) || []).filter(t => now - t < this.windowMs);
     if (arr.length >= this.max) {
       this.hits.set(key, arr);
@@ -600,7 +603,16 @@ export class Accounts {
       let hit = -1;
       for (let i = 0; i < RECOVERY_COUNT; i++) {
         let ok = false;
-        try { ok = await verifyPassword(probe, recs[i] || null, this.scrypt); } catch { ok = false; }
+        // 每次验证都过同一个并发闸（性能审查 P0）：登录/注册/换码都走 _throttled，唯独这条
+        // 循环曾经裸跑 —— 一次 recover 无条件 5 次 scrypt（每次 32 MiB），多 IP 洪水会让
+        // 并发 scrypt 无上界，libuv 池饱和之后静态资源与 fs 全部变慢。busy 的语义与登录
+        // 同款：当场干净地拒（'busy' 是与 bad_recovery 不同的结局，不泄露"第几张"的信息，
+        // 固定跑满 5 次的时序纪律只对"码对不对"这一维成立）。
+        try {
+          const r = await this._throttled(() => verifyPassword(probe, recs[i] || null, this.scrypt));
+          if (r === 'busy') return this._reject('busy');
+          ok = r;
+        } catch { ok = false; }
         // hit 走"第一个命中"，但比较**不落在这上面**：上面 5 次无论如何都跑完。
         if (ok && hit < 0) hit = i;
       }

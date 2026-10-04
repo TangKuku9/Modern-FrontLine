@@ -113,6 +113,8 @@ export class MemoryStore {
   // meta 是"小 JSON 片段"的杂项抽屉（聊天历史就在里面）。内存版只保证形状与 SQLite 版一致。
   getMeta(k) { return this.meta.get(k) ?? null; }
   setMeta(k, v) { this.meta.set(k, String(v)); }
+  // 内存版没有"崩溃丢一个刷盘窗口"可言，攒批与直写同义 —— 但契约（方法存在、读回一致）必须与 SQLite 版对齐。
+  setMetaLazy(k, v) { this.meta.set(k, String(v)); }
   // 审计的**契约与 SQLite 版一致**：不许往调用方抛（审计失败不许挡住注册/登录），
   // 内存上限只影响留多少条 —— 判据里量的是形状，不是容量。
   audit(ev, name, ip) {
@@ -145,6 +147,9 @@ export class SqliteStore {
     this.dirtyUsers = new Set();
     this.dirtySessions = new Set();
     this.goneSessions = new Set();
+    // 攒批 meta（setMetaLazy）：聊天历史那种"每条消息一次直写"的键走这里，
+    // 与账号写共用同一个 250ms 刷盘周期。恢复码哈希那种"丢了就是丢了"的键仍走直写 setMeta。
+    this.dirtyMeta = new Map();
     this.stat = { loaded: 0, sessions: 0, flushMs: 0, flushes: 0, written: 0, errors: 0, dropped: 0, pendingMax: 0 };
 
     this._load();
@@ -218,16 +223,22 @@ export class SqliteStore {
   getAudit(limit = 50) {
     return this.db.prepare('select t, ev, name, ip from audit order by id desc limit ?').all(limit | 0);
   }
-  // meta 直写，与 audit 同一条理由：一次一句小 upsert，量级与登录时的审计写相同，
-  // 且**不许**往调用方抛 —— 聊天历史写不进去不该挡住聊天本身（stat.errors 留字据）。
+  // meta 的两条路（性能审查 P0：聊天历史曾是"每条消息一次同步直写"）：
+  //   · setMeta 直写 —— 恢复码哈希这类"进程被杀也不能丢"的安全键继续走这里；
+  //   · setMetaLazy 攒批 —— 聊天历史这类"丢一个刷盘窗口可接受"的高频键走这里，
+  //     由 flush() 与账号写同一事务落盘。读侧（getMeta）先看未落盘的脏值，
+  //     所以"写完立刻读"永远一致，攒批只影响崩溃窗口，不影响本进程可见性。
   getMeta(k) {
-    try { const r = this.db.prepare('select v from meta where k = ?').get(String(k)); return r ? r.v : null; }
+    k = String(k);
+    if (this.dirtyMeta.has(k)) return this.dirtyMeta.get(k);
+    try { const r = this.db.prepare('select v from meta where k = ?').get(k); return r ? r.v : null; }
     catch { this.stat.errors++; return null; }
   }
   setMeta(k, v) {
     try { this._insMeta.run(String(k), String(v)); } catch { this.stat.errors++; }
   }
-  get pending() { return this.dirtyUsers.size + this.dirtySessions.size + this.goneSessions.size; }
+  setMetaLazy(k, v) { this.dirtyMeta.set(String(k), String(v)); }
+  get pending() { return this.dirtyUsers.size + this.dirtySessions.size + this.goneSessions.size + this.dirtyMeta.size; }
 
   // 一批一事务。批内条数有上限，见文件头"雪崩"那段。
   flush() {
@@ -235,15 +246,21 @@ export class SqliteStore {
     if (pending > this.stat.pendingMax) this.stat.pendingMax = pending;
     if (!pending) return 0;
     const t0 = this.now();
-    const uk = [...this.dirtyUsers].slice(0, MAX_BATCH);
-    const sk = [...this.dirtySessions].slice(0, MAX_BATCH);
-    const dk = [...this.goneSessions].slice(0, MAX_BATCH);
+    // 只取前 MAX_BATCH 条（迭代器早停）：曾经的 [...set].slice(0, MAX_BATCH) 会先把
+    // 整个集合摊平再截断 —— 积压越大，每次刷盘的固定成本越大，与"单批上限"的本意相反。
+    const take = (set) => { const out = []; for (const k of set) { out.push(k); if (out.length >= MAX_BATCH) break; } return out; };
+    const uk = take(this.dirtyUsers);
+    const sk = take(this.dirtySessions);
+    const dk = take(this.goneSessions);
+    const mk = [];
+    for (const [k, v] of this.dirtyMeta) { mk.push([k, v]); if (mk.length >= MAX_BATCH) break; }
     let n = 0;
     try {
       this.db.exec('begin');
       for (const k of uk) { const u = this.users.get(k); if (u) { this._insUser.run(...userRow(k, u)); n++; } this.dirtyUsers.delete(k); }
       for (const t of sk) { const s = this.sessions.get(t); if (s) { this._insSess.run(t, s.key, s.exp); n++; } this.dirtySessions.delete(t); }
       for (const t of dk) { this._delSess.run(t); n++; this.goneSessions.delete(t); }
+      for (const [k, v] of mk) { this._insMeta.run(k, v); n++; this.dirtyMeta.delete(k); }
       // 顺手清过期会话，但只在这一次刷盘真的动了 sessions 的时候做 ——
       // 每 250ms 全表 scan 一次 sessions 是纯浪费，而 sessions 的增长本来就很慢。
       if (sk.length || dk.length) this._delExp.run(this.now());
@@ -256,6 +273,7 @@ export class SqliteStore {
       for (const k of uk) this.dirtyUsers.add(k);
       for (const t of sk) this.dirtySessions.add(t);
       for (const t of dk) this.goneSessions.add(t);
+      for (const [k, v] of mk) this.dirtyMeta.set(k, v);
       return -1;
     }
     this.stat.flushes++; this.stat.written += n;

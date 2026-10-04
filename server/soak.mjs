@@ -106,7 +106,14 @@ const ok = (label, cond, extra = '') => { n++; if (!cond) bad++; console.log(`  
 const srv = EXT
   // 外部目标：只借它一个 base/ws，kill 与日志都不是我们的事（那台机器不归这个进程管）
   ? { base: EXT_BASE, ws: EXT_BASE.replace(/^http/, 'ws') + '/ws', kill: () => {}, log: () => '(外部目标：本机没有它的日志)' }
-  : await withServer({ MAX_ROOMS: '16', MAX_CLIENTS: '400', ROOM_IDLE_MS: '3000' });
+  // REQUIRE_ACCOUNT 必须显式关掉：默认要登录（net-server 的 REQUIRE_ACCOUNT !== '0'），
+  // 而假客户端没有会话 ⇒ 每一条都在握手阶段 401，`await c.open.catch(() => {})` 把它吞掉后
+  // 全按 dead 算 —— 整个阶梯压的其实是"鉴权拒绝所有人"。net-probe 早就为同一件事写过
+  // 同一条 env（并注明了漏写它每条都会红在"连不上"上），本地临时服这里必须带上；
+  // --url 外部目标不受影响（要不要登录由那一台自己的配置决定，走 --cookie）。
+  // CONNS_PER_IP 同理：本机压测所有连接同一 IP，默认 6 ⇒ 第 7 条起全被拆（文件头注释
+  // 写明的第二个坑），读数就成了"闸门工作正常"。README 记载的本机读数就是按 256 跑的。
+  : await withServer({ MAX_ROOMS: '16', MAX_CLIENTS: '400', ROOM_IDLE_MS: '3000', REQUIRE_ACCOUNT: '0', CONNS_PER_IP: '256' });
 const STDNAME = `soak-${process.pid.toString(36)}`;      // 自己开的房间都带这个前缀，回收只认它们
 const clients = [];
 const myRooms = new Set();

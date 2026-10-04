@@ -68,6 +68,20 @@ const api = async (base, path, body, cookie) => {
   return { status: r.status, json: json || {}, setCookie: setCookie ? setCookie.split(';')[0] : '' };
 };
 
+// 目录可见性现在是**合并进心跳窗口**的（性能审查 P0 的既定取舍：跨台可见从"即时"变为
+// "最坏一个 ROOMS_BEAT_MS"，换来的是主线程上不再有每次大厅变动一次的同步 SQLite 事务）。
+// 曾经的判据读法是"建完房下一行立刻就在"—— 那钉的是旧语义。现在改为在一个
+// 2×beat + 余量的窗口内轮询：窗口内出现才算过，窗口过了还没有才是红。
+const pollApi = async (fn, ms = 2500, step = 60) => {
+  const t0 = Date.now();
+  for (;;) {
+    const r = await fn();
+    if (r) return r;
+    if (Date.now() - t0 > ms) return null;
+    await sleep(step);
+  }
+};
+
 // ───────────────────────── U. 单元：对着一个临时文件钉死纯行为 ─────────────────────────
 console.log('\n── U. 单元：RoomDirectory（注入时钟，不等真实时间）──');
 {
@@ -131,11 +145,11 @@ console.log('\n── G. 集成（访客可玩的服）：发布 / 跨台加入 
   const room1 = await c1.until(j => j.t === 'room');
   ok('G1 先决：P1 上房间建起来了', !!room1 && room1.room && room1.room.id === 'cross1', room1 ? room1.room.id : '没等到 room 帧');
 
-  // G2 P2 的 /api/rooms 与大厅帧都看得见它，带 P1 的 url
-  const r2 = await api(p2.base, '/api/rooms');
-  const row = (r2.json.rooms || []).find(x => x.id === 'cross1');
+  // G2 P2 的 /api/rooms 与大厅帧都看得见它，带 P1 的 url（合并进心跳窗口后，轮询到即算过）
+  const row = await pollApi(async () =>
+    ((await api(p2.base, '/api/rooms')).json.rooms || []).find(x => x.id === 'cross1' && x.remote === true));
   ok('G2 别台的 /api/rooms 看得见这间房：remote:true + url 指向 P1',
-    !!row && row.remote === true && row.url === p1.base && row.players === 1, JSON.stringify(row || {}));
+    !!row && row.url === p1.base && row.players === 1, JSON.stringify(row || {}));
   const c2 = client(p2.ws, 'P2看客');
   await c2.opened;
   c2.send({ t: 'lobby' });   // 进大厅频道（浏览器端 LobbyClient.onopen 发的就是这一句）
@@ -155,10 +169,13 @@ console.log('\n── G. 集成（访客可玩的服）：发布 / 跨台加入 
   ok('G5 访客从 P2 的清单出发，真的进了 P1 上那间房', !!joined && joined.me && joined.me.name === '访客乙',
     joined ? `me=${joined.me && joined.me.name}` : '没等到 room 帧');
 
-  // G6 人数的变传回 P2 的清单（发布是即时的：pushLobby 钩子）
-  const r2b = await api(p2.base, '/api/rooms');
-  const row2 = (r2b.json.rooms || []).find(x => x.id === 'cross1');
-  ok('G6 进人之后 P2 清单里这一行的人数跟着涨（不用等心跳）', !!row2 && row2.players === 2, JSON.stringify(row2 || {}));
+  // G6 人数的变传回 P2 的清单。发布合并进心跳窗口之后，"涨"不再要求发生在下一毫秒，
+  // 但必须在一个窗口内到 —— 到不了才是红（取舍见 pollApi 上面的注释）。
+  const row2 = await pollApi(async () => {
+    const r = ((await api(p2.base, '/api/rooms')).json.rooms || []).find(x => x.id === 'cross1');
+    return r && r.players === 2 ? r : null;
+  });
+  ok('G6 进人之后 P2 清单里这一行的人数跟着涨（一个心跳窗口内）', !!row2, JSON.stringify(row2 || {}));
 
   // G7【反证】不开目录的台：它的房谁也看不见，它自己也发不出票
   const c3 = client(p3.ws, 'P3孤岛');
@@ -173,8 +190,9 @@ console.log('\n── G. 集成（访客可玩的服）：发布 / 跨台加入 
   ok('G8 没开目录的台上 /api/dispatch 是 404（没有票可发，也没有"另一台"可言）', disp3.status === 404, `status=${disp3.status}`);
 
   // G9 TTL：P1 整台被杀（模拟崩溃），它的行在 TTL 内从 P2 的清单里消失
-  const r2d = await api(p2.base, '/api/rooms');
-  ok('G9 先决：P1 的房此刻还在 P2 的清单里', (r2d.json.rooms || []).some(x => x.id === 'cross1'));
+  const stillThere = await pollApi(async () =>
+    ((await api(p2.base, '/api/rooms')).json.rooms || []).some(x => x.id === 'cross1'));
+  ok('G9 先决：P1 的房此刻还在 P2 的清单里', !!stillThere);
   p1.kill();
   let gone = false;
   for (let i = 0; i < 40 && !gone; i++) {   // TTL 1.2s + beat 0.3s，给 4 秒窗口（机器慢时也不假红）
@@ -208,10 +226,12 @@ console.log('\n── D. 门票（要账号的服）：验会话才发票 / 目�
   const broom = await cb.until(j => j.t === 'room');
   ok('D1 先决：B 台上那间房建起来了（建房的 ws 握手认了 B 台自己的会话）', !!broom && broom.room && broom.room.id === 'broom');
 
-  // A 台的清单看得见 B 台的房（账号服的目录回路与访客那半共用，这里只当先决看一眼）
-  const listA = await api(pa.base, '/api/rooms', undefined, regA.setCookie);
-  const rowA = (listA.json.rooms || []).find(x => x.id === 'broom');
-  ok('D2 先决：A 台登录玩家的清单里有 B 台的房（remote + url）', !!rowA && rowA.remote === true && rowA.url === pb.base, JSON.stringify(rowA || {}));
+  // A 台的清单看得见 B 台的房（账号服的目录回路与访客那半共用，这里只当先决看一眼）。
+  // 可见性合并进心跳窗口：轮询到即算过（取舍见 pollApi 注释）。
+  const rowA = await pollApi(async () =>
+    ((await api(pa.base, '/api/rooms', undefined, regA.setCookie)).json.rooms || []).find(x => x.id === 'broom' && x.remote === true));
+  ok('D2 先决：A 台登录玩家的清单里有 B 台的房（remote + url）',
+    !!rowA && rowA.url === pb.base, JSON.stringify(rowA || {}));
 
   // D3 未登录拿不到票
   const noSess = await api(pa.base, '/api/dispatch', { room: 'broom', url: pb.base });
@@ -219,24 +239,33 @@ console.log('\n── D. 门票（要账号的服）：验会话才发票 / 目�
   // D4 目标不在目录里拿不到票（否则发票 = 把登录身份转发到任意地址）
   const bogus = await api(pa.base, '/api/dispatch', { room: 'broom', url: 'http://evil.example:1' }, regA.setCookie);
   ok('D4【反证】url 不在目录里的 dispatch 是 400（票不发去任意地址）', bogus.status === 400, `status=${bogus.status}`);
-  // D5 正常拿票、凭票跨台握手、身份是票上那个人
-  const tick = await api(pa.base, '/api/dispatch', { room: 'broom', url: pb.base }, regA.setCookie);
-  ok('D5 A 台给登录玩家发了票', tick.status === 200 && !!tick.json.ticket, `status=${tick.status}`);
-  const cCross = client(pb.ws + '?ticket=' + encodeURIComponent(tick.json.ticket || ''), 'A台的甲');
-  await cCross.opened;
+  // D5 正常拿票、凭票跨台握手、身份是票上那个人。
+  // dispatch 的放行条件是"目标房在目录里"（mintFor），所以同样要等一个心跳窗口。
+  const tick = await pollApi(async () => {
+    const r = await api(pa.base, '/api/dispatch', { room: 'broom', url: pb.base }, regA.setCookie);
+    return r.status === 200 ? r : null;
+  });
+  ok('D5 A 台给登录玩家发了票', !!tick && !!tick.json.ticket, `status=${tick ? tick.status : '窗口内没等到'}`);
+  const cCross = client(pb.ws + '?ticket=' + encodeURIComponent(tick ? (tick.json.ticket || '') : ''), 'A台的甲');
+  // 有界等待：若 D5 真的红了，空票的握手必然被拒 —— 不加这一层的话 open 永远不来，
+  // 测试就挂在 await 上（比一条红判据糟糕得多的死法）。
+  await Promise.race([cCross.opened, sleep(4000)]);
   cCross.send({ t: 'joinRoom', room: 'broom' });
   const crossed = await cCross.until(j => j.t === 'room' && j.me);
   ok('D6 凭票握手被放行，B 台上他的身份就是票上的呼号（join 不看自报的 name）',
     !!crossed && crossed.me && crossed.me.name === '甲台A', crossed ? `me=${crossed.me && crossed.me.name}` : '没等到 room 帧');
 
   // D7【反证】同一张票再用一次：握手 401（消费即死是原子的，不是"尽量别重复"）
-  const again = client(pb.ws + '?ticket=' + encodeURIComponent(tick.json.ticket || ''), '重放票');
+  const again = client(pb.ws + '?ticket=' + encodeURIComponent(tick ? (tick.json.ticket || '') : ''), '重放票');
   const code = await Promise.race([again.rejected, sleep(3000).then(() => 0)]);
   ok('D7【反证】用过的票第二次握手被 401 拒（单次有效）', code === 401, `status=${code}`);
-  // D8【反证】过期票：TTL 600ms，等过去再试
-  const tick2 = await api(pa.base, '/api/dispatch', { room: 'broom', url: pb.base }, regA.setCookie);
+  // D8【反证】过期票：TTL 600ms，等过去再试。同样轮询（发票的前提是"房在目录里"）。
+  const tick2 = await pollApi(async () => {
+    const r = await api(pa.base, '/api/dispatch', { room: 'broom', url: pb.base }, regA.setCookie);
+    return r.status === 200 ? r : null;
+  });
   await sleep(900);
-  const late = client(pb.ws + '?ticket=' + encodeURIComponent(tick2.json.ticket || ''), '过期票');
+  const late = client(pb.ws + '?ticket=' + encodeURIComponent(tick2 ? (tick2.json.ticket || '') : ''), '过期票');
   const code2 = await Promise.race([late.rejected, sleep(3000).then(() => 0)]);
   ok('D8【反证】过了 TTL 的票握手被 401 拒（短有效期）', code2 === 401, `status=${code2}`);
 

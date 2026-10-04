@@ -74,6 +74,22 @@ try {
   ok('进大厅先拿到一份房间清单（不是靠轮询 /api/rooms）', !!l0 && Array.isArray(l0.rooms), JSON.stringify(l0 && l0.rooms));
   ok('服务器上还没有任何在跑的 sim', (await health(base)).rooms === 0);
 
+  // attach 幂等（性能审查 P1）：已经在大厅的连接重复发 {t:'lobby'}，只回它自己一份，
+  // 不再触发一次全厅广播 —— 曾经每条重复帧都是"全量清单 × 全部连接"的扇出。
+  // 250ms 远大于服务端的 50ms 合帧窗口：若服务端仍在广播，旁听者这里必然多收一帧。
+  const a2 = client(wsUrl, '乙');
+  await a2.opened;
+  a2.send({ t: 'lobby' });
+  await a2.until(j => j.t === 'lobby');
+  await sleep(120);                 // 先等 a2 自己那次 attach 的合帧广播（50ms 窗）落地，别污染测量
+  const eavesdropped = () => a2.frames.filter(j => j.t === 'lobby').length;
+  const own = () => a.frames.filter(j => j.t === 'lobby').length;
+  const silent0 = eavesdropped(), own0 = own();
+  a.send({ t: 'lobby' });
+  await sleep(250);
+  ok('重复 attach 对旁听者静默（不再触发全厅广播）', eavesdropped() === silent0, `旁听 lobby 帧 ${silent0}→${eavesdropped()}`);
+  ok('重复 attach 仍回自己一份清单（这一帧是"给我刷新"，不是给别人广播）', own() === own0 + 1, `自己 ${own0}→${own()}`);
+
   a.send({ t: 'createRoom', room: 'hall', title: '我的房', name: '阿甲', map: 'dune', mode: 'tdm' });
   const r1 = await a.until(j => j.t === 'room' && j.room && j.room.id === 'hall');
   ok('建房成功且我是房主', !!r1 && !!r1.me && r1.me.isHost === true, JSON.stringify(r1 && r1.me));
@@ -853,6 +869,10 @@ try {
     await c.until(j => j.t === 'lobby');
     c.send({ t: 'say', ch: 'lobby', text });
     await c.until(j => j.t === 'chat' && j.text === text, 3000);
+    // 聊天历史已并入 250ms 批刷（性能审查 P0：曾经每条消息一次同步直写）。
+    // 杀进程（Windows 上是 TerminateProcess，没有优雅收尾）之前要给刷盘定时器一个窗口，
+    // 否则这条判据量的就不是"落盘"而是"攒批还没落"。
+    await sleep(400);
     c.close();
     srv.kill();
     await sleep(300);
