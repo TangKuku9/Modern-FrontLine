@@ -143,7 +143,7 @@ function shoot(L, aim, view) {
   if (!pose) return { err: `第 ${room.tick} 拍不在姿态缓冲里（不该发生：每一拍都在 record）` };
   // ② 世界那个盒子会不会先被墙挡下 —— 和 traceBullet 同一套语义（best 从墙距起算）
   const wh = W0.raycast(ro, rd, 400);
-  const box = hitTestPlayer(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5], ro, rd, wh ? wh.t : 1e9);
+  const box = hitTestPlayer(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5], pose[6], ro, rd, wh ? wh.t : 1e9);
   const predicted = !!box;
 
   // ③ 实测
@@ -247,7 +247,7 @@ for (const c of cells) {
     const ro = S.eyePoint(new THREE.Vector3());
     const rd = S.aimDir(new THREE.Vector3());
     const wh = W0.raycast(ro, rd, 400);
-    const predicted = !!hitTestPlayer(posePast[0], posePast[1], posePast[2], posePast[3], posePast[4], posePast[5], ro, rd, wh ? wh.t : 1e9);
+    const predicted = !!hitTestPlayer(posePast[0], posePast[1], posePast[2], posePast[3], posePast[4], posePast[5], posePast[6], ro, rd, wh ? wh.t : 1e9);
     const perpNow = +perpTo(ro, rd, bot.pos.x, bot.pos.z).toFixed(3);
     const perpPast = +perpTo(ro, rd, posePast[0], posePast[2]).toFixed(3);
     const dist = +Math.hypot(posePast[0] - ro.x, posePast[2] - ro.z).toFixed(2);
@@ -323,12 +323,12 @@ for (const c of cells) {
   const dist = +Math.hypot(at.x - ro.x, at.z - ro.z).toFixed(2);
   chk(wh === null || wh.t > dist, '趴姿靶：目标在墙前面（中/不中都不是墙替它决定的）',
     `墙距 ${wh === null ? null : +wh.t.toFixed(2)} / 目标距 ${dist}`);
-  chk(!hitTestPlayer(T.pos.x, T.pos.y, T.pos.z, 1.62, T.yaw, 0, ro, rd, wh === null ? 1e9 : wh.t),
+  chk(!hitTestPlayer(T.pos.x, T.pos.y, T.pos.z, 1.62, T.yaw, 0, 0, ro, rd, wh === null ? 1e9 : wh.t),
     '趴姿靶【反证臂】：同一射线按站立盒判不中（不然"中"证明不了趴姿盒的功劳）');
   const eff = rewindTick(past, room.tick + 1, ca.lastSnapSent);
   chk(eff === past, '趴姿靶：报过去过得了闸门（这条不红，"不中"才轮得到 H1 背锅）',
     `eff=${eff} past=${past} lastSnapSent=${ca.lastSnapSent}`);
-  const predicted = !!hitTestPlayer(ppPast[0], ppPast[1], ppPast[2], ppPast[3], ppPast[4], ppPast[5], ro, rd, wh === null ? 1e9 : wh.t);
+  const predicted = !!hitTestPlayer(ppPast[0], ppPast[1], ppPast[2], ppPast[3], ppPast[4], ppPast[5], ppPast[6], ro, rd, wh === null ? 1e9 : wh.t);
   chk(predicted, '趴姿靶：生产函数（按环里的 yaw/prone）预测命中');
   const hp0 = T.hp;
   step({ a: { buttons: BTN.Ads | BTN.Fire, view: past }, b: { keys: 0 } });

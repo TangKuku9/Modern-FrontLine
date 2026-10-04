@@ -22,7 +22,7 @@ import { openSocket, tabNonce } from '../account.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
 // 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
-const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Prone | FLAG.Sprint | FLAG.OnGround | FLAG.Sliding;
+const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Prone | FLAG.Sprint | FLAG.OnGround | FLAG.Sliding | FLAG.LeanL | FLAG.LeanR;
 // 队伍键的规范形。只放行 'B' 与 'P' 前缀（'P'+cid 是自由混战每人一支的独立队，是
 // 播报前缀 / 直升机归属 / own、foes 过滤 / 名牌的**敌我键**——把它压成 'A' 的症状是
 // 全场都是"队友"、自己叫的直升机被念成敌机）。URL team= 的直连路上只有 'A'/'B'，
@@ -828,7 +828,8 @@ export class NetClient {
         // "这一窗服务端跑过的 dTick 步重演完之后"的姿态，才是真正和权威同一时刻的那一份。
         const bs = r.baseState;
         const jf = bs ? ((bs.alive ? FLAG.Alive : 0) | (bs.crouchT > 0.5 ? FLAG.Crouch : 0) | (bs.proneT > 0.5 ? FLAG.Prone : 0)
-          | (bs.sprinting ? FLAG.Sprint : 0) | (bs.onGround ? FLAG.OnGround : 0) | (bs.sliding ? FLAG.Sliding : 0)) : null;
+          | (bs.sprinting ? FLAG.Sprint : 0) | (bs.onGround ? FLAG.OnGround : 0) | (bs.sliding ? FLAG.Sliding : 0)
+          | (bs.leanT < -0.5 ? FLAG.LeanL : 0) | (bs.leanT > 0.5 ? FLAG.LeanR : 0)) : null;
         // 只在"基态和快照是同一时刻"时才计数：rep>0 时基态本就早 rep 拍，不等是对的。
         if (steady && !(e.rep | 0) && hit && jf !== null && jf !== (e.flags & FLAG_BASE_MASK)) {
           this.flagMismatch = (this.flagMismatch || 0) + 1;

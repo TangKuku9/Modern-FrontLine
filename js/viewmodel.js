@@ -278,6 +278,10 @@ export class Viewmodel {
     rx += -0.25 * s; ry += 0.7 * s; rz += 0.35 * s;
     // 滑铲
     if (pl.sliding) { rz -= 0.3; }
+    // 探头：相机已经带着横移与横滚（player.js:updateCamera），枪身给一点"滞后"——小幅反向
+    // 平移 + 部分回正的滚转，读作"人探出去、枪还端着"，而不是整幅画面刚性平移。
+    // 幅度是纯表现旋钮，不影响任何裁决（弹道从 camPos/aimDir 取）。
+    if (pl.leanT) { pos.x -= pl.leanT * 0.03; rz += pl.leanT * 0.09; }
     // 状态动画
     const k = ws.stateDur ? clamp(ws.stateT / ws.stateDur, 0, 1) : 1;
     const arms = cur.arms;

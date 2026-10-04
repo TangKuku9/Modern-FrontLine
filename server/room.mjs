@@ -1206,6 +1206,10 @@ export class NetRoom {
       if (pl.alive) flags |= FLAG.Alive;
       if (pl.crouchT > 0.5) flags |= FLAG.Crouch;
       if (pl.proneT > 0.5) flags |= FLAG.Prone;   // 趴姿：与蹲同一口径（>0.5 过半才算姿态成立）
+      // 探头（Q/E）：与蹲/趴同一口径（|leanT| 过半才算成立）。两位表达一个单维量的方向，
+      // 恒互斥 —— 远端按"R 加一、L 减一"求和（js/net/remote.mjs），同时亮会正好抵消成 0。
+      if (pl.leanT < -0.5) flags |= FLAG.LeanL;
+      else if (pl.leanT > 0.5) flags |= FLAG.LeanR;
       if (pl.sprinting) flags |= FLAG.Sprint;
       if (ws.adsT > 0.5) flags |= FLAG.Ads;
       if (pl.onGround) flags |= FLAG.OnGround;

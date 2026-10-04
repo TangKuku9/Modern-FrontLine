@@ -29,33 +29,36 @@ export const LAG_MAX_TICKS = 60;
 // 环形缓冲长度：1.6 s。要比上限多出余量 —— 判据端能查到的最旧拍号是
 // lastSent − LAG_MAX_TICKS，而 lastSent 最旧可以落后当前拍 SNAP_EVERY−1 拍。
 export const LAG_HIST = 96;
-// x, y, z, eye, yaw, prone —— 后两个是趴姿加的：趴下的命中盒沿体轴平摊出去 ~1.6 m
-// （js/combat.js:hitTestPlayer），"脚跟朝哪"没有 yaw 答不出来，"是否已经趴下"没有
-// prone 答不出来。盒子依赖什么，缓冲里就得存什么。
-export const POSE_FIELDS = 6;
+// x, y, z, eye, yaw, prone, lean —— 后三个各管一维姿态：趴下的命中盒沿体轴平摊出去 ~1.6 m
+// （js/combat.js:hitTestPlayer），"脚跟朝哪"没有 yaw 答不出来，"是否已经趴下"没有 prone 答不出来；
+// 探头把头/躯干盒沿"此人右边"侧移出去 ~0.34 m（LEAN_DIST），"探出去多少"没有 lean 答不出来。
+// 盒子依赖什么，缓冲里就得存什么。lean 存**原始倾量**（-1..1），米/倍数的换算只在
+// hitTestPlayer 一处几何里做。
+export const POSE_FIELDS = 7;
 
 // 一个玩家的姿态环形缓冲。拍号单调递增，按下标取模写入；lo/hi 记窗口，
 // 于是"这一拍还在不在缓冲里"是个可判定的问题，而不是靠调用方自己算。
 export class PoseRing {
   constructor(n = LAG_HIST) { this.n = n; this.d = new Float64Array(n * POSE_FIELDS); this.lo = 0; this.hi = -1; }
-  // pl 要有 pos / curEye() / yaw / proneT —— Player 与 NetPlayer 都有这四个（命中盒的定义在
-  // js/combat.js）。Bot 没有 proneT（它们不趴），读出来是 undefined，与 0 同义。
+  // pl 要有 pos / curEye() / yaw / proneT / leanT —— 命中盒的定义在 js/combat.js。
+  // Bot 没有 proneT / leanT（它们既不趴也不探），读出来是 undefined，与 0 同义。
   record(tick, pl) {
     const i = (tick % this.n) * POSE_FIELDS, d = this.d;
     d[i] = pl.pos.x; d[i + 1] = pl.pos.y; d[i + 2] = pl.pos.z; d[i + 3] = pl.curEye();
-    d[i + 4] = pl.yaw; d[i + 5] = pl.proneT > 0.5 ? 1 : 0;
+    d[i + 4] = pl.yaw; d[i + 5] = pl.proneT > 0.5 ? 1 : 0; d[i + 6] = pl.leanT || 0;
     if (this.hi < this.lo) { this.lo = this.hi = tick; }        // 第一笔
     else { this.hi = tick; this.lo = Math.max(this.lo, tick - this.n + 1); }
   }
-  // 把 tick 那一拍的 [x,y,z,eye,yaw,prone] 交出来；不在窗口里返回 null。
+  // 把 tick 那一拍的 [x,y,z,eye,yaw,prone,lean] 交出来；不在窗口里返回 null。
   // 返回**新数组**而不是复用一个 scratch：核弹级的坑是"交错对象静默毒化下游"——
   // 这里每次裁决也就几次分配，不值得为它冒那个险。
-  // 必须交满 POSE_FIELDS 个：消费方（js/combat.js:traceBullet）按 p[4]/p[5] 读 yaw/prone，
-  // 少交一个就是"趴姿一律按站立盒裁决"的静默失真 —— 自测里有一条按长度钉死它。
+  // 必须交满 POSE_FIELDS 个：消费方（js/combat.js:traceBullet）按 p[4]/p[5]/p[6] 读
+  // yaw/prone/lean，少交一个就是"趴姿一律按站立盒裁决 / 探头一律按不探判"的静默失真
+  // —— 自测里有一条按长度钉死它。
   at(tick) {
     if (this.hi < this.lo || tick < this.lo || tick > this.hi) return null;
     const i = (tick % this.n) * POSE_FIELDS, d = this.d;
-    return [d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5]];
+    return [d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5], d[i + 6]];
   }
 }
 
@@ -116,16 +119,21 @@ if (typeof process !== 'undefined' && isDirectRun(process.argv[1], import.meta.u
   eq(r2.at(40)[0], 2, '稀疏拍号：新的那笔在');
 
   // at() 必须交满 POSE_FIELDS 个字段：消费方（js/combat.js:traceBullet → hitTestPlayer）
-  // 按 p[4]/p[5] 读 yaw/prone。这里曾经只回 4 个 —— "能取到值"的判据照样全绿，而
+  // 按 p[4]/p[5]/p[6] 读 yaw/prone/lean。这里曾经只回 4 个 —— "能取到值"的判据照样全绿，而
   // 趴姿在联机里一律按站立盒裁决（趴姿盒沿体轴平摊 ~1.6 m，yaw 答脚跟朝哪、prone 答
   // 是否趴下）。所以长度要逐条断言，不能只比 [0]。
-  const prone = { pos: { x: 12, y: 0, z: 34 }, curEye: () => 0.6, yaw: 2.25, proneT: 1 };
-  const stand = { pos: { x: 56, y: 0, z: 78 }, curEye: () => 1.62, yaw: -1.5, proneT: 0 };
+  const prone = { pos: { x: 12, y: 0, z: 34 }, curEye: () => 0.6, yaw: 2.25, proneT: 1, leanT: -1 };
+  const stand = { pos: { x: 56, y: 0, z: 78 }, curEye: () => 1.62, yaw: -1.5, proneT: 0, leanT: 0 };
   r2.record(50, prone); r2.record(51, stand);
   const gotP = r2.at(50), gotS = r2.at(51);
   eq(gotP.length, POSE_FIELDS, 'at() 交回来的字段数必须等于 POSE_FIELDS');
-  eq(JSON.stringify(gotP), JSON.stringify([12, 0, 34, 0.6, 2.25, 1]), '趴姿靶：位置/眼高/yaw/prone 逐字段原样（eq 比的是引用，数组要走 JSON）');
-  eq(JSON.stringify(gotS), JSON.stringify([56, 0, 78, 1.62, -1.5, 0]), '站姿靶：yaw 原样、prone 是 0');
+  eq(JSON.stringify(gotP), JSON.stringify([12, 0, 34, 0.6, 2.25, 1, -1]), '趴姿靶：位置/眼高/yaw/prone/lean 逐字段原样（eq 比的是引用，数组要走 JSON）');
+  eq(JSON.stringify(gotS), JSON.stringify([56, 0, 78, 1.62, -1.5, 0, 0]), '站姿靶：yaw 原样、prone/lean 是 0');
+  // Bot（与一切没有 leanT 的实体）record 进来的倾量必须落成 0，不能是 NaN —— NaN 一进
+  // Float64Array 就会顺着 hitTestPlayer 的侧移把头球/躯干盒挪出实数域，那一拍的人永远打不中。
+  const botlike = { pos: { x: 1, y: 0, z: 2 }, curEye: () => 1.62, yaw: 0, proneT: 0 };
+  r2.record(52, botlike);
+  eq(r2.at(52)[6], 0, '没有 leanT 的实体（Bot）：倾量按 0 记，不产生 NaN');
 
   eq(rewindTick(990, 1000, 998), 990, '正常：报 10 拍前 → 回溯到 990');
   eq(rewindTick(995, 1000, 998), 995, '正常：报 5 拍前 → 回溯到 995');

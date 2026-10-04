@@ -17,7 +17,7 @@ import * as THREE from 'three';
 import { createSoldierModel, animateSoldier, makeNameTag, applyFlashTex } from '../soldier.js';
 import { WEAPONS } from '../data.js';
 import { angleDiff, clamp, lerp } from '../util.js';
-import { hitTestPlayer } from '../combat.js';
+import { hitTestPlayer, LEAN_DIST } from '../combat.js';
 import { FLAG, WEAPON_IDS } from '../quant.js';
 
 // 插值回退量（秒）。它不再是一个写死的常数而是**可收放的**：NetClient 每收一份快照
@@ -53,7 +53,7 @@ export class NetPlayer {
     // 小地图的幽灵过滤靠它（hud.drawMinimap 里的 hasPerk('ghost')）—— 协议里没有逐人
     // 技能字段，也不该有：技能跟着装备走，装备的真相在服务端，跟着那三处事件走就够。
     this.perks = Array.isArray(o.perks) ? o.perks.slice() : [];
-    this.crouchT = 0; this.proneT = 0; this.onGround = true; this.sprinting = false; this.sliding = false;
+    this.crouchT = 0; this.proneT = 0; this.leanT = 0; this.onGround = true; this.sprinting = false; this.sliding = false;
     this.revealT = 0; this.dmgT = 99; this.stealthy = false;
     this.radius = 0.35;
     this.lastAttacker = null;
@@ -75,7 +75,7 @@ export class NetPlayer {
     this.model.root.position.copy(this.pos);
     game.scene.add(this.model.root);
     this.tag = null; this.buildTag();
-    this.anim = { speed: 0, phase: 0, crouch: 0, prone: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0, sprint: 0, air: 0, rocket: true };
+    this.anim = { speed: 0, phase: 0, crouch: 0, prone: 0, lean: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, ads: 0, slide: 0, sprint: 0, air: 0, rocket: true };
     // —— 表现层账本（见文件头）——
     this.fireCool = 0;                              // 下一发枪声还要等多久
     this.stepDist = 0;                              // 从上一声脚步起走了多少米
@@ -179,16 +179,24 @@ export class NetPlayer {
   }
 
   curEye() { return lerp(lerp(1.62, 1.05, this.crouchT), 0.45, this.proneT); }
-  eyePos(out) { return out.set(this.pos.x, this.pos.y + this.curEye(), this.pos.z); }
-  chestPos(out) { return out.set(this.pos.x, this.pos.y + this.curEye() - 0.4, this.pos.z); }
+  // 探头侧移与 Player 同一份几何（LEAN_DIST、右向 (cos yaw, 0, -sin yaw)）：eyePos 是
+  // "他的眼睛"、chestPos 是躯干盒中心（半量），Bot/HUD 对两类实体一视同仁。
+  eyePos(out) {
+    const l = this.leanT * LEAN_DIST;
+    return out.set(this.pos.x + Math.cos(this.yaw) * l, this.pos.y + this.curEye(), this.pos.z - Math.sin(this.yaw) * l);
+  }
+  chestPos(out) {
+    const l = this.leanT * LEAN_DIST * 0.5;
+    return out.set(this.pos.x + Math.cos(this.yaw) * l, this.pos.y + this.curEye() - 0.4, this.pos.z - Math.sin(this.yaw) * l);
+  }
   forward(out) { return out.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)); }
 
   // 命中盒与权威裁决**共用一处定义**（js/combat.js:hitTestPlayer）。本机这份只影响"打到了"
   // 的即时反馈（真值在服务端），但盒子必须是同一个：抄一份的症状是"改了常数之后本地反馈说中、
-  // 权威说没中"，而两边都不报错。延迟补偿的缓冲里存的也正是这个函数的六个入参。
-  // yaw 用权威值不用 yawSm：裁决不迟于权威，平滑只是给观众看的。
+  // 权威说没中"，而两边都不报错。延迟补偿的缓冲里存的也正是这个函数的七个入参。
+  // yaw/lean 用权威值不用平滑值：裁决不迟于权威，平滑只是给观众看的。
   hitTest(o, d, maxT) {
-    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, this.proneT > 0.5 ? 1 : 0, o, d, maxT);
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, this.proneT > 0.5 ? 1 : 0, this.leanT, o, d, maxT);
   }
   // 客户端不裁决伤害：只记下"我这一枪大概打掉多少"用于反馈，真值等服务器快照。
   // 返回值是**本地预测**的"这一枪会不会打死他"：它只驱动红叉与击杀音
@@ -265,6 +273,9 @@ export class NetPlayer {
     this.hp = s.hp; this.alive = !!(s.flags & FLAG.Alive);
     this.crouchT = (s.flags & FLAG.Crouch) ? 1 : 0;
     this.proneT = (s.flags & FLAG.Prone) ? 1 : 0;
+    // 探头：权威只给方向两位（LeanL/LeanR），本机的 hitTest/eyePos 吃**瞬时**的 ±1/0，
+    // 动画通道（a.lean）另做平滑 —— 与 yaw 同一套分工。
+    this.leanT = ((s.flags & FLAG.LeanR) ? 1 : 0) + ((s.flags & FLAG.LeanL) ? -1 : 0);
     this.sprinting = !!(s.flags & FLAG.Sprint);
     this.onGround = !!(s.flags & FLAG.OnGround);
     this.sliding = !!(s.flags & FLAG.Sliding);
@@ -297,6 +308,8 @@ export class NetPlayer {
     // 趴姿通道与冲刺/滞空同一套：位来自快照，按帧平滑（10/s）交给 animateSoldier。
     // 直接跳变会让模型"啪"地拍在地上 —— 这人趴下时尤其明显，整个身位都在转。
     a.prone = lerp(a.prone, this.proneT, Math.min(1, dt * 10));
+    // 探头通道：位是 ±1 的阶跃（20Hz），模型按帧平滑 —— 直接跳变会把躯干甩过去。
+    a.lean = lerp(a.lean, this.leanT, Math.min(1, dt * 10));
     // 同理：俯仰不加负号（本地 AI 是 `A.pitch = this.pitch`，ai.js:329）。
     a.pitch = this.pitch;
     a.speed = spd;

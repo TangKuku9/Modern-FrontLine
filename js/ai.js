@@ -76,7 +76,7 @@ export class Bot {
   // 单机联机从此一个手感。改盒子的同时必须记得 test/lagcomp.mjs 的规格注释。
   hitTest(o, d, maxT) {
     if (!this.alive) return null;
-    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, 0, o, d, maxT);
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, 0, 0, o, d, maxT);
   }
   takeDamage(dmg, info) {
     if (!this.alive) return false;

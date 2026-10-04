@@ -14,18 +14,29 @@ const _p = new THREE.Vector3(), _q = new THREE.Vector3();
 // 这里要是蹭用了别人的临时向量，症状会是"偶发的火星喷向奇怪的方向"而没人查得到。
 const _n = new THREE.Vector3();
 
+// 探头（Q/E 侧倾）满倾时头/眼离开原位的横向距离（米）。侧移方向 = lean 的符号 ×
+// "此人右边"（right = (cos yaw, 0, -sin yaw)，右探为正）。
+// 必须**小于** Player.radius（0.35）：camPos 是弹道起点，而碰撞只管以 pos 为圆心的圆柱 ——
+// 探头距离一旦越过碰撞半径，贴墙的人能把视点探进墙里，那半边是从墙内部往外打。
+// 0.34 把相机永远留在碰撞柱内 1 cm，穿墙与穿模两头都不开门。
+// 改这里要连着看 Player.radius（js/player.js）。
+export const LEAN_DIST = 0.34;
+
 // 玩家命中盒的解析定义（站/蹲：头球 + 躯干 AABB；趴：沿体轴的球链）。**一处定义，五处用**：
 // 本机玩家的当下裁决（js/player.js:hitTest）、远端玩家的即时反馈（js/net/remote.mjs:hitTest）、
 // Bot 的裁决（js/ai.js:hitTest，2026-10-02 收编——此前私盒半宽 0.27 比这里窄 3cm，
 // 是"本地中、权威不中"的第三层来源）、
 // 服务端按历史姿态的回溯裁决（延迟补偿，server/room.mjs:shotRewind → traceBullet 的 rewind 回调）、
 // 以及判据里"这一枪该不该中"的预测（test/lagcomp.mjs 调的就是它）。
-// 参数抽成 (x,y,z,eye,yaw,prone) 六个标量而不是整个 Player，是因为延迟补偿每拍要存的就只是
-// 这六个量（见 server/lagcomp.mjs:PoseRing）—— 命中盒依赖什么，缓冲里就该存什么，多存是浪费，
+// 参数抽成 (x,y,z,eye,yaw,prone,lean) 七个标量而不是整个 Player，是因为延迟补偿每拍要存的就只是
+// 这七个量（见 server/lagcomp.mjs:PoseRing）—— 命中盒依赖什么，缓冲里就该存什么，多存是浪费，
 // 少存就是"回溯过去的盒子"和"当时的盒子"不是同一个，而那种错只会表现为偶尔打不中。
 // yaw 与 prone 是趴姿加的：趴下的身体沿朝向平摊出去 ~1.6 m，只靠 (x,z) 一个 0.6 m 的方块
 // 盖不住，而"脚在哪个方向"没有 yaw 答不出来。
-export function hitTestPlayer(x, y, z, eye, yaw, prone, o, d, maxT) {
+// lean 是探头的**原始倾量**（-1..1，右为正）：距离的换算（×LEAN_DIST）只发生在这一处几何里，
+// 调用方（含姿态环）都交原始值 —— 环里存的和这里吃的是同一个数，谁也不用记"存的是米还是倍数"。
+// 探头与趴姿在 sim 里互斥（趴着时探头目标恒 0，见 js/player.js），趴支不消费 lean。
+export function hitTestPlayer(x, y, z, eye, yaw, prone, lean, o, d, maxT) {
   if (prone) {
     // 趴姿盒子 = 沿体轴的四颗球（与 soldier.js 的趴姿模型对位：脚跟在身后 ~0.85 m、
     // 头在身前 ~0.78 m，俯卧时躯干中心高 ~0.24 m）。躯干三颗 r 0.30（盖住肩宽 0.285 与
@@ -46,10 +57,14 @@ export function hitTestPlayer(x, y, z, eye, yaw, prone, o, d, maxT) {
   // 与外观贴合:头球 0.145 ≈ 盔体 0.135 + 1cm 容差(旧 0.16 比盔大一圈,贴着盔边擦过也算爆头);
   // 躯干半宽 0.30 盖住肩球 0.285(旧 0.28,打肩球边缘不判中)。改这里同时影响本机/远端/
   // Bot/服务端回溯四路裁决与 test/lagcomp.mjs 的判据线。
+  // 探头：头球按**全量**侧移 —— 它必须与 camPos/eyePos（弹道与"眼睛"的定义）落在同一点，
+  // 否则"我看见的 exposed 头"和"能被打的头"分家，探头就成了单向玻璃。躯干盒按**半量**：
+  // 倾是以髋为轴的,腿留在原位,整个盒子平移会在视觉上让"打腿"漂出人形。
+  const lx = Math.cos(yaw) * lean * LEAN_DIST, lz = -Math.sin(yaw) * lean * LEAN_DIST;
   const hy = y + eye + 0.02;
-  let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x, hy, z, 0.145);
+  let t = raySphere(o.x, o.y, o.z, d.x, d.y, d.z, x + lx, hy, z + lz, 0.145);
   if (t >= 0 && t < maxT) return { t, part: 'head' };
-  const b = { x0: x - 0.30, x1: x + 0.30, y0: y, y1: y + eye - 0.12, z0: z - 0.30, z1: z + 0.30 };
+  const b = { x0: x + lx * 0.5 - 0.30, x1: x + lx * 0.5 + 0.30, y0: y, y1: y + eye - 0.12, z0: z + lz * 0.5 - 0.30, z1: z + lz * 0.5 + 0.30 };
   t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, maxT);
   if (t >= 0) { const hy2 = o.y + d.y * t; return { t, part: hy2 < y + eye * 0.5 ? 'legs' : 'body' }; }
   return null;
@@ -65,7 +80,7 @@ export function damageAt(stats, dist, part) {
   return d;
 }
 
-// rewind：可选的取姿态函数 (entity) => [x, y, z, eye] | null —— 延迟补偿用。
+// rewind：可选的取姿态函数 (entity) => [x, y, z, eye, yaw, prone, lean] | null —— 延迟补偿用。
 // 它返回非 null 的实体按**历史上的那个盒子**判，返回 null 的（不是玩家、缓冲里没有那一拍、
 // 就是开枪者本人）照旧按当下判。所以"没接补偿"的那条路走的是同一份 hitTest，不是复制品。
 export function traceBullet(game, shooter, o, d, maxDist = 400, rewind = null) {
@@ -75,7 +90,7 @@ export function traceBullet(game, shooter, o, d, maxDist = 400, rewind = null) {
     if (e === shooter || !e.alive) continue;
     if (shooter && e.team === shooter.team) continue;
     const p = rewind ? rewind(e) : null;
-    const h = p ? hitTestPlayer(p[0], p[1], p[2], p[3], p[4], p[5], o, d, best) : e.hitTest(o, d, best);
+    const h = p ? hitTestPlayer(p[0], p[1], p[2], p[3], p[4], p[5], p[6], o, d, best) : e.hitTest(o, d, best);
     if (h && h.t < best) { best = h.t; ent = e; part = h.part; }
   }
   const point = new THREE.Vector3().copy(o).addScaledVector(d, best);

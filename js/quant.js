@@ -62,6 +62,9 @@ export const roundLook = (v) => (Number.isFinite(v) ? Q.unpackLook(Q.packLook(v)
 export const FLAG = {
   Alive: 1, Crouch: 2, Sprint: 4, Ads: 8, OnGround: 16, Sliding: 32, Firing: 64, Reloading: 128,
   Prone: 256,
+  // 探头（Q/E 侧倾）两位。u16 还有空位（本行之前用到 256）；这对位表达的是**倾的方向**，
+  // 不是连续的 leanT —— 远端按位做平滑（js/net/remote.mjs），与蹲/趴同一套。
+  LeanL: 512, LeanR: 1024,
 };
 // 上行按键位（与 js/main.js 的 input 字段一一对应）
 export const KEY = {
@@ -83,6 +86,9 @@ export const BTN = {
   // 这两个字段（codec 自测的往返表还在列它们），旧的上行包照常能解。
   LethalPressed: 64, LethalHeld: 128, TacticalPressed: 256, TacticalHeld: 512,
   GrenadePressed: 1024,
+  // 探头（Q/E，2026-10-04）：两个**按住**位。keys 只剩 32768 一格放不下成对的位，
+  // buttons 还有 2048/4096/8192/16384 四格 —— 按住类状态位本来就和按钮同住 buttons。
+  LeanL: 2048, LeanR: 4096,
 };
 
 // 世界级位标志（快照头里的一个字节）。
@@ -130,6 +136,7 @@ const BTNMAP = [
   ['LethalPressed', 'lethalPressed'], ['LethalHeld', 'lethal'],
   ['TacticalPressed', 'tacticalPressed'], ['TacticalHeld', 'tactical'],
   ['GrenadePressed', 'grenadePressed'],
+  ['LeanL', 'leanL'], ['LeanR', 'leanR'],
 ];
 
 export function packInput(inp) {
@@ -145,7 +152,7 @@ export function unpackInput(keys, buttons) {
     pronePressed: false,
     fire: false, ads: false, reloadPressed: false, swapPressed: false, slot1: false, slot2: false,
     meleePressed: false, lethalPressed: false, lethal: false, tacticalPressed: false, tactical: false,
-    grenadePressed: false,
+    grenadePressed: false, leanL: false, leanR: false,
     interact: false, interactPressed: false, nvgPressed: false, streak: -1,
     firePressed: false, adsPressed: false, mdx: 0, mdy: 0,
   };

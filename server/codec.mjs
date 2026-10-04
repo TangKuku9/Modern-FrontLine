@@ -263,7 +263,8 @@ if (isDirectRun()) {
   const fields = ['fwd', 'back', 'left', 'right', 'sprint', 'jumpPressed', 'crouchPressed', 'pronePressed',
     'reloadPressed',
     'interact', 'interactPressed', 'nvgPressed', 'meleePressed', 'fire', 'ads', 'firePressed', 'adsPressed',
-    'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical', 'grenadePressed', 'slot1', 'slot2'];
+    'swapPressed', 'lethalPressed', 'lethal', 'tacticalPressed', 'tactical', 'grenadePressed', 'slot1', 'slot2',
+    'leanL', 'leanR'];
   const bad = [];
   for (const f of fields) {
     const src = {}; src[f] = true;

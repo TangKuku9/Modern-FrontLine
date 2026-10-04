@@ -1,7 +1,7 @@
 // 玩家控制器
 import * as THREE from 'three';
 import { WeaponSystem } from './weapons.js';
-import { hitTestPlayer } from './combat.js';
+import { hitTestPlayer, LEAN_DIST } from './combat.js';
 import { clamp, damp, lerp, DEG, entStream } from './util.js';
 import { WEAPONS, LETHALS, TACTICALS } from './data.js';
 
@@ -9,7 +9,7 @@ import { WEAPONS, LETHALS, TACTICALS } from './data.js';
 // 漏一个字段 = 那一维带着两边不同的初值继续分叉，而且没人会报错，只有手感怪。
 // test/net-journal.mjs 遍历 Player / WeaponState 的 own keys 检查覆盖率，新增字段
 // 要么登记进来，要么进 J_EXCLUDE 并写清理由。
-export const J_PL = ['yaw', 'pitch', 'hp', 'crouchT', 'proneT', 'slideT', 'eyeSmooth', 'dmgT', 'shakeT', 'shakeAmt',
+export const J_PL = ['yaw', 'pitch', 'hp', 'crouchT', 'proneT', 'leanT', 'slideT', 'eyeSmooth', 'dmgT', 'shakeT', 'shakeAmt',
   'punchV', 'landDip', 'stepDist', 'revealT', 'sprintLock', 'stunT', 'interactHold',
   'alive', 'crouching', 'proning', 'sprinting', 'sliding', 'onGround'];
 export const J_WS = ['state', 'stateT', 'stateDur', 'adsT', 'cool', 'cycleT', 'triggerHeld', 'rp', 'lastShot',
@@ -114,6 +114,7 @@ export class Player {
     this.sens = null; this.adsSens = null; this.invertY = null;
     this.maxHp = 100; this.hp = 100; this.alive = true;
     this.crouchT = 0; this.crouching = false; this.proneT = 0; this.proning = false;
+    this.leanT = 0;                                   // 探头倾量：-1 左 … +1 右（Q/E），damp 平滑
     this.sprinting = false; this.sliding = false; this.slideT = 0;
     this.onGround = true; this.eyeH = 1.62; this.eyeSmooth = this.pos.y + 1.62;
     // 视点与视线：updateCamera 每拍算一次，弹道从这里取。联机时每个玩家各有一份，
@@ -154,6 +155,7 @@ export class Player {
     this.pos.copy(pos); this.vel.set(0, 0, 0); this.yaw = yaw; this.pitch = 0;
     this.hp = this.maxHp; this.alive = true; this.dmgT = 99;
     this.crouchT = 0; this.crouching = false; this.proneT = 0; this.proning = false; this.sliding = false;
+    this.leanT = 0;
     this.eyeSmooth = pos.y + 1.62; this.stats.streak = 0;
     this.ws.fullAmmo();
     if (this.lethal) this.lethal.count = this.lethal.max;
@@ -164,8 +166,16 @@ export class Player {
     // 的死亡视角分支），抽数次数会和权威端错开，不归零就会让死后第一枪的后坐永久对不上。
     this.rng.setState(this.rng0);
   }
-  eyePos(out) { return out.set(this.pos.x, this.pos.y + this.curEye(), this.pos.z); }
-  chestPos(out) { return out.set(this.pos.x, this.pos.y + this.curEye() - 0.4, this.pos.z); }
+  eyePos(out) {
+    const l = this.leanT * LEAN_DIST;
+    return out.set(this.pos.x + Math.cos(this.yaw) * l, this.pos.y + this.curEye(), this.pos.z - Math.sin(this.yaw) * l);
+  }
+  // 胸口 = 躯干盒中心：探头时躯干盒按半量侧移（js/combat.js:hitTestPlayer），这里跟同一份 ——
+  // Bot 瞄胸、近战够不够得着，量的都是"躯干当下在哪"。
+  chestPos(out) {
+    const l = this.leanT * LEAN_DIST * 0.5;
+    return out.set(this.pos.x + Math.cos(this.yaw) * l, this.pos.y + this.curEye() - 0.4, this.pos.z - Math.sin(this.yaw) * l);
+  }
   // 视线高度三层：站 1.62 → 蹲 1.05 → 趴 0.45。proneT 是外层 —— 趴下时 crouching 也为真
   // （两层同时过渡，视线走的是一条连续曲线而不是折线），所以趴这一层必须最后叠。
   curEye() { return lerp(lerp(1.62, 1.05, this.crouchT), 0.45, this.proneT); }
@@ -173,7 +183,7 @@ export class Player {
   // 命中盒在这里只剩"把当下姿态喂给公共定义"这一件事 —— 延迟补偿要拿历史姿态调同一个
   // 函数（js/combat.js:hitTestPlayer），所以它必须是纯函数而不是这个类的方法。
   hitTest(o, d, maxT) {
-    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, this.proneT > 0.5 ? 1 : 0, o, d, maxT);
+    return hitTestPlayer(this.pos.x, this.pos.y, this.pos.z, this.curEye(), this.yaw, this.proneT > 0.5 ? 1 : 0, this.leanT, o, d, maxT);
   }
   takeDamage(dmg, info) {
     if (!this.alive || this.game.godMode) return false;
@@ -313,6 +323,13 @@ export class Player {
       this.slideT -= dt;
       if (this.slideT <= 0) { this.sliding = false; }
     }
+    // 探头（Q/E）：按住的侧倾，leanT ∈ [-1,1] 阻尼跟随。趴/滑铲/冲刺时不探 —— 前两个的
+    // 姿态动画与侧倾打架，冲刺的相机已经在晃，再叠一个横滚读不出来。探头的表现全部
+    // 派生自 leanT（camPos 侧移、相机横滚、命中盒侧移、快照 LeanL/R 位），这一维是唯一的源头。
+    // 距离与碰撞的关系见 js/combat.js:LEAN_DIST —— 它必须留在碰撞半径之内，这里不改距离。
+    const leanIn = (input.leanR ? 1 : 0) - (input.leanL ? 1 : 0);
+    const canLean = leanIn !== 0 && !this.proning && this.proneT < 0.5 && !this.sliding && !this.sprinting;
+    this.leanT = damp(this.leanT, canLean ? leanIn : 0, 14, dt);
     // 移动输入
     const fx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     const fz = (input.fwd ? 1 : 0) - (input.back ? 1 : 0);
@@ -439,8 +456,12 @@ export class Player {
     const spd = Math.hypot(this.vel.x, this.vel.z);
     const bob = this.onGround ? Math.sin(ws.bobPhase * 2) * 0.02 * Math.min(1, spd / 6) * (1 - ws.adsT) : 0;
     // 视点与视线是"每个玩家各一份"的状态：联机时服务端同时跑 N 份，谁都能算出
-    // 自己的枪口射线；只有本机玩家才去写那块真相机。
-    this.camPos.set(this.pos.x, this.eyeSmooth - this.landDip + bob, this.pos.z);
+    // 自己的枪口射线；只有本机玩家才写那块真相机。
+    // 探头把视点沿"此人右边"平移（右为正）—— camPos 是弹道起点（eyePoint），所以探头
+    // 掩体后探出去的部分才是真的能打到人的位置；这也是它必须留在碰撞半径内的原因
+    // （js/combat.js:LEAN_DIST）。
+    const lo = this.leanT * LEAN_DIST;
+    this.camPos.set(this.pos.x + Math.cos(this.yaw) * lo, this.eyeSmooth - this.landDip + bob, this.pos.z - Math.sin(this.yaw) * lo);
     this.aimYaw = this.yaw + sx;
     this.aimPitch = this.pitch + ws.rp + this.punchV + sy;
     // 真相机只属于"这台机器上的本机玩家，且不是在重放"：服务端同时跑 N 份 sim 时
@@ -452,7 +473,9 @@ export class Player {
     cam.rotation.order = 'YXZ';
     cam.rotation.y = this.aimYaw;
     cam.rotation.x = this.aimPitch;
-    cam.rotation.z = this.sliding ? -0.06 : (ws.sprintT * Math.sin(ws.bobPhase) * 0.01);
+    // 横滚：探头向倾的方向歪头（右倾 = 负 z），滑铲的定值侧倾与它互斥（滑铲时探头目标恒 0）；
+    // 冲刺的呼吸摆是小量，照旧叠在后面。
+    cam.rotation.z = this.sliding ? -0.06 : -this.leanT * 0.12 + (ws.sprintT * Math.sin(ws.bobPhase) * 0.01);
     const zoom = lerp(1, ws.w ? ws.w.stats.zoom : 1, ws.adsT * ws.adsT);
     const base = this.game.settings.fov;
     const f = 2 * Math.atan(Math.tan(base * DEG / 2) / zoom) / DEG;

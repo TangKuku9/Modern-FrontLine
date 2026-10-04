@@ -245,7 +245,7 @@ export function makeNameTag(text, color) {
 
 // 动画状态机
 export function animateSoldier(p, s, dt) {
-  // s: {speed, phase, crouch(0..1), prone(0..1), pitch, dead, deadT, fallDir, fallRoll, recoil, ads, slide}
+  // s: {speed, phase, crouch(0..1), prone(0..1), lean(-1..1), pitch, dead, deadT, fallDir, fallRoll, recoil, ads, slide}
   if (s.dead) {
     const k = Math.min(1, s.deadT / 0.55);
     const e = 1 - Math.pow(1 - k, 3);
@@ -263,6 +263,9 @@ export function animateSoldier(p, s, dt) {
     p.legL.leg.rotation.x = e * 0.3; p.legR.leg.rotation.x = -e * 0.2;
     // 撑起的胸腔（活人趴姿的 0.42）随倒地拍平 —— 不写的话 e=0 那一帧胸口一沉。
     p.torso.rotation.x = (1 - e) * pr0 * 0.42;
+    // 探头是活着才有的姿态：死了躯干回正（活人分支每帧写的两个偏移在这里归零），
+    // 否则侧倾着倒地的人胸口还歪着。
+    p.torso.position.x = 0; p.torso.rotation.z = 0;
     // 枪贴到身上:位置收到 GUN_DEAD、枪口转向脚尖。手是枪的子件、手臂 IK 的靶点跟着枪,
     // 于是落成"搂着枪倒下",而不是站姿的胳膊平摊在两边。趴姿起点的枪位/转角从 GUN_PRONE
     // 那一套接过来 —— 不接的话 e=0 那一帧枪会瞬移回站立枪位。
@@ -291,6 +294,16 @@ export function animateSoldier(p, s, dt) {
     // 第三人称只有联机看别人、以及看 Bot 时才有观众。
     const sl = s.slide || 0, ad = s.ads || 0;
     const sp = s.sprint || 0, air = s.air || 0;
+    // 探头（lean，-1..1）：躯干（连着头/双臂/枪，都是 torso 的子件）沿 root-local +X
+    // 平移 + 绕 Z 滚转，腿留在髋上不动 —— 倾以髋为轴，与命中盒"头全量/躯干半量"的侧移
+    // （js/combat.js:hitTestPlayer）同一套几何。模型正面在 -Z，root-local +X 就是此人的
+    // 右边（与相机 right = (cos yaw, 0, -sin yaw) 同向），lean 为正（右探）往 +X 挪；
+    // 滚转符号与相机一致（右探 = 负 z，见 js/player.js:updateCamera）。源头是快照的
+    // LeanL/LeanR 位（远端平滑后递进来）或本地 Bot（不产，缺省 0）；趴姿与它互斥，
+    // 但过渡期两通道可能同时非零 —— 趴姿通道管 root 旋转，探头管 torso 侧移，互不覆盖。
+    const ln = s.lean || 0;
+    p.torso.position.x = ln * 0.18;
+    p.torso.rotation.z = -ln * 0.2;
     // 同理要复位的还有:枪的倒地转角、趴倒垫高的髋 —— 都是死亡分支写过、活人分支曾放任不管的。
     // 冲刺在复位之上叠一个枪口上抬(gunPoint 会带着手靶一起转,手仍扣在枪上)。
     if (p.gun) p.gun.rotation.x = p.gunBaseRotX + sp * 0.5 + pr * (Math.PI / 2);
