@@ -128,7 +128,13 @@ export class NetPlayer {
       this.tag = null;
     }
     const me = this.game.player;
-    if (!me || me.team !== this.team) return;
+    if (!me) return;
+    // FFA 要**显式**排除，不能靠"队键每人一支所以永远不相等"这个巧合：单机那半写的是
+    // `team === 'A' && !this.ffa`（js/mp.js:95），那里有明写的 ffa 位。联机这边没有它的
+    // 话，"FFA 没有名牌"这件事完全寄生在队键的形状上 —— 哪天给 FFA 引入临时结盟、
+    // 或队键改成共用一支队，这里会静默翻转成"组内互挂名牌"，正是上面注释挡的那一半。
+    if (this.game.net && this.game.net.ffa) return;
+    if (me.team !== this.team) return;
     this.tag = makeNameTag(this.name, '#6cf');
     this.model.root.add(this.tag);
   }

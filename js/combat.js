@@ -128,7 +128,13 @@ export function explode(game, pos, radius, maxDmg, attacker, weapon, opts = {}) 
     const c = e.chestPos(_q);
     const dist = c.distanceTo(src);
     if (dist > radius) continue;
-    if (attacker && e !== attacker && e.team === attacker.team && !opts.ff) continue;
+    // "不打自己人"这一条没有任何开关可传（这里曾经留着一个没人传过的 opts.ff —— 死代码，
+    // 会让人误以为爆炸友伤是个可配的量）。它的成立方式是**数据层面的**：队队对战的队键是
+    // 'A'/'B'，而 FFA 的队键是 'P'+cid 每人一支（server/room.mjs），所以
+    // `e.team === attacker.team` 对 FFA 里的任何别人都不成立。将来若做"共用一支队"的
+    // 分组玩法（小队战 / 组队 FFA），要动的是队键那一层 —— 到那时这里会自然跟上，
+    // 而不是靠在这里加参数。
+    if (attacker && e !== attacker && e.team === attacker.team) continue;
     if (!direct || direct.ent !== e) { if (game.world.lineBlocked(src, c)) continue; }
     let dmg = maxDmg * Math.pow(1 - dist / radius, 0.8);
     if (e.isPlayer && e.hasPerk && e.hasPerk('eod')) dmg *= 0.5;
