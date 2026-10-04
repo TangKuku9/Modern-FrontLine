@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { gzip as gzipCb } from 'node:zlib';
 import { WebSocketServer } from 'ws';
 import { NetRoom, DT, SNAP_EVERY, RESPAWN_DELAY } from './room.mjs';
-import { fanout, nadeCounts } from './fanout.mjs';
+import { fanout, nadeCounts, splitEvents, directedFor } from './fanout.mjs';
 import { Lobby, MAX_SEATS, CHAT_LEN, flat, HEAVY_FRAMES, HEAVY_MIN_FRAMES, roomId } from './lobby.mjs';
 import { encodeSnapshot, ENTITY_SIZE, HEADER_SIZE, decodeInput, INPUT_SIZE } from './codec.mjs';
 import { createAuth, sessionOf, clientIp, apiCounters } from './http-api.mjs';
@@ -1088,13 +1088,19 @@ function broadcast(room) {
   const { view, byteLength } = encodeSnapshot({ ...room.snapshot(), seq: (room.seq = (room.seq || 0) + 1) }, snapScratch(room));
   // 一份 Buffer 发给这个房间的所有人：ws.send 不会改写传入的 Buffer，没必要每人再拷一次。
   const buf = Buffer.from(view.buffer, 0, byteLength);
-  // 事件在这里一次排干（splice），再整份交给 fanout —— **顺序与去留的纪律在
+  // 事件在这里一次排干（splice），再交给 fanout —— **顺序与去留的纪律在
   // server/fanout.mjs 里**（事件排在背压闸之前、次序上先事件后快照，以及为什么）。
   // 搬出去的理由只有一个：那份文件能被判据在进程内直接用假 ws 量，而这一份不能
   // （import server/net-server.mjs 等于起一台服务器）。见 test/net-audit.mjs 的 D 段。
   const ev = room.events.splice(0, room.events.length);
-  const evMsg = ev.length ? JSON.stringify({ t: 'ev', tick: room.tick, ev }) : null;
-  const { stalls } = fanout(room, evMsg, buf, CFG.wsBacklogBytes);
+  // 事件分层（性能审查 W1）：出厂时就带寻址（cid/team/to），这里拆成两层 —— 全房层编成
+  // **一条**字符串发所有人（与从前同形），定向层每连接按需再编一条（没有就不发）。旧客户端
+  // 本来就在客户端筛，少收到自己不需要的事件向后兼容；纪律不破：只属于一个人的事件只发给
+  // 他不是丢。拆分本身是纯函数，test/net-audit.mjs 的 D 段能逐条量它。
+  const layer = ev.length ? splitEvents(ev) : null;
+  const evMsg = layer && layer.shared.length ? JSON.stringify({ t: 'ev', tick: room.tick, ev: layer.shared }) : null;
+  const directed = layer ? (c) => directedFor(layer, c, room.tick) : null;
+  const { stalls } = fanout(room, evMsg, buf, CFG.wsBacklogBytes, directed);
   for (const s of stalls) console.log(`[room ${room.id}] cid ${s.cid} 下行积压 ${s.backlog} B，跳过快照（TCP 零窗？）`);
 }
 

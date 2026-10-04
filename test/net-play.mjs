@@ -57,7 +57,10 @@ async function openPage(browser, name, team) {
   // 于是服务端会拿注册用的同一个白名单去验它，不合法就**拒绝进场**（不是悄悄改成"访客"）。
   // 所以这里不能再写 '甲'：单字会被拒，而症状是"两个窗口都拿不到 cid" —— 看起来像网络坏了。
   // 第一版就是这么红的，红的是量具不是被测对象。
-  await page.goto(`${BASE}?online=1&room=${ROOM}&name=${encodeURIComponent(name)}&team=${team}`, { waitUntil: 'domcontentloaded' });
+  // netdebug=1：pairProbe（配对探针）现在挂在调试开关下（性能审查 W7 把它从生产稳态挪下来），
+  // 而这一份判据正是读它的 —— 页面必须把开关打开，否则下面 `q.pair` 恒为 null、那几条断言
+  // 会静默地不再运行（"跳过的判据"和"通过的判据"在输出里长得一样）。
+  await page.goto(`${BASE}?online=1&room=${ROOM}&name=${encodeURIComponent(name)}&team=${team}&netdebug=1`, { waitUntil: 'domcontentloaded' });
   return { page, logs };
 }
 // 每个交互前把窗口带到前台：后台标签页的 rAF 会被降频，而降频会直接改变下面的读数

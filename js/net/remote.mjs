@@ -245,29 +245,37 @@ export class NetPlayer {
     else if (target >= buf[buf.length - 1].t) {
       const last = buf[buf.length - 1];
       const dt2 = clamp(target - last.t, 0, MAX_EXTRAPOLATION);
-      s = { ...last.s, x: last.s.x + last.s.vx * dt2, z: last.s.z + last.s.vz * dt2 };
+      // 外推写进这块复用的 scratch（性能审查 W3，与下面插值分支共用一份）：先把上一份快照
+      // 整份搬进来（与 `{...last.s}` 同义），再只改位置两格。搬的是快照的**值**，buf 里那份
+      // 原件不许动 —— 它是跨帧持有的插值原料。
+      s = this._s || (this._s = {});
+      Object.assign(s, last.s);
+      s.x = last.s.x + last.s.vx * dt2;
+      s.z = last.s.z + last.s.vz * dt2;
     } else {
       let i = 0;
       while (i < buf.length - 1 && buf[i + 1].t < target) i++;
       const a = buf[i], b = buf[i + 1];
       const k = clamp((target - a.t) / Math.max(1e-4, b.t - a.t), 0, 1);
-      s = {
-        x: lerp(a.s.x, b.s.x, k), y: lerp(a.s.y, b.s.y, k), z: lerp(a.s.z, b.s.z, k),
-        yaw: a.s.yaw + angleDiff(a.s.yaw, b.s.yaw) * k,
-        pitch: lerp(a.s.pitch, b.s.pitch, k),
-        hp: lerp(a.s.hp, b.s.hp, k), flags: k < 0.5 ? a.s.flags : b.s.flags,
-        // 步态相位是**角度**量（服务端那边一直往上加、编解码折进 [0,2π)），所以按**角差**插值。
-        // 这里原来写成"就近取 a 或 b" —— 那正是"腿部每包跳一次整数"的另一半成因：
-        // 20Hz 相邻两包差 0.5 rad 左右，取整就是每 50 ms 跳一格。按角差 lerp 之后渲染帧上
-        // 是连续的，而幅值仍然完全来自权威端（客户端不自己积分）。
-        phase: a.s.phase === undefined ? undefined : a.s.phase + angleDiff(a.s.phase, b.s.phase) * k,
-        vx: lerp(a.s.vx, b.s.vx, k), vz: lerp(a.s.vz, b.s.vz, k),
-        weapon: b.s.weapon,
-        // mag 要跟着插值对象一起搬：这个分支是**新拼出来的** plain object，抄漏任何一格
-        // 它就静默变成 undefined（两端点分支拿到的是原快照，于是"有的包有、有的包没有"）。
-        // 以前 mag 就这么丢的 —— 它是"到了没人消费"那一半的真正成因。
-        mag: b.s.mag,
-      };
+      // 逐字段写进同一块 scratch（性能审查 W3）：插值结果只活到本次 update 结束、消费全在
+      // 这一帧内，复用是安全的。**字段一个都不能少**（mag 那次的教训：抄漏一格它就静默变成
+      // undefined，而两端点分支拿到的是原快照，于是"有的包有、有的包没有"）。
+      s = this._s || (this._s = {});
+      s.x = lerp(a.s.x, b.s.x, k); s.y = lerp(a.s.y, b.s.y, k); s.z = lerp(a.s.z, b.s.z, k);
+      s.yaw = a.s.yaw + angleDiff(a.s.yaw, b.s.yaw) * k;
+      s.pitch = lerp(a.s.pitch, b.s.pitch, k);
+      s.hp = lerp(a.s.hp, b.s.hp, k); s.flags = k < 0.5 ? a.s.flags : b.s.flags;
+      // 步态相位是**角度**量（服务端那边一直往上加、编解码折进 [0,2π)），所以按**角差**插值。
+      // 这里原来写成"就近取 a 或 b" —— 那正是"腿部每包跳一次整数"的另一半成因：
+      // 20Hz 相邻两包差 0.5 rad 左右，取整就是每 50 ms 跳一格。按角差 lerp 之后渲染帧上
+      // 是连续的，而幅值仍然完全来自权威端（客户端不自己积分）。
+      s.phase = a.s.phase === undefined ? undefined : a.s.phase + angleDiff(a.s.phase, b.s.phase) * k;
+      s.vx = lerp(a.s.vx, b.s.vx, k); s.vz = lerp(a.s.vz, b.s.vz, k);
+      s.weapon = b.s.weapon;
+      // mag 要跟着一起搬：这个分支是**新拼出来的**对象，抄漏任何一格它就静默变成 undefined
+      // （两端点分支拿到的是原快照，于是"有的包有、有的包没有"）。以前 mag 就这么丢的 ——
+      // 它是"到了没人消费"那一半的真正成因。
+      s.mag = b.s.mag;
     }
     if (!s) return;
     this.hp = s.hp; this.alive = !!(s.flags & FLAG.Alive);

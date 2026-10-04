@@ -217,6 +217,16 @@ export class HUD {
   scorebar(html) { $('scorebar').innerHTML = html; }
   streaks(list, kills) {
     const el = $('streaks');
+    // 内容签名门（与 client.mjs 标记层的 `_mSig` 同款；性能审查 W4）：这一格由 NetClient.update
+    // 在 **60Hz 模拟拍**上每拍调一次，而它是整块 innerHTML 赋值 —— 60Hz 全量重建会白掉帧
+    // （比分条那格早就按 6Hz 刷，理由就是这个）。签名只含**真正参与渲染**的几个量：槽位
+    // id/ready/cost + 连杀数；变了才写。也包括"没有连杀槽"那一格 —— 以前每拍写一次
+    // innerHTML = ''，现在只在从有到无时写。
+    const sig = list
+      ? list.map(s => `${s.id}:${s.ready ? 1 : 0}:${s.cost}`).join('|') + '#' + kills
+      : 'none';
+    if (sig === this._stkSig) return;
+    this._stkSig = sig;
     if (!list) { el.innerHTML = ''; return; }
     el.innerHTML = list.map((s, i) => {
       const def = KILLSTREAKS.find(k => k.id === s.id);

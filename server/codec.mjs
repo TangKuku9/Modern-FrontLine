@@ -116,16 +116,21 @@ export function decodeSnapshot(buf) {
 // "按住不放会一直呼叫"那种错。以前这个字段只存在于客户端（js/main.js:snapshotInput），
 // 从来没进过协议，于是联机下按 3 呼叫 UAV 是**真的什么都不做**。
 export const INPUT_SIZE = 16;
-export function encodeInput(inp) {
-  const v = new DataView(new ArrayBuffer(INPUT_SIZE));
-  v.setUint32(0, inp.tick >>> 0, true);
-  v.setInt16(4, Q.packLook(inp.mdx), true);
-  v.setInt16(6, Q.packLook(inp.mdy), true);
-  v.setUint16(8, inp.keys & 0xffff, true);
-  v.setUint16(10, inp.buttons & 0xffff, true);
-  v.setUint16(12, inp.view & 0xffff, true);
-  v.setUint8(14, inp.seq & 0xff, true);
-  v.setUint8(15, packStreak(inp.streak ?? -1), true);
+// out / byteOffset（性能审查 W6）：与 decodeInput 的 B1 收口同形。热路径上 flush 会对一帧里的
+// 每个 16B 包各调一次 —— 曾经每次都 new 一个 DataView+ArrayBuffer，再由调用方拷一次。调用方
+// 传 out（一帧复用一个 view）与 byteOffset（按偏移写包）时这两笔分配与拷贝就没了；**不传时
+// 行为与从前逐字节相同**（codec 自测与所有走默认路的判据都吃这条）。返回的仍是那个 view。
+export function encodeInput(inp, out = null, byteOffset = 0) {
+  const v = out || new DataView(new ArrayBuffer(INPUT_SIZE));
+  const o = byteOffset | 0;
+  v.setUint32(o, inp.tick >>> 0, true);
+  v.setInt16(o + 4, Q.packLook(inp.mdx), true);
+  v.setInt16(o + 6, Q.packLook(inp.mdy), true);
+  v.setUint16(o + 8, inp.keys & 0xffff, true);
+  v.setUint16(o + 10, inp.buttons & 0xffff, true);
+  v.setUint16(o + 12, inp.view & 0xffff, true);
+  v.setUint8(o + 14, inp.seq & 0xff, true);
+  v.setUint8(o + 15, packStreak(inp.streak ?? -1), true);
   return v;
 }
 // out / byteOffset（性能审查 B1）：热路径上 net-server 会对一帧里的每个 16B 包各调一次

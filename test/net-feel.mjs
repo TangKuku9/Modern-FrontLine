@@ -1307,6 +1307,37 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   ok('V9 别人的槽位就绪不念给我（这一格带 cid）',
     feed('A', 7, [{ e: 'streakReady', cid: 9, slot: 0, id: 'uav', name: '侦察无人机' }]).said.length === 0);
 
+  // ── W8：连杀槽的**写回**也必须带 cid 门 ──
+  // 槽位表是每人一份，别人的 ready 写进来会点亮我的同名槽（HUD 显示"就绪 [i+5]"），
+  // 他一呼叫又用 streak 把我的槽灰掉 —— 窗口期内我按键会被权威端 rejected，而 HUD 毫无反馈，
+  // 正是"按了没反应"那一族。V9 只钉了**语音**那一格（said），没人钉槽位本身。
+  // 双向判据：别人的不许写、我自己的必须写 —— 只钉"不许写"的话，把整段删掉也能绿。
+  {
+    const mkSlot = (team, cid) => {
+      const g = makeGame();
+      g.player.team = team;
+      const c = new NetClient(g, { url: 'ws://127.0.0.1:1/ws', name: '我', team });
+      c.cid = cid;
+      c.streakDefs = [{ id: 'uav', name: '侦察无人机' }];
+      c.streakState = [{ id: 'uav', ready: false, used: false, cost: 3 }];   // 初始 ready=false：写没写才分得开
+      return { c, g };
+    };
+    const o1 = mkSlot('A', 7); o1.c.onEvents({ ev: [{ e: 'streakReady', cid: 9, id: 'uav', name: '侦察无人机' }] });
+    ok('V9b【W8】别人的 streakReady 不许写我的槽（初始 false 不许被写成 true）',
+      o1.c.streakState[0].ready === false, JSON.stringify(o1.c.streakState));
+    const m1 = mkSlot('A', 7); m1.c.onEvents({ ev: [{ e: 'streakReady', cid: 7, id: 'uav', name: '侦察无人机' }] });
+    ok('V9c【W8·反证臂】我自己的 streakReady 必须写（否则 V9b 可以是"永远不写"的恒真绿灯）',
+      m1.c.streakState[0].ready === true, JSON.stringify(m1.c.streakState));
+    const o2 = mkSlot('A', 7); o2.c.streakState[0].ready = true;
+    o2.c.onEvents({ ev: [{ e: 'streak', cid: 9, id: 'uav', name: '侦察无人机' }] });
+    ok('V9d【W8】别人的 streak（呼叫）不许灰我的槽（ready/used 都不动）',
+      o2.c.streakState[0].ready === true && !o2.c.streakState[0].used, JSON.stringify(o2.c.streakState));
+    const m2 = mkSlot('A', 7); m2.c.streakState[0].ready = true;
+    m2.c.onEvents({ ev: [{ e: 'streak', cid: 7, id: 'uav', name: '侦察无人机' }] });
+    ok('V9e【W8·反证臂】我自己的 streak 必须写（ready=false / used=true）',
+      m2.c.streakState[0].ready === false && m2.c.streakState[0].used === true, JSON.stringify(m2.c.streakState));
+  }
+
   // ── 结算念胜负（走共用表，且**按 win/draw/lose 三态**各量一次）──
   // 三态是必须的：只量"胜利"的话，把 lose 写成 win 也能绿。
   // winner 的形状是**队名**（tdm/dom 传 'A'/'B'，自由混战才传 cid），而"我"那台视角

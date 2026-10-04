@@ -371,11 +371,14 @@ export class NetClient {
   }
   flush() {
     if (!this.ws || this.ws.readyState !== 1 || !this.pending.length) return;
-    const v = new DataView(new ArrayBuffer(this.pending.length * INPUT_SIZE));
-    for (let i = 0; i < this.pending.length; i++) {
-      const b = encodeInput(this.pending[i]);
-      new Uint8Array(v.buffer).set(new Uint8Array(b.buffer), i * INPUT_SIZE);
-    }
+    // 一帧一块缓冲，按偏移把每个 16B 包直接编进去（性能审查 W6）：以前每包各 new 一个
+    // DataView+ArrayBuffer，再用两个 Uint8Array + set() 拷一次 —— 每帧 60 包就是 60 次分配
+    // 加 60 次拷贝。codec 的 encodeInput(inp, out, byteOffset) 与 decodeInput 的 B1 同形。
+    // 缓冲仍**每帧新开**（不复用上一帧那块）：ws.send 之后那一块要等排空，复用会在积压时
+    // 把还没发出去的字节覆写掉。省下的只是"每包一次分配与拷贝"，安全边界一步没动。
+    const n = this.pending.length;
+    const v = new DataView(new ArrayBuffer(n * INPUT_SIZE));
+    for (let i = 0; i < n; i++) encodeInput(this.pending[i], v, i * INPUT_SIZE);
     this.ws.send(v.buffer);
     this.pending.length = 0;
   }
@@ -494,7 +497,12 @@ export class NetClient {
     // ack = 服务端"已经消费完"的那一拍，快照对应的是它的下一拍起点 ⇒ 本地起点是 ack+1
     const start = ((e.ack >>> 0) + 1) & 0xffff;
     const ahead = (t) => ((t - start) & 0xffff);
-    const win = this.history.filter(h => h.j && ahead(h.tick) < 2000);
+    // 复用容器（性能审查 W7）：这行每份快照（20Hz）跑一次，filter 每次新开一个最多 240 项的
+    // 数组。元素是 history 里那些对象的**同一批引用**（rollback 会写 win[i+1].j，改的是元素、
+    // 不是数组容器），所以复用这个容器安全。顺序照旧（history 按 tick 升序），谓词逐字不变。
+    const win = this._win || (this._win = []);
+    win.length = 0;
+    for (const h of this.history) if (h.j && ahead(h.tick) < 2000) win.push(h);
     // 这两条**必须**在调 rollback 之前算出来：它是"这一窗服务端到底跑了什么"的全部信息 ——
     // 服务端从上一包到这包推进了 dTick 步，其中 dAck 步消费了我的输入，剩下的 deficit 步
     // 是拿手里那份空跑（见 server/room.mjs:step）。随包的 rep 只报末尾连拍，落在首次消费
@@ -878,7 +886,10 @@ export class NetClient {
     // 为什么不只量 >5cm 的那几次（上一版那样）：如果配对整体错了一格，每次校正就恰好是
     // "满速一拍 ≈ 0.078 m"这种小到跨不过 5cm 门的量，系统性偏差会在报表上伪装成噪声。
     // sum0（假设 offset=0 时的残差）和 sumBest（每包最优 offset 的残差）一比就知道。
-    if (steady) {
+    // W7：这段是**恒真/恒假的形状诊断**，每个稳态包要付 13 个 offset × history.find（各 O(240)，
+    // 外加一次重取的 distAt(0)）≈ 每秒 6~7 万次迭代，但它不参与任何裁决 —— 挂到 ?netdebug=1
+    // 下（test/net-play.mjs 的页面开着它，读数与从前逐位一致），生产稳态不付这笔钱。
+    if (steady && this.game.netDebug) {
       const p = this.pairProbe = this.pairProbe || { n: 0, hist: {}, worst: 0, bad: [], sum0: 0, sumBest: 0, sumD: 0, nZero: 0, nOne: 0, nOther: 0, nMis: 0, attributed: 0, unexplained: [] };
       const distAt = (o) => {
         const want = (start + o) & 0xffff;
@@ -976,17 +987,25 @@ export class NetClient {
       } else if (ev.e === 'streakReady') {
         // 充能到线。槽位状态**由服务端推**，客户端不自己比 progress >= cost ——
         // 那会让"什么时候算就绪"有两个真相，而两者对不上时玩家按下去没反应。
-        this.setStreakSlot(ev.id, { ready: true });
+        // W8：写槽位必须只认自己的 cid。槽位表是**每人一份**，别人的 ready 写进来会点亮
+        // 我的同名槽（HUD 显示"就绪 [i+5]"），他一呼叫又用下面那条 streak 把我的槽灰掉 ——
+        // 窗口期内我按键会被权威端 rejected（HUD 毫无反馈，正是"按了没反应"那一族）。
+        // 与隔壁 streakCharge 的 cid 门同一条约定（差别只是它没被漏）。
         if (ev.cid === this.cid) {
+          this.setStreakSlot(ev.id, { ready: true });
           const i = this.streakState.findIndex(s => s.id === ev.id);
           this.game.hud.announce(`${ev.name} 就绪`, `按 [${i + 3}] 呼叫`, 2.5);
           this.game.audio.say(SAY.ready(ev.name)); this.game.audio.beep(3);
         }
       } else if (ev.e === 'streak') {
-        this.setStreakSlot(ev.id, { ready: false, used: true });
         // 按 id 走共用表，不拿 ev.name 拼 —— 单机那边也是按 id 分支的固定文案
         // （'无人机已上线'），以前联机念"侦察无人机已呼叫"，同一件事两种措辞。
-        if (ev.cid === this.cid) this.game.audio.say(streakOwn(ev.id) || SAY.ready(ev.name));
+        // W8：同上 —— 别人的呼叫不许灰我的槽（used 位也只对本人有意义，HUD 不渲染它，
+        // 语义在 js/match-rules.js 的账本里）。
+        if (ev.cid === this.cid) {
+          this.setStreakSlot(ev.id, { ready: false, used: true });
+          this.game.audio.say(streakOwn(ev.id) || SAY.ready(ev.name));
+        }
       } else if (ev.e === 'turret') {
         this.spawnTurret(ev);
       } else if (ev.e === 'gone') {

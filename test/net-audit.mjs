@@ -16,7 +16,7 @@
 import '../server/browser-shim.mjs';
 import * as THREE from 'three';
 import { NetRoom, INPUT_QUEUE } from '../server/room.mjs';
-import { fanout, nadeCounts } from '../server/fanout.mjs';
+import { fanout, nadeCounts, splitEvents, directedFor } from '../server/fanout.mjs';
 import { sanitizeViewSettings, viewSettingsOf, VIEW_LIMITS } from '../js/player.js';
 import { NetClient } from '../js/net/client.mjs';
 import { encodeInput, decodeInput } from '../server/codec.mjs';
@@ -276,6 +276,46 @@ const mkRoom = (...cs) => ({ id: 'D', clients: new Map(cs.map(c => [c.cid, c])) 
   const out = fanout(r, EV, buf, LIMIT);
   ok('D11 readyState ≠ 1 的连接整条跳过（发过去会抛，而抛在广播循环里会打断后面的人）',
     dead.got.length === 0 && out.drops === 0);
+}
+
+// ⑥ 事件分层（性能审查 W1）：定向事件只发给该收的人，全房项照旧一条发所有人。
+// 分层是纯函数，这里用假连接在进程内逐条量 —— 真机上的读写见 J 段同款手法。
+{
+  const layer = splitEvents([
+    { e: 'kill', killer: '甲' },                                      // 全房
+    { e: 'hurt', cid: 1, hp: 87 },                                    // cid 定向（只喂挨打的人）
+    { e: 'streakCharge', cid: 2, sk: 3 },                             // cid 定向
+    { e: 'announce', team: 'A', to: 'own', text: 'own-A' },           // 队定向（own）
+    { e: 'announce', team: 'A', to: 'foes', text: 'foes-A' },         // 队定向（foes）
+    { e: 'announce', team: 'A', to: 'self', cid: 1, text: 'self-1' }, // cid 定向
+    { e: 'proj', netId: 5 },                                          // 全房
+  ]);
+  ok('D12 分层：cid 定向进 cidMap、own/foes 进队表、其余（kill/proj）进全房层',
+    layer.shared.length === 2 && (layer.cidMap.get(1) || []).length === 2
+    && (layer.cidMap.get(2) || []).length === 1 && layer.ownList.length === 1 && layer.foeList.length === 1,
+    `shared=${layer.shared.length} cid1=${(layer.cidMap.get(1) || []).length} cid2=${(layer.cidMap.get(2) || []).length} own=${layer.ownList.length} foes=${layer.foeList.length}`);
+  const texts = (d) => d ? d.ev.map(e => e.text || e.e).sort().join(',') : '';
+  const dA = JSON.parse(directedFor(layer, { cid: 1, pl: { team: 'A' } }, 7));
+  const dB = JSON.parse(directedFor(layer, { cid: 2, pl: { team: 'B' } }, 7));
+  ok('D13 定向只给该收的：A(cid1/队A) = hurt#1 + to:self#1 + to:own(A)，不含 foes-A',
+    texts(dA) === 'hurt,own-A,self-1', texts(dA));
+  ok('D14【反证臂】B(cid2/队B) 拿不到 A 的 hurt 与 own-A，只拿到自己的 streakCharge + foes-A',
+    texts(dB) === 'foes-A,streakCharge', texts(dB));
+  ok('D15 没有定向事件的连接返回 null，不是空 ev 数组的"空帧"（D8 那条反证臂量的形状）',
+    directedFor(splitEvents([{ e: 'kill' }, { e: 'proj' }]), { cid: 999, pl: { team: 'A' } }, 7) === null);
+}
+// ⑦ fanout 带定向层时：定向帧同样排在背压闸**之前**（它也是"不可再生"那一类）
+{
+  const s = mkConn(1, LIMIT + 1);
+  const h = mkConn(2, 0);
+  const r = mkRoom(s, h);
+  const DIR = JSON.stringify({ t: 'ev', tick: 7, ev: [{ e: 'hurt', cid: 1 }] });
+  const out = fanout(r, null, buf, LIMIT, (c) => (c.cid === 1 ? DIR : null));
+  ok('D16【W1】积压的连接仍然收到自己的定向帧（定向事件不许被背压闸跳掉）',
+    s.got.some(g => g.d === DIR && g.bin === false), s.got.map(g => g.bin ? '快照' : '事件').join('→') || '（空）');
+  ok('D17 它照样跳过快照；没有定向帧的健康邻居只收快照（没被塞别人的事件）',
+    !s.got.some(g => g.bin === true) && h.got.length === 1 && h.got[0].bin === true
+    && out.drops === 1, `healthy=${h.got.length} 帧 drops=${out.drops}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

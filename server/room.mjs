@@ -626,7 +626,10 @@ export class NetRoom {
         if (this.tick - c.lastHurtTick >= HURT_EVERY) {
           c.lastHurtTick = this.tick;
           const a = c.pl.lastAttacker;
-          const from = (a && a.pos) ? [a.pos.x, a.pos.y, a.pos.z] : null;
+          // from 只喂受击方向指示器（main.js:477 的 damageFrom），差 0.1 m 不可感知 —— 限到
+          // 1 位小数，每条省 ~40B（性能审查 W5）。**不要**顺手把 proj/turret/respawn 的坐标
+          // 也限了：那几位喂客户端哑副本的同一套物理，起点差能改变蹬墙判定、弹道肉眼分叉。
+          const from = (a && a.pos) ? [+a.pos.x.toFixed(1), +a.pos.y.toFixed(1), +a.pos.z.toFixed(1)] : null;
           this.events.push({ e: 'hurt', cid: c.cid, hp: Math.round(hp), from });
         }
       }
