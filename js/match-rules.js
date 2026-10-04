@@ -142,7 +142,7 @@ export class MatchRules {
     this.tick = 0;
     this.over = null;                              // { winner, tick }
     this.firstBlood = false;
-    this.lastKillTicks = [];                       // 连杀奖章（双杀/三杀…）用的最近击杀拍号
+    this.chainBy = new Map();                      // 连杀奖章（双杀/三杀…）的窗口，**按击杀者分账**（键 = 击杀者实体）
     // 判据要能区分"规则没接上"与"规则接上了但没触发"：这两个计数就是那个分界。
     this.kills = 0; this.charged = 0; this.calls = 0;
   }
@@ -168,11 +168,28 @@ export class MatchRules {
 
   // 连杀奖章窗口（双杀/三杀…）。窗口按**拍**而不是秒：秒基的窗口在权威端要读
   // game.time，而 game.time 与 tick 在权威端是同一件事的两种写法，多一个就多一处漂移。
-  killChain(ticks = 4 * 60) {
-    this.lastKillTicks = this.lastKillTicks.filter(t => this.tick - t < ticks);
-    this.lastKillTicks.push(this.tick);
-    return this.lastKillTicks.length;
+  // 账按**击杀者**分开记（键 = 击杀者实体）。这条链曾经是实例上一条全局滚动表：
+  // 单机只有本地玩家的击杀会调它，"碰巧"只装一个人的账；联机权威端**每一杀**都过
+  // 这里，全房 4 秒内谁杀的都算进"你这一杀"的 chain —— 症状是热闹的房里每杀必念
+  // "暴走/无人可挡"，分值跟着 chain×50 一起虚高（2026-10-04 实网报的 bug）。
+  // 键的生命周期归调用方：死亡与离场时调 resetChain 删账。
+  killChain(key, ticks = 4 * 60) {
+    let arr = this.chainBy.get(key);
+    if (!arr) this.chainBy.set(key, arr = []);
+    // arr 恒按拍号升序，过期修剪从头数：多数拍里第一条就没过期，循环空转
+    let i = 0;
+    while (i < arr.length && this.tick - arr[i] >= ticks) i++;
+    if (i) arr.splice(0, i);
+    arr.push(this.tick);
+    return arr.length;
   }
+
+  // 清掉一个击杀者的链。两处语义共用：死亡（隔着一次重生的两杀不该算双杀 —— 复活
+  // 只要 3 秒，比 4 秒窗口短，光靠时间过期盖不住）与离场（删账防泄漏）。
+  resetChain(key) { this.chainBy.delete(key); }
+
+  // 清整张表。**测试钩子**：问"这一杀的 tags 里有什么"的场景不想要上一场景的账。
+  resetChains() { this.chainBy.clear(); }
 
   addScore(team, v) { this.scores[team] = (this.scores[team] || 0) + v; }
 

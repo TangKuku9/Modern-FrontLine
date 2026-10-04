@@ -340,7 +340,7 @@ ok('F1【先决】两个同名的人在同一个房间里（不同名的话下�
 
 // 同拍两杀：一个爆头、一个不爆头，受害者恰好同名 —— 配对错就会交叉。
 r3.events.length = 0;
-r3.rules.lastKillTicks.length = 0;
+r3.rules.resetChains();
 r3.game.onKill(K1.pl, X1.pl, 'ak', true, {});
 r3.game.onKill(K1.pl, X2.pl, 'ak', false, {});
 stepN(r3, 1);
@@ -402,7 +402,7 @@ ok('F3b【反证臂】两条队列错位时奖章仍各归各（配对认 cid，
 const bA = r3.spawnBot({ name: '同名', team: 'A', skill: 1 });
 const bB = r3.spawnBot({ name: '同名', team: 'B', skill: 1 });
 r3.events.length = 0;
-r3.rules.lastKillTicks.length = 0;
+r3.rules.resetChains();
 r3.game.onKill(bA, bB, 'ak', true, {});
 stepN(r3, 1);
 const botKill = r3.events.find(e => e.e === 'kill');

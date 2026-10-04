@@ -189,10 +189,11 @@ sec('J. 击杀奖章随 kill 事件下发（联机屏幕上也该有爆头/双�
 // 同一张，那张表自己在 test/mp-rules.mjs 的 A24-A27 里被量过）。
 // 这一节量的是**连接处**：权威端算出来的 tags 有没有真的走到事件里、分对不对。
 //
-// 连杀窗口是**全房滚动**的（MatchRules.killChain，4 秒），所以每条场景开跑前先清空它：
-// 这一节问的是"这一杀的 tags 里有什么"，不是"今晚连杀排到第几"。清空之后 killChain()
-// 照样会把当前这一拍记进去（返回 1），所以"第一杀不许带连杀标签"依然是一条真判据。
-const soloChain = () => { room.rules.lastKillTicks.length = 0; };
+// 连杀奖章的窗口**按击杀者分账**（MatchRules.chainBy，4 秒，键 = 击杀者实体），所以
+// 每条场景开跑前先清表：这一节问的是"这一杀的 tags 里有什么"，不是"今晚连杀排到第几"。
+// 清空之后 killChain() 照样会把当前这一拍记进去（返回 1），所以"第一杀不许带连杀标签"
+// 依然是一条真判据。
+const soloChain = () => { room.rules.resetChains(); };
 const killsOf = (name) => room.events.filter(e => e.e === 'kill' && e.victim === name);
 const botNamed = (n) => (room.game.bots || []).find(b => b.name === n);
 // 开打之前要**摆距离**：killScore 的远距离那条线是 40 m，而这张图上的 Bot 正好都站在
@@ -203,7 +204,7 @@ const put = (killer, victim, m) => { killer.pos.set(0, 0, 0); victim.pos.set(0, 
 room.events.length = 0;
 soloChain();
 ok('J1【先决】连杀窗口清空了（不清的话"第二杀带 chain2"可能本该是 chain4 的后半截）',
-  room.rules.lastKillTicks.length === 0);
+  room.rules.chainBy.size === 0);
 
 // ① 近距离爆头：tags 里要有 head，且分值 100 + 50
 const vJ = botNamed('野马');
@@ -224,16 +225,31 @@ ok('J3 这一批 tags 画出来就是 HUD 上那一行（与单机同一张表�
 ok('J4【反证】第一杀不带连杀标签（chain1 不是"双杀"）',
   !!ev1 && !ev1.tags.some(t => t.startsWith('chain')), JSON.stringify(ev1 && ev1.tags));
 
-// ② 同一拍里的第二杀 = 双杀（走的是权威端那一句 killChain()，不是这里补的）
+// ② 同一个击杀者窗口内的第二杀 = 双杀（走的是权威端那一句 killChain(killer)）。
+// 击杀者必须是 J2 那同一个甲：账按人分，换了人这就不是**他的**第二杀。
 const vJ2 = botNamed('黑曼巴');
 ok('J5a【先决】这一节要用的三个 Bot 都还在场上（名字写错了的话下面每条都会读到 undefined）',
   !!vJ && !!vJ2 && vJ !== vJ2, `${vJ && vJ.name} / ${vJ2 && vJ2.name}`);
-put(B.pl, vJ2, 3);
-room.game.onKill(B.pl, vJ2, 'm4', false, {});
+put(A.pl, vJ2, 3);
+room.game.onKill(A.pl, vJ2, 'm4', false, {});
 stepN(room, 1);
 const ev2 = killsOf(vJ2.name).pop();
-ok('J5 紧接着的第二杀带 chain2，分值 100 + 2×50（连杀那一条也是账上真加了的）',
+ok('J5 同一击杀者紧接着的第二杀带 chain2，分值 100 + 2×50（连杀那一条也是账上真加了的）',
   !!ev2 && ev2.tags.join(',') === 'chain2' && ev2.pts === 200, JSON.stringify(ev2 && { pts: ev2.pts, tags: ev2.tags }));
+
+// ②'【反证】分账的另一面：两个不同的击杀者贴在同一拍里各杀一人，谁都不带 chain 标。
+// 实网报的 bug 正是它的反面 —— 窗口曾是全房一条滚动表，别人 4 秒内的击杀替你把数攒满，
+// 每杀必念"暴走/无人可挡"，分值跟着 chain×50 一起虚高。这条在旧实现上跑是红的。
+soloChain();
+put(A.pl, vJ, 3);
+put(B.pl, vJ2, 3);
+room.game.onKill(A.pl, vJ, 'ak', false, {});
+room.game.onKill(B.pl, vJ2, 'm4', false, {});
+stepN(room, 1);
+const evA = killsOf(vJ.name).pop(), evB = killsOf(vJ2.name).pop();
+ok('J5d【反证】同一窗口里两个击杀者各杀一人，两条都不带 chain 标（不是全房一条滚动表）',
+  !!evA && !!evB && !evA.tags.some(t => t.startsWith('chain')) && !evB.tags.some(t => t.startsWith('chain')),
+  JSON.stringify({ a: evA && evA.tags, b: evB && evB.tags }));
 
 // ③ 远距离：40 m 那条线在**权威端这条路上**也要成立（纯函数那半边在 mp-rules 的 A22/A23）
 const vJ3 = botNamed('雷霆');
@@ -272,8 +288,8 @@ ok('J9【反证】再杀一次同一人不算复仇：pts 回到 100、tags 是�
   !!ev4 && ev4.pts === 100 && ev4.tags.length === 0 && !ev4.tags.includes('revenge'),
   JSON.stringify(ev4 && { pts: ev4.pts, tags: ev4.tags }));
 ok('J10 这一节每一条 kill 事件都带 tags 数组（缺字段时客户端会画出一行 undefined）',
-  [ev1, ev2, ev2b, ev3, ev4].every(e => !!e && Array.isArray(e.tags)),
-  [ev1, ev2, ev2b, ev3, ev4].map(e => JSON.stringify(e && e.tags)).join(' '));
+  [ev1, ev2, evA, evB, ev2b, ev3, ev4].every(e => !!e && Array.isArray(e.tags)),
+  [ev1, ev2, evA, evB, ev2b, ev3, ev4].map(e => JSON.stringify(e && e.tags)).join(' '));
 
 const bad = checks.filter(c => !c[0]).length;
 for (const [pass, label] of checks) console.log(`  ${pass ? '✅' : '❌'} ${label}`);

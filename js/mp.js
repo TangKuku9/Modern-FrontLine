@@ -194,6 +194,7 @@ export class MPMatch {
       pl.stats.streak = 0;
       this.streakKills = 0;
       this.streakBook.onDeath();
+      this.rules.resetChain(pl);      // 奖章窗口跟着死：复活只要 4.5 秒，比 4 秒窗口长不了多少
       this.updateStreakHUD();
       if (document.pointerLockElement) document.exitPointerLock();
     } else {
@@ -209,7 +210,9 @@ export class MPMatch {
   playerKill(victim, weapon, head, info) {
     const game = this.game, pl = game.player;
     pl.stats.kills++; pl.stats.streak++;
-    const n = this.rules.killChain();
+    // 键 = 本地玩家实体。单机里只有玩家的击杀走这条（Bot 击杀在 onKill 里不调它），
+    // 所以 Bot 不需要账；联机权威端每一杀都调，那份分账在 server/room.mjs:onKill。
+    const n = this.rules.killChain(pl);
     // 分值来自 js/match-rules.js:killScore（联机权威端问的是同一句）。
     // 逐条奖章那几行问 killMedals（**联机画的是同一张表**，见 js/main.js:onNetKill）。
     const sc = killScore({

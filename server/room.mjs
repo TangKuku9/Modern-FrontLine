@@ -342,6 +342,7 @@ export class NetRoom {
     const i = this.game.entities.indexOf(c.pl);
     if (i >= 0) this.game.entities.splice(i, 1);
     this.byPlayer.delete(c.pl);
+    this.rules.resetChain(c.pl);                  // 奖章窗口的账跟着人走（键就是他的 pl 实体）
     this.clients.delete(cid);
     this.events.push({ e: 'leave', cid });
   }
@@ -830,6 +831,9 @@ export class NetRoom {
       if (tail && tail.e === 'kill') { tail.killerCid = kc ? kc.cid : null; tail.victimCid = vc ? vc.cid : null; }
     }
     if (vc) { vc.deaths++; vc.book.onDeath(); this.pushStreakCharge(vc); }
+    // 死亡清掉死者自己的奖章链（键 = 击杀者实体，Bot 也有账）。复活只要 3 秒、
+    // 窗口有 4 秒，不清的话"死前最后一杀 + 重生后第一杀"会被算成双杀。
+    if (victim) R.resetChain(victim);
     let pts = 0;
     // 这一杀挣了哪几条奖章（'head' / 'melee' / 'longshot' / 'revenge' / 'chain3'…），
     // 由 killScore 算出来、随 kill 事件一起下发（drainKillFeed）。客户端拿它画逐条弹窗
@@ -845,7 +849,7 @@ export class NetRoom {
       // 服务端跑同一份 combat.js ⇒ 这一格真的有值）。单机那条路写的是
       // `pl.lastAttacker === victim`（js/mp.js:216），这里是同一句的权威端写法。
       const revenge = !!(killer.lastAttacker && killer.lastAttacker === victim);
-      const sc = killScore({ head: !!head, melee: !!(info && info.melee), explosive: !!(info && info.explosive), dist, chain: R.killChain(), revenge });
+      const sc = killScore({ head: !!head, melee: !!(info && info.melee), explosive: !!(info && info.explosive), dist, chain: R.killChain(killer), revenge });
       pts = sc.points;
       tags = sc.tags.slice();
       // 记完就清（与单机 mp.js:218 同一步）：不清的话，同一个对手在你身上再挨一枪之前
