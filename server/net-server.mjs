@@ -605,6 +605,9 @@ const dir = CFG.roomDb ? new RoomDirectory({
   url: CFG.publicUrl || `http://${CFG.host === '0.0.0.0' ? '127.0.0.1' : CFG.host}:${CFG.port}`,
   ttlMs: CFG.roomTtlMs,
   ticketTtlMs: CFG.ticketTtlMs,
+  // 大厅每一帧都要拼进别台的行（性能审查 N6）：按心跳周期缓存 list()，风暴合帧后
+  // 的 20 帧/秒不再各付一次主线程同步 SELECT。判据与探针不传这一格 = 不缓存。
+  cacheMs: CFG.roomBeatMs,
 }) : null;
 
 // 本台的行 → 目录。有增删改时把新名单（含远端行）推给本台大厅里的连接 ——
@@ -1183,39 +1186,15 @@ wss.on('connection', (ws, req) => {
   // 实测：以前只发一个 200 KB 的帧就能把对局服务连带所有人的房间一起打死。
   // 单个访客的坏包不该有能力影响其他房间 —— 这正是部署前必须堵的那个洞。
   ws.on('error', e => { console.error(`[ws error] ${(req && req.socket && req.socket.remoteAddress) || '?'}: ` + (e && e.message || e)); try { ws.terminate(); } catch { /* 已经断了 */ } });
-  ws.on('message', async (data, isBinary) => {
-    // ── 每连接消息速率闸门 ──
-    // 放在最前面，在**任何解析之前**：这一层要挡的正是解析要花的那些 CPU。
-    // 一个 64 KB 的帧 = 4096 个输入包，每个都要解一遍位域 —— 而队列本身是有上限的
-    // （INPUT_QUEUE=60，多出来的直接丢），所以"狂发"真正烧的是解码，不是内存。
-    // 超限就拆连接：正常客户端是 60 帧/秒，永远到不了这个数，
-    // 而留着一个正在灌的 socket 比拆掉它贵得多。
-    const nowMs = Date.now();
-    const w = ws.__msgWin;
-    if (nowMs - w.t >= 1000) { w.t = nowMs; w.n = 0; }
-    if (++w.n > CFG.wsMsgPerSec) {
-      gate.msgFlood++;
-      try { ws.close(1008, 'rate limited'); } catch { /* 已经断了 */ }
-      return;
-    }
+  // ── 上行入口（性能审查 N4：同步/异步分流）──
+  // 原来整个 message 处理器是 async 的：输入帧占全部消息的绝大多数（60 帧/秒/连接 ×
+  // 满员 ≈ 每秒几千帧），每一帧都要付一次隐式 Promise 分配 + 微任务调度 —— B1 修掉
+  // 整帧拷贝之后，这层壳就是上行链路上最稳的每帧分配源。现在二进制（上行输入）在
+  // 下面那个同步 listener 里直通（applyInput 当场消费完那份 view，全程无 await）；
+  // 文本帧里的 join / 大厅 start 才有真的 await，它们进 handleTextFrame —— 每连接
+  // 一份闭包（连接建立才创建一次，不是每帧）。两条路共用同一个速率闸门。
+  const handleTextFrame = async (data) => {
     try {
-      if (isBinary) {
-        if (ws.__cid == null) return;
-        const room = ws.__room;
-        if (!room) return;
-        // 零拷贝（性能审查 B1）：ws 给的 Buffer 背后是它自己的池化 ArrayBuffer，而这份
-        // view 只在本帧内**同步**用完（applyInput 当场把字段抄进新建的输入对象），
-        // 直接按 byteOffset 架视图即可 —— 曾经每帧 buffer.slice() 整帧拷一次是白付的。
-        const view = data instanceof ArrayBuffer ? new DataView(data)
-          : new DataView(data.buffer, data.byteOffset, data.byteLength);
-        // 一帧可以攒多个 tick 的输入包，按顺序落地，最后一条生效。
-        // scratch 每条连接一个：decodeInput 把字段写进它，applyInput 只读不存它。
-        const scratch = ws.__inScratch || (ws.__inScratch = {});
-        for (let o = 0; o + INPUT_SIZE <= view.byteLength; o += INPUT_SIZE) {
-          room.applyInput(ws.__cid, decodeInput(view, scratch, o));
-        }
-        return;
-      }
       const msg = JSON.parse(String(data));
       if (msg.t === 'join') {
         // 一条连接只许进一个房间：反复 join 会往房间里塞出一串没人退出的玩家
@@ -1283,7 +1262,18 @@ wss.on('connection', (ws, req) => {
         // 而那个座位是握手时定下的 ⇒ 客户端报不了别人的 cid，也没有越权的余地。
         const room = ws.__room;
         if (!room || ws.__cid == null) return;
-        if (msg.t === 'loadout') room.applyLoadout(ws.__cid, msg.loadout || null);
+        if (msg.t === 'loadout') {
+          // 局内换配装的最小间隔（性能审查 N5）：它不在 HEAVY_FRAMES 里（M7 只盖大厅帧），
+          // 曾经只受总闸管 —— 一条连接拿满总闸灌 loadout，每帧一次 sanitizeLoadout
+          // （js/loadout.mjs：两个 new Set + 一整棵配装对象树）。正常玩家从死亡画面/
+          // 暂停菜单确认一次才发一条，150ms 谁都碰不到；同配装的连发重复帧被丢也不损
+          // 语义（客户端 applyClass 每次选择只发一条）。respawn/streak 的 sim 侧守卫
+          // （respawnT/槽位就绪）本来就是 O(1) 的，不另设闸。
+          const now3 = Date.now();
+          if (now3 - (ws.__loadoutAt || 0) < 150) { lobby.stat.loadoutRate++; return; }
+          ws.__loadoutAt = now3;
+          room.applyLoadout(ws.__cid, msg.loadout || null);
+        }
         else if (msg.t === 'respawn') room.requestRespawn(ws.__cid);
         else room.requestStreak(ws.__cid, msg.slot, { x: msg.x, z: msg.z });
       } else if (LOBBY_FRAMES.has(msg.t)) {
@@ -1364,6 +1354,47 @@ wss.on('connection', (ws, req) => {
       else console.error('[ws] ' + (e && e.stack || e));
       ws.send(JSON.stringify({ t: 'err', msg: String(e && e.message || e) }));
     }
+  };
+  ws.on('message', (data, isBinary) => {
+    // ── 每连接消息速率闸门 ──
+    // 放在最前面，在**任何解析之前**：这一层要挡的正是解析要花的那些 CPU。
+    // 一个 64 KB 的帧 = 4096 个输入包，每个都要解一遍位域 —— 而队列本身是有上限的
+    // （INPUT_QUEUE=60，多出来的直接丢），所以"狂发"真正烧的是解码，不是内存。
+    // 超限就拆连接：正常客户端是 60 帧/秒，永远到不了这个数，
+    // 而留着一个正在灌的 socket 比拆掉它贵得多。二进制与文本共用同一个闸。
+    const nowMs = Date.now();
+    const w = ws.__msgWin;
+    if (nowMs - w.t >= 1000) { w.t = nowMs; w.n = 0; }
+    if (++w.n > CFG.wsMsgPerSec) {
+      gate.msgFlood++;
+      try { ws.close(1008, 'rate limited'); } catch { /* 已经断了 */ }
+      return;
+    }
+    if (isBinary) {
+      if (ws.__cid == null) return;
+      const room = ws.__room;
+      if (!room) return;
+      try {
+        // 零拷贝（性能审查 B1）：ws 给的 Buffer 背后是它自己的池化 ArrayBuffer，而这份
+        // view 只在本帧内**同步**用完（applyInput 当场把字段抄进新建的输入对象），
+        // 直接按 byteOffset 架视图即可 —— 曾经每帧 buffer.slice() 整帧拷贝是白付的。
+        const view = data instanceof ArrayBuffer ? new DataView(data)
+          : new DataView(data.buffer, data.byteOffset, data.byteLength);
+        // 一帧可以攒多个 tick 的输入包，按顺序落地，最后一条生效。
+        // scratch 每条连接一个：decodeInput 把字段写进它，applyInput 只读不存它。
+        const scratch = ws.__inScratch || (ws.__inScratch = {});
+        for (let o = 0; o + INPUT_SIZE <= view.byteLength; o += INPUT_SIZE) {
+          room.applyInput(ws.__cid, decodeInput(view, scratch, o));
+        }
+      } catch (e) {
+        // 同步路径的兜底原来由外层 async 的 try/catch 顺带提供；分流后这里自带一份，
+        // 语义不变：listener 里抛出去同样能打死进程，一条坏包不许走到那一步。
+        console.error('[ws] ' + (e && e.stack || e));
+        try { ws.send(JSON.stringify({ t: 'err', msg: String(e && e.message || e) })); } catch { /* 已经在断了 */ }
+      }
+      return;
+    }
+    handleTextFrame(data);
   });
   ws.on('close', () => {
     // 连接计数必须**在这里**减：放在别处（比如房间移除那一步）的话，

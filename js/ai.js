@@ -39,6 +39,7 @@ export class Bot {
     this.anim = { speed: 0, phase: Math.random() * 6, crouch: 0, pitch: 0, dead: false, deadT: 0, fallDir: 1, fallRoll: 0, recoil: 0, slide: 0, sprint: 0 };
     this.mag = this.stats.mag;
     this.target = null; this.targetVisible = false; this.lastSeenPos = null; this.lastSeenT = -99; this.acquireT = 0;
+    this.__hearAt = -99;   // 听觉扫描的降频戳（性能审查 N1，见 update 里的听觉块）
     this.perceiveT = rng.next() * 0.2; this.fireT = 0; this.burstLeft = 0; this.reloadT = 0;
     this.path = null; this.pathT = -99; this.pathGoal = null; this.goal = null; this.goalT = 0;
     this.strafeDir = rng.next() < 0.5 ? -1 : 1; this.strafeT = 0; this.wantCrouch = false; this.crouchT = 0;
@@ -179,12 +180,20 @@ export class Bot {
       this.targetVisible = false;
       if (this.target && (!this.target.alive || game.time - this.lastSeenT > 6)) this.target = null;
     }
-    // 听觉
-    if (!this.targetVisible) {
+    // 听觉（性能审查 N1）：这段曾经每拍对每个无目标的 Bot 全表扫 noises —— O(bots×noises)，
+    // 交火中的满 Bot 房 ≈ 每秒几万次带 sqrt 的距离检查，全部花在"看不见东西的 Bot"上。
+    // 三刀，前两刀行为逐位一致：
+    //   ① 动作闸前置 —— 循环体内的副作用只在"lastSeenPos 空 / 已过期 2s"时发生（循环自己
+    //      会把 lastSeenT 改成 time-1，闸随即关上），闸关着时整个循环是纯白工，先问一次就够；
+    //   ② 平方距离替代 distanceTo —— 去掉 sqrt，比较结果同序；
+    //   ③ 每 Bot 降到 10Hz（__hearAt）—— 唯一的行为让步：听觉最多晚 0.1s。噪声 0.5s 就
+    //      过期，交火时下一发子弹立刻补上；换来的是把 O(60Hz×bots×noises) 钉成 O(10Hz)。
+    if ((!this.targetVisible && (!this.lastSeenPos || game.time - this.lastSeenT > 2)) && game.time - this.__hearAt >= 0.1) {
+      this.__hearAt = game.time;
       for (const n of game.noises) {
         if (n.team === this.team || game.time - n.t > 0.5) continue;
-        const d = n.pos.distanceTo(this.pos);
-        if (d < n.r) {
+        const dx = n.pos.x - this.pos.x, dy = n.pos.y - this.pos.y, dz = n.pos.z - this.pos.z;
+        if (dx * dx + dy * dy + dz * dz < n.r * n.r) {
           if (!this.lastSeenPos || game.time - this.lastSeenT > 2) {
             this.lastSeenPos = n.pos.clone(); this.lastSeenT = game.time - 1;
             if (!this.alerted && this.group && game.alertGroup && !n.footstep) game.alertGroup(this.group, n.pos);

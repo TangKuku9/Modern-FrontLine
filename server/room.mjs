@@ -350,9 +350,19 @@ export class NetRoom {
   applyInput(cid, net) {
     const c = this.clients.get(cid);
     if (!c) return;
+    // 16 位回绕下的"更新"：差值落在 (0, 2000) 才算后面，重复包和迟到旧包一律丢。
+    // 基准刻意不是 c.ack：新玩家一进场 ack 就是 0，而他发出的第一拍也是 0 —— 用 ack 当基准
+    // 会把第 0 拍当成重复包丢掉（实测：出生后的第一拍输入永远不被消费）。
+    // 判重**提到解码之前**（性能审查 N7）：net.tick 是 codec.decodeInput 已经解出的原值，
+    // 在建那个 28 字段输入对象之前就能判 —— 突发恢复 / 迟到包 / 洪水里被丢掉的每包不再
+    // 白建一次对象。判定式与逐字版本一致（原来写在解码之后，读的是同一个 net.tick）。
+    const nt = net.tick & 0xffff;
+    const last = c.q.length ? c.q[c.q.length - 1].tick : c.lastQueued;
+    const d = last < 0 ? 1 : (nt - last) & 0xffff;
+    if (d === 0 || d >= 2000) return;
     const inp = decodeInputBits(net.keys, net.buttons);
     inp.mdx = net.mdx; inp.mdy = net.mdy;
-    inp.tick = net.tick & 0xffff;
+    inp.tick = nt;
     // 客户端说它发出这一拍时，屏幕上渲染的是服务端的哪一拍（低 16 位）。
     // 它只在这里被搬进队列，真正生效是在 step() 里被消费的那一刻 —— 和输入本身同一时刻，
     // 于是"打到的是当时看到的世界"这句话里的"当时"就是这一拍。
@@ -362,12 +372,6 @@ export class NetRoom {
     // 不在收包时立刻处理 —— 那会让"第 100 拍按的 3"在第 103 拍生效，而玩家屏幕上
     // 那一刻的 HUD 已经跳到下一个槽了。
     inp.streak = unpackStreak(net.streak & 0xff);
-    // 16 位回绕下的"更新"：差值落在 (0, 2000) 才算后面，重复包和迟到旧包一律丢。
-    // 基准刻意不是 c.ack：新玩家一进场 ack 就是 0，而他发出的第一拍也是 0 —— 用 ack 当基准
-    // 会把第 0 拍当成重复包丢掉（实测：出生后的第一拍输入永远不被消费）。
-    const last = c.q.length ? c.q[c.q.length - 1].tick : c.lastQueued;
-    const d = last < 0 ? 1 : (inp.tick - last) & 0xffff;
-    if (d === 0 || d >= 2000) return;
     // 按拍入队，一步只取一条。直接在收包时覆盖 lastInput 会丢中间拍：
     // 一个包带 3 拍时只有最后一拍生效，而 mdx 是"那一拍的鼠标位移"，
     // 丢掉的就是转向 —— 客户端重放却会把它们全算上，两边永久错开。
@@ -493,7 +497,11 @@ export class NetRoom {
     // 抄成"更合理"的版本会让两端的手感分叉，而那种差异没人会去查。走的也是同一条
     // 公共玩法流：客户端的流每份快照都会按 rngState 拨回来，所以这不产生分叉。
     if (this.rules.wpTicks > 0 && this.wpOwner) {
-      for (const e of this.enemiesOf(this.wpOwner.team)) {
+      // 白磷灼烧每拍都要"这一队的地面敌人"：走 fillEnemies 的复用数组（性能审查 N3），
+      // 不再每拍 filter 一个新数组。快照语义与 enemiesOf 一致（先取名单再逐个裁，
+      // 循环中死掉的对手不中断遍历），rng 的抽取顺序也不变。
+      const foes = this.fillEnemies(this.wpOwner.team, this.__wpFoes || (this.__wpFoes = []));
+      for (const e of foes) {
         if (rng.next() < DT * 2) e.takeDamage(6, { attacker: this.wpOwner, weapon: '白磷弹', explosive: true, dir: DOWN });
       }
     }
@@ -702,9 +710,17 @@ export class NetRoom {
 
   // 与单机同一份语义（js/mp.js:MPMatch.enemiesOf）：**地面上的**敌对目标。
   // 直升机照样会被射线打得到，但不进"白磷弹烧谁 / 集束空袭炸哪儿"那类照地投放的集合。
-  enemiesOf(team) {
-    return this.game.entities.filter(e => e.alive && e.team !== team && e.pos && e.targetable !== false && !e.isHeli);
+  // fillEnemies 是它的零分配内核（性能审查 N3）：调用方给一个复用数组，返回的就是它 ——
+  // 只许在同一次调用里同步消费，不许留到下一拍；要持有名单的调用方（比如按队缓存）
+  // 传自己的数组即可。
+  fillEnemies(team, out) {
+    out.length = 0;
+    for (const e of this.game.entities) {
+      if (e.alive && e.team !== team && e.pos && e.targetable !== false && !e.isHeli) out.push(e);
+    }
+    return out;
   }
+  enemiesOf(team) { return this.fillEnemies(team, []); }
 
   // ── 往对局里放一个 Bot（房主在房间屏上点的那个「+」）──
   // 它和 addClient 是并列的两条路：真人走「连接 → addClient」，Bot 走「房主名单 → spawnBot」。

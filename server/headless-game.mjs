@@ -10,8 +10,6 @@
 import './browser-shim.mjs';            // js/textures.js 与 js/materials.js 要 document/canvas 才能 import
 import * as THREE from 'three';
 import { makeStubs, deepRecorder } from './stubs.mjs';
-import { buildGun } from '../js/gunmodel.js';
-import { crand } from '../js/rng.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS } from '../js/data.js';
 
 // 吸收型 renderer。
@@ -38,6 +36,10 @@ function makeAbsorbingRenderer(log) {
 export class HeadlessGame {
   constructor(opts = {}) {
     this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, invertY: false }, opts.settings);
+    // 权威端旗标（性能审查 N2）：共享代码（js/mp.js 的 Sentry/Heli）拿它区分"要不要建
+    // 看得见的那一半"。判据用的 stubGame（test/heli-armor.mjs）不带这一格 ⇒ 照旧全量建模，
+    // 那些读 .mesh 的判据不受影响。只有真的跑在这份 HeadlessGame 上的对局才走哑态。
+    this.headless = true;
     this.scene = new THREE.Scene();
     // 故意不建 vmScene/vmCamera：WeaponSystem 没有 vmScene 就不构造 Viewmodel
     // （js/weapons.js:11）。于是"权威服务端偷偷跑了画面代码"会变成当场抛错，
@@ -132,18 +134,22 @@ export class HeadlessGame {
   // 服务端专用对局里它们全都是权威状态的一部分，不能省。
   saveProfile() { this.profileSaved = (this.profileSaved || 0) + 1; }
 
-  // 与 main.js:317-327 同形：掉落武器是真实体，拾取属权威裁决，不能只留在客户端
+  // 与 main.js:317-327 同形：掉落武器是真实体，拾取属权威裁决，不能只留在客户端。
+  // 模型不建（性能审查 N2）：权威端只读 p.pos —— 拾取距离（x/z）与事件坐标；地上枪的
+  // 哑模型由客户端按 'pickup' 事件自己建。buildGun 是仓库里最重的建模函数（几十个
+  // mesh/geometry/material），掉落规则 60% 概率 × 14 把上限反复建/丢，server 上全是白工。
+  // y 仍按地面吸附（与旧版同一句 groundHeight + 0.06）：事件坐标就是客户端摆模型的唯一
+  // 依据，少这一步的话枪会埋进地/悬在半空。旧版还顺手抽了一次 crand 转枪身 —— 那是
+  // 画面流（js/rng.js 文件头的分工），权威端不转它了。
   spawnPickup(weaponId, att, pos, mag, reserve) {
-    const info = buildGun(weaponId, att || {}, 'none', { low: true });
-    const m = info.group;
-    m.position.set(pos.x, (this.world ? this.world.groundHeight(pos.x, pos.z, pos.y + 1, 0.2) : 0) + 0.06, pos.z);
-    m.rotation.set(0, crand.next() * 6, Math.PI / 2);
-    this.scene.add(m);
-    const p = { weaponId, att: att || {}, mesh: m, pos: m.position.clone(), mag, reserve, t: 0 };
+    const p = {
+      weaponId, att: att || {}, mesh: null,
+      pos: new THREE.Vector3(pos.x, (this.world ? this.world.groundHeight(pos.x, pos.z, pos.y + 1, 0.2) : 0) + 0.06, pos.z),
+      mag, reserve, t: 0,
+    };
     this.pickups.push(p);
     if (this.pickups.length > 14) {
       const o = this.pickups.shift();
-      this.scene.remove(o.mesh);
       // 溢出回收**必须回告**：客户端地上那把枪是照 'pickup' 事件建的哑模型，收掉却不发
       // pickupGone 的话它就永远留在地上 —— 走过去没提示、按键无反应；而且它还参与
       // pickupAction 的"身边有枪"提示计算，屏上的提示与实际能捡的东西从此对不上。
@@ -175,7 +181,16 @@ export class HeadlessGame {
     this.time += dt;
     this.tick++;
     this.pathBudget = 3;
-    if (this.noises.length) this.noises = this.noises.filter(n => this.time - n.t < 0.6);
+    // 噪声表原地压实（性能审查 N1）：曾经每拍 filter 一个新数组 —— 只要场上有枪声/脚步
+    // （常态成立）这就是 60 次/秒的稳定分配。谓词与幸存次序逐字不变。
+    if (this.noises.length) {
+      let w = 0;
+      for (let i = 0; i < this.noises.length; i++) {
+        const n = this.noises[i];
+        if (this.time - n.t < 0.6) this.noises[w++] = n;
+      }
+      this.noises.length = w;
+    }
     for (const p of (pairs || (this.player ? [{ pl: this.player, inp }] : []))) {
       if (p.pl.alive) p.pl.update(dt, p.inp);
     }

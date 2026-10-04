@@ -524,15 +524,23 @@ export class Sentry {
     this.pos = pos.clone(); this.pos.y = game.world.groundHeight(pos.x, pos.z, pos.y + 0.5, 0.3);
     this.hp = 300; this.alive = true; this.t = opts.duration || 60; this.yaw = owner.yaw; this.fireT = 0; this.target = null; this.scanT = 0;
     this.stats = { dmgNear: 20, dmgFar: 16, rangeNear: 20, rangeFar: 50, headMul: 1.2, name: '哨戒机枪' };
+    // ── 模型二态（性能审查 N2）──
+    // 权威端（game.headless，见 server/headless-game.mjs）不渲染，却曾经为每台哨戒机建
+    // 全套 mesh/geometry/material。**枪口这一层不能删**：update 里 muzzle.getWorldPosition()
+    // 的矩阵链是表现坐标的唯一来源，head.rotation.y 的赋值节奏也是 —— 所以只删"看得见的
+    // 那一半"：Group/head/muzzle 三个 Object3D 原样保留（零几何成本），update 与 dispose
+    // 的相关代码逐字不动。判据用的 stubGame 不带 headless 旗 ⇒ 照旧全量建模。
     const g = new THREE.Group();
-    for (let i = 0; i < 3; i++) { const l = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1.1, 6), mat('darkMetal')); const a = i / 3 * Math.PI * 2; l.position.set(Math.cos(a) * 0.3, 0.45, Math.sin(a) * 0.3); l.rotation.set(Math.sin(a) * 0.5, 0, -Math.cos(a) * 0.5); g.add(l); }
     const head = new THREE.Group(); head.position.y = 0.95; g.add(head);
-    head.add(new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.3, 0.5), mat('gunGreen')));
-    const b = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.7, 8).rotateX(Math.PI / 2), mat('gunMetal')); b.position.set(0, 0.02, -0.55); head.add(b);
-    const box = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.25), mat('gunGreen')); box.position.set(0.25, -0.05, 0); head.add(box);
-    const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.03, 8, 6), new THREE.MeshBasicMaterial({ color: owner.isPlayer ? new THREE.Color(0.3, 1.5, 3) : new THREE.Color(3, 0.3, 0.3) })); lamp.position.set(0, 0.17, 0.1); head.add(lamp);
+    if (!game.headless) {
+      for (let i = 0; i < 3; i++) { const l = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1.1, 6), mat('darkMetal')); const a = i / 3 * Math.PI * 2; l.position.set(Math.cos(a) * 0.3, 0.45, Math.sin(a) * 0.3); l.rotation.set(Math.sin(a) * 0.5, 0, -Math.cos(a) * 0.5); g.add(l); }
+      head.add(new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.3, 0.5), mat('gunGreen')));
+      const b = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.7, 8).rotateX(Math.PI / 2), mat('gunMetal')); b.position.set(0, 0.02, -0.55); head.add(b);
+      const box = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.25), mat('gunGreen')); box.position.set(0.25, -0.05, 0); head.add(box);
+      const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.03, 8, 6), new THREE.MeshBasicMaterial({ color: owner.isPlayer ? new THREE.Color(0.3, 1.5, 3) : new THREE.Color(3, 0.3, 0.3) })); lamp.position.set(0, 0.17, 0.1); head.add(lamp);
+      g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+    }
     this.muzzle = new THREE.Object3D(); this.muzzle.position.set(0, 0.02, -0.92); head.add(this.muzzle);
-    g.traverse(o => { if (o.isMesh) o.castShadow = true; });
     g.position.copy(this.pos); game.scene.add(g);
     this.mesh = g; this.head = head;
     // 只有**权威的那一个**进实体表 —— 与下面 Heli 构造函数同一口径。
@@ -674,9 +682,15 @@ export class Heli {
     this.radius = opts.radius || Math.min(28, game.world.half * 0.55);
     this.height = opts.height || 24;
     this.stats = { dmgNear: 26, dmgFar: 22, rangeNear: 30, rangeFar: 80, headMul: 1.2, name: '武装直升机' };
-    this.mesh = buildHeli(team === game.player.team ? 0x3a4a3a : 0x2a2a2a);
-    this.rotor = this.mesh.userData.rotor; this.tail = this.mesh.userData.tail;
-    game.scene.add(this.mesh);
+    // 模型二态（性能审查 N2）：权威端只要数值状态（pos/ang/yaw/hp），不建那 40 多个
+    // mesh 的机体。update/dispose 对 mesh 的三处引用按 null 门控；客户端的哑副本与单机
+    // （game 无 headless 旗）照旧全量建模 —— 画面那一半一行没动。heli 的开火起点本来就是
+    // 纯数值（pos.clone().add(...)），不需要 Sentry 那种"留一层 Object3D"的处置。
+    if (!game.headless) {
+      this.mesh = buildHeli(team === game.player.team ? 0x3a4a3a : 0x2a2a2a);
+      this.rotor = this.mesh.userData.rotor; this.tail = this.mesh.userData.tail;
+      game.scene.add(this.mesh);
+    } else { this.mesh = null; this.rotor = null; this.tail = null; }
     this.pos = new THREE.Vector3();
     this.yaw = 0;
     this.enter = 1;
@@ -734,7 +748,7 @@ export class Heli {
     return true;
   }
   dispose() {
-    this.game.scene.remove(this.mesh);
+    if (this.mesh) this.game.scene.remove(this.mesh);   // 权威端无模型（性能审查 N2）
     this.game.audio.stopLoop(this.loopName);
     // 从实体表里摘掉：game.entities 是被每发子弹与每次爆炸遍历的表，留着一个已经死了的
     // 直升机不报错（takeDamage 第一行就 return false），只是让这张表每局多攒几架。
@@ -750,8 +764,7 @@ export class Heli {
     this.enter = Math.max(0, this.enter - dt * 0.3);
     const r = this.radius + this.enter * 120;
     this.pos.set(Math.cos(this.ang) * r, this.height + this.enter * 20, Math.sin(this.ang) * r);
-    this.mesh.position.copy(this.pos);
-    this.rotor.rotation.y += dt * 30; this.tail.rotation.x += dt * 40;
+    if (this.mesh) { this.mesh.position.copy(this.pos); this.rotor.rotation.y += dt * 30; this.tail.rotation.x += dt * 40; }   // 权威端无模型（性能审查 N2）
     const d = game.player ? this.pos.distanceTo(game.camera.position) : 100;
     game.audio.setLoopVol(this.loopName, clamp(0.5 - d / 150, 0.02, 0.5));
     this.scanT -= dt; this.fireT -= dt;
@@ -783,9 +796,11 @@ export class Heli {
         if (res.ent && this.owner && this.owner.isPlayer) game.hud.hitmarker(res.killed);
       }
     } else look = this.ang + Math.PI;
-    this.mesh.rotation.y = look;
-    this.mesh.rotation.z = Math.sin(this.ang * 3) * 0.05;
-    this.mesh.rotation.x = -0.1;
+    if (this.mesh) {           // 权威端无模型（性能审查 N2）；yaw 那一行在门外面，永不被跳过
+      this.mesh.rotation.y = look;
+      this.mesh.rotation.z = Math.sin(this.ang * 3) * 0.05;
+      this.mesh.rotation.x = -0.1;
+    }
     // 命中体跟着机头转（HELI_HITBOXES 是局部坐标），所以 yaw 必须在这儿落地 ——
     // 漏了这一行的话，命中体永远停在 yaw=0，直升机看上去朝着东、实际能被从北边打穿。
     this.yaw = look;

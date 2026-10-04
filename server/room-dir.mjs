@@ -51,7 +51,7 @@ create table if not exists tickets (
 `;
 
 export class RoomDirectory {
-  constructor({ file, url, boot, ttlMs = 8000, ticketTtlMs = 30000, now = Date.now, DatabaseSync = NodeDatabaseSync, sweepMinMs = 1000 } = {}) {
+  constructor({ file, url, boot, ttlMs = 8000, ticketTtlMs = 30000, now = Date.now, DatabaseSync = NodeDatabaseSync, sweepMinMs = 1000, cacheMs = 0 } = {}) {
     if (!file) throw new Error('RoomDirectory 需要 file');
     this.url = url;
     this.boot = boot || randomBytes(8).toString('hex');
@@ -68,6 +68,16 @@ export class RoomDirectory {
     // 代价是"死行最多多显示 sweepMinMs 毫秒"，换来的是把写放大钉成常数。
     this.sweepMinMs = sweepMinMs;
     this._lastSweep = 0;
+    // ── list() 结果的按拍缓存（性能审查 N6）──
+    // 0 = 不缓存（默认）：判据要在写入别台行之后立刻 list() 看见，探针/测试全走默认。
+    // 生产上 net-server 传心跳周期（ROOMS_BEAT_MS）：目录行对"推给大厅的那一帧"的
+    // 新鲜度上限本来就是"最坏一个心跳周期"（第一轮 A3 已立账），而 pushLobby 风暴时
+    // 每 50ms 一帧大厅都同步 SELECT 一遍 —— 逐帧重读只是把同一份新鲜度再买一遍。
+    // 本台的行永远不进 list()（selAll where boot != ?），所以 publishAll 不用失效它；
+    // sweep 会删**别台**的死行 —— 显式失效。
+    this.cacheMs = cacheMs;
+    this._listCache = null;
+    this._listAt = 0;
     this.db = new DatabaseSync(file);
     this.db.exec('pragma journal_mode = wal; pragma synchronous = normal;');
     // 多进程并发写同一文件：WAL 下写者串行，撞上时等而不是抛 —— 目录的每笔都小，等得起。
@@ -126,14 +136,20 @@ export class RoomDirectory {
   }
 
   // 别台的行（自己的除外）。sweep 负责新鲜度，这里只读。
+  // cacheMs > 0 时走按拍缓存（性能审查 N6）：缓存期内不读库也不顺手 sweep ——
+  // 隐式扫描的间隔本来就受 sweepMinMs 管，这里只是再乘上心跳周期。
   list() {
+    const n = this.now();
+    if (this.cacheMs > 0 && this._listCache && n - this._listAt < this.cacheMs) return this._listCache;
     this.sweepIfDue();
-    return this._selAll.all(this.boot)
+    this._listCache = this._selAll.all(this.boot)
       .map(r => ({
         id: r.id, title: r.title, map: r.map, mode: r.mode, players: r.players, max: r.max,
         ready: r.ready, time: r.time, score: r.score, state: r.state, host: r.host,
         remote: true, url: r.url,
       }));
+    this._listAt = n;
+    return this._listCache;
   }
 
   ownCount() { return this._cntOwn.get(this.boot).n; }
@@ -146,6 +162,7 @@ export class RoomDirectory {
     const dead = n - this.ttlMs;
     this._delStaleRooms.run(dead);
     this._delExpTickets.run(n);
+    this._listCache = null;   // 删的是别台的行，缓存里的名单不再可信（性能审查 N6）
   }
 
   // 隐式扫描：距上次（显式或隐式）扫描不足 sweepMinMs 就直接返回。

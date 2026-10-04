@@ -388,6 +388,10 @@ export function onKillPerks(pl) {
 // 写的），联机服务端传 null —— 那边没有"我"，每队的 UAV 都该喂自己的 Bot。
 // 计时器在队伍循环**外面**走一次：两个队同时开着 UAV 时按循环里各减一次会把节奏减半。
 // 返回被报点的次数（判据读数）。
+// 报点的目标表**每队建一次**，且用"最近者一次线性扫描"替代"每个 Bot 各 sort 一遍"
+// （性能审查 N1/N3）：旧写法把 enemiesOf(t).filter(...) 放在 Bot 循环里，同队 8 个 Bot
+// 就是 8 次相同的 filter + 8 次 sort，而排序只为取 tg[0] = 最近的一个。
+// 最近者与稳定排序的首个最小值同序（严格 < 保留迭代序里的第一个最小），行为逐位一致。
 export function uavHints(game, rules, state, dt, skipTeam, enemiesOf) {
   state.uavPing = (state.uavPing || 0) - dt;
   if (state.uavPing > 0) return 0;
@@ -395,12 +399,20 @@ export function uavHints(game, rules, state, dt, skipTeam, enemiesOf) {
   let hinted = 0;
   for (const t of ['A', 'B']) {
     if (t === skipTeam || !rules.uavActive(t)) continue;
+    let tg = null;
     for (const b of game.bots) {
       if (b.team !== t || !b.alive) continue;
-      const tg = enemiesOf(t).filter(e => !(e.isPlayer && e.hasPerk && e.hasPerk('ghost')));
-      if (!tg.length) continue;
-      tg.sort((a, c) => a.pos.distanceTo(b.pos) - c.pos.distanceTo(b.pos));
-      b.hint(tg[0].pos);
+      if (!tg) {
+        tg = [];
+        for (const e of enemiesOf(t)) if (!(e.isPlayer && e.hasPerk && e.hasPerk('ghost'))) tg.push(e);
+      }
+      let best = null, bd = Infinity;
+      for (const e of tg) {
+        const d = e.pos.distanceTo(b.pos);
+        if (d < bd) { bd = d; best = e; }
+      }
+      if (!best) continue;
+      b.hint(best.pos);
       hinted++;
     }
   }
@@ -424,8 +436,13 @@ export function maybeDropWeapon(game, victim) {
 
 // 时间走一格：到 30 秒的枪从场上收掉。返回被收掉的那些（调用方拆模型 / 编事件）。
 // 每拍**只由一个人调**（联机是房间调，不是每个客户端各调）—— 否则 p.t 一拍走好几格。
+// 返回值是**模块级复用**的同一个数组（性能审查 N3）：两个调用方（main.js:989 的
+// updatePickups 与 server/room.mjs 的 pickupTick）都在同一次调用里同步消费它，
+// 没有人把它留到下一拍 —— 曾经每拍无条件 new 一个空数组，没枪的时候也在分配。
+const PICKUPS_GONE = [];
 export function pickupsExpire(game, dt) {
-  const out = [];
+  const out = PICKUPS_GONE;
+  out.length = 0;
   for (let i = game.pickups.length - 1; i >= 0; i--) {
     const p = game.pickups[i];
     p.t += dt;
@@ -484,18 +501,33 @@ export function pickupAction(game, pl, inp, apply = true) {
 // 单机在 MPMatch.update、联机在 NetRoom.step 都调它。**只有状态与分数** —— 网格、
 // 颜色、进度条、播报全归调用方（返回值告诉它们发生了什么、点里站着谁）。
 // 返回 { caps: [{f, team, inRange}], flags: [{f, teams, cnt, inRange, capped}] }。
+//
+// 返回值是**模块级复用**的（性能审查 N3）：dom 房每拍调一次，曾经每拍分配
+// out/cnt/inRange/teams/结果对象共十几个 —— 全在 60Hz 的 young-gen 里。两个调用方
+// （js/mp.js:362 的进度条与 server/room.mjs:506 的换旗事件）都在同一次调用里同步消费，
+// 没有人把返回值留到下一拍，所以按旗下标复用槽位是安全的；caps 条目罕见（只在换旗
+// 那一拍出现），保持每次新分配。字段与旧版逐一同名同序，消费方一行不用改。
+const FLAGS_OUT = { caps: [], flags: [] };
+const FLAGS_POOL = [];
 export function flagsTick(flags, rules, entities, dt) {
-  const out = { caps: [], flags: [] };
+  const out = FLAGS_OUT;
+  out.caps.length = 0;
+  let fi = 0;
   for (const f of flags) {
-    const cnt = {}, inRange = [];
+    const slot = FLAGS_POOL[fi] || (FLAGS_POOL[fi] = { f: null, teams: [], cnt: {}, inRange: [], capped: null });
+    slot.f = f; slot.capped = null;
+    slot.teams.length = 0; slot.inRange.length = 0;
+    const cnt = slot.cnt;
+    for (const k in cnt) delete cnt[k];
     for (const e of entities) {
       if (!e.alive || !e.pos || e.targetable === false || e.isTurret) continue;
       if (Math.hypot(e.pos.x - f.pos.x, e.pos.z - f.pos.z) < 4.5 && Math.abs(e.pos.y - f.pos.y) < 3) {
         cnt[e.team] = (cnt[e.team] || 0) + 1;
-        inRange.push(e);
+        slot.inRange.push(e);
       }
     }
-    const teams = Object.keys(cnt);
+    const teams = slot.teams;
+    for (const k in cnt) teams.push(k);
     let capped = null;
     if (teams.length === 1 && teams[0] !== f.owner) {
       const t = teams[0];
@@ -504,15 +536,17 @@ export function flagsTick(flags, rules, entities, dt) {
       if (f.prog >= 1) {
         f.owner = t; f.prog = 0; f.capTeam = null;
         capped = t;
-        out.caps.push({ f, team: t, inRange });
+        out.caps.push({ f, team: t, inRange: slot.inRange });
       }
     } else if (teams.length !== 1) {
       if (f.capTeam && teams.length === 0) f.prog = Math.max(0, f.prog - dt * 0.1);
     }
+    slot.capped = capped;
     // 得分挂在**旗**上不挂在人上：谁占着谁涨，0.6/秒/点（与单机同一条式子）。
     if (f.owner) rules.addScore(f.owner, dt * 0.6);
-    out.flags.push({ f, teams, cnt, inRange, capped });
+    out.flags[fi++] = slot;
   }
+  out.flags.length = fi;
   return out;
 }
 

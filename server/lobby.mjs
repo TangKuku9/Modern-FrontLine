@@ -158,6 +158,9 @@ export class Lobby {
       // 重帧被限速的次数（M7）。和 sayRate 一样：限速生效的样子在玩家侧只是
       // "点了没反应"，不数出来就只能靠猜。
       heavyRate: 0,
+      // 局内换配装帧被最小间隔丢掉的次数（性能审查 N5）：正常玩家碰不到这条闸，
+      // 非零即有人在拿窄帧灌 sanitizeLoadout。
+      loadoutRate: 0,
       // 举报：来了多少条、多少条找不到人、多少条是自己举报自己。后两者都是"报了但没用"——
       // 与 streak.rejected 同一性质的读数：没生效的举报在玩家侧只表现为"石沉大海"。
       report: 0, reportNoTarget: 0, reportSelf: 0,
