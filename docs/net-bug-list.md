@@ -480,3 +480,35 @@ M1（顺带加 `tick > 2^31` 告警读数）、M2、M3、L1、L2、L3、L4。
 
 其中 **M1 严格说不是"现在会坏"**，但它是本清单里唯一一个**会永久坏且没有自愈**的
 时间炸弹，值得单独在 `rewindTick` 上加一句注释或一条读数。
+
+---
+
+## 六、处置记录（2026-10-04，同日复核）
+
+逐条拿运行时探针/判据复核后的落地结果。基线 `7f537c7`（15c13ab 之上多一个手雷 CS 制提交，
+与本清单无冲突）。**10 条属实已修，2 条复核不成立**，逐条附证据与判据落点。
+
+| 条目 | 处置 | 说明 |
+|---|---|---|
+| H1 | **已修** | `PoseRing.at()` 回满 6 字段。判据：`server/lagcomp.mjs` 自测加趴姿靶逐字段断言；`test/lagcomp.mjs` 删掉那个把 H1 掩住的 `|| [6 字段]` 手写兜底、新增趴姿靶整节（瞄体后腿球 + 报过去 ⇒ 中，同射线按站立盒 ⇒ 不中） |
+| H2 | **已修** | `headless-game.spawnPickup` 溢出 shift 时编 `pickupGone(why:'overflow')` 进 `game.events`，`room.mjs:drainKillFeed` 原样转发（与 30 秒过期同一出口）。判据：`test/mp-rules.mjs` M8（未到上限零事件 + 溢出收最旧、带同一 netId） |
+| H3 | **已修** | count 改 u16，`HEADER_SIZE` 11→12（客户端 `decodeSnapshot` import 同一模块，自动跟上）。判据：`server/codec.mjs` 自测加 300 实体越界往返（count 曾回绕成 44 的那条形状） |
+| H4 | **已修（改方案）** | 没按"模块级 scratch"落——**跨房间会互相盖字节**：不同房间的 broadcast 可落在同一次 timers 相位里，而 `socket.write` 排队的是 buffer 引用。改成**每房**一块（128 实体容量，超限仍退回按需分配）；同一间房两份快照隔 ≥50ms 与一轮 poll 相位，写早已落地 |
+| H5 | **不成立** | 不是双记：客户端那笔走 `addAccountXp` 写的是档案的**账号半**，而账号半在下一次 `/api/me` 被 `applyAccountXp` **整体覆盖**（不累加）；且两端金额同式同源（客户端 `round(myStats.s)+胜负分`，服务端 `round(c.score)+胜负分`，`myStats.s` 就是权威 `round(c.score)`；win/won 同一句判式）。progress.mjs 头注释明写这是"先按本地式子记上、下次 /api/me 用服务端的数确认"的设计。会漂的只有"结算后 1 秒内（resultDrain 周期）就问 /api/me"与多设备两种边角，属已知限界 |
+| M1 | **已修** | `cur & ~0xffff`（32 位有符号折叠，2^31 后变负）换纯算术 `cur - cur % 0x10000 + view`。判据：`server/lagcomp.mjs` 自测加 2^31 后三臂（正常回溯 / 上限沿 / 超限拒） |
+| M2 | **已修** | 删掉没人传过的 `!opts.ff`，把"FFA 靠队键每人一支兜住"钉进注释（将来做共用队玩法时动队键层，不是这里） |
+| M3 | **改判：注释错，行为不动** | 复核发现 `test/service-guards.mjs` C6 **把 `*.ok.test` 不吃裸域钉死为有意语义**（"通配只往上加一级……写出来免得下次当成 bug 改"），C7 的 `originRefused===3` 也依赖它。真相是 net-server.mjs:451 那行注释（"裸域也算"）与事实相反——已改注释并对齐 C6 口径。运维要连裸域放行就把裸域自己写进 ALLOW_ORIGIN |
+| L1 | **已修** | join 处理器加 `ws.__joining`（发起 pickRoom 前同步置、`finally` 清）：第二条并发 join 在 pickRoom 之前就被拦，孤儿房建不出来。判据：`test/service-guards.mjs` A13/A14（两条不同房号的并发 join ⇒ 恰好一 welcome 一 err、rooms 只 +1） |
+| L2 | **不成立（探针证伪）** | `beginLive` 是房间 promise 的**创建者**，它的 await 注册永远先于任何后来者（房间不建出来就没有人能 await 它）；promise 解析时微任务按注册序跑 ⇒ `live.__closed = true` 先于 join 者的 `__closed` 检查。探针复刻真实 promise 结构、在窗口第 0/1/10/40/79/80/81/120 ms 注入 join，8 个时刻全部被拒、全部只建 1 间房。原文的"1194 那道闸此刻还没置上"忽略了这个时序 |
+| L3 | **已修** | `buildTag` 显式 `if (this.game.net && this.game.net.ffa) return;`（单机无 `game.net` 不受影响），不再寄生在"FFA 队键每人一支"的巧合上 |
+| L4 | **已修** | net-server 头注释 13→16 B（`INPUT_SIZE`）、780→960 B（maxPayload 注释）、快照头 11→12 B；`fanout.mjs` 那句 `(len-11)/25` 改为引用 `HEADER_SIZE`/`ENTITY_SIZE` 常量 |
+
+**判据补强**（对应《四》的三条方向）：
+- PoseRing.at() 的返回**逐字段断言**（趴姿靶 + 长度 = POSE_FIELDS），不再是"能取到值就算过"；
+- 静默丢弃路径配事件读数（M8 的溢出事件 + 反证臂"未到上限零事件"）；
+- 定长协议计数字段的越界用例（codec 自测 300 实体往返；rewindTick 的 2^31 三臂）。
+
+**复核中新增的一条量具教训**（不在原清单里）：`test/service-guards.mjs` 的每 IP 名额
+只有 6（`CONNS_PER_IP` 默认），共享服的判据段之间是**连接受预算约束**的——A13 的
+racer 连接用完必须 `close()` 还名额，否则 F 段的 cfg 连接在**握手**上被 429 拒掉，
+以"cfgMade=0"的形状无声变红（`client()` 的 opened 对错误也落地，异常不冒头）。
