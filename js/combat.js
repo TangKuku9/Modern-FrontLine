@@ -7,7 +7,7 @@ import { mat } from './materials.js';
 // 实测：Node 比 Chrome 多抽 3 次，正好是这一行一次的量。
 // rand 是**玩法流**，只有连杀奖励的落点抖动用它 —— 那件事在权威端要可复现（见
 // clusterStrike 上方），所以在两端都跑得到的那条流上。
-import { crandRange as crand, rand, clamp, raySphere, rayAABB } from './util.js';
+import { crandRange as crand, rand, randInt, shuffle, clamp, raySphere, rayAABB } from './util.js';
 
 const _p = new THREE.Vector3(), _q = new THREE.Vector3();
 // 金属命中要用的法线。不与 _p/_q 共用：那两个在爆炸/弹道那一段里跨调用带着值，
@@ -368,6 +368,16 @@ const CLUSTER_FALL = 1.6;        // 从投放高度落到地面要几秒
 const CLUSTER_LEAD = 84;         // 呼叫到开始投弹：1.4 s @60Hz
 const CLUSTER_STAGGER = 110 / 1000 * 60;   // 每颗之间 110 ms = 6.6 拍
 
+// 白磷弹头与集束弹共用"从天而降"的那套常数（ALT/FALL/LEAD/STAGGER 与落点算式）：
+// "像集束空袭那样"就是字面要求 —— 高度、落差、呼叫提前量、投弹节奏全是同一套，
+// 调其中任何一个，两条连杀的观感要一起看。
+export const WP_BOMBS = 10;       // 总共十颗
+export const WP_SCATTER = 1.0;    // 加投弹在锁定点周围的散布（每人的保底那颗正中锁定点，不散）
+// 进近横移：集束是 25 m 的浅航线掠袭，途中任何一层屋顶都会把弹提前吃掉 —— 对"落点
+// 锁定"是致命的（敌人身边有楼，他那颗就炸在半路上）。白磷要的是"正头顶掉下来"：
+// 高度/落差与集束同一套，横移收到 8 m，拦截窗只剩目标正上方一小片，锁定点保得住。
+const WP_DRIFT = 8;
+
 // pos 是弹幕中心，ang 是弹幕铺开的方向（弧度，世界 XZ 平面）。
 // 九颗的落点与初速**在这一刻全部算好**，clock 只负责"什么时候投" —— 抽数与投弹绑在
 // 一起的话，随机流的位置就跟"第几拍投"挂钩，而那条时序以前是墙钟的。
@@ -393,13 +403,26 @@ export function clusterStrike(game, clock, pos, owner, ang) {
   }
 }
 
-// 白磷弹：立刻给 targets 每人 55 点（无视掩体的灼烧），再按拍点着 12 处火。
+// 白磷弹：立刻给 targets 每人 55 点（无视掩体的灼烧），再按拍点着 12 处火；
+// 另有十颗弹头像集束空袭那样从天而降（wpWarheads）。
 // 火的**位置**也在这里抽好，理由同上。
 // 注意伤害是在**这一拍**结清的，而"持续灼烧"由调用方按 wpTicks 在 update 里每拍结算 ——
 // 后者读的是规则内核里的那个计时器，不是这里。
 // 返回 12 处火的位置表：联机的权威端拿它编 wpFires 事件（服务端的 effects 是桩，
 // 不发事件的话联机里白磷只掉血不发光）；单机忽略返回值（火本来就在本机看得见）。
+// 弹头不需要进这个事件：Projectile 构造器里的 onProjectile 钩子会把它们逐颗编成
+// proj 事件广播（与集束弹同一条路）。
 export function phosphorusSweep(game, clock, owner, targets, spread = 12, staggerTicks = 15) {
+  // 弹头的锁定点在**呼叫这一拍**抓下来："敌军每个人当时所在的位置"，55 点灼烧把人
+  // 烧死了他也照落（锁的是位置不是人）。贴地取高与集束的弹幕中心同一式。
+  const aims = targets.map(e => {
+    const p = new THREE.Vector3(e.pos.x, 0, e.pos.z);
+    p.y = game.world.groundHeight(p.x, p.z, e.pos.y + 1, 0.5);
+    return p;
+  });
+  // 场上没有活敌：十颗退化到随机可走点（与 12 处火同一取点法）—— 火照点、屏照橙，
+  // 弹幕不该因为没目标整场哑掉。
+  if (!aims.length) for (let i = 0; i < WP_BOMBS; i++) aims.push(game.world.randomWalkable());
   for (const e of targets) {
     e.takeDamage(55, { attacker: owner, weapon: '白磷弹', explosive: true, dir: new THREE.Vector3(0, -1, 0) });
   }
@@ -417,5 +440,44 @@ export function phosphorusSweep(game, clock, owner, targets, spread = 12, stagge
       game.effects.addFireSource(p.clone().setY(0.1), 1.5, 8);
     });
   }
+  wpWarheads(game, clock, owner, aims);
   return spots;
+}
+
+// 十颗白磷弹头的落点与初速**在这一刻全部算好**（clock 只管"什么时候投"，理由同
+// clusterStrike），落点锁定调用方抓好的那批位置：数量在目标间随机分配但保底每人
+// 一颗（余数逐颗 randInt 砸回去，落点在锁定点周围散 WP_SCATTER；保底那颗正中）。
+// 目标比弹多时洗牌挑十个 —— 保底本来就保不住所有人，至少"轮到谁"是随机的。
+// 全部 opts.dumb（表现副本）：白磷的账由"55 即时 + wpTicks 灼烧"那两条结清，弹头
+// 再裁决一次伤害就是重复计费 —— 飞行、落地一炸、光声冲击都真，一次伤害不裁
+// （explode 的 noDamage 分支连 makeNoise 都跳：Bot 不该对着一片烟花跑图）。
+// 联机里它们经 onProjectile 钩子逐颗编成 proj 事件广播（dumb 弹不带 mirror ⇒ 呼叫者
+// 自己的客户端也照常建副本，与集束弹同一句注），中途进来的人靠 liveWorld 补看。
+function wpWarheads(game, clock, owner, aims) {
+  if (!aims.length) return;   // phosphorusSweep 已把空目标垫成随机点；这里兜的是将来新的调用点
+  game.audio.whoosh(aims[0]);
+  const order = aims.slice();
+  if (order.length > WP_BOMBS) shuffle(order);
+  const counts = order.map(() => 0);
+  for (let i = 0; i < order.length && i < WP_BOMBS; i++) counts[i] = 1;
+  for (let i = order.length; i < WP_BOMBS; i++) counts[randInt(0, order.length - 1)]++;
+  const drops = [];
+  for (let i = 0; i < order.length; i++) {
+    for (let k = 0; k < counts[i]; k++) {
+      const p = order[i].clone();
+      if (k > 0) { p.x += rand(-WP_SCATTER, WP_SCATTER); p.z += rand(-WP_SCATTER, WP_SCATTER); }
+      // 进近方位每颗独立抽：白磷是"整片泼下来"，不是集束那种一条弹幕线。
+      const ang = rand(0, Math.PI * 2);
+      const start = p.clone().addScaledVector(new THREE.Vector3(Math.cos(ang), 0, Math.sin(ang)), -WP_DRIFT);
+      start.y = CLUSTER_ALT;
+      const v = p.clone().sub(start); const T = CLUSTER_FALL;
+      drops.push({ start, vel: new THREE.Vector3(v.x / T, (v.y + 0.5 * 12 * T * T) / T, v.z / T) });
+    }
+  }
+  for (let i = 0; i < drops.length; i++) {
+    const d = drops[i];
+    clock.after(CLUSTER_LEAD + Math.round(i * CLUSTER_STAGGER), () => {
+      if (game.world) game.projectiles.push(new Projectile(game, 'bomb', d.start, d.vel, owner, 10, { dumb: true }));
+    });
+  }
 }

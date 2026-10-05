@@ -15,6 +15,7 @@ import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, 
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD, teamIndex, teamId } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
+import { phosphorusSweep, WP_BOMBS, WP_SCATTER } from '../js/combat.js';
 import { KILLSTREAKS } from '../js/data.js';
 import * as THREE from 'three';
 
@@ -284,6 +285,87 @@ for (let i = 0; i < 10 * 60 + 2; i++) roomE.step();
 ok('D5【反证】10 秒之后标志位自己熄掉（计时是按拍推进的，不是一次性的）',
   roomE.rules.wpTicks === 0 && (roomE.rules.worldFlags() & WORLD.WhitePhosphorus) === 0,
   `flags 前=${flags0} 后=${roomE.rules.worldFlags()}`);
+
+// ── D6+：白磷弹头。十颗从天而降的哑弹（与集束弹同一套高度/落差与落点算式，js/combat.js）：
+//    第 84 拍起投、每颗隔 ~7 拍（末颗 143）、落差 1.6 s = 96 拍 ⇒ 呼叫后 150 拍时
+//    十颗全在飞、一颗未落；300 拍时全部落地清场。
+//    弹的**出生状态**必须在构造那一刻抓（Projectile 构造器同步调 onProjectile）：
+//    step 之后再读 pos 的话弹已经飞了一拍（vx×dt = 8/1.6/60 ≈ 8.3 cm），"正中"判据
+//    就被这一拍吃掉 —— 落点解析式 land = start + vel×1.6 只对出生态成立。
+// ── 锁点不锁人：落点锁定**呼叫这一拍**的位置，呼叫之后人挪走弹也不跟。
+const birthRecorder = (room) => {
+  const births = [];
+  const prev = room.game.onProjectile;
+  room.game.onProjectile = (p) => {
+    if (p.type === 'bomb') births.push({ p, start: p.pos.clone(), vel: p.vel.clone() });
+    if (prev) prev(p);
+  };
+  return births;
+};
+const landOf = (b) => ({ x: b.start.x + b.vel.x * 1.6, z: b.start.z + b.vel.z * 1.6 });
+
+const roomE2 = new NetRoom({ id: 'rules-e2', mapId: 'yard', seed: 20260926, streaks: ['uav', 'cluster', 'wp'] });
+await roomE2.start();
+const E2A = roomE2.addClient({ name: '甲', team: 'A' });
+const E2B = roomE2.addClient({ name: '乙', team: 'B' });
+for (let i = 0; i < 10; i++) roomE2.game.onKill(E2A.pl, E2B.pl, 'm4', false, {});
+const ebPos = E2B.pl.pos.clone();
+const births2 = birthRecorder(roomE2);
+roomE2.applyInput(E2A.cid, { tick: 0, mdx: 0, mdy: 0, keys: 0, buttons: 0, view: 0, seq: 1, streak: 2 });
+roomE2.step();
+// 呼叫之后把乙挪走 40 m：这条红了 = 有人把"锁点"写成了"锁人"（弹追着活人跑）。
+E2B.pl.pos.x += 40;
+for (let i = 0; i < 150; i++) roomE2.step();
+ok('D6 十颗弹头都在天上（投放窗 84–143 拍、首颗落点在 180 拍）',
+  births2.length === WP_BOMBS && births2.every(b => b.p.alive), `n=${births2.length}`);
+ok('D7 全部是表现副本（dumb）：白磷的账由"55 即时 + wpTicks 灼烧"结清，弹头再裁决就是重复计费',
+  births2.length > 0 && births2.every(b => b.p.dumb === true));
+const dOfE2 = (b) => Math.hypot(landOf(b).x - ebPos.x, landOf(b).z - ebPos.z);
+ok('D8 至少一颗正中呼叫时乙的位置（保底那颗不散）',
+  births2.some(b => dOfE2(b) < 0.02), `min=${Math.min(...births2.map(dOfE2)).toFixed(4)}`);
+ok('D9 全部十颗都落在乙"当时"的位置 ± 散布内（人被挪走也不跟）',
+  births2.every(b => dOfE2(b) <= WP_SCATTER * Math.SQRT2 + 0.05),
+  `max=${Math.max(...births2.map(dOfE2)).toFixed(3)}`);
+for (let i = 0; i < 150; i++) roomE2.step();
+ok('D10【反证】300 拍后十颗全部落地清场（不残留在 projectiles 里挂账）',
+  births2.every(b => !b.p.alive), `alive=${births2.filter(b => b.p.alive).length}`);
+
+// ── 保底每人一颗 + 加投随机分配：三个敌手各站一处（无输入的客户端，位置死静不掺 AI），
+//    十颗里每人至少一颗正中，其余的也都落在某个敌人的锁定点附近（随机 ≠ 扔进无人区）。
+//    呼叫之后三人全部挪走 40 m —— 与 D9 同一条锁点约定，三份各验一遍。
+const roomE3 = new NetRoom({ id: 'rules-e3', mapId: 'yard', seed: 20260926, streaks: ['uav', 'cluster', 'wp'] });
+await roomE3.start();
+const E3A = roomE3.addClient({ name: '甲', team: 'A' });
+const foes3 = [
+  roomE3.addClient({ name: '乙', team: 'B' }),
+  roomE3.addClient({ name: '丙', team: 'B' }),
+  roomE3.addClient({ name: '丁', team: 'B' }),
+];
+for (let i = 0; i < 10; i++) roomE3.game.onKill(E3A.pl, foes3[0].pl, 'm4', false, {});
+const foePos = foes3.map(c => c.pl.pos.clone());
+const births3 = birthRecorder(roomE3);
+roomE3.applyInput(E3A.cid, { tick: 0, mdx: 0, mdy: 0, keys: 0, buttons: 0, view: 0, seq: 1, streak: 2 });
+roomE3.step();
+for (const c of foes3) c.pl.pos.x += 40;
+for (let i = 0; i < 150; i++) roomE3.step();
+const dMin3 = (pos) => Math.min(...births3.map(b => Math.hypot(landOf(b).x - pos.x, landOf(b).z - pos.z)));
+ok('D11 三个敌人分十颗：总数还是 10', births3.length === WP_BOMBS, `n=${births3.length}`);
+ok('D12 每个敌人的锁定点上都有一颗正中（保底每人一颗；人已挪走弹照落原点）',
+  foes3.every((c, i) => dMin3(foePos[i]) < 0.02),
+  foes3.map((c, i) => dMin3(foePos[i]).toFixed(3)).join(','));
+ok('D13 每颗弹都落在某个敌人的位置 ± 散布内（加投随机分配，不进无人区）',
+  births3.every(b => Math.min(...foePos.map(pos => Math.hypot(landOf(b).x - pos.x, landOf(b).z - pos.z))) <= WP_SCATTER * Math.SQRT2 + 0.05));
+
+// ── 场上没有活敌：十颗退化到随机可走点，不整场哑掉。直接调共用段（与房间同参）——
+//    这是个两行的兜底，用单元粒度钉就够，不值得为它搭一条"把人弄死"的真链路。
+const roomE4 = new NetRoom({ id: 'rules-e4', mapId: 'yard', seed: 20260926, streaks: ['uav', 'cluster', 'wp'] });
+await roomE4.start();
+const E4A = roomE4.addClient({ name: '甲', team: 'A' });
+const births4 = birthRecorder(roomE4);
+phosphorusSweep(roomE4.game, roomE4.rules.clock, E4A.pl, []);
+for (let i = 0; i < 150; i++) roomE4.step();
+ok('D14【反证】空目标也投满十颗（火照点、屏照橙，弹幕不哑火）',
+  births4.length === WP_BOMBS, `n=${births4.length}`);
 
 // ═══════════════════════════════════════════════════════════════════════════
 sec('E. 群体警戒（alertGroup）：把"静默失效"接回来');

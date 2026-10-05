@@ -1121,10 +1121,12 @@ export class NetRoom {
     } else if (s.id === 'wp') {
       this.rules.wpTicks = WP_SECONDS * 60;
       this.wpOwner = pl;                       // 持续灼烧要认"谁放的这一片火"
-      // 白磷的 12 处火点在**此刻**就已抽好（phosphorusSweep 只把"什么时候点"交给排程器）。
-      // 服务端的 effects 是桩 ⇒ 这些火在权威世界里只是 fires 表里的一行，谁也看不见；
-      // 单机有真粒子，联机里却是"只掉血不发光"。把火点随事件发出去，客户端各点各的
-      // （表现副本，伤害照旧走 wpTicks 那条权威账）。
+      // 白磷的 12 处火点与十颗弹头的锁定落点在**此刻**就已抽好（phosphorusSweep 只把
+      // "什么时候点/投"交给排程器）。服务端的 effects 是桩 ⇒ 这些火在权威世界里只是
+      // fires 表里的一行，谁也看不见；单机有真粒子，联机里却是"只掉血不发光"。把火点
+      // 随事件发出去，客户端各点各的（表现副本，伤害照旧走 wpTicks 那条权威账）。
+      // 弹头不用进事件：Projectile 构造器的 onProjectile 钩子把它们逐颗编成 proj
+      // 事件广播，客户端各建各的表现副本（opts.dumb，零伤害）。
       const spots = phosphorusSweep(game, this.rules.clock, pl, this.enemiesOf(pl.team));
       this.events.push({
         e: 'wpFires', team: pl.team,
