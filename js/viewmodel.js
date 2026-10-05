@@ -281,7 +281,10 @@ export class Viewmodel {
     // 探头：相机已经带着横移与横滚（player.js:updateCamera），枪身给一点"滞后"——小幅反向
     // 平移 + 部分回正的滚转，读作"人探出去、枪还端着"，而不是整幅画面刚性平移。
     // 幅度是纯表现旋钮，不影响任何裁决（弹道从 camPos/aimDir 取）。
-    if (pl.leanT) { pos.x -= pl.leanT * 0.03; rz += pl.leanT * 0.09; }
+    // 开镜时必须随 (1-ae) 归零（与 sway/kick/呼吸同族）：ADS 位姿的全部意义是瞄具钉死在
+    // 弹道轴上，而开镜后瞄点就贴在眼底，这点横移会把分划甩出半屏（m4 红点满倾实测
+    // NDC x=0.52）。"枪滞后"是腰射的读法；贴腮了枪就没有滞后。
+    if (pl.leanT) { pos.x -= pl.leanT * 0.03 * (1 - ae); rz += pl.leanT * 0.09 * (1 - ae); }
     // 状态动画
     const k = ws.stateDur ? clamp(ws.stateT / ws.stateDur, 0, 1) : 1;
     const arms = cur.arms;
