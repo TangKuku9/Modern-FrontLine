@@ -19,6 +19,9 @@ export class HUD {
     this.announceT = 0;
     this.buildCompass();
     this.fpsAcc = 0; this.fpsN = 0;
+    // 节流累加器（客户端性能审查 C1）：初值给满 —— 进对局第一拍就把小地图/敌名画出来，
+    // 不等第一个周期。
+    this.sweepT = 1; this.mmT = 1;
     // 对局内聊天（差距 43）：行的缓冲、开合状态与频道都归 HUD —— 它是唯一画这块的层。
     // 命令（/w 私聊 · /emote 表情 · /mute /report）的判定在 js/net/chat.mjs（与菜单屏共用），这里只做分发。
     this.chatRows = []; this.chatActive = false; this.chatChannel = 'match';
@@ -51,6 +54,10 @@ export class HUD {
     $('fade').style.opacity = 0; $('flashOverlay').style.opacity = 0; this.flashT = 0;
     $('announce').style.opacity = 0; $('scorebar').innerHTML = ''; $('streaks').innerHTML = '';
     this.markerEls = {};
+    // 节流状态一并归位（C1）：_eqSig 不清的话，重开局装备串恰好与上局相同会跳写、
+    // 装备行空白；累加器给满让第一拍立刻重画。
+    this._eqSig = undefined; this.sweepT = 1; this.mmT = 1;
+    $('enemyName').textContent = '';
     // 聊天条也是上一局的残留：不清的话上一局的话会跟着新局一起开（与 deathScreen 同一类事）
     this.chatRows = []; this.chatActive = false; this.chatChannel = 'match'; clearTimeout(this.chatT);
     const cb = $('chatBox');
@@ -292,15 +299,23 @@ export class HUD {
     this.alertT -= dt;
     $('alertEdge').style.opacity = this.alertT > 0 ? 1 : 0;
     // 弹药。切出雷时弹面板换成雷种与余数（CS 同款：武器名位置报雷名）。
+    // 三格走同值门（C1）：textContent 同值赋值也会替换文本节点触发失效，而这四样
+    // 99% 的拍里没变 —— mag 只在开枪/换弹/拾取时动。low 类只随 mag 值变，跟着进门。
+    const wnEl = $('weaponName'), magEl = $('ammoMag'), resEl = $('ammoRes');
     if (w && ws.nadeMode) {
       const inv = ws.nadeMode.kind === 'lethal' ? pl.lethal : pl.tactical;
-      $('weaponName').textContent = (inv && inv.name) || ws.nadeMode.id;
-      const m = $('ammoMag'); m.textContent = inv ? inv.count : 0; m.classList.toggle('low', !inv || inv.count <= 1);
-      $('ammoRes').textContent = '';
+      const wnTxt = (inv && inv.name) || ws.nadeMode.id;
+      if (wnEl.textContent !== wnTxt) wnEl.textContent = wnTxt;
+      const magTxt = inv ? String(inv.count) : '0';
+      if (magEl.textContent !== magTxt) { magEl.textContent = magTxt; magEl.classList.toggle('low', !inv || inv.count <= 1); }
+      if (resEl.textContent !== '') resEl.textContent = '';
     } else if (w) {
-      $('weaponName').textContent = w.stats.name + (w.stats.suppressed ? ' · 消音' : '');
-      const m = $('ammoMag'); m.textContent = w.mag; m.classList.toggle('low', w.mag <= Math.ceil(w.stats.mag * 0.25));
-      $('ammoRes').textContent = '/ ' + w.reserve;
+      const wnTxt = w.stats.name + (w.stats.suppressed ? ' · 消音' : '');
+      if (wnEl.textContent !== wnTxt) wnEl.textContent = wnTxt;
+      const magTxt = String(w.mag);
+      if (magEl.textContent !== magTxt) { magEl.textContent = magTxt; magEl.classList.toggle('low', w.mag <= Math.ceil(w.stats.mag * 0.25)); }
+      const resTxt = '/ ' + w.reserve;
+      if (resEl.textContent !== resTxt) resEl.textContent = resTxt;
     }
     // 装备行：两种雷都挂在 4 上（按 4 在其间循环），切出中的那种点亮。
     {
@@ -309,7 +324,9 @@ export class HUD {
       if (pl.lethal) eq += `<span${on === 'lethal' ? ' style="color:var(--acc)"' : ''}>[4] ${pl.lethal.name}<b>×${pl.lethal.count}</b></span>`;
       if (pl.tactical) eq += `<span${on === 'tactical' ? ' style="color:var(--acc)"' : ''}>[4] ${pl.tactical.name}<b>×${pl.tactical.count}</b></span>`;
       if (game.mode && game.mode.nvgAvailable) eq += `<span>[N] 夜视仪</span>`;
-      $('equipRow').innerHTML = eq;
+      // 签名门（C1，W4 streak 同族）：这段 innerHTML 此前每拍全量重建 —— 60Hz 写一个
+      // 几乎从不变的字符串。变了才写。
+      if (eq !== this._eqSig) { this._eqSig = eq; $('equipRow').innerHTML = eq; }
     }
     // 罗盘
     const deg = ((-pl.yaw * 180 / Math.PI) % 360 + 360) % 360;
@@ -324,24 +341,32 @@ export class HUD {
       if (s.speaker) game.audio.beep(1);
     }
     if (this.announceT > 0) { this.announceT -= dt; if (this.announceT <= 0) $('announce').style.opacity = 0; }
-    // 瞄准敌人名称
-    const en = $('enemyName');
-    let name = '';
-    if (pl.alive) {
-      const cam = game.camera;
-      const d = cam.getWorldDirection(_v);
-      let best = 60;
-      const wh = game.world.raycast(cam.position, d, 60);
-      if (wh) best = wh.t;
-      for (const e of game.entities) {
-        // FFA 下 team 是每人一支的独立键，拿"同队"排除会把全场跳过 —— 瞄谁都不出名字。
-        if (e === pl || !e.alive || (e.team === pl.team && !(game.mode && game.mode.ffa)) || !e.hitTest) continue;
-        const h = e.hitTest(cam.position, d, best);
-        if (h) { name = e.name; best = h.t; }
+    // 瞄准敌人名称（C1）：一次 = world.raycast 全盒线性扫 + 全场实体 hitTest，
+    // 60Hz 跑它就是烧钱；名字读数 15Hz 足够 —— 上名/清名最坏延迟 66ms，肉眼不可分。
+    this.sweepT += dt;
+    if (this.sweepT >= 1 / 15) {
+      this.sweepT %= 1 / 15;
+      const en = $('enemyName');
+      let name = '';
+      if (pl.alive) {
+        const cam = game.camera;
+        const d = cam.getWorldDirection(_v);
+        let best = 60;
+        const wh = game.world.raycast(cam.position, d, 60);
+        if (wh) best = wh.t;
+        for (const e of game.entities) {
+          // FFA 下 team 是每人一支的独立键，拿"同队"排除会把全场跳过 —— 瞄谁都不出名字。
+          if (e === pl || !e.alive || (e.team === pl.team && !(game.mode && game.mode.ffa)) || !e.hitTest) continue;
+          const h = e.hitTest(cam.position, d, best);
+          if (h) { name = e.name; best = h.t; }
+        }
       }
+      en.textContent = name;
     }
-    en.textContent = name;
-    this.drawMinimap();
+    // 小地图（C1）：clearRect + topDown 整图缩放 blit + 逐实体圆点，HUD 里最重的一格。
+    // 30Hz —— 2.4px/m 的比例下跑动者每拍挪不到半像素，转身时 12°/拍的旋转也无顿挫感。
+    this.mmT += dt;
+    if (this.mmT >= 1 / 30) { this.mmT %= 1 / 30; this.drawMinimap(); }
     this.updateMarkers();
   }
 
@@ -358,15 +383,22 @@ export class HUD {
       seen.add(m.id);
       let el = this.markerEls[m.id];
       if (!el) { el = document.createElement('div'); box.appendChild(el); this.markerEls[m.id] = el; }
-      el.className = 'marker ' + (m.cls || '');
+      // 内容签名门（C1，streaks/_mSig 同族）：innerHTML 此前每标记每拍重写（含距离读数）
+      // —— 距离取整米，跑动时每秒也就变几次，站着不动一次都不写。投影与 left/top 仍
+      // 每拍照写（贴镜头的活不省），只把 className/innerHTML 按签名刷。
+      const dist = Math.round(m.pos.distanceTo(pl.pos));
+      const sig = (m.cls || '') + '|' + (m.label || '') + '|' + (m.text || '') + '|' + (m.hideDist ? '' : dist);
+      if (el._sig !== sig) {
+        el._sig = sig;
+        el.className = 'marker ' + (m.cls || '');
+        el.innerHTML = `<div class="dia"><span>${m.label || ''}</span></div>${m.text ? m.text + ' ' : ''}${m.hideDist ? '' : dist + 'm'}`;
+      }
       _v.copy(m.pos).project(cam);
       const behind = _v.z > 1;
       let x = (_v.x * 0.5 + 0.5) * W, y = (-_v.y * 0.5 + 0.5) * H;
       if (behind) { x = W - x; y = H - 40; }
       x = clamp(x, 40, W - 40); y = clamp(y, 60, H - 40);
-      const dist = Math.round(m.pos.distanceTo(pl.pos));
       el.style.left = x + 'px'; el.style.top = y + 'px';
-      el.innerHTML = `<div class="dia"><span>${m.label || ''}</span></div>${m.text ? m.text + ' ' : ''}${m.hideDist ? '' : dist + 'm'}`;
     }
     for (const id in this.markerEls) if (!seen.has(id)) { this.markerEls[id].remove(); delete this.markerEls[id]; }
   }

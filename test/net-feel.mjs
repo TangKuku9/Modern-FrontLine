@@ -1399,6 +1399,41 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
     medalSay(undefined, '无 tag') === '');
 }
 
+// ───────────────────────── AE. 骨骼求解钉 60Hz（docs/client-performance-audit.md C3）─────────────────────────
+// update 按渲染帧跑，144Hz 屏上 animateSoldier（两骨 IK + 落骨）跟着跑 144 次/s/人。
+// 节流后：插值/姿态平滑仍每帧走，只有落骨按 ≥1/60 的节拍跑，dt 用累进的真实帧时 ——
+// 动画速度与 60Hz 驱动同速。三条臂各跑 1 秒模拟时间，60Hz 那条必须逐位等于旧行为。
+{
+  const g = makeGame();
+  const r = mkRemote(g);
+  r.push(snap({}), 0);
+  r.update(1 / 60, 0.05 + INTERP_DELAY);          // 预热一拍，buf 有货
+  r.animRuns = 0;
+  for (let i = 0; i < 60; i++) r.update(1 / 60, 1 + i / 60);
+  ok('AE1 60Hz 驱动：骨骼求解每拍必发（与旧代码逐位一致）', r.animRuns === 60, `animRuns=${r.animRuns}`);
+  r.animRuns = 0;
+  for (let i = 0; i < 144; i++) r.update(1 / 144, 2 + i / 144);
+  ok('AE2 144Hz 驱动（高刷屏）：仍钉 60（老代码 144）', r.animRuns >= 59 && r.animRuns <= 61, `animRuns=${r.animRuns}`);
+  r.animRuns = 0;
+  for (let i = 0; i < 240; i++) r.update(1 / 240, 3 + i / 240);
+  ok('AE3 240Hz 驱动：仍钉 60（老代码 240）', r.animRuns >= 59 && r.animRuns <= 61, `animRuns=${r.animRuns}`);
+  // 平滑通道仍在**每帧**走：趴姿通道按 10/s 收敛，同样的喂法与模拟时长，240 小步与
+  // 60 大步应收敛到同一落点（差 ~2e-5）。若有人把平滑搬进节流分支，240 那条会停在
+  // 0.08 附近 —— 这条就是抓那个的。
+  const driveProne = (steps, dt, t0) => {
+    const gg = makeGame();
+    const rr = mkRemote(gg);
+    rr.push(snap({ flags: FLAG.Alive | FLAG.OnGround | FLAG.Prone }), 0);
+    rr.update(dt, t0 + INTERP_DELAY);
+    for (let i = 0; i < steps; i++) rr.update(dt, t0 + INTERP_DELAY + (i + 1) * dt);
+    return rr.anim.prone;
+  };
+  const p240 = driveProne(240, 1 / 240, 3);
+  const p60 = driveProne(60, 1 / 60, 4);
+  ok('AE4 姿态平滑仍按渲染帧收敛：240 小步 ≈ 60 大步（平滑被搬进节流分支会当场分叉）',
+    Math.abs(p240 - p60) < 1e-3, `prone(240Hz)=${p240.toFixed(5)} · prone(60Hz)=${p60.toFixed(5)}`);
+}
+
 // ───────────────────────── 收口 ─────────────────────────
 const bad = out.filter(([g]) => !g);
 for (const [g, label] of out) console.log(`  ${g ? '✅' : '❌'} ${label}`);

@@ -7,6 +7,9 @@
 // 这三条在 server/net-probe.mjs 里只有前半个（裸 WebSocket 版本），这里补上
 // "浏览器里那份 sim + 那套输入总线 + 那个插值渲染"确实接上了的实证。
 //
+// 另有 HUD 节流段（docs/client-performance-audit.md C1）：暂停本地模拟，同步手动驱动
+// hud.update 计数 —— 小地图/敌名的真实频率与 equipRow/marker 的 DOM 写次数。
+//
 //   node test/net-play.mjs          自己起临时服务，不需要事先手起 8080
 import { chromium } from 'playwright';
 import { withServer } from './with-server.mjs';
@@ -1026,6 +1029,60 @@ try {
   await sleep(500);
   const ticks2 = await A.page.evaluate(() => window.game.tick);
   ok('甲的模拟节拍没停', ticks2 - frozen > 20, `0.5 秒推进 ${ticks2 - frozen} 拍（≈${((ticks2 - frozen) * 2).toFixed(0)}Hz）`);
+
+  // ── HUD 节流（docs/client-performance-audit.md C1）──
+  // 暂停停掉自然驱动（frame() 在 paused 下不进 Game.update，hud.update 只剩手动这一路），
+  // 然后在**一段同步代码里**驱动 hud.update(1/60)：同步块内不会有快照/事件插进来改状态，
+  // 玩家位置与装备都是冻结的，计数是确定性的 —— 老代码这几格都是每拍 60 次。
+  const hudR = await A.page.evaluate(() => {
+    const g = window.game, h = g.hud;
+    g.paused = true;
+    const origList = h.markerList;
+    // 标记层可能为空（看模式）：HUD 是数据驱动的，从生产入口 setMarkers 喂一个探针标记
+    if (!(origList || []).length) h.setMarkers([{ id: '__probe', pos: { x: 12, y: 1.2, z: 8, distanceTo: () => 42 } }]);
+    const origMM = h.drawMinimap;
+    let mm = 0;
+    h.drawMinimap = function (...a) { mm++; return origMM.apply(this, a); };
+    const out = { en: 0, equip: 0, marker: 0 };
+    const enEl = document.getElementById('enemyName');
+    const textDesc = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent');
+    Object.defineProperty(enEl, 'textContent', {
+      configurable: true, get: textDesc.get,
+      set(v) { out.en++; textDesc.set.call(this, v); },
+    });
+    const htmlDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+    Object.defineProperty(Element.prototype, 'innerHTML', {
+      configurable: true, get: htmlDesc.get,
+      set(v) {
+        if (this.id === 'equipRow') out.equip++;
+        else if (this.parentElement && this.parentElement.id === 'markers') out.marker++;
+        htmlDesc.set.call(this, v);
+      },
+    });
+    h.update(1 / 60);                 // 预热拍：新建标记元素/首写全在这一拍，不计入
+    mm = 0; out.en = 0; out.equip = 0; out.marker = 0;
+    for (let i = 0; i < 60; i++) h.update(1 / 60);    // 静止 1 秒（模拟时间）
+    const r = { mm: mm, en: out.en, equip: out.equip, marker: out.marker };
+    if (g.player.lethal) g.player.lethal.count++;     // 变更臂：数据真变必须当拍写回
+    else h._eqSig = undefined;                        //（没有雷的形态退到签名桩，同一最低水位）
+    h.update(1 / 60);
+    r.eqDelta = out.equip - r.equip;
+    r.nMarkers = document.getElementById('markers').children.length;
+    // 还原：原型描述符、探针标记、包装器 —— 最后一拍让 updateMarkers 自己收掉探针元素
+    Object.defineProperty(Element.prototype, 'innerHTML', htmlDesc);
+    delete enEl.textContent;
+    delete h.drawMinimap;
+    h.setMarkers(origList);
+    h.update(1 / 60);
+    g.paused = false;
+    return r;
+  });
+  ok(`小地图 30Hz：1 秒重绘 ${hudR.mm} 次（老代码 60）`, hudR.mm >= 29 && hudR.mm <= 31, `mm=${hudR.mm}`);
+  ok(`敌名扫描 15Hz：1 秒 ${hudR.en} 次（老代码 60，每次 = 全盒 raycast + 全场 hitTest）`, hudR.en >= 14 && hudR.en <= 16, `en=${hudR.en}`);
+  ok('equipRow 静止 60 拍 0 次 innerHTML（老代码 60）', hudR.equip === 0, `equip=${hudR.equip}`);
+  ok('equipRow 数据变更当拍写回', hudR.eqDelta === 1, `eqDelta=${hudR.eqDelta}`);
+  ok(`marker 内容签名门：静止 60 拍 0 次 innerHTML × ${hudR.nMarkers} 个标记（老代码每标记 60）`,
+    hudR.marker === 0 && hudR.nMarkers >= 1, `marker=${hudR.marker} n=${hudR.nMarkers}`);
 
   await A.page.screenshot({ path: 'test/net-play-A.png' });
   await B.page.screenshot({ path: 'test/net-play-B.png' });

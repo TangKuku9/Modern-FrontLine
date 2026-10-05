@@ -34,6 +34,9 @@ export function setInterpDelay(v) { INTERP_DELAY = clamp(v, INTERP_MIN, INTERP_M
 export const MAX_EXTRAPOLATION = 0.15;              // 速度外推上限，秒
 export const LEAVE_FADE = 0.8;                      // 离房淡出时长，秒
 const TRACER_LEN = 60;                              // 曳光画多长，米
+// 骨骼求解的最小间隔（性能审查 C3）：update 按渲染帧跑，144Hz 屏上两骨 IK + 落骨
+// 会跑 144 次/s/人 —— 钉回 60Hz，动画速度不吃亏（dt 用累进的真实帧时）。
+const ANIM_MIN_DT = 1 / 60;
 
 const _v = new THREE.Vector3(), _m = new THREE.Vector3(), _e = new THREE.Vector3();
 
@@ -225,12 +228,24 @@ export class NetPlayer {
     this.alive = !!(s.flags & FLAG.Alive);
   }
 
+  // 骨骼求解钉 60Hz（性能审查 C3）：pos/yaw/姿态通道的插值与平滑仍按渲染帧走
+  // （144Hz 下移动依旧丝滑），只有两骨 IK + 落骨这一坨按 ≥1/60 的节拍跑，dt 用
+  // 累进的真实帧时 —— 动画速度与 60Hz 驱动同速。按 60Hz 驱动（net-feel、锁 60 的
+  // 渲染）时每拍必发，行为与旧代码一致。animRuns 给判据数（net-feel 的 C3 段）。
+  _anim(dt) {
+    this._animT = (this._animT || 0) + dt;
+    if (this._animT < ANIM_MIN_DT) return;
+    this.animRuns = (this.animRuns || 0) + 1;
+    animateSoldier(this.model, this.anim, this._animT);
+    this._animT %= ANIM_MIN_DT;
+  }
+
   update(dt, now = performance.now() / 1000) {
     // 正在淡出的人不再接快照、不再做表现，只把倒地动画走完 + 把不透明度推下去。
     if (this.leaving) {
       this.leaveT += dt;
       this.anim.speed = 0;
-      animateSoldier(this.model, this.anim, dt);
+      this._anim(dt);
       const k = clamp(1 - this.leaveT / LEAVE_FADE, 0, 1);
       for (const m of this._fadeMats || []) m.opacity = k;
       if (this.tag) this.tag.visible = false;
@@ -337,7 +352,7 @@ export class NetPlayer {
     // 冲刺 / 滞空同理：位在快照里存了很久（this.sprinting / this.onGround），模型端一直没消费。
     a.sprint = lerp(a.sprint, this.sprinting ? 1 : 0, Math.min(1, dt * 10));
     a.air = lerp(a.air, this.onGround ? 0 : 1, Math.min(1, dt * 10));
-    animateSoldier(this.model, a, dt);
+    this._anim(dt);
 
     // 受击抖动：模型沿弹道方向被推一下，幅度线性衰减。纯表现，不改 pos（pos 是权威的）。
     if (this.hurtT > 0) {

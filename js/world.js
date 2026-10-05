@@ -18,6 +18,8 @@ function boxGeo(w, h, d, s) {
   return g;
 }
 
+const _asc = (a, b) => a - b;
+
 export class World {
   constructor(game, def) {
     this.game = game;
@@ -51,13 +53,14 @@ export class World {
       if (opt.rotY && Math.abs(Math.sin(opt.rotY)) > 0.7) { hw = d / 2; hd = w / 2; }
       const b = { x0: cx - hw, x1: cx + hw, y0, y1: y0 + h, z0: cz - hd, z1: cz + hd, mat: matName, pen: opt.pen };
       this.boxes.push(b);
+      this._broadDirty = true;
       return b;
     }
     return null;
   }
   collider(x0, y0, z0, x1, y1, z1) {
     const b = { x0, y0, z0, x1, y1, z1 };
-    this.boxes.push(b); return b;
+    this.boxes.push(b); this._broadDirty = true; return b;
   }
   mesh(geo, matName, x, y, z, opt = {}) {
     const m = new THREE.Mesh(geo, typeof matName === 'string' ? mat(matName) : matName);
@@ -504,11 +507,109 @@ export class World {
   }
 
   // ---------- 碰撞查询 ----------
+  // 宽相（性能审查 C2）：静态盒的均匀哈希格子。查询按"查询包围盒(+裕量)覆盖的格子"取
+  // 候选，**索引升序**返回 —— 五条查询的逐盒判定一字不改、顺序与全量线性扫一致，因此
+  // 命中/推挤结果逐位相同（tie 也落在同一盒）。格子分派与查询都取 floor（单调），候选集
+  // 是"可能命中"的超集；P=2cm 是实数↔浮点的裕量（浮点误差 ~1e-12 量级，裕量大十个数量级）。
+  // 两端共用这份文件（server/headless-game.mjs 动态 import），逐位等价是预测/回滚的命根子：
+  // 任何"顺手优化"判定式的改动都会让两端分叉，判据见 test/rollback / reconcile-chain / lagcomp。
+  buildBroad() {
+    // 格网范围取**全部盒子的联合包围盒**（不是 def.size）：地面那张大平面横跨
+    // size+80 米，比任何"按地图尺寸"的格网都宽 —— 范围窄了的话，格外的查询一格
+    // 都取不到，而全量扫照样命中（第一版在这里翻的车）。x/z 各有原点。
+    const cs = this.bcs = 8, pad = 2;
+    let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+    for (const b of this.boxes) {
+      if (b.x0 < minX) minX = b.x0; if (b.x1 > maxX) maxX = b.x1;
+      if (b.z0 < minZ) minZ = b.z0; if (b.z1 > maxZ) maxZ = b.z1;
+    }
+    minX -= pad; minZ -= pad; maxX += pad; maxZ += pad;
+    const nx = this.bnx = Math.max(1, Math.ceil((maxX - minX) / cs));
+    const nz = this.bnz = Math.max(1, Math.ceil((maxZ - minZ) / cs));
+    this.bx0 = minX; this.bz0 = minZ;
+    const cells = this.broad = new Array(nx * nz);
+    for (let i = 0; i < cells.length; i++) cells[i] = [];
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
+      const x0 = Math.floor((b.x0 - this.bx0) / cs), x1 = Math.floor((b.x1 - this.bx0) / cs);
+      const z0 = Math.floor((b.z0 - this.bz0) / cs), z1 = Math.floor((b.z1 - this.bz0) / cs);
+      for (let z = Math.max(0, z0); z <= Math.min(nz - 1, z1); z++)
+        for (let x = Math.max(0, x0); x <= Math.min(nx - 1, x1); x++)
+          cells[z * nx + x].push(i);
+    }
+    this._qStamp = new Int32Array(this.boxes.length);
+    this._qTick = 0;
+    this._qOut = [];
+    // 精确贴面索引（rayAABB 的 NaN 幽灵命中兜底，见 raycast 内注释）：每轴一张
+    // "面坐标 → 盒索引"表。键是精确浮点相等，Map 的 SameValueZero 恰好就是这个语义。
+    const fx = this._faceX = new Map(), fy = this._faceY = new Map(), fz = this._faceZ = new Map();
+    const push = (m, k, i) => { const a = m.get(k); if (a) a.push(i); else m.set(k, [i]); };
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
+      push(fx, b.x0, i); push(fx, b.x1, i);
+      push(fy, b.y0, i); push(fy, b.y1, i);
+      push(fz, b.z0, i); push(fz, b.z1, i);
+    }
+    this._broadLen = this.boxes.length;
+    this._broadDirty = false;
+  }
+  // 返回候选盒**索引**的复用数组（升序、去重）。scratch 挂在实例上不挂模块级：
+  // 服务端多房间各有一个 World，跨房互踩是立过账的事（快照 scratch 同款教训）。
+  _query(minx, minz, maxx, maxz) {
+    // 运行时增删盒子会绕过 box()/collider()（战役的闸门是直接 filter w.boxes，
+    // campaign.js:openGate）—— 脏标记之外再校验一次长度，变了就重建。
+    if (!this.broad || this._broadDirty || this._broadLen !== this.boxes.length) this.buildBroad();
+    // Int32 戳的回绕守卫：戳写进 Int32Array 会截断，回绕后旧戳可能假阳性（重复候选）。
+    if (this._qTick >= 0x7ffffffe) { this._qStamp.fill(0); this._qTick = 0; }
+    const cs = this.bcs, nx = this.bnx, nz = this.bnz, P = 0.02;
+    const x0 = Math.floor((minx - P - this.bx0) / cs), x1 = Math.floor((maxx + P - this.bx0) / cs);
+    const z0 = Math.floor((minz - P - this.bz0) / cs), z1 = Math.floor((maxz + P - this.bz0) / cs);
+    const tick = ++this._qTick, stamp = this._qStamp, out = this._qOut, cells = this.broad;
+    out.length = 0;
+    for (let z = z0; z <= z1; z++) {
+      if (z < 0 || z >= nz) continue;
+      const row = z * nx;
+      for (let x = x0; x <= x1; x++) {
+        if (x < 0 || x >= nx) continue;
+        const cell = cells[row + x];
+        for (let j = 0; j < cell.length; j++) {
+          const i = cell[j];
+          if (stamp[i] !== tick) { stamp[i] = tick; out.push(i); }
+        }
+      }
+    }
+    out.sort(_asc);
+    return out;
+  }
+  // 把"面坐标与 coord 精确相等"的盒子并进候选（通常一张都不剩）。只在对应 d 分量
+  // 恰为 0 时调用 —— 平时一个 Map 查询都不付。
+  _phantom(cand, map, coord) {
+    const l = map.get(coord);
+    if (!l) return;
+    let added = false;
+    for (let j = 0; j < l.length; j++) if (!cand.includes(l[j])) { cand.push(l[j]); added = true; }
+    if (added) cand.sort(_asc);
+  }
   raycast(o, d, maxT, ignorePen = false) {
     let best = maxT, hit = null;
-    const bx = this.boxes;
-    for (let i = 0; i < bx.length; i++) {
-      const b = bx[i];
+    // 段包围盒（+2cm 裕量）取候选，y 范围再粗筛一道；逐盒 rayAABB 原样。
+    const ex = o.x + d.x * maxT, ey = o.y + d.y * maxT, ez = o.z + d.z * maxT;
+    const cand = this._query(Math.min(o.x, ex), Math.min(o.z, ez), Math.max(o.x, ex), Math.max(o.z, ez));
+    // NaN 幽灵命中兜底（既有行为，两端逐位共有，必须复刻而不是修）：d 某轴分量为 0
+    // 时 rayAABB 走 1/0=∞，若原点坐标与某盒面**精确相等**，(0)×(∞)=NaN 毒化 tmax，
+    // 之后所有比较恒 false —— 任何远处的盒子都会被判成 t=0 命中。这类盒子在空间上
+    // 可以离段无限远、不认任何 slab 几何（连 y 都不认），格子取不到，只能按"贴面"
+    // 精确索引进候选；且轴零射线的 y 粗筛必须整段跳过（幽灵连 y 几何都不遵守）。
+    const axisZero = d.x === 0 || d.y === 0 || d.z === 0;
+    if (axisZero) {
+      if (d.x === 0) this._phantom(cand, this._faceX, o.x);
+      if (d.y === 0) this._phantom(cand, this._faceY, o.y);
+      if (d.z === 0) this._phantom(cand, this._faceZ, o.z);
+    }
+    const ymin = Math.min(o.y, ey) - 0.02, ymax = Math.max(o.y, ey) + 0.02;
+    for (let k = 0; k < cand.length; k++) {
+      const b = this.boxes[cand[k]];
+      if (!axisZero && (b.y0 > ymax || b.y1 < ymin)) continue;
       const t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, best);
       if (t >= 0 && t < best) { best = t; hit = b; }
     }
@@ -527,46 +628,73 @@ export class World {
     const L = Math.hypot(dx, dy, dz);
     if (L < 0.01) return false;
     const ix = dx / L, iy = dy / L, iz = dz / L;
-    const bx = this.boxes;
-    for (let i = 0; i < bx.length; i++) {
-      if (rayAABB(a.x, a.y, a.z, ix, iy, iz, bx[i], L - 0.05) >= 0) return true;
+    const endT = L - 0.05;
+    const ex = a.x + ix * endT, ey = a.y + iy * endT, ez = a.z + iz * endT;
+    const cand = this._query(Math.min(a.x, ex), Math.min(a.z, ez), Math.max(a.x, ex), Math.max(a.z, ez));
+    const axisZero = ix === 0 || iy === 0 || iz === 0;
+    if (axisZero) {
+      if (ix === 0) this._phantom(cand, this._faceX, a.x);
+      if (iy === 0) this._phantom(cand, this._faceY, a.y);
+      if (iz === 0) this._phantom(cand, this._faceZ, a.z);
+    }
+    const ymin = Math.min(a.y, ey) - 0.02, ymax = Math.max(a.y, ey) + 0.02;
+    for (let k = 0; k < cand.length; k++) {
+      const bx = this.boxes[cand[k]];
+      if (!axisZero && (bx.y0 > ymax || bx.y1 < ymin)) continue;
+      if (rayAABB(a.x, a.y, a.z, ix, iy, iz, bx, endT) >= 0) return true;
     }
     return false;
   }
   // 圆柱体与方块碰撞，修改 pos，返回是否着地
   collide(pos, vel, radius, height, step = 0.45) {
-    const bx = this.boxes;
-    for (let iter = 0; iter < 2; iter++) {
-      for (let i = 0; i < bx.length; i++) {
-        const b = bx[i];
-        if (b.y1 <= pos.y + step || b.y0 >= pos.y + height) continue;
-        if (pos.x + radius < b.x0 || pos.x - radius > b.x1 || pos.z + radius < b.z0 || pos.z - radius > b.z1) continue;
-        const cx = clamp(pos.x, b.x0, b.x1), cz = clamp(pos.z, b.z0, b.z1);
-        let dx = pos.x - cx, dz = pos.z - cz;
-        const d2 = dx * dx + dz * dz;
-        if (d2 > radius * radius) continue;
-        if (d2 > 1e-8) {
-          const d = Math.sqrt(d2), push = radius - d;
-          dx /= d; dz /= d;
-          pos.x += dx * push; pos.z += dz * push;
-          const vn = vel.x * dx + vel.z * dz;
-          if (vn < 0) { vel.x -= vn * dx; vel.z -= vn * dz; }
-        } else {
-          // 中心在盒内
-          const l = pos.x - b.x0, r = b.x1 - pos.x, n = pos.z - b.z0, s = b.z1 - pos.z;
-          const m = Math.min(l, r, n, s);
-          if (m === l) pos.x = b.x0 - radius; else if (m === r) pos.x = b.x1 + radius;
-          else if (m === n) pos.z = b.z0 - radius; else pos.z = b.z1 + radius;
+    // 候选按"入参 pos ± (radius+M)"取一轮，两轮迭代共用。陷阱：推挤会在循环中途改 pos
+    // —— 原全量扫"处理到谁"取决于当时的活 pos，固定候选框可能漏掉被推出去之后才碰到的
+    // 盒子。所以推挤全程记包络（min/max），出包络就还原入参、包络翻倍整轮重来 ——
+    // 最终候选集收敛到全量，结果与旧实现逐位一致。正常几何一轮都出不了包络，重试是零成本。
+    const ox = pos.x, oy = pos.y, oz = pos.z, ovx = vel.x, ovz = vel.z;
+    let M = 1.5;
+    for (;;) {
+      pos.x = ox; pos.y = oy; pos.z = oz; vel.x = ovx; vel.z = ovz;
+      let minX = ox, maxX = ox, minZ = oz, maxZ = oz;
+      const cand = this._query(ox - radius - M, oz - radius - M, ox + radius + M, oz + radius + M);
+      for (let iter = 0; iter < 2; iter++) {
+        for (let k = 0; k < cand.length; k++) {
+          const b = this.boxes[cand[k]];
+          if (b.y1 <= pos.y + step || b.y0 >= pos.y + height) continue;
+          if (pos.x + radius < b.x0 || pos.x - radius > b.x1 || pos.z + radius < b.z0 || pos.z - radius > b.z1) continue;
+          const cx = clamp(pos.x, b.x0, b.x1), cz = clamp(pos.z, b.z0, b.z1);
+          let dx = pos.x - cx, dz = pos.z - cz;
+          const d2 = dx * dx + dz * dz;
+          if (d2 > radius * radius) continue;
+          if (d2 > 1e-8) {
+            const d = Math.sqrt(d2), push = radius - d;
+            dx /= d; dz /= d;
+            pos.x += dx * push; pos.z += dz * push;
+            if (pos.x < minX) minX = pos.x; else if (pos.x > maxX) maxX = pos.x;
+            if (pos.z < minZ) minZ = pos.z; else if (pos.z > maxZ) maxZ = pos.z;
+            const vn = vel.x * dx + vel.z * dz;
+            if (vn < 0) { vel.x -= vn * dx; vel.z -= vn * dz; }
+          } else {
+            // 中心在盒内
+            const l = pos.x - b.x0, r = b.x1 - pos.x, n = pos.z - b.z0, s = b.z1 - pos.z;
+            const m = Math.min(l, r, n, s);
+            if (m === l) pos.x = b.x0 - radius; else if (m === r) pos.x = b.x1 + radius;
+            else if (m === n) pos.z = b.z0 - radius; else pos.z = b.z1 + radius;
+            if (pos.x < minX) minX = pos.x; else if (pos.x > maxX) maxX = pos.x;
+            if (pos.z < minZ) minZ = pos.z; else if (pos.z > maxZ) maxZ = pos.z;
+          }
         }
       }
+      if (minX >= ox - M && maxX <= ox + M && minZ >= oz - M && maxZ <= oz + M) return;
+      M *= 2;
     }
   }
   groundHeight(x, z, feetY, radius, step = 0.45) {
     let g = 0;
-    const bx = this.boxes;
     const r = radius * 0.7;
-    for (let i = 0; i < bx.length; i++) {
-      const b = bx[i];
+    const cand = this._query(x - r, z - r, x + r, z + r);
+    for (let k = 0; k < cand.length; k++) {
+      const b = this.boxes[cand[k]];
       if (b.y1 > feetY + step || b.y1 <= g) continue;
       if (x + r < b.x0 || x - r > b.x1 || z + r < b.z0 || z - r > b.z1) continue;
       g = b.y1;
@@ -576,7 +704,9 @@ export class World {
   ceilingHeight(x, z, feetY, radius) {
     let c = Infinity;
     const r = radius * 0.7;
-    for (const b of this.boxes) {
+    const cand = this._query(x - r, z - r, x + r, z + r);
+    for (let k = 0; k < cand.length; k++) {
+      const b = this.boxes[cand[k]];
       if (b.y0 < feetY + 0.5 || b.y0 >= c) continue;
       if (x + r < b.x0 || x - r > b.x1 || z + r < b.z0 || z - r > b.z1) continue;
       c = b.y0;

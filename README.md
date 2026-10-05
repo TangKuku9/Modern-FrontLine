@@ -240,7 +240,7 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 ### 验收
 
 ```bash
-npm test              # 主体档：gate + docs-guard + rollback + reconcile-chain + net-journal + codec + lagcomp + mp-rules + accounts + progress + hardening + service-guards + room-flow + room-bots + room-dir + image + net-probe + deploy-probe + xenv + fps + viewmodel + gunvisual + net-feel + net-audit + heli-armor + optic + state-leak
+npm test              # 主体档：gate + docs-guard + rollback + reconcile-chain + world-equiv + net-journal + codec + lagcomp + mp-rules + accounts + progress + hardening + service-guards + room-flow + room-bots + room-dir + image + net-probe + deploy-probe + xenv + fps + viewmodel + gunvisual + net-feel + net-audit + heli-armor + optic + state-leak
 npm run test:browser  # 对打 / 掉线 / 同源双标签页三档：net-play + net-drop + tab-session
 npm run test:all      # 上面两档全跑
 ```
@@ -255,6 +255,7 @@ npm run test:all      # 上面两档全跑
 - `test/docs-guard.mjs`：文档守卫 —— 两份清单（README《验收》与 `docs/deploy-checklist.md` §0）和 `package.json` 三档脚本的**互相**覆盖、一份从源码推的浏览器分档名单，外加两张表：「已推翻的断言」（旧话不许再出现，收口记录也不许被删掉换绿）与「已换掉的尺子」（D′ 段，尺子架在测试源码上：`server/net-probe.mjs` 与 `test/net-play.mjs` 那两条"各自最后一包相减"、`≥50Hz` 那条绝对门槛、以及 `test/hardening.mjs` 那条"睡 300 ms 再重连" —— 旧写法不许回来，新写法**连它的先决臂与判别臂**也不许被删掉换绿）。六段之外还有两处"两半边一起看"：D″ 段（README《已知缺口》与部署清单**对同一件事必须说同一句话**：一处改了另一处没改要红）与 G 段（每份浏览器判据的 `launch` 链里必须有一档交给 Playwright 自己解析，否则上面那句 `npx playwright install chromium` 是假的）。各段都带反证臂，且先决臂要求解析出来的集合非空（改个标题就想让它恒绿会被当场点名）
 - `test/rollback.mjs`：回滚重放与顺跑逐位相同（含两代回滚、首段空跑、同一拍多次纠正、每实体私有流几组反证）
 - `test/reconcile-chain.mjs`：快照**链**上的回滚记账，判据按窗口形状分开写，核心是 `applySteps == dTick` 恒等式
+- `test/world-equiv.mjs`：碰撞宽相（`js/world.js` 的 `buildBroad`/`_query`，C2）与旧全量线性扫的**逐位等价**差分 —— 两端共用这一份文件，候选集漏一个盒就是预测/回滚分叉。覆盖真地图差分、原点贴盒面的边缘用例（这里钉住 `rayAABB` 的 NaN 幽灵命中：d 某轴为 0 且原点与某盒面**精确相等**时，任何远处的盒子都可能被判成 t=0 命中 —— 两端共有的既有行为，**必须复刻而不是修**，宽相为此带 `_faceX/Y/Z` 贴面索引、轴零射线不做 y 粗筛）、嵌套大盒逼出的 collide 包络重试、战役闸门运行时删盒的重建，以及"比对器会红"的反证臂。改 `rayAABB`/`_query`/碰撞常数之后必须先过这里
 - `test/net-journal.mjs`：日记本字段覆盖率守卫（新字段必须登记归属）
 - `server/lagcomp.mjs` + `test/lagcomp.mjs`：回溯裁决与"报哪一拍"两半各自有反证臂；判据是二维矩阵（瞄哪一点 × 报哪一拍），闸门两端由 `44 ≥ (L+42) − 60` 的解定在 L = 62/63，不是猜的
 - `test/mp-rules.mjs`：联机规则（连杀奖励 / 按拍排程 / 群体警戒 / 记分 / 隔离）的机制证明，进程内手动 `step()`，所以"呼叫集束空袭后第 84 拍出第一颗弹"是确定性判据而不是"等 1.4 秒看看"
