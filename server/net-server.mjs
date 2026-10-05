@@ -193,7 +193,11 @@ const GZIPPABLE = /^(text\/|application\/(javascript|json|wasm))/;
 // 把 server/（权威端源码、协议细节）和 .git/ 一起发给任何人 —— 实测 dev 模式下
 // GET /server/net-server.mjs 会返回 15 KB 源码。判据用白名单而不是黑名单：
 // 黑名单要每次都想全（test/、node_modules/、*.log、.env…），白名单一次写完。
-const PUBLIC = ['index.html', 'style.css', 'js/', 'lib/', 'assets/', 'public/', 'favicon.ico'];
+// 'server/codec.mjs' 是唯一放行的 server/ 单文件：它是**协议编解码**，客户端模块图
+// 正经引用着它（js/net/client.mjs / lobby.mjs）—— 不放行的话生产模式整张页面因模块
+// 解析失败起不来（test/preload-graph.mjs 揪出来的潜伏 bug）。编解码数学本就是任何
+// 客户端必备、无一处机密；server/ 其余源码照旧全封（remote-probe 的 404 断言不变）。
+const PUBLIC = ['index.html', 'style.css', 'js/', 'lib/', 'assets/', 'public/', 'favicon.ico', 'server/codec.mjs'];
 function publiclyServable(rel) {
   const p = rel.replace(/\\/g, '/');
   if (p.split('/').some(seg => seg.startsWith('.'))) return false;         // .git / .vscode / .env

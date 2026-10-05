@@ -21,7 +21,7 @@
 ## 0. 先把自己关在门外看一遍（改代码之后必跑）
 
 ```bash
-npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / world-equiv / worker-core / net-journal / codec / lagcomp / mp-rules / accounts / progress / hardening / service-guards / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / net-audit / heli-armor / optic / state-leak
+npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / world-equiv / worker-core / preload-graph / net-journal / codec / lagcomp / mp-rules / accounts / progress / hardening / service-guards / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / net-audit / heli-armor / optic / state-leak
                   # 其中要一个真浏览器的那几份，名单见 README《验收》（从源码推的，别在这儿抄第二份）
 npm run test:all  # 再加四个真浏览器测试（net-play 对打、net-drop 掉线、tab-session 同源双标签页、worker-live 离线实跑 Worker 双路）
 ```

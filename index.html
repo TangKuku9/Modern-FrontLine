@@ -9,6 +9,66 @@
 <script type="importmap">
 { "imports": { "three": "./lib/three.module.js", "three/addons/": "./lib/jsm/" } }
 </script>
+<!-- 模块预载清单（性能审查 C8）：ESM 的按需发现是瀑布——main.js 解析完才知道下一层
+     import，冷加载白付五六轮 RTT。这份清单由 test/preload-graph.mjs 从源码模块图推出
+     （两个根：js/main.js 页面入口 + js/worker.mjs 常驻 Worker），加了新模块跑一遍判据，
+     缺哪行它会打印出来。语义红线：预载不改缓存语义 —— 服务端仍然 no-cache + 304 回源，
+     "发版本即同步"（云部署更新时旧缓存卡加载屏的那条账）一行不动。 -->
+<link rel="modulepreload" href="js/account.js">
+<link rel="modulepreload" href="js/ai.js">
+<link rel="modulepreload" href="js/audio.js">
+<link rel="modulepreload" href="js/campaign.js">
+<link rel="modulepreload" href="js/combat.js">
+<link rel="modulepreload" href="js/data.js">
+<link rel="modulepreload" href="js/effects.js">
+<link rel="modulepreload" href="js/escape.js">
+<link rel="modulepreload" href="js/gunmodel.js">
+<link rel="modulepreload" href="js/hud.js">
+<link rel="modulepreload" href="js/loadout.mjs">
+<link rel="modulepreload" href="js/main.js">
+<link rel="modulepreload" href="js/maps.js">
+<link rel="modulepreload" href="js/match-rules.js">
+<link rel="modulepreload" href="js/materials.js">
+<link rel="modulepreload" href="js/menu.js">
+<link rel="modulepreload" href="js/mp.js">
+<link rel="modulepreload" href="js/net/chat.mjs">
+<link rel="modulepreload" href="js/net/client.mjs">
+<link rel="modulepreload" href="js/net/identity.mjs">
+<link rel="modulepreload" href="js/net/idle-ruler.mjs">
+<link rel="modulepreload" href="js/net/lobby.mjs">
+<link rel="modulepreload" href="js/net/predict.mjs">
+<link rel="modulepreload" href="js/net/remote.mjs">
+<link rel="modulepreload" href="js/noise.js">
+<link rel="modulepreload" href="js/pathfind.js">
+<link rel="modulepreload" href="js/player.js">
+<link rel="modulepreload" href="js/progress.mjs">
+<link rel="modulepreload" href="js/quant.js">
+<link rel="modulepreload" href="js/rng.js">
+<link rel="modulepreload" href="js/soldier.js">
+<link rel="modulepreload" href="js/textures-core.js">
+<link rel="modulepreload" href="js/textures.js">
+<link rel="modulepreload" href="js/util.js">
+<link rel="modulepreload" href="js/viewmodel.js">
+<link rel="modulepreload" href="js/weapon-state.js">
+<link rel="modulepreload" href="js/weapons.js">
+<link rel="modulepreload" href="js/worker.mjs">
+<link rel="modulepreload" href="js/world.js">
+<link rel="modulepreload" href="lib/jsm/environments/RoomEnvironment.js">
+<link rel="modulepreload" href="lib/jsm/objects/Sky.js">
+<link rel="modulepreload" href="lib/jsm/postprocessing/EffectComposer.js">
+<link rel="modulepreload" href="lib/jsm/postprocessing/MaskPass.js">
+<link rel="modulepreload" href="lib/jsm/postprocessing/OutputPass.js">
+<link rel="modulepreload" href="lib/jsm/postprocessing/Pass.js">
+<link rel="modulepreload" href="lib/jsm/postprocessing/RenderPass.js">
+<link rel="modulepreload" href="lib/jsm/postprocessing/ShaderPass.js">
+<link rel="modulepreload" href="lib/jsm/postprocessing/UnrealBloomPass.js">
+<link rel="modulepreload" href="lib/jsm/shaders/CopyShader.js">
+<link rel="modulepreload" href="lib/jsm/shaders/FXAAShader.js">
+<link rel="modulepreload" href="lib/jsm/shaders/LuminosityHighPassShader.js">
+<link rel="modulepreload" href="lib/jsm/shaders/OutputShader.js">
+<link rel="modulepreload" href="lib/jsm/utils/BufferGeometryUtils.js">
+<link rel="modulepreload" href="lib/three.module.js">
+<link rel="modulepreload" href="server/codec.mjs">
 </head>
 <body>
 <div id="app"></div>

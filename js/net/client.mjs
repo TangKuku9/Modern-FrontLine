@@ -6,7 +6,8 @@
 // 之所以重放得起，是因为 P0 那几件事：固定步长、玩法随机流可播种、
 // 权威侧不碰渲染。重放时把世界侧副作用（命中、特效、噪声）关掉，只重跑自身状态。
 import * as THREE from 'three';
-import { NetPlayer, INTERP_DELAY, setInterpDelay } from './remote.mjs';import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
+import { NetPlayer, INTERP_DELAY, setInterpDelay } from './remote.mjs';
+import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
 import { uavFromFlags, SAY, streakOwn, SAY_START, medalSay } from '../match-rules.js';
 import { kitsOf } from '../loadout.mjs';

@@ -240,7 +240,7 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 ### 验收
 
 ```bash
-npm test              # 主体档：gate + docs-guard + rollback + reconcile-chain + world-equiv + worker-core + net-journal + codec + lagcomp + mp-rules + accounts + progress + hardening + service-guards + room-flow + room-bots + room-dir + image + net-probe + deploy-probe + xenv + fps + viewmodel + gunvisual + net-feel + net-audit + heli-armor + optic + state-leak
+npm test              # 主体档：gate + docs-guard + rollback + reconcile-chain + world-equiv + worker-core + preload-graph + net-journal + codec + lagcomp + mp-rules + accounts + progress + hardening + service-guards + room-flow + room-bots + room-dir + image + net-probe + deploy-probe + xenv + fps + viewmodel + gunvisual + net-feel + net-audit + heli-armor + optic + state-leak
 npm run test:browser  # 对打 / 掉线 / 同源双标签页 / Worker 双路实跑四档：net-play + net-drop + tab-session + worker-live
 npm run test:all      # 上面两档全跑
 ```
@@ -257,6 +257,7 @@ npm run test:all      # 上面两档全跑
 - `test/reconcile-chain.mjs`：快照**链**上的回滚记账，判据按窗口形状分开写，核心是 `applySteps == dTick` 恒等式
 - `test/world-equiv.mjs`：碰撞宽相（`js/world.js` 的 `buildBroad`/`_query`，C2）与旧全量线性扫的**逐位等价**差分 —— 两端共用这一份文件，候选集漏一个盒就是预测/回滚分叉。覆盖真地图差分、原点贴盒面的边缘用例（这里钉住 `rayAABB` 的 NaN 幽灵命中：d 某轴为 0 且原点与某盒面**精确相等**时，任何远处的盒子都可能被判成 t=0 命中 —— 两端共有的既有行为，**必须复刻而不是修**，宽相为此带 `_faceX/Y/Z` 贴面索引、轴零射线不做 y 粗筛）、嵌套大盒逼出的 collide 包络重试、战役闸门运行时删盒的重建，以及"比对器会红"的反证臂。改 `rayAABB`/`_query`/碰撞常数之后必须先过这里
 - `test/worker-core.mjs`：Worker 抽核（性能审查 C4/C5）的进程内判据 —— textures-core/pathfind 是要同时活在主线程与 Worker（无 import map，'three' 裸说明符进不去）的纯模块：同参数两次生成逐位一致（核心不许混非确定源）、initTextures 同步回退路 19 种 TEX 全部就位（工单表完备性）、`world.findPath` == `astarPath` 直调 == 格子拷贝路（路径点逐位一致）、BinaryHeap 同一份实现（util 转出，不许抄出第二份漂移）。真浏览器端到端在 worker-live
+- `test/preload-graph.mjs`：index.html 预载清单守卫（性能审查 C8）—— `<link rel="modulepreload">` 必须等于源码模块图的闭包（两个根：js/main.js + js/worker.mjs；裸说明符按 index.html 自己的 import map 解析）。清单过期时判据直接打印缺哪行/多哪行；同时按 net-server.mjs 源码里抠出来的 PUBLIC 白名单逐个核对"生产模式发得出去"——server/codec.mjs 是唯一放行的 server/ 单文件（客户端模块图正经引用它，不放行就是线上整页起不来的潜伏 bug），其余 server/ 照旧全封。**语义红线**：预载不改缓存语义，no-cache + 304 的"发版本即同步"一行不动
 - `test/worker-live.mjs`：Worker 双路真浏览器离线实跑 —— A 臂：加载期贴图在 Worker 里生成、离线 bot 的 A* 经 Worker 送达、`pathPending` 门防洪（请求数有界，不是每拍连发）；B 臂：把 `window.Worker` 封锁死 —— 加载屏照常走完、对局照常开、bot 靠同步现算照常拿路径（file:// / 老浏览器 / 策略封锁的替身）。net-play 的两个页面是联机客户端（bot 在服务端），fps.mjs 为逐位全等关掉了 Worker —— 离线端到端只有这份能看见
 - `test/net-journal.mjs`：日记本字段覆盖率守卫（新字段必须登记归属）
 - `server/lagcomp.mjs` + `test/lagcomp.mjs`：回溯裁决与"报哪一拍"两半各自有反证臂；判据是二维矩阵（瞄哪一点 × 报哪一拍），闸门两端由 `44 ≥ (L+42) − 60` 的解定在 L = 62/63，不是猜的

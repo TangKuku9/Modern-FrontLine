@@ -8,7 +8,8 @@
   `WebAssembly`：客户端目前**零多核**——唯一一份 `WorkerPool.js` 在 vendored 的 three
   addons 里且未被引用。本轮无 profile 取证——需要数据的项（C2）按服务端审计立的门槛
   **先测量再动**。
-- **实施状态（2026-10-05）**：C1、C2、C3 已当日落地，其余按文末《建议的实施批次》。
+- **实施状态（2026-10-05）**：C1-C8 **全部收口**（C1/C2/C3 = 52d2920，C4/C5 = a06ad73，
+  C8 见文末实施记录；C6/C7 与若干子项按"不做"存照）。
   本文证据段的行号按**改动前**的代码写，落地后的偏移见文末《实施记录》。
 
 ## 清单（按收益/风险比排）
@@ -175,11 +176,44 @@ Worker 后对局照常、bot 照常拿路径）；全矩阵里 room-bots/mp-rule
 - 备忘：若未来真要 SharedArrayBuffer 共享快照，部署侧要加 COOP/COEP 头（目前无此
   计划，届时先过 deploy-checklist）。
 
-### C8 · 打包/压缩/HTTP 缓存（发布线，独立评估）
+### C8 · 打包/压缩/HTTP 缓存（发布线）—— 已收口（modulepreload 落地，其余决定存照）
 
-**证据**：无 bundler、无压缩；three 54k 行 vendored + jsm 全目录在盘上（ESM 按需
-拉取，问题在请求数不在体积）。esbuild 压缩 + 静态缓存头属于**加载**优化，不属于
-帧率；且第一轮立过"发版本即同步"的取舍（no-cache 是有意的），动它要先对齐那条账。
+**状态**：已收口（`index.html` 模块预载清单 + `test/preload-graph.mjs`；打包/压缩/
+哈希缓存按下列决定**不做**）。
+
+**证据**（改动前行号）：无 bundler、无压缩；three 1.3MB vendored + jsm 全目录 867KB/114
+文件在盘上（ESM 按需拉取，问题在请求数不在体积）；静态缓存只有一种策略——全部
+no-cache + 304 回源。
+
+**落地：模块预载清单**。ESM 的按需发现是瀑布——main.js 解析完才知道下一层 import，
+冷加载白付五六轮 RTT（全图 55 个文件）。`index.html` 现在带一份 `<link rel="modulepreload">`
+清单，把发现瀑布拉平成并行取+预解析；`test/preload-graph.mjs` 钉住"清单 == 源码模块图
+闭包"（两个根：js/main.js + js/worker.mjs；裸说明符按 index.html 自己的 import map
+解析），清单过期时判据直接打印缺哪行/多哪行。**语义红线（用户确认的账）**：预载不改
+缓存语义——服务端仍然 no-cache + 304 回源，"发版本即同步"（云部署更新时旧缓存卡
+加载屏）一行不动。
+
+**顺手揪出的潜伏生产 bug**：客户端模块图里正经引用着 `server/codec.mjs`
+（js/net/client.mjs / lobby.mjs——协议编解码必须发给浏览器），而生产白名单没有
+`server/`，线上整页会因模块解析失败起不来。修复：PUBLIC 加**精确单文件**特例
+`server/codec.mjs`（编解码数学无一处机密，本就是任何客户端必备）；server/ 其余源码
+照旧全封，remote-probe 的 `/server/net-server.mjs` 404 断言不变。
+
+**决定：不做（存照）**
+
+- **bundler + 哈希文件名 + 长缓存**：与"发版本即同步"直接冲突（新鲜期内的浏览器
+  不会来问，服务端一更新就是新 HTML + 旧 JS 混跑），或者要引入构建步骤 + 入口/依赖
+  图重写。no-cache + 304 已经给出"改了文件下一个请求就重新读"，重验证不带包体。
+- **serve 时压缩（esbuild transform）**：three gzip 后 ~300KB → 压缩后 ~110KB，
+  冷加载省 ~200KB；代价是新增运行时依赖 + 首请求变换 + minified 栈回溯。量级不值。
+- **brotli**：同上，对纯文本的增量收益不抵一条新依赖。
+- **HTTP/2**：浏览器只走 TLS 的 h2；部署形态（内网/反代）不归这轮管，且多路复用的
+  大头收益已被 modulepreload 拉平瀑布拿到。
+- **lib/jsm 全目录裁剪**：867KB 里可及闭包约 40KB 级——省的是镜像体积的零头，
+  裁错一个内部依赖就是运行时 404。不做。
+
+**验收**：test/preload-graph.mjs 5/5（图规模/清单等值/白名单放行/图内无白名单外文件/
+差分器会红）；test/image.mjs B2（.dockerignore 与新 PUBLIC 项对账）全绿。
 
 ## 查过并排除的（本轮的"不是问题"）
 
@@ -204,7 +238,8 @@ Worker 后对局照常、bot 照常拿路径）；全矩阵里 room-bots/mp-rule
   判据 `test/world-equiv.mjs` 进 `npm test` 主体档；原文"先测量再动"的门槛被
   逐位等价差分探针替代——探针本身就是测量）。
 - **批次 C-D（多核线）**：C4 → C5 —— ✅ 2026-10-05 已落地（C6/C7 按上文决定不做）。
-- **发布线**：C8 独立评估，与帧率无关。
+- **发布线**：C8 —— ✅ 2026-10-05 已收口（modulepreload + 白名单特例落地；
+  打包/压缩/哈希缓存/h2/jsm 裁剪决定存照）。至此 C1-C8 全部收口。
 
 ## 实施记录（2026-10-05 · C1）
 
@@ -307,3 +342,25 @@ onGridRebuilt/requestPath）、`server/headless-game.mjs`（同名同步 request
 
 **判据**：worker-core 20/20、worker-live 11/11（A 臂 6 + B 臂 5）、docs-guard 全绿
 （三处登记对账）；全矩阵见当日提交说明。
+
+## 实施记录（2026-10-05 · C8 发布线收口）
+
+**改了什么**：`index.html`（55 行 modulepreload 清单，test/preload-graph.mjs 从源码图推）、
+`server/net-server.mjs`（PUBLIC 加精确单文件特例 `server/codec.mjs`）、`js/net/client.mjs`
+（把挤在一行的两段 import 拆开——图巡检就是这么扫出 server/ 依赖的）、
+`test/preload-graph.mjs`（新增 5 条判据，登记主体档三处对账）。
+
+**判据顺手揪出的潜伏生产 bug**：生产白名单没有 `server/`，而客户端模块图正经引用
+`server/codec.mjs`——线上页面会因模块解析失败起不来。修复是**精确单文件**特例（编解码
+数学无机密、本就是客户端必备），不是放开 `server/` 前缀；remote-probe 的
+`/server/net-server.mjs` 404 断言不变。deploy-probe / image.mjs（B2 与 .dockerignore
+对账）全绿。
+
+**纪律**
+1. 缓存语义零改动：no-cache + 304 一行不动（用户确认的"发版本即同步"账——云部署
+   更新时防旧缓存卡加载屏）。
+2. 清单不许手抄：P2 的期望集由判据自己从源码图推，过期时打印缺哪行贴回 index.html；
+   P5 反证臂钉"差分器会红"。
+3. PUBLIC 白名单从 net-server.mjs 源码抠（image.mjs 同款手法），测试里不抄第二份；
+   P4 顺带钉死"图内不许有白名单外文件"——将来谁在客户端 import 一个 server/ 文件，
+   这条会当场点名。
