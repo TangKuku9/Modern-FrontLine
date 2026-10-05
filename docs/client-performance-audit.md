@@ -99,20 +99,62 @@ fireHitscan/traceBullet）、bot 感知与哨戒炮/直升机的 LOS（ai.js / m
 驱动钉在 60、以及"姿态平滑仍按帧收敛"（240 小步 ≈ 60 大步收敛到同一落点；平滑被
 搬进节流分支会当场分叉）。
 
-### C4 · 过程化贴图生成占着主线程做启动（多核最高 ROI，立账）
+### C4 · 过程化贴图生成占着主线程做启动（多核最高 ROI）—— 已落地
 
-**证据**：全部纹理都是启动时逐像素 JS 循环生成（textures.js）；`initTextures`
-（materials.js:10-27）14 种材质 + 5 fabric + 6 camo 全同步，只在 kind 之间
-`setTimeout(0)` 让出 —— 加载画面那段时间里的主线程大头。
+**状态**：已落地（`js/textures-core.js` 抽核 + `js/worker.mjs` + `materials.initTextures`
+双路；判据 `test/worker-core.mjs` + `test/worker-live.mjs`）。
 
-**建议**：标准 Worker 形态——worker 里生成，transferable（ImageData/ImageBitmap）
-回主线程建 CanvasTexture。纯数值循环、零玩法面，是多核路线的第一站。
+**证据**（改动前行号）：全部纹理都是启动时逐像素 JS 循环生成（textures.js）；`initTextures`
+（materials.js:10-27）14 种材质 + 5 fabric + 6 camo 全同步，只在 kind 之间 `setTimeout(0)`
+让出 —— 加载画面那段时间里的主线程大头。
 
-### C5 · A* 寻路 Worker 化（低优先，立账）
+**落地要点**
 
-**证据**：`world.findPath`（world.js:641）是静态 Uint8Array 网格上的 BFS/堆，已有
-每 tick 3 次的预算闸（main.js）。联机的 bot 在服务端跑，客户端这份只服务单机/离线
-——收益限单机，排在 C4 之后。网格可 transfer，结构上最自然的 worker 适配户。
+- 抽核分层：`textures-core.js` 是**纯计算**（GEN 表 + 逐像素循环 + 法线差分，零 THREE/
+  零 DOM），`textures.js` 只剩"包 canvas/建 THREE 纹理"的薄壳（memcpy 量级）与运行时
+  小贴图（particleTex/textTexture，事件驱动，不值一条消息往返）。
+- **Worker 里没有 import map**：module worker 的模块解析不走页面的 import map，
+  `'three'` 裸说明符当场解析失败，而 util.js 顶层 import 'three' —— noise.js/`BinaryHeap`
+  等小件全部下沉到纯模块，util.js **转出保持既有 import 不变**（rng.js 同款先例）。
+- 工单数据化：materials 的 `texJobs()` 是 Worker 路与同步回退路的唯一数据源，两条路
+  不会漂；同工单同一份核心 ⇒ 输出**逐位一致**，回退路随时可换。
+- 失败全兜底：Worker 起不来（file://、老浏览器、策略封锁）、脚本 404、生成抛错、
+  30s 看门狗 —— 任何一路失败整条退回同步路重生成（纯函数，重生成安全）。
+
+**验收**：worker-core（C4a-e：确定性/工单形状/同步路 19 种 TEX 全就位/Node 回退标记）；
+worker-live A 臂（真浏览器：`__texViaWorker === true`）。gunvisual/optic/viewmodel 等
+截图套件全绿 = Worker 生成的纹理与旧主线程产物像素级同貌。
+
+### C5 · A* 寻路 Worker 化 —— 已落地（客户端离线路）
+
+**状态**：已落地（`js/pathfind.js` 抽核 + `js/worker.mjs` 兼跑 + `ai.js requestPath`
+异步接缝；判据同上两份）。
+
+**证据**（改动前行号）：`world.findPath`（world.js:641）是静态 Uint8Array 网格上的
+BFS/堆，已有每 tick 3 次的预算闸。全仓唯一调用点是 `ai.js Bot.requestPath`（ai.js:211）
+—— 接缝单点。联机的 bot 在服务端跑，客户端这份只服务单机/离线。
+
+**落地要点**
+
+- 抽核：`pathfind.js` = BinaryHeap（自 util.js 迁来，util 转出）+ `astarPath`
+  （world.js 原文逐字搬入，输出改裸 `{x,z}[]`）；`world.findPath` 变包装层。
+  nearestWalkable/gridLOS 随本体迁移（全仓无其他调用点；cellOf/walkable 留守给
+  ai.js 的侧向探针）。
+- 双端同形接缝：`Bot.requestPath` 改走 `game.requestPath(from, to, cb)` ——
+  **服务端/回退同步现算且回调当场执行（与旧代码逐位一致）**；客户端 Worker 路晚几拍
+  送达（FIFO），在途时 bot 直奔目标（与"找不到路"同一行为）。`pathPending` 门防
+  "在途连发"——同步路下回调当场清门，行为与旧代码完全一致。
+- 网格同步：每次建图后 `grid.slice()` 一份送 Worker（40KB 量级，不 transfer）；
+  战役东门的运行时 rebuild（campaign.js 两处 buildGrid）经 `game.onGridRebuilt()`
+  重发 —— 闸门开了 Worker 的格子也要跟上。
+- **fps.mjs 显式关掉 Worker 寻路**（`g.pathWorker = null`）：它的跨帧率逐位全等
+  判据吃 bot 行为的确定性（hp/aliveBots 在比对行里），而 Worker 送达拍随墙钟抖。
+  Worker 寻路的端到端判据归 worker-live。
+
+**验收**：worker-core（C5a-f：金标路径可重复/包装层==直调==格子拷贝逐位一致/
+heap 同一份）；worker-live A 臂（bot 路径经 Worker 送达 + 防洪臂）+ B 臂（封锁
+Worker 后对局照常、bot 照常拿路径）；全矩阵里 room-bots/mp-rules 等 server 侧
+寻路判据全绿 = 同步路与旧代码逐位一致。
 
 ### C6 · 快照解码 Worker 化（评估后不做）
 
@@ -161,7 +203,7 @@ fireHitscan/traceBullet）、bot 感知与哨戒炮/直升机的 LOS（ai.js / m
 - **批次 C-C（两端同形状）**：C2 —— ✅ 2026-10-05 已落地（等价性先于一切，
   判据 `test/world-equiv.mjs` 进 `npm test` 主体档；原文"先测量再动"的门槛被
   逐位等价差分探针替代——探针本身就是测量）。
-- **批次 C-D（多核线）**：C4 → C5；C6/C7 按上文决定不做。
+- **批次 C-D（多核线）**：C4 → C5 —— ✅ 2026-10-05 已落地（C6/C7 按上文决定不做）。
 - **发布线**：C8 独立评估，与帧率无关。
 
 ## 实施记录（2026-10-05 · C1）
@@ -224,3 +266,44 @@ world-equiv）：
 
 **判据**：world-equiv 6/6（1.6s，含 R1/R1b 反证臂）；net-feel 217/217（AE 段 +4）；
 全矩阵见当日提交说明。
+
+## 实施记录（2026-10-05 · C4 + C5 多核线）
+
+**改了什么**：新模块 `js/noise.js`（clamp/lerp/TileNoise 下沉）、`js/textures-core.js`
+（贴图生成纯核）、`js/pathfind.js`（BinaryHeap + astarPath 纯核）、`js/worker.mjs`
+（常驻 Worker：贴图工单 + 寻路服务）；`js/textures.js` 瘦身为包壳、`js/materials.js`
+工单化双路（texJobs + worker 交换 + 同步回退 + 30s 看门狗 + `__texViaWorker` 读数）、
+`js/world.js` findPath 改包装（nearestWalkable/gridLOS 迁出）、`js/util.js` 转出
+（rng.js 同款先例）、`js/main.js`（spawnGameWorker/消息泵易主/syncPathGrid/
+onGridRebuilt/requestPath）、`server/headless-game.mjs`（同名同步 requestPath）、
+`js/ai.js`（requestPath 异步接缝 + pathPending 门）、`js/campaign.js`（东门两处
+网格重发钩子）、`test/fps.mjs`（显式关 Worker 寻路保逐位全等）；判据
+`test/worker-core.mjs`（node，20 条）+ `test/worker-live.mjs`（真浏览器离线实跑
+双路，11 条），均已登记主体档/浏览器档 + README《验收》+ deploy-checklist §0。
+
+**落地时守住的纪律**
+
+1. **Worker 里零 THREE**：module worker 没有 import map，'three' 裸说明符解析失败。
+   凡 worker 要 import 的模块（noise/textures-core/pathfind/rng）一个 THREE 都不能
+   碰 —— 小件下沉 + util.js 转出是唯一通路，这也是 BinaryHeap/TileNoise 迁家的原因。
+2. **两条路逐位一致才许并存**：Worker 路与同步回退路共用同一份核心（工单表同源、
+   astarPath 同函数），worker-core 钉死"包装层 == 直调 == 格子拷贝"。差分探针法
+   继续沿用：先一次性探针跑通，再收敛成常驻判据。
+3. **异步接缝的最小行为差**：Bot.requestPath 的 pathT/pathGoal 在**请求时**就写
+   （steer 的重寻路条件靠它自限），pathPending 门防在途连发；服务端同步路回调当场
+   执行 —— room-bots 等全部服务端寻路判据全绿 = 与旧代码逐位一致。
+4. **确定性判据与 Worker 判据分家**：fps.mjs 的跨帧率逐位全等吃 bot 确定性（hp/
+   aliveBots 在比对行），Worker 送达拍随墙钟抖 —— 该套件 `g.pathWorker = null` 走
+   同步路；Worker 端到端归 worker-live，不混在一起。
+5. **失败全兜底**：Worker 构造失败/脚本 404/生成抛错/30s 看门狗/运行中 onerror，
+   任何一路失败都整条退回主线程同步路（纯函数重生成安全）；worker-live B 臂把
+   `window.Worker` 封锁死做了整条回退的真浏览器实证。
+6. **手动喂帧的套件必须关 Worker 寻路**（viewmodel/optic/gunvisual/state-leak/fps
+   五份，`g.pathWorker = null`）：它们在**一段同步 evaluate 里**驱动整局 —— 同步块内
+   Worker 消息永远送不进来，bot 会卡死在 pathPending（pending 门反而不放行重试）、
+   全体直奔目标，走位与旧代码不同步不说，真会把测试玩家打死（viewmodel 首跑就是这么
+   红的：玩家死亡后 updateRender 停摆，adsT 恒 0、reload 永不推进）。这些套件要的
+   也是确定性 —— 同步路与旧代码逐位一致，正合适。
+
+**判据**：worker-core 20/20、worker-live 11/11（A 臂 6 + B 臂 5）、docs-guard 全绿
+（三处登记对账）；全矩阵见当日提交说明。

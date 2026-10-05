@@ -28,6 +28,11 @@ import { repairClass } from './loadout.mjs';
 import { applyAccountXp } from './progress.mjs';
 import { damp } from './util.js';
 import { escHtml } from './escape.js';
+
+function spawnGameWorker() {
+  try { return new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' }); }
+  catch (e) { return null; }
+}
 import { Account } from './account.js';
 import { unpackInput } from './quant.js';
 
@@ -147,7 +152,22 @@ class Game {
     this.audio = new Audio();
     this.audio.setVolume(this.settings.volume); this.audio.voice = this.settings.voice;
     const fill = document.getElementById('loadFill'), txt = document.getElementById('loadText');
-    await initTextures(p => { fill.style.width = (p * 80) + '%'; });
+    // 性能审查 C4/C5：起一个常驻 Worker —— 加载期跑贴图生成的逐像素循环（占加载
+    // CPU 的大头），之后兼跑离线 bot 的 A* 寻路。起不来（file://、老浏览器、策略封锁）
+    // 就是 null，initTextures 与寻路各自整条回退主线程，结果逐位一致。
+    this.pathWorker = await initTextures(p => { fill.style.width = (p * 80) + '%'; }, spawnGameWorker());
+    if (this.pathWorker) {
+      this._pathCbs = new Map(); this._pathSeq = 0;
+      // 贴图交换结束后，消息泵易主给寻路（worker 是请求-响应串行用的，无并发冲突）
+      this.pathWorker.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === 'pathResult') {
+          const cb = this._pathCbs.get(m.id);
+          if (cb) { this._pathCbs.delete(m.id); this.__pathsViaWorker = (this.__pathsViaWorker || 0) + 1; cb(m.pts ? m.pts.map(p => new THREE.Vector3(p.x, 0, p.z)) : null); }
+        }
+      };
+      this.pathWorker.onerror = () => { this.pathWorker = null; };   // 半路死掉就整体回退同步路
+    }
     txt.textContent = '正在初始化渲染管线…';
     await new Promise(r => setTimeout(r, 10));
     this.effects = new Effects(this);
@@ -725,6 +745,7 @@ class Game {
     w.setupEnvironment(def.env);
     def.build(w, this);
     w.finalize();
+    this.syncPathGrid();
     this.effects.setWeather(def.env.weather);
     // 视图模型灯光
     this.vmSun.color.set(def.env.sunColor); this.vmSun.intensity = Math.max(1.1, def.env.sun * 0.6);
@@ -734,6 +755,28 @@ class Game {
     this.vmScene.environmentIntensity = Math.max(0.4, def.env.envIntensity);
     if (def.env.ambient) this.audio.loop('amb', def.env.ambient, def.env.ambient === 'rain' ? 0.12 : 0.08);
     return w;
+  }
+  // 寻路 Worker 的格子副本（性能审查 C5）：每次建图重发；拷贝不走 transfer ——
+  // 主线程自己的 world.grid 还要用（cellOf/walkable、小地图、战役闸门 rebuild 都读它）。
+  syncPathGrid() {
+    if (this.pathWorker && this.world) this.pathWorker.postMessage({ type: 'grid', grid: this.world.grid.slice(), gn: this.world.gn, cs: this.world.cs, half: this.world.half });
+  }
+  // 战役在运行时改盒子后手动 buildGrid()（campaign.js 东门），Worker 的格子要跟上
+  onGridRebuilt() { this.syncPathGrid(); }
+  // bot 寻路统一入口（ai.js Bot.requestPath 调，两端各有一份实现）：
+  //   服务端/回退 —— 同步现算，回调当场执行，与旧代码逐位一致；
+  //   客户端 Worker —— A* 挪出主线程，结果晚几拍送达（FIFO），在途时 bot 直奔目标。
+  // 两条路共用同一份 pathfind.astarPath，路径点逐位一致；fps.mjs 那类逐位判据把
+  // pathWorker 置 null 走同步路保确定性。
+  requestPath(from, to, cb) {
+    if (this.pathWorker) {
+      const id = ++this._pathSeq;
+      this._pathCbs.set(id, cb);
+      this.__pathRequests = (this.__pathRequests || 0) + 1;
+      this.pathWorker.postMessage({ type: 'path', id, fx: from.x, fz: from.z, tx: to.x, tz: to.z });
+      return;
+    }
+    cb(this.world ? this.world.findPath(from, to) : null);
   }
   async startGame(kind, cfg) {
     this.menu.showLoadingOverlay('正在部署…');

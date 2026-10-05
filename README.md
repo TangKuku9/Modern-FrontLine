@@ -240,8 +240,8 @@ docker run -d -p 8090:8090 --env-file .env -v mw-accounts:/data mw-room
 ### 验收
 
 ```bash
-npm test              # 主体档：gate + docs-guard + rollback + reconcile-chain + world-equiv + net-journal + codec + lagcomp + mp-rules + accounts + progress + hardening + service-guards + room-flow + room-bots + room-dir + image + net-probe + deploy-probe + xenv + fps + viewmodel + gunvisual + net-feel + net-audit + heli-armor + optic + state-leak
-npm run test:browser  # 对打 / 掉线 / 同源双标签页三档：net-play + net-drop + tab-session
+npm test              # 主体档：gate + docs-guard + rollback + reconcile-chain + world-equiv + worker-core + net-journal + codec + lagcomp + mp-rules + accounts + progress + hardening + service-guards + room-flow + room-bots + room-dir + image + net-probe + deploy-probe + xenv + fps + viewmodel + gunvisual + net-feel + net-audit + heli-armor + optic + state-leak
+npm run test:browser  # 对打 / 掉线 / 同源双标签页 / Worker 双路实跑四档：net-play + net-drop + tab-session + worker-live
 npm run test:all      # 上面两档全跑
 ```
 
@@ -249,13 +249,15 @@ npm run test:all      # 上面两档全跑
 
 **比两个客户端的位置，只能比同一个服务端 tick。** "各自最后收到的那一包"不是同一拍：4.7 m/s 下错一包就是 0.12 m 的假差，于是这类判据随"谁先被调度到"又绿又红（`server/net-probe.mjs` 与 `test/net-play.mjs` 都在这上面红过，单独跑却都是绿的）。两份现在都**同时取样、只认共同的那一拍**，容差跟着收到 `1e-6`（同一拍的那份下行是同一批字节，逐位相同才是它该有的样子）。同理，凡是拿"我自己这一步"当尺子的判据，都得把"这一步真的在动"单列成一条判别臂 —— 站着不动时那把尺子会缩到量化噪声上去。换掉的旧尺子、以及新尺子那两条臂，由 `test/docs-guard.mjs` 的 D′ 段钉住不许换回去（记录见 `docs/net-vs-local-gaps.md` 附九）。第 9 轮又踩到同一类一次：`test/hardening.mjs` 那条"关掉一条连接之后名额还回来了"原本是 `await sleep(300)` 再重连 —— 拿**客户端的钟**去等服务端把 `close` 事件跑完，机器被拖热时 300 ms 不够，当场红成"配额没还回来"（`test:all` 最后一段红过一次，紧接着同一份代码单跑两次 111/111）。尺子同样换成了**服务端自报的数**（`/healthz` 的 `clients`，它和 `connsByIp` 的减一写在同一个 `ws.on('close')` 里），轮询到"在线数真的降了"再重连。第 10 轮把"尺子会缩到噪声"这条原则用到了空跑窗那把尺子自己身上：静止格给 `2×POS_STEP` 的下限、走动格仍按自己的步长量（`js/net/idle-ruler.mjs` + `test/net-feel.mjs` AA 段，旧尺子由 D′ 立碑不许回潮），见 `docs/net-vs-local-gaps.md` 附十四/附十五那条账。
 
-**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` / `tab-session` —— 这份名单是**从源码推的**（谁 `import { chromium } from 'playwright'` 就是谁），守卫拿它逐份去对，漏写和多写都红。这 9 份的 `launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本仓库开发机上实际存在的那份绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据：改动前 8 份只有"Chrome + 那台开发机的绝对路径"两档，于是本仓库那句安装提示在没装 Chrome 的机器上是句空话 —— 现在文档守卫的 G 段逐份核它（少一档就红）。其余判据都在进程内跑完，不碰浏览器。
+**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` / `tab-session` / `worker-live` —— 这份名单是**从源码推的**（谁 `import { chromium } from 'playwright'` 就是谁），守卫拿它逐份去对，漏写和多写都红。这 10 份的 `launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本仓库开发机上实际存在的那份绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据：改动前 8 份只有"Chrome + 那台开发机的绝对路径"两档，于是本仓库那句安装提示在没装 Chrome 的机器上是句空话 —— 现在文档守卫的 G 段逐份核它（少一档就红）。其余判据都在进程内跑完，不碰浏览器。
 
 - `server/gate.mjs` / `codec.mjs`：协议字段与包长自测（包长一变就打印新值）
 - `test/docs-guard.mjs`：文档守卫 —— 两份清单（README《验收》与 `docs/deploy-checklist.md` §0）和 `package.json` 三档脚本的**互相**覆盖、一份从源码推的浏览器分档名单，外加两张表：「已推翻的断言」（旧话不许再出现，收口记录也不许被删掉换绿）与「已换掉的尺子」（D′ 段，尺子架在测试源码上：`server/net-probe.mjs` 与 `test/net-play.mjs` 那两条"各自最后一包相减"、`≥50Hz` 那条绝对门槛、以及 `test/hardening.mjs` 那条"睡 300 ms 再重连" —— 旧写法不许回来，新写法**连它的先决臂与判别臂**也不许被删掉换绿）。六段之外还有两处"两半边一起看"：D″ 段（README《已知缺口》与部署清单**对同一件事必须说同一句话**：一处改了另一处没改要红）与 G 段（每份浏览器判据的 `launch` 链里必须有一档交给 Playwright 自己解析，否则上面那句 `npx playwright install chromium` 是假的）。各段都带反证臂，且先决臂要求解析出来的集合非空（改个标题就想让它恒绿会被当场点名）
 - `test/rollback.mjs`：回滚重放与顺跑逐位相同（含两代回滚、首段空跑、同一拍多次纠正、每实体私有流几组反证）
 - `test/reconcile-chain.mjs`：快照**链**上的回滚记账，判据按窗口形状分开写，核心是 `applySteps == dTick` 恒等式
 - `test/world-equiv.mjs`：碰撞宽相（`js/world.js` 的 `buildBroad`/`_query`，C2）与旧全量线性扫的**逐位等价**差分 —— 两端共用这一份文件，候选集漏一个盒就是预测/回滚分叉。覆盖真地图差分、原点贴盒面的边缘用例（这里钉住 `rayAABB` 的 NaN 幽灵命中：d 某轴为 0 且原点与某盒面**精确相等**时，任何远处的盒子都可能被判成 t=0 命中 —— 两端共有的既有行为，**必须复刻而不是修**，宽相为此带 `_faceX/Y/Z` 贴面索引、轴零射线不做 y 粗筛）、嵌套大盒逼出的 collide 包络重试、战役闸门运行时删盒的重建，以及"比对器会红"的反证臂。改 `rayAABB`/`_query`/碰撞常数之后必须先过这里
+- `test/worker-core.mjs`：Worker 抽核（性能审查 C4/C5）的进程内判据 —— textures-core/pathfind 是要同时活在主线程与 Worker（无 import map，'three' 裸说明符进不去）的纯模块：同参数两次生成逐位一致（核心不许混非确定源）、initTextures 同步回退路 19 种 TEX 全部就位（工单表完备性）、`world.findPath` == `astarPath` 直调 == 格子拷贝路（路径点逐位一致）、BinaryHeap 同一份实现（util 转出，不许抄出第二份漂移）。真浏览器端到端在 worker-live
+- `test/worker-live.mjs`：Worker 双路真浏览器离线实跑 —— A 臂：加载期贴图在 Worker 里生成、离线 bot 的 A* 经 Worker 送达、`pathPending` 门防洪（请求数有界，不是每拍连发）；B 臂：把 `window.Worker` 封锁死 —— 加载屏照常走完、对局照常开、bot 靠同步现算照常拿路径（file:// / 老浏览器 / 策略封锁的替身）。net-play 的两个页面是联机客户端（bot 在服务端），fps.mjs 为逐位全等关掉了 Worker —— 离线端到端只有这份能看见
 - `test/net-journal.mjs`：日记本字段覆盖率守卫（新字段必须登记归属）
 - `server/lagcomp.mjs` + `test/lagcomp.mjs`：回溯裁决与"报哪一拍"两半各自有反证臂；判据是二维矩阵（瞄哪一点 × 报哪一拍），闸门两端由 `44 ≥ (L+42) − 60` 的解定在 L = 62/63，不是猜的
 - `test/mp-rules.mjs`：联机规则（连杀奖励 / 按拍排程 / 群体警戒 / 记分 / 隔离）的机制证明，进程内手动 `step()`，所以"呼叫集束空袭后第 84 拍出第一颗弹"是确定性判据而不是"等 1.4 秒看看"

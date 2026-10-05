@@ -3,7 +3,8 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { mat } from './materials.js';
-import { rayAABB, BinaryHeap, TileNoise, mulberry32, clamp, rng } from './util.js';
+import { rayAABB, TileNoise, mulberry32, clamp, rng } from './util.js';
+import { astarPath } from './pathfind.js';
 
 function boxGeo(w, h, d, s) {
   const g = new THREE.BoxGeometry(w, h, d);
@@ -740,13 +741,6 @@ export class World {
   }
   cellOf(x, z) { return [Math.floor((x + this.half) / this.cs), Math.floor((z + this.half) / this.cs)]; }
   walkable(ix, iz) { return ix >= 0 && iz >= 0 && ix < this.gn && iz < this.gn && this.grid[iz * this.gn + ix] === 0; }
-  nearestWalkable(ix, iz) {
-    if (this.walkable(ix, iz)) return [ix, iz];
-    for (let r = 1; r < 8; r++)
-      for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++)
-        if ((Math.abs(dx) === r || Math.abs(dz) === r) && this.walkable(ix + dx, iz + dz)) return [ix + dx, iz + dz];
-    return null;
-  }
   randomWalkable(cx = 0, cz = 0, rad = 1e9) {
     for (let i = 0; i < 60; i++) {
       // 出生点/巡逻点/空袭落点都走这里 —— 玩法流，必须由服务端决定
@@ -756,68 +750,13 @@ export class World {
     }
     return new THREE.Vector3(cx, 0, cz);
   }
-  gridLOS(ax, az, bx, bz) {
-    let x0 = ax, z0 = az; const dx = Math.abs(bx - ax), dz = Math.abs(bz - az);
-    const sx = ax < bx ? 1 : -1, sz = az < bz ? 1 : -1; let err = dx - dz;
-    while (true) {
-      if (!this.walkable(x0, z0)) return false;
-      if (x0 === bx && z0 === bz) return true;
-      const e2 = 2 * err;
-      if (e2 > -dz) { err -= dz; x0 += sx; }
-      if (e2 < dx) { err += dx; z0 += sz; }
-      if (e2 > -dz && e2 < dx && (!this.walkable(x0 - sx, z0) || !this.walkable(x0, z0 - sz))) return false;
-    }
-  }
+  // 寻路本体在 pathfind.js（性能审查 C5 抽核）：那里是纯模块，寻路 Worker 装的是
+  // 同一份 astarPath + 本格的拷贝 —— 两条路的路径点逐位一致，判据 test/worker-core.mjs。
+  // nearestWalkable/gridLOS 随本体一起迁了过去（全仓无其他调用点；cellOf/walkable 留守，
+  // ai.js 的侧向探针在用）。
   findPath(from, to) {
-    const n = this.gn;
-    let s = this.cellOf(from.x, from.z), e = this.cellOf(to.x, to.z);
-    s = this.nearestWalkable(s[0], s[1]); e = this.nearestWalkable(e[0], e[1]);
-    if (!s || !e) return null;
-    const si = s[1] * n + s[0], ei = e[1] * n + e[0];
-    const g = new Float32Array(n * n).fill(1e9), par = new Int32Array(n * n).fill(-1), closed = new Uint8Array(n * n);
-    const f = new Float32Array(n * n);
-    const heap = new BinaryHeap(i => f[i]);
-    g[si] = 0; f[si] = 0; heap.push(si);
-    const ex = e[0], ez = e[1];
-    let iter = 0, found = false;
-    const dirs = [[1, 0, 1], [-1, 0, 1], [0, 1, 1], [0, -1, 1], [1, 1, 1.414], [1, -1, 1.414], [-1, 1, 1.414], [-1, -1, 1.414]];
-    while (heap.size && iter++ < 12000) {
-      const c = heap.pop();
-      if (c === ei) { found = true; break; }
-      if (closed[c]) continue; closed[c] = 1;
-      const cx = c % n, cz = (c / n) | 0;
-      for (const [dx, dz, cost] of dirs) {
-        const nx = cx + dx, nz = cz + dz;
-        if (!this.walkable(nx, nz)) continue;
-        if (dx && dz && (!this.walkable(cx + dx, cz) || !this.walkable(cx, cz + dz))) continue;
-        const ni = nz * n + nx;
-        if (closed[ni]) continue;
-        const ng = g[c] + cost;
-        if (ng < g[ni]) {
-          g[ni] = ng; par[ni] = c;
-          const hx = Math.abs(nx - ex), hz = Math.abs(nz - ez);
-          f[ni] = ng + (hx + hz) + (1.414 - 2) * Math.min(hx, hz);
-          heap.push(ni);
-        }
-      }
-    }
-    if (!found) return null;
-    const cells = [];
-    for (let c = ei; c !== -1; c = par[c]) cells.push(c);
-    cells.reverse();
-    // 路径平滑
-    const pts = [];
-    let anchor = 0;
-    pts.push(cells[0]);
-    for (let i = 2; i < cells.length; i++) {
-      const a = cells[anchor], b = cells[i];
-      if (!this.gridLOS(a % n, (a / n) | 0, b % n, (b / n) | 0)) { anchor = i - 1; pts.push(cells[anchor]); }
-    }
-    pts.push(cells[cells.length - 1]);
-    const out = pts.map(c => new THREE.Vector3((c % n + 0.5) * this.cs - this.half, 0, (((c / n) | 0) + 0.5) * this.cs - this.half));
-    out.shift();
-    out.push(new THREE.Vector3(to.x, 0, to.z));
-    return out;
+    const pts = astarPath(this.grid, this.gn, this.cs, this.half, from.x, from.z, to.x, to.z);
+    return pts ? pts.map(p => new THREE.Vector3(p.x, 0, p.z)) : null;
   }
 
   // ---------- 小地图 ----------

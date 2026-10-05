@@ -160,6 +160,13 @@ export class HeadlessGame {
     return p;
   }
 
+  // bot 寻路统一入口（性能审查 C5；与 js/main.js 的 Game.requestPath 同名同契约）：
+  // Node 侧没有 Worker，同步现算且回调当场执行 —— 与旧代码逐位一致。客户端 Worker 路
+  // 与这里共用同一份 pathfind.astarPath，路径点逐位一致。
+  requestPath(from, to, cb) {
+    cb(this.world ? this.world.findPath(from, to) : null);
+  }
+
   // ---------- main.js:253-259 的同形实现（去天气、去音频环境音）----------
   async loadMap(id) {
     const { World } = await import('../js/world.js');

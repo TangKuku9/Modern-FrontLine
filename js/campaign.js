@@ -86,6 +86,8 @@ export class Campaign {
     this.gate.position.set(88, 1.45, 0); this.gate.castShadow = true; w.root.add(this.gate);
     this.gateBox = w.collider(87.85, 0, -2.5, 88.15, 2.9, 2.5);
     w.buildGrid();
+    // 寻路 Worker 的格子副本跟上来（性能审查 C5；客户端 Game 有这份钩子，headless 无）
+    if (game.onGridRebuilt) game.onGridRebuilt();
     // 空投弹药箱标记
     // 插入直升机
     const h = buildHeli(0x2e3a2e);
@@ -163,6 +165,8 @@ export class Campaign {
     this.anims.push({ t: 0, f: (a, dt) => { a.t += dt; this.gate.position.z = Math.min(5, a.t * 2.5); return a.t > 2; } });
     // 更新导航
     w.buildGrid();
+    // 闸门开了，Worker 那份格子也要重发（性能审查 C5：网格一变就同步）
+    if (this.game.onGridRebuilt) this.game.onGridRebuilt();
     this.game.audio.click(300, 1, 0.4, this.gate.position);
   }
   spawnExfil() {

@@ -206,10 +206,15 @@ export class Bot {
 
   requestPath(goal) {
     const game = this.game;
-    if (game.pathBudget <= 0) return;
+    if (this.pathPending) return;              // 异步在途不许连发：老代码同步赋值，steer 的
+    if (game.pathBudget <= 0) return;          // !this.path 分支在 Worker 路下会把预算一拍打光
     game.pathBudget--;
-    this.path = game.world.findPath(this.pos, goal);
+    this.pathPending = true;
     this.pathT = game.time; this.pathGoal = goal.clone();
+    // 性能审查 C5：走 game.requestPath（服务端同步现算 = 与旧代码逐位一致；客户端
+    // Worker 路晚几拍送达，FIFO 不乱序）。在途时 path 为 null，steer 直奔 goal ——
+    // 与"找不到路"是同一个行为，只是几拍。
+    game.requestPath(this.pos, goal, pts => { this.pathPending = false; this.path = pts; });
   }
   // 沿路径移动，返回期望速度方向
   steer(goal, speed, out) {

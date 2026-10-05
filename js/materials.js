@@ -1,29 +1,80 @@
 // 材质库
 import * as THREE from 'three';
-import { genTexture, genCamo } from './textures.js';
+import { genTexture, genCamo, textureFromData, getTextureSize } from './textures.js';
 
 const TEX = {};
 const MATS = {};
 const CAMO = {};
 
 const TEX_KINDS = ['concrete', 'plaster', 'brick', 'sand', 'snow', 'asphalt', 'metal', 'wood', 'crate', 'dirt', 'grass', 'rock', 'sandbag', 'tiles'];
+const FABRICS = {
+  fab_ally: [[150, 130, 95], [110, 100, 70], [85, 90, 60], [175, 155, 115]],
+  fab_enemy: [[48, 50, 52], [32, 33, 35], [70, 68, 62], [58, 60, 64]],
+  fab_snowA: [[215, 220, 225], [150, 158, 165], [110, 118, 125], [235, 238, 240]],
+  fab_snowB: [[60, 64, 58], [40, 42, 38], [85, 80, 70], [52, 55, 50]],
+  fab_urbanB: [[70, 30, 30], [40, 22, 22], [90, 88, 85], [55, 28, 26]],
+};
+const CAMO_KINDS = ['desert', 'woodland', 'digital', 'tiger', 'gold', 'dragon'];
 
-export async function initTextures(progress) {
-  let i = 0;
-  const kinds = [...TEX_KINDS, 'fab_ally', 'fab_enemy', 'fab_snowA', 'fab_snowB', 'fab_urbanB'];
-  for (const k of kinds) {
-    if (k === 'fab_ally') TEX[k] = genTexture('fabric', { size: 256, normal: 1, cfg: { colors: [[150, 130, 95], [110, 100, 70], [85, 90, 60], [175, 155, 115]] } });
-    else if (k === 'fab_enemy') TEX[k] = genTexture('fabric', { size: 256, normal: 1, cfg: { colors: [[48, 50, 52], [32, 33, 35], [70, 68, 62], [58, 60, 64]] } });
-    else if (k === 'fab_snowA') TEX[k] = genTexture('fabric', { size: 256, normal: 1, cfg: { colors: [[215, 220, 225], [150, 158, 165], [110, 118, 125], [235, 238, 240]] } });
-    else if (k === 'fab_snowB') TEX[k] = genTexture('fabric', { size: 256, normal: 1, cfg: { colors: [[60, 64, 58], [40, 42, 38], [85, 80, 70], [52, 55, 50]] } });
-    else if (k === 'fab_urbanB') TEX[k] = genTexture('fabric', { size: 256, normal: 1, cfg: { colors: [[70, 30, 30], [40, 22, 22], [90, 88, 85], [55, 28, 26]] } });
-    else TEX[k] = genTexture(k, { rough: k === 'asphalt' || k === 'metal' || k === 'tiles', normal: k === 'metal' ? 4 : 3 });
-    i++;
-    progress && progress(i / kinds.length);
-    await new Promise(r => setTimeout(r, 0));
+// 贴图工单（性能审查 C4）：kind/opts 数据化 —— Worker 路与同步回退路都从这一张表
+// 出发，加种类只改这里，两条路不会漂。
+function texJobs() {
+  const jobs = [];
+  for (const k of TEX_KINDS) jobs.push({ key: k, kind: k, opts: { rough: k === 'asphalt' || k === 'metal' || k === 'tiles', normal: k === 'metal' ? 4 : 3 } });
+  for (const k of Object.keys(FABRICS)) jobs.push({ key: k, kind: 'fabric', opts: { size: 256, normal: 1, cfg: { colors: FABRICS[k] } } });
+  return jobs;
+}
+
+// 判据读数：真浏览器里 worker 路应置 true（test/worker-live.mjs），被封锁/回退为 false
+export let texturesViaWorker = false;
+
+export async function initTextures(progress, worker) {
+  const jobs = texJobs();
+  let viaWorker = false;
+  if (worker) {
+    // Worker 路（性能审查 C4）：逐像素循环整体在 worker 里跑，裸数组 transferable
+    // 回来，这里只包 canvas。任何失败（起不来/脚本 404/生成抛错/看门狗超时）都整体
+    // 退回下面的同步路 —— 同一份 textures-core，结果逐位一致，重生成是安全的。
+    try {
+      await new Promise((res, rej) => {
+        let settled = false;
+        const done = (ok2, err) => { if (!settled) { settled = true; clearTimeout(wd); ok2 ? res() : rej(err); } };
+        const wd = setTimeout(() => done(false, new Error('texture worker watchdog (30s)')), 30000);
+        worker.onmessage = (e) => {
+          const m = e.data;
+          if (m.type === 'texOne') {
+            const tex = textureFromData(m.data);
+            if (m.camo) CAMO[m.key] = tex;
+            else {
+              TEX[m.key] = tex;
+              progress && progress((m.i + 1) / jobs.length);
+            }
+            if (m.i + 1 === m.total) done(true);
+          } else if (m.type === 'texFail') done(false, new Error(m.message || 'texture worker failed'));
+        };
+        worker.onerror = (e) => done(false, new Error('texture worker error: ' + (e.message || 'unknown')));
+        worker.postMessage({ type: 'textures', size: getTextureSize(), jobs: [...jobs, ...CAMO_KINDS.map(c => ({ key: c, camo: c }))] });
+      });
+      viaWorker = true;
+    } catch (e) {
+      viaWorker = false;      // 回退重生成会整份覆盖 TEX/CAMO，无残留
+    }
   }
-  for (const c of ['desert', 'woodland', 'digital', 'tiger', 'gold', 'dragon']) CAMO[c] = genCamo(c);
+  if (!viaWorker) {
+    let i = 0;
+    for (const j of jobs) {
+      TEX[j.key] = genTexture(j.kind, j.opts);
+      i++;
+      progress && progress(i / jobs.length);
+      await new Promise(r => setTimeout(r, 0));
+    }
+    for (const c of CAMO_KINDS) CAMO[c] = genCamo(c);
+  }
+  texturesViaWorker = viaWorker;
+  if (typeof globalThis !== 'undefined') globalThis.__texViaWorker = viaWorker;
   buildMaterials();
+  // Worker 活着回来了就交给调用方兼跑寻路（C5）；回退路返回 null —— 寻路也走同步
+  return viaWorker ? worker : null;
 }
 
 function std(texKey, scale, params = {}) {

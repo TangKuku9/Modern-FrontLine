@@ -216,6 +216,9 @@ const play = await page.evaluate(async () => {
   const realClock = g.clock;
   g.clock = { getDelta: () => 1 / 60 };
   const frames = (n, inp) => { for (let i = 0; i < n; i++) { if (inp) inp(); g.frame(); } };
+  // 性能审查 C5：同步 evaluate 块里 Worker 消息永远送不进来，bot 会卡死在 pathPending
+  // 直奔目标；且本套件要的是确定性 —— 寻路整条走同步路（fps.mjs 同款，端到端在 worker-live）。
+  g.pathWorker = null;
   await g.startGame('mp', { mode: 'tdm', map: 'yard', diff: 1, allies: 2, enemies: 2, scoreLimit: 50, timeLimit: 10 });
   // 对面是活 bots：玩家一旦被打死 vm.update 就停跑，syncLoadout 挂起，后面所有
   // replaceSlot 都建不出新枪模（S9 的 info.cylinder 会是 null）。判据量的是枪模，

@@ -1,11 +1,14 @@
 // 通用工具：数学、随机、噪声
 import * as THREE from 'three';
 import { rng, mulberry32 } from './rng.js';
+import { clamp, lerp } from './noise.js';
 // 随机相关的实现统一收在 rng.js（玩法流/画面流双流），此处转出以保持既有 import 不变
 export { mulberry32, crandRange, rng, crand, rand, randInt, pick, shuffle, entStream } from './rng.js';
+// clamp/lerp/TileNoise 收进 noise.js（性能审查 C4 抽核）：textures-core 与寻路 Worker
+// 要在**没有 import map 的环境**里跑，'three' 裸说明符当场解析失败 —— 这三个小件必须
+// 与 THREE 断开。此处转出保持既有 import 不变（rng.js 同款先例）。
+export { clamp, lerp, TileNoise } from './noise.js';
 
-export const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-export const lerp = (a, b, t) => a + (b - a) * t;
 export const damp = (a, b, k, dt) => lerp(a, b, 1 - Math.exp(-k * dt));
 export const DEG = Math.PI / 180;
 
@@ -14,37 +17,6 @@ export function angleDiff(a, b) {
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
   return d;
-}
-
-// 可平铺值噪声
-export class TileNoise {
-  constructor(seed = 1, period = 64) {
-    const r = mulberry32(seed);
-    this.p = period;
-    this.v = new Float32Array(period * period);
-    for (let i = 0; i < this.v.length; i++) this.v[i] = r();
-  }
-  get(x, y, freq) {
-    // x,y in [0,1)
-    const p = Math.min(this.p, freq);
-    const fx = x * p, fy = y * p;
-    const ix = Math.floor(fx), iy = Math.floor(fy);
-    const tx = fx - ix, ty = fy - iy;
-    const sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
-    const P = this.p;
-    const x0 = ((ix % p) + p) % p, x1 = (x0 + 1) % p;
-    const y0 = ((iy % p) + p) % p, y1 = (y0 + 1) % p;
-    const v = this.v;
-    const a = v[y0 * P + x0], b = v[y0 * P + x1], c = v[y1 * P + x0], d = v[y1 * P + x1];
-    return lerp(lerp(a, b, sx), lerp(c, d, sx), sy);
-  }
-  fbm(x, y, base = 4, oct = 5, gain = 0.5) {
-    let amp = 1, sum = 0, norm = 0, f = base;
-    for (let i = 0; i < oct; i++) {
-      sum += this.get(x, y, f) * amp; norm += amp; amp *= gain; f *= 2;
-    }
-    return sum / norm;
-  }
 }
 
 // 射线-AABB (slab)，返回 t 或 -1
@@ -97,32 +69,7 @@ export function fmtTime(s) {
   return m + ':' + (r < 10 ? '0' : '') + r;
 }
 
-export class BinaryHeap {
-  constructor(score) { this.c = []; this.s = score; }
-  push(e) { this.c.push(e); this._up(this.c.length - 1); }
-  pop() {
-    const r = this.c[0], e = this.c.pop();
-    if (this.c.length) { this.c[0] = e; this._down(0); }
-    return r;
-  }
-  get size() { return this.c.length; }
-  _up(n) {
-    const c = this.c, el = c[n], s = this.s(el);
-    while (n > 0) {
-      const p = ((n + 1) >> 1) - 1, pe = c[p];
-      if (s >= this.s(pe)) break;
-      c[p] = el; c[n] = pe; n = p;
-    }
-  }
-  _down(n) {
-    const c = this.c, len = c.length, el = c[n], es = this.s(el);
-    while (true) {
-      const r = (n + 1) << 1, l = r - 1;
-      let sw = null, ls;
-      if (l < len) { ls = this.s(c[l]); if (ls < es) sw = l; }
-      if (r < len) { const rs = this.s(c[r]); if (rs < (sw === null ? es : ls)) sw = r; }
-      if (sw === null) break;
-      c[n] = c[sw]; c[sw] = el; n = sw;
-    }
-  }
-}
+// BinaryHeap 迁去 pathfind.js（性能审查 C5 抽核）：寻路 Worker 里没有 import map，
+// util.js 顶层 import 'three' 进不去 —— 本体在那边，此处转出保持既有 import 不变。
+export { BinaryHeap } from './pathfind.js';
+

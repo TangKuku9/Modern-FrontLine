@@ -396,6 +396,9 @@ const px = await page.evaluate(async () => {
   // 上下文丢失的打点：丢了之后一切都变 no-op，"哪一步丢的"决定修哪一段。
   const mark = (tag) => { (window.__cl ||= []).push(tag + '=' + g.renderer.getContext().isContextLost()); };
   mark('起始');
+  // 性能审查 C5：同步 evaluate 块里 Worker 消息永远送不进来，bot 会卡死在 pathPending
+  // 直奔目标；且本套件要的是确定性 —— 寻路整条走同步路（fps.mjs 同款，端到端在 worker-live）。
+  g.pathWorker = null;
   await g.startGame('mp', { mode: 'tdm', map: 'yard', diff: 1, allies: 4, enemies: 4, scoreLimit: 50, timeLimit: 10 });
   mark('startGame后');
   const ws = g.player.ws, vm = ws.vm;

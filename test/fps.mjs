@@ -77,6 +77,10 @@ const out = await page.evaluate(async ({ HZ, TICKS, seed }) => {
 
   async function boot(hz) {
     rng.seed(seed);
+    // 性能审查 C5：Worker 寻路的送达拍随墙钟抖，会把下面"跨帧率逐位全等"的判据
+    // 打碎（bot 的走位进 hp/aliveBots 比对行）。本套件量的是物理离散化，寻路 Worker
+    // 的端到端判据在 test/worker-live.mjs —— 这里整条走同步路保确定性。
+    g.pathWorker = null;
     await g.startGame('mp', CFG);                // startGame 自己会把 time/tick/acc 归零
     g.clock = { getDelta: () => 1 / hz };
     g.input.keys.KeyW = true;
