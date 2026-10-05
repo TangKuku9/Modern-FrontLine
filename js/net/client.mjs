@@ -1045,14 +1045,6 @@ export class NetClient {
         this.game.hud.popup(ev.text, ev.color || '#fff', true);
       } else if (ev.e === 'proj') {
         this.spawnProjectile(ev);
-      } else if (ev.e === 'wpFires') {
-        // 白磷的 12 处火点：权威端的 effects 是桩，这些火只在事件里存在 —— 不接的话
-        // 联机里白磷"只掉血不发光"。表现副本只发光不伤害（灼烧走 wpTicks 那条权威账，
-        // 与单机同一条式子）。服务端是按拍错开点的，这里一把全点：0.25 s/处的视觉
-        // 差别没人看得出来，为它做一条定时器账不值。
-        if (this.game.world) for (const s of (ev.spots || [])) {
-          this.game.effects.addFireSource(new THREE.Vector3(s[0], s[1], s[2]), 1.5, 8);
-        }
       } else if (ev.e === 'pickup') {
         this.spawnGroundPickup(ev);
       } else if (ev.e === 'pickupGone') {
@@ -1268,7 +1260,8 @@ export class NetClient {
     if (ev.self) return;
     const owner = { team: ev.team, isPlayer: ev.team === this.team, alive: true };
     const p = new Projectile(g, ev.kind, new THREE.Vector3(ev.x, ev.y, ev.z),
-      new THREE.Vector3(ev.vx, ev.vy, ev.vz), owner, ev.fuse, { dumb: true });
+      new THREE.Vector3(ev.vx, ev.vy, ev.vz), owner, ev.fuse,
+      { dumb: true, fire: !!ev.fire, groundY: Number.isFinite(ev.gy) ? ev.gy : undefined });
     p.netId = ev.netId;
     g.projectiles.push(p);
     this.projs.set(ev.netId, p);

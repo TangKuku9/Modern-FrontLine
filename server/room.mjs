@@ -211,6 +211,11 @@ export class NetRoom {
       vx: p.vel.x, vy: p.vel.y, vz: p.vel.z,
       fuse: Math.max(0, Math.round((p.fuse || 0) * 100) / 100),
       team: (o && o.team) || null,
+      // 白磷弹头专属的两格（别的投掷物事件一个字节都不多）：
+      //   fire —— 落地点火位，客户端那颗哑副本落地时自己点火（火与爆炸同帧）；
+      //   gy —— 锁定点的地面，哑副本据此落地，途中屋顶不算地。
+      ...(p.wpFire ? { fire: 1 } : {}),
+      ...(p.groundY != null ? { gy: +p.groundY.toFixed(2) } : {}),
     });
   }
 
@@ -242,6 +247,8 @@ export class NetRoom {
         e: 'proj', netId: p.netId, kind: p.type, cid: cidOf(p.owner), self: false,
         x: p.pos.x, y: p.pos.y, z: p.pos.z, vx: p.vel.x, vy: p.vel.y, vz: p.vel.z,
         fuse: Math.max(0, Math.round((p.fuse || 0) * 100) / 100), team: (p.owner && p.owner.team) || null,
+        ...(p.wpFire ? { fire: 1 } : {}),
+        ...(p.groundY != null ? { gy: +p.groundY.toFixed(2) } : {}),
       })),
     };
   }
@@ -1121,17 +1128,11 @@ export class NetRoom {
     } else if (s.id === 'wp') {
       this.rules.wpTicks = WP_SECONDS * 60;
       this.wpOwner = pl;                       // 持续灼烧要认"谁放的这一片火"
-      // 白磷的 12 处火点与十颗弹头的锁定落点在**此刻**就已抽好（phosphorusSweep 只把
-      // "什么时候点/投"交给排程器）。服务端的 effects 是桩 ⇒ 这些火在权威世界里只是
-      // fires 表里的一行，谁也看不见；单机有真粒子，联机里却是"只掉血不发光"。把火点
-      // 随事件发出去，客户端各点各的（表现副本，伤害照旧走 wpTicks 那条权威账）。
-      // 弹头不用进事件：Projectile 构造器的 onProjectile 钩子把它们逐颗编成 proj
-      // 事件广播，客户端各建各的表现副本（opts.dumb，零伤害）。
-      const spots = phosphorusSweep(game, this.rules.clock, pl, this.enemiesOf(pl.team));
-      this.events.push({
-        e: 'wpFires', team: pl.team,
-        spots: spots.map(p => [+p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2)]),
-      });
+      // 十颗弹头的锁定落点在**此刻**就已抽好（phosphorusSweep 只把"什么时候投"交给
+      // 排程器），火由弹头落地自己点（fire 位随 proj 事件下发，客户端的哑副本落地时
+      // 与爆炸同帧点火）—— 旧版那 12 处"呼叫即点、随 wpFires 事件下发"的随机火点已删，
+      // 火跑在弹头前面的画面就是"先着火、再掉弹、又着火"。伤害照旧走 wpTicks 权威账。
+      phosphorusSweep(game, this.rules.clock, pl, this.enemiesOf(pl.team));
       this.events.push({ e: 'announce', team: pl.team, to: 'own', say: SAY.wpOwn, text: ANNOUNCE.wp });
       this.events.push({ e: 'announce', team: pl.team, to: 'foes', say: SAY.wpFoe, text: ANNOUNCE.wpFoe });
     } else if (s.id === 'sentry') {

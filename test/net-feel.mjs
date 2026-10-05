@@ -50,7 +50,7 @@ function makeGame() {
   const game = {
     time: 0, scene: new THREE.Scene(), entities: [], projectiles: [],
     world: { def: { surface: 'dirt' }, lineBlocked: () => false },
-    player: { name: '我', team: 'A', pos: new THREE.Vector3(), alive: true },
+    player: { name: '我', team: 'A', pos: new THREE.Vector3(), alive: true, shake: () => {} },
     // Heli.update 拿相机位置调旋翼音量 —— 桩里没这一格的话 X 段会 TypeError，
     // 而"桩不全崩掉"不是判据的失败形状（见文件头纪律③）。
     camera: { position: new THREE.Vector3() },
@@ -551,10 +551,21 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   c3.onEvents({ ev: [] });
   const fires = [];
   g2.effects.addFireSource = (pos, r, dur) => fires.push([pos.x, pos.y, pos.z, r, dur]);
-  c3.onEvents({ ev: [{ e: 'wpFires', team: 'A', spots: [[1, 0, 2], [3, 0, 4]] }] });
-  ok('JR5 wpFires 接到表现侧：白磷的火点在客户端点得着（只发光，不裁伤害）',
-    fires.length === 2 && fires[0][0] === 1 && fires[1][2] === 4 && fires[0][3] === 1.5 && fires[0][4] === 8,
+  // 白磷弹头的火随弹走：proj 事件带 fire 位，哑副本**落地时自己点火**（与爆炸同帧）。
+  // 旧 wpFires"火点清单"已删 —— 火跑在弹头前面的画面就是"先着火、再掉弹"。
+  // frameUpdate 不推进弹道物理（那是 game 帧的事），这里直接步进表现副本 ——
+  // 只步 bomb：world 桩没有 raycast，别把 JR3 补种的那颗 frag 也卷进来。
+  c3.onEvents({ ev: [{ e: 'proj', netId: 44, kind: 'bomb', cid: null, self: false,
+    x: 5, y: 0.3, z: 6, vx: 0, vy: 0, vz: 0, fuse: 5, team: 'A', fire: 1 }] });
+  for (let i = 0; i < 12; i++) for (const p of [...g2.projectiles]) if (p.type === 'bomb') p.update(1 / 60);
+  ok('JR5 白磷弹头落地即点火：fire 位随 proj 事件下发、哑副本落地自己点（只发光，不裁伤害）',
+    fires.length === 1 && fires[0][0] === 5 && fires[0][2] === 6 && fires[0][3] === 1.5 && fires[0][4] === 8,
     JSON.stringify(fires));
+  // 反证臂：不带 fire 位的弹（集束空袭的弹）落地绝不点火 —— 点了就是每场空袭都烧一片。
+  c3.onEvents({ ev: [{ e: 'proj', netId: 45, kind: 'bomb', cid: null, self: false,
+    x: 50, y: 0.3, z: 60, vx: 0, vy: 0, vz: 0, fuse: 5, team: 'A' }] });
+  for (let i = 0; i < 12; i++) for (const p of [...g2.projectiles]) if (p.type === 'bomb') p.update(1 / 60);
+  ok('JR5【反证】不带 fire 位的弹（集束弹）落地不点火', fires.length === 1, `fires=${fires.length}`);
 
   // —— 重名认尸：kill 事件按名字找人时，死者才是 !alive 的那个 ——
   const r2 = Object.create(NetRoom.prototype);

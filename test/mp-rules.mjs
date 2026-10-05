@@ -278,7 +278,9 @@ ok('D2 呼叫白磷弹被接受', roomE.streak.byId.wp === 1, JSON.stringify(roo
 ok('D3 白磷弹的计时器被规则内核点上（世界标志位置位）',
   roomE.rules.wpTicks > 0 && (roomE.rules.worldFlags() & WORLD.WhitePhosphorus) !== 0,
   `wpTicks=${roomE.rules.wpTicks} flags=${roomE.rules.worldFlags()}`);
-ok('D4 白磷弹的落火排了 12 个任务（spread 默认值）', roomE.rules.clock.pending >= 12, `pending=${roomE.rules.clock.pending}`);
+ok('D4 呼叫这一拍：排程器里只有十颗弹头、场上一处地上火都没有（旧版 12 处随机火先行 —— "先着火、再掉弹"的病根）',
+  roomE.rules.clock.pending === WP_BOMBS && roomE.game.fires.length === 0,
+  `pending=${roomE.rules.clock.pending} fires=${roomE.game.fires.length}`);
 const flags0 = roomE.rules.worldFlags();
 for (let i = 0; i < 10 * 60 + 2; i++) roomE.step();
 // 反证臂：这条红了 = 计时器没人推进（标志位永远亮着，屏幕效果永远不消）
@@ -329,6 +331,18 @@ ok('D9 全部十颗都落在乙"当时"的位置 ± 散布内（人被挪走也�
 for (let i = 0; i < 150; i++) roomE2.step();
 ok('D10【反证】300 拍后十颗全部落地清场（不残留在 projectiles 里挂账）',
   births2.every(b => !b.p.alive), `alive=${births2.filter(b => b.p.alive).length}`);
+// 火由弹头落地自己点：十颗弹落地后场上十处火，位置就是各弹的解析落点（引爆时
+// pos = 落点地面 +0.1，XZ 差最多一拍的横移 ≈ 8cm，容 0.3），且 dmg 全空 —— 白磷的
+// 伤害走 wpTicks 权威账，火再烧人就是重复计费。
+const wpFires2 = roomE2.game.fires;
+ok('D10b 十颗弹头落地即十处火（火与爆炸同帧、位置=落点）',
+  wpFires2.length === WP_BOMBS && wpFires2.every(f => births2.some(b => {
+    const L = landOf(b);
+    return Math.hypot(f.pos.x - L.x, f.pos.z - L.z) < 0.3;
+  })),
+  `n=${wpFires2.length}`);
+ok('D10c 火不裁伤害（dmg 全空，视觉份）', wpFires2.length > 0 && wpFires2.every(f => f.dmg === null),
+  wpFires2.map(f => f.dmg).join(','));
 
 // ── 保底每人一颗 + 加投随机分配：三个敌手各站一处（无输入的客户端，位置死静不掺 AI），
 //    十颗里每人至少一颗正中，其余的也都落在某个敌人的锁定点附近（随机 ≠ 扔进无人区）。
@@ -366,6 +380,9 @@ phosphorusSweep(roomE4.game, roomE4.rules.clock, E4A.pl, []);
 for (let i = 0; i < 150; i++) roomE4.step();
 ok('D14【反证】空目标也投满十颗（火照点、屏照橙，弹幕不哑火）',
   births4.length === WP_BOMBS, `n=${births4.length}`);
+for (let i = 0; i < 150; i++) roomE4.step();
+ok('D15【反证】空目标的十颗落地照样十处火（火随弹走，不因没目标哑掉）',
+  roomE4.game.fires.length === WP_BOMBS, `n=${roomE4.game.fires.length}`);
 
 // ═══════════════════════════════════════════════════════════════════════════
 sec('E. 群体警戒（alertGroup）：把"静默失效"接回来');
