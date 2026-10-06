@@ -5,6 +5,7 @@ import { Sky } from 'three/addons/objects/Sky.js';
 import { mat } from './materials.js';
 import { rayAABB, TileNoise, mulberry32, clamp, rng } from './util.js';
 import { astarPath } from './pathfind.js';
+import { Terrain, SLOPE } from './terrain.js';
 
 function boxGeo(w, h, d, s) {
   const g = new THREE.BoxGeometry(w, h, d);
@@ -20,6 +21,17 @@ function boxGeo(w, h, d, s) {
 }
 
 const _asc = (a, b) => a - b;
+
+// 小地图配色用：#rrggbb → [r,g,b]（0..255）。放模块级是因为它无状态、纯函数。
+const hexRGB = (h) => [(h >> 16) & 255, (h >> 8) & 255, h & 255];
+
+// 「这条路有多宽到算个门」：盘山路的**墙体豁免**半宽（米）。
+//
+// 为什么不用 def.terrainRoadHalf：那个数（ridges 上是 30）是给**坡度**判定设计的，
+// 坡度连续、放宽一点无害；但障碍是二值的 —— 30m 半宽会把营区北墙整60m 都标成
+// "可走"，等于给 bot 开了一整面墙的门（实测北墙只剩 9/60 格不可走）。
+// 8m 才是"路本身"的宽度：够车行，够窄到墙还在。地图可用 terrainRoadGate 覆盖。
+const def_gateHalf = (def) => def.terrainRoadGate ?? 8;
 
 export class World {
   constructor(game, def) {
@@ -37,11 +49,48 @@ export class World {
     this.lights = [];
     this.animated = [];
     this.rng = mulberry32(def.seed || 7);
+    // 地形：def.terrain 为空时 this.terrain 是 null，下面每一条查询都走原来那条分支 ——
+    // 既有五张图的行为因此逐位不变（这是判据 test/world-equiv.mjs 的 A 段要盯的）。
+    // 有地形时它是**唯一**的地面高度来源：ground()/那片 y=0 大平板对有地形图不再生成。
+    this.terrain = def.terrain ? new Terrain(this.half, def.terrain.shape, def.terrain) : null;
+    // 地形命中的替身盒：raycast 的返回结构里 box 是必填（combat.js 读 box.mat 决定
+// 弹着点材质），所以给一个只带语义的轻对象。挂实例见上面的说明。
+    this._terrainHit = { x0: 0, y0: 0, z0: 0, x1: 0, y1: 0, z1: 0, mat: 'dirt', terrain: true, slope: 0 };
+    // 摆件的"落地高度"偏置：无地形图恒为 0，于是既有五张图逐位不变；有地形图由
+    // build() 按地面高度设它（w.baseY = w.groundY(x,z)），所有搭建助手自动跟着抬起来 ——
+    // 否则房子会按 y=0 摆，在 30m 的高地上悬空一半。
+    this.baseY = 0;
+  }
+
+  // 地面高度（无地形时就是 0）。摆件前先读它。
+  groundY(x, z) { return this.terrain ? this.terrain.height(x, z) : 0; }
+  // 把这一批摆件放到 (x,z) 的地面上。返回该处的地面高度，方便接着算相对高度。
+  place(x, z) { this.baseY = this.groundY(x, z); return this.baseY; }
+  // 抬到"离地多高"（摆第二层/屋顶/塔上平台时用）。
+  placeAt(x, z, up = 0) { this.baseY = this.groundY(x, z) + up; return this.baseY; }
+  // 建筑底面：取**足迹四角与中心的最高地面**，再往下沉 0.1m。
+  //
+  // 为什么不能只读中心那一点：建筑是 8~18m 见方，坡上中心比一角高 1m 时，
+  // 按中心摆就会有一角悬空、一角埋进土里（判据 test/terrain.mjs B1/B2 盯这个）。
+  // 取最高点保证整栋都在地面之上，代价是下坡那角最多露出一点墙基 ——
+  // 与 building() 的墙同一个道理：**宁可露基，不可埋腰**。
+  padTo(x, z, w = 8, d = 8) {
+    let hi = -Infinity;
+    for (const [dx, dz] of [[0, 0], [-w / 2, -d / 2], [w / 2, -d / 2], [-w / 2, d / 2], [w / 2, d / 2],
+      [-w / 2, 0], [w / 2, 0], [0, -d / 2], [0, d / 2]]) {
+      const h = this.groundY(x + dx, z + dz);
+      if (h > hi) hi = h;
+    }
+    this.baseY = hi - 0.1;
+    return this.baseY;
   }
 
   // ---------- 基础构建 ----------
   box(cx, y0, cz, w, h, d, matName = 'concrete', opt = {}) {
     const m = mat(matName);
+    // y0 是"相对这一批摆件落地面"的高度：加上 baseY 才落到地上。无地形图 baseY=0，
+    // 于是这一行对既有两张图是恒等变换（判据 test/world-equiv.mjs 的 A 段盯的就是它）。
+    y0 += this.baseY;
     if (opt.visible !== false) {
       const g = boxGeo(w, h, d, opt.texScale || m.userData.texScale || 2);
       if (opt.rotY) g.rotateY(opt.rotY);
@@ -60,16 +109,63 @@ export class World {
     return null;
   }
   collider(x0, y0, z0, x1, y1, z1) {
-    const b = { x0, y0, z0, x1, y1, z1 };
+    // 与 box() 同一套 baseY 约定：调用方写的是相对落地面。
+    const b = { x0, y0: y0 + this.baseY, z0, x1, y1: y1 + this.baseY, z1 };
     this.boxes.push(b); this._broadDirty = true; return b;
   }
   mesh(geo, matName, x, y, z, opt = {}) {
     const m = new THREE.Mesh(geo, typeof matName === 'string' ? mat(matName) : matName);
-    m.position.set(x, y, z);
+    m.position.set(x, y + this.baseY, z);   // 同 box()：y 是相对落地面
     if (opt.rotY) m.rotation.y = opt.rotY;
     m.castShadow = opt.cast !== false; m.receiveShadow = true;
     (opt.parent || this.root).add(m);
     return m;
+  }
+
+  // 贴地墙：把一段墙切成短块，每块各自站在自己那儿的地面上。
+  //
+  // 为什么需要它：wall() 是一整块 box，y0 只从一个值起步。有地形时一段 70m 的围墙
+  // 会横穿 2m 落差 —— 按一端摆，另一端就悬空（或整段埋进土里）。
+  // 无地形图 terrain 是 null，这层直接退化成原 wall() 一次调用，行为逐位不变。
+  // seg 默认 4m：一段墙取的是自己两个端点的**最高**地面，段越长、这段两端的高差就越大，
+  // 于是一头浮一头埋（实测 8m 分段时围墙有一段下沉 1.62m）。4m 配取高点，
+  // 两端差值落到 0.2m 量级，肉眼读不出来。
+  wallBy(x0, z0, x1, z1, h, t, matName, openings = [], seg = 4) {
+    if (!this.terrain) return this.wall(x0, z0, x1, z1, h, t, matName, openings, 0);
+    const len = Math.hypot(x1 - x0, z1 - z0);
+    // 零长/非有限：退化成一次普通 wall。早一版不挡，`gAt` 里 `u/len` 成了 0/0 = NaN，
+    // 造出一个 z0/z1 全是 NaN 的盒子 —— 而 NaN 盒子进宽相格网时会污染整格，
+    // 让那一带的 ceilingHeight/raycast 全部漏命中（判据 test/world-equiv.mjs
+    // 在 ridges 上逮到过：6 处分歧，追下去是一张 NaN 盒）。
+    if (!(len > 0.001) || !Number.isFinite(len)) return this.wall(x0, z0, x1, z1, h, t, matName, openings, 0);
+    const n = Math.max(1, Math.round(len / seg));
+    const horiz = Math.abs(z1 - z0) < 0.001;
+    const sx = Math.min(x0, x1), sz = Math.min(z0, z1);
+    // 开口按"沿墙的米"换算成分段索引，落在哪一段就从哪一段挖掉。
+    const ops = openings.map(o => {
+      const c = horiz ? (o.c + sx - x0) : (o.c + sz - z0);
+      return { from: c - o.w / 2, to: c + o.w / 2, y0: o.y0 || 0, y1: o.y1 || 2.3 };
+    }).sort((p, q) => p.from - q.from);
+    for (let i = 0; i < n; i++) {
+      const a = i * len / n, b = (i + 1) * len / n;
+      const cx = x0 + (x1 - x0) * (a + b) / (2 * len);
+      const cz = z0 + (z1 - z0) * (a + b) / (2 * len);
+      // 每段的落地高度取该段**两端地面的中点**。
+      //
+      // 取最高点会在下坡侧整段陷进土里（实测围墙沿坡下行时下沉 1.8m，墙腰看不见）；
+      // 取最低点会在上坡侧整段悬空。两者都不对 —— 取中点：一段的最大偏差被摊到
+      // 两端各一半（4m 分段、下坡 1.8m 高差时约 0.9m，肉眼读不出），
+      // 且**两个方向的偏差是有号的**（一段要么整体略高、要么整体略低），
+      // 不会像分段取极值那样忽上忽下。
+      const gAt = (u) => this.groundY(x0 + (x1 - x0) * (u / len), z0 + (z1 - z0) * (u / len));
+      this.baseY = (gAt(a) + gAt(b)) / 2 - 0.15;
+      // 这一段若被开口覆盖，就只建开口之外的部分
+      const segOps = ops.filter(o => o.to > a && o.from < b)
+        .map(o => ({ c: (Math.max(o.from, a) + Math.min(o.to, b)) / 2 - a, w: Math.min(o.to, b) - Math.max(o.from, a), y0: o.y0, y1: o.y1 }));
+      if (horiz) this.wall(sx + a, z0, sx + b, z0, h, t, matName, segOps);
+      else this.wall(x0, sz + a, x0, sz + b, h, t, matName, segOps);
+    }
+    this.baseY = 0;
   }
 
   // 带开口的墙 (轴对齐)
@@ -95,19 +191,82 @@ export class World {
   }
 
   // 可进入建筑 doors/windows: {n:[offset...], s:[], e:[], w:[]}, offset 以墙中心为0
+  // opt.baseY：建筑底面高度。缺省读 this.baseY（也就是"这一批摆件的落地面"）。
+  // 有地形时**每面墙各自贴地**：12m 长的一面墙两端可能差 0.5m，按一个高度摆就会
+  // 一端悬空。做法是每面墙各自算自己的落地高度，沿墙取 5 个采样点的**最高**地面：
+  //
+  // 为什么是最高而不是中心/平均：这面墙横跨的地面本身是斜的（兵营那面墙两端差 2m）。
+  // 按中心摆 → 一头埋进土里 2m、另一头悬空 2m（实测）；按平均摆 → 两头各错 1m。
+  // 取最高点则整面墙都在地面之上，代价是下坡那一头最多露出 2m 的墙基 ——
+  // 而墙有 0.3m 厚度、两侧都立着，那点露出读不出来。**宁可露基，不可埋腰。**
   building(cx, cz, w, d, h, opt = {}) {
     const m = opt.mat || 'plaster', t = 0.3;
     const x0 = cx - w / 2, x1 = cx + w / 2, z0 = cz - d / 2, z1 = cz + d / 2;
-    const mk = (side, len) => {
-      const arr = [];
-      for (const c of (opt.doors?.[side] || [])) arr.push({ c: len / 2 + c, w: 1.5, y0: 0, y1: 2.4 });
-      for (const c of (opt.windows?.[side] || [])) arr.push({ c: len / 2 + c, w: 1.3, y0: 1.0, y1: 2.1 });
-      return arr;
-    };
-    this.wall(x0, z0, x1, z0, h, t, m, mk('n', w));
-    this.wall(x0, z1, x1, z1, h, t, m, mk('s', w));
-    this.wall(x0, z0 + t / 2, x0, z1 - t / 2, h, t, m, mk('w', d - t));
-    this.wall(x1, z0 + t / 2, x1, z1 - t / 2, h, t, m, mk('e', d - t));
+    const ground = this.terrain;
+// 建筑底面高度：取整栋足迹上地面的**最高**点（墙的水平基准线取最高点，
+  // 低于它的部分由勒脚填上）。
+  //
+  // 为什么取最高点：墙是竖直的一片，若按中心或最低点摆，下坡侧会整段悬空
+  // —— 实测一栋 9×7.5m 的兵营压在 1.4m 高差上时，下坡侧墙脚能浮空 1.3m，
+  // 从外面看就是"房子没落地"。
+  const wallY = (ax, az, bx, bz) => {
+    if (!ground) return this.baseY;
+    let hi = -Infinity;
+    for (let i = 0; i <= 4; i++) {
+      const s = i / 4;
+      const g = ground.height(ax + (bx - ax) * s, az + (bz - az) * s);
+      if (g > hi) hi = g;
+    }
+    return hi - 0.1;
+  };
+  // 这面墙脚下的**最低**地面：勒脚要一路填到这里，墙才不会有一角悬空。
+  const wallLo = (ax, az, bx, bz) => {
+    if (!ground) return this.baseY;
+    let lo = Infinity;
+    for (let i = 0; i <= 4; i++) {
+      const s = i / 4;
+      const g = ground.height(ax + (bx - ax) * s, az + (bz - az) * s);
+      if (g < lo) lo = g;
+    }
+    return lo;
+  };
+  const mk = (side, len) => {
+    const arr = [];
+    for (const c of (opt.doors?.[side] || [])) arr.push({ c: len / 2 + c, w: 1.5, y0: 0, y1: 2.4 });
+    for (const c of (opt.windows?.[side] || [])) arr.push({ c: len / 2 + c, w: 1.3, y0: 1.0, y1: 2.1 });
+    return arr;
+  };
+  const keep = this.baseY;
+  // ---- 勒脚：把每面墙脚下的地形填成水平 ----
+  //
+  // 这是"建筑在斜坡上怎么站着"的正解：不是让地形迁就房子（改高度场），
+  // 而是**房子自己带一道混凝土基座**（真实建筑就是这么做的）。基座顶与墙底齐，
+  // 底一路填到该处地面的最低点。于是任何地形起伏下房子都不会悬空，
+  // 视觉上是一圈勒脚，而不是踩空的墙。
+  //
+  // opt.plinth:false 可关掉（无地形图默认不生成，既有五张图行为逐位不变）。
+  const wantPlinth = !!ground && opt.plinth !== false;
+  const plinth = (ax, az, bx, bz, t2) => {
+    const top = wallY(ax, az, bx, bz);
+    const bottom = wallLo(ax, az, bx, bz) - 0.25;
+    const hgt = top - bottom;
+    if (hgt < 0.06) return;
+    this.baseY = bottom;
+    const horiz = Math.abs(bz - az) < 0.001;
+    if (horiz) this.box((ax + bx) / 2, 0, az, Math.abs(bx - ax), hgt, t2, opt.plinthMat || 'concreteDark', { collide: false });
+    else this.box(ax, 0, (az + bz) / 2, t2, hgt, Math.abs(bz - az), opt.plinthMat || 'concreteDark', { collide: false });
+  };
+  if (wantPlinth) {
+    plinth(x0, z0, x1, z0, t + 0.24);
+    plinth(x0, z1, x1, z1, t + 0.24);
+    plinth(x0, z0 + t / 2, x0, z1 - t / 2, t + 0.24);
+    plinth(x1, z0 + t / 2, x1, z1 - t / 2, t + 0.24);
+  }
+  this.baseY = wallY(x0, z0, x1, z0); this.wall(x0, z0, x1, z0, h, t, m, mk('n', w));
+    this.baseY = wallY(x0, z1, x1, z1); this.wall(x0, z1, x1, z1, h, t, m, mk('s', w));
+    this.baseY = wallY(x0, z0 + t / 2, x0, z1 - t / 2); this.wall(x0, z0 + t / 2, x0, z1 - t / 2, h, t, m, mk('w', d - t));
+    this.baseY = wallY(x1, z0 + t / 2, x1, z1 - t / 2); this.wall(x1, z0 + t / 2, x1, z1 - t / 2, h, t, m, mk('e', d - t));
+    this.baseY = keep;
     if (opt.roof !== false) {
       this.box(cx, h, cz, w + 0.4, 0.3, d + 0.4, opt.roofMat || 'concreteDark');
       if (opt.parapet) {
@@ -121,6 +280,43 @@ export class World {
     if (opt.floor !== false) this.box(cx, 0, cz, w - 0.3, 0.03, d - 0.3, opt.floor || 'tiles', { collide: false });
     if (opt.light) this.pointLight(cx, h - 0.4, cz, opt.light, 1.2, 10);
     return { x0, x1, z0, z1 };
+  }
+
+  // 圆形夯土地坪：碰撞体是**内接正八边形**，不能用外接方盒，也不能用"四条方盒拼"。
+  //
+  // 为什么不能用外接方盒：视觉是CylinderGeometry(r,r,h) 圆盘，早一版直接给
+  // r*2 见方的盒子 —— 方盒四个角各伸到圆盘外 r*(√2-1)（r=9 时 5.5m），
+  // 玩家走到圆盘外的草地上会被一堵看不见的空气墙挡住。
+  //
+  // 为什么"四条方盒拼八边形"也不行：判据 test/props.mjs 的 B10 抓到过 ——
+  // 那种拼法的外侧两块本身就是 r 见方的方盒，圆盘外的角又各自伸出去 0.076r。
+  //
+  // 这里用**8 块窄条**（每块对应八边形的一条边，法向沿半径），拼出来的正是内接八边形。
+  // 每块的宽度只有边长，三角函数直接算，不需要任何"近似旋转盒"。
+  pad(x, z, r, h = 0.25, matName = 'concrete') {
+    const keep = this.baseY;
+    this.baseY = this.groundY(x, z) - 0.05;
+    const m = this.mesh(new THREE.CylinderGeometry(r, r, h, 32), matName, x, h / 2, z);
+    // 正八边形：顶点方向 ap，边中点方向 am（两者都从圆心算起）
+    const ap = r * Math.cos(Math.PI / 8);
+    const T = 0.4;                              // 盒厚（径向），够挡住玩家
+    for (let k = 0; k < 8; k++) {
+      const a0 = Math.PI / 8 + k * Math.PI / 4;
+      const a1 = Math.PI / 8 + (k + 1) * Math.PI / 4;
+      const p0x = x + Math.cos(a0) * ap, p0z = z + Math.sin(a0) * ap;
+      const p1x = x + Math.cos(a1) * ap, p1z = z + Math.sin(a1) * ap;
+      // 边中点 → 沿半径方向向内收 T/2，得到这条边的中心 c
+      const mx = (p0x + p1x) / 2, mz = (p0z + p1z) / 2;
+      const dx = mx - x, dz = mz - z;
+      const d = Math.hypot(dx, dz) || 1;
+      const cx = mx - dx / d * T / 2, cz = mz - dz / d * T / 2;
+      // 盒的半宽：这条边在两个轴上的半投影 + 一点余量（斜边不是轴对齐的）
+      const hx = Math.abs(p1x - p0x) / 2 + 0.1;
+      const hz = Math.abs(p1z - p0z) / 2 + 0.1;
+      this.collider(cx - hx, 0, cz - hz, cx + hx, h, cz + hz);
+    }
+    this.baseY = keep;
+    return m;
   }
 
   // 实心建筑（大楼）
@@ -153,20 +349,50 @@ export class World {
     this.box(x, y, z, s, s, s, 'crate', { texScale: s, rotY: rot });
   }
   crateStack(x, z) {
+    // 整堆按足迹取一次地面（取两只箱子覆盖范围的最高点，与 padTo 同理）：
+    // 逐只按中心高度摆的话，在一小片斜坡上后一只会比前一只高 0.2m，堆就歪了。
+    const keep = this.baseY;
+    if (this.terrain) this.baseY = Math.max(this.groundY(x, z), this.groundY(x + 1.25, z)) - 0.1;
     this.crate(x, z, 1.2); this.crate(x + 1.25, z, 1.2); this.crate(x + 0.6, z, 1.1, 1.2, 0.3);
+    this.baseY = keep;
   }
+  // 集装箱：6m 长，按中心点摆在坡上会让一端沉进土里（实测入地 0.68m）。
+  // 取足迹最低点当底 → 整只箱体坐在坡下沿，被土埋一截反而像真的（箱体就那样放地上）。
   container(x, z, rotY = 0, color = 'containerRed', y = 0, doorOpen = false) {
     const L = 6.06, W = 2.44, H = 2.6;
     const along = Math.abs(Math.sin(rotY)) > 0.7;
     const w = along ? W : L, d = along ? L : W;
+    const keep = this.baseY;
+    if (this.terrain && y === 0) {
+      let lo = Infinity;
+      for (const [ux, uz] of [[-w / 2, -d / 2], [w / 2, -d / 2], [-w / 2, d / 2], [w / 2, d / 2], [0, 0]]) {
+        const g = this.groundY(x + ux, z + uz);
+        if (g < lo) lo = g;
+      }
+      this.baseY = lo - 0.12;
+    }
     this.box(x, y, z, w, H, d, color);
     // 顶部框架条纹
     this.box(x, y + H - 0.05, z, w + 0.04, 0.1, d + 0.04, 'darkMetal', { collide: false });
     this.box(x, y, z, w + 0.04, 0.12, d + 0.04, 'darkMetal', { collide: false });
+    this.baseY = keep;
   }
   sandbags(x, z, len, rotY = 0, h = 1.0) {
     const along = Math.abs(Math.sin(rotY)) > 0.7;
     const rows = Math.round(h / 0.25);
+    // 有地形时按**整条沙袋的足迹**取地面：4~5m 长的一排在坡上按中心点摆，
+    // 下坡那头会整排沉进土里（实测埋 0.55m，肉眼看得见沙袋变矮一截）。
+    const keep = this.baseY;
+    if (this.terrain) {
+      const half = len / 2 + 0.3;
+      let lo = Infinity;
+      for (let i = 0; i <= 4; i++) {
+        const s = -half + (half * 2) * (i / 4);
+        const g = along ? this.groundY(x, z + s) : this.groundY(x + s, z);
+        if (g < lo) lo = g;
+      }
+      this.baseY = lo - 0.1;
+    }
     for (let r = 0; r < rows; r++) {
       const off = (r % 2) * 0.25;
       const n = Math.floor((len - off) / 0.55);
@@ -184,6 +410,7 @@ export class World {
       }
     }
     this.box(x, 0, z, along ? 0.6 : len, h, along ? len : 0.6, 'sandbag', { visible: false });
+    this.baseY = keep;
   }
   barrier(x, z, rotY = 0) { // 混凝土防爆墙
     const along = Math.abs(Math.sin(rotY)) > 0.7;
@@ -214,7 +441,7 @@ export class World {
       }
     }
     g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
-    g.position.set(x, 0, z); g.rotation.y = rotY;
+    g.position.set(x, this.baseY, z); g.rotation.y = rotY;
     this.root.add(g);
     const along = Math.abs(Math.sin(rotY)) > 0.7;
     this.collider(x - (along ? 2.1 : 0.9), 0, z - (along ? 0.9 : 2.1), x + (along ? 2.1 : 0.9), 1.1, z + (along ? 0.9 : 2.1));
@@ -239,19 +466,42 @@ export class World {
     const hl = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.15, 0.05), mat('lampCold'));
     hl.position.set(-0.7, 1.05, -3.52); g.add(hl); const hl2 = hl.clone(); hl2.position.x = 0.7; g.add(hl2);
     g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
-    g.position.set(x, 0, z); g.rotation.y = rotY;
+    g.position.set(x, this.baseY, z); g.rotation.y = rotY;
     this.root.add(g);
     return g;
   }
+  // 卡车碰撞体：**必须与 truck() 的建模尺寸一致**。
+  //
+  // 这里的 `along` 语义是"车头朝 z（长轴在 z）"，而不是"旋转了 90°"。
+  // 早一版写成 `Math.abs(Math.sin(rotY)) > 0.7`（"转过 90°"），于是 truck(rotY=π/2)
+  // 拿到的是 **7m 宽 × 2.1m 长** 的盒子，而视觉卡车是 **2.1m 宽 × 6.0m 长**
+  // —— 两侧各有 2.5m 的纯空气挡着玩家。这是"虚空碰撞箱"的典型来源：
+  // 撞到了眼睛看不见的东西。
+  //
+  // 尺寸取自 truck() 的实际建模：局部 x 宽 2.1（s2 侧板在 ±1.0，宽 0.08），
+  // 局部 z 从 -3.5（车头保险杠）到 +2.54（尾板）= 6.04。
   truckCollider(x, z, rotY) {
-    const along = Math.abs(Math.sin(rotY)) > 0.7;
-    this.collider(x - (along ? 3.5 : 1.05), 0, z - (along ? 1.05 : 3.5), x + (along ? 3.5 : 1.05), 1.6, z + (along ? 1.05 : 3.5));
+    // 尺寸必须**容得下** truck() 的建模包围盒，判据 B8 直接量这一点。
+    // 车体 2.1 宽 × 6.04 长，但两侧有**后视镜**，实测视觉短边 2.22m
+    // —— 碰撞盒给 2.2 时两侧各差 0.01m，判据B8 报"容不下"。
+    // 碰撞盒的原则是"宁可略大不可略小"：略小会让玩家的子弹/身体
+    // 从后视镜那里穿过去（视觉上打中了车却没中）。
+    const W = 2.3, L = 6.2, H = 1.9;
+    const along = Math.abs(Math.sin(rotY)) > 0.7;   // 车头朝 x → 长轴在 x
+    this.collider(
+      x - (along ? L / 2 : W / 2), 0, z - (along ? W / 2 : L / 2),
+      x + (along ? L / 2 : W / 2), H, z + (along ? W / 2 : L / 2));
   }
   barrel(x, z, matName = 'containerBlue', fire = false) {
+    const keep = this.baseY;
+    // 油桶是 0.6m 直径的圆柱，摆在坡上按中心点取高会有一半陷进土里（实测 0.6m）。
+    // 取桶底覆盖范围的最高地面：宁可露出一点桶底，也别让它坐进坡里。
+    if (this.terrain) this.baseY = Math.max(this.groundY(x - 0.3, z - 0.3), this.groundY(x + 0.3, z + 0.3)) - 0.1;
     const m = this.mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.9, 16), matName, x, 0.45, z);
     this.collider(x - 0.3, 0, z - 0.3, x + 0.3, 0.9, z + 0.3);
+    this.baseY = keep;
     if (fire) {
-      this.game.effects && this.game.effects.addFireSource(new THREE.Vector3(x, 0.95, z), 0.4);
+      this.game.effects && this.game.effects.addFireSource(new THREE.Vector3(x, 0.95 + this.baseY, z), 0.4);
       this.pointLight(x, 1.6, z, 0xff8a3a, 2.5, 12, true);
     }
     return m;
@@ -310,18 +560,44 @@ export class World {
       }
     }
     g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
-    g.position.set(x, 0, z);
+    // 有地形时按树干的**足迹四角**取地面，而不是读中心那一点：中心高、四角低时
+    // 树干会一角悬空（实测局部 0.14m 起伏 → 一角浮 0.39m、一角埋 0.06m）。
+    // 树是"半埋进土里"的造型，所以取最低点、往下沉 0.1 —— 悬空比埋一点难看得多。
+    const keep = this.baseY;
+    if (this.terrain) {
+      const rr = 0.25 * s;
+      this.baseY = Math.min(
+        this.groundY(x - rr, z - rr), this.groundY(x + rr, z - rr),
+        this.groundY(x - rr, z + rr), this.groundY(x + rr, z + rr)) - 0.1;
+    }
+    g.position.set(x, this.baseY, z);
     this.root.add(g);
     this.collider(x - 0.25 * s, 0, z - 0.25 * s, x + 0.25 * s, 4 * s, z + 0.25 * s);
+    this.baseY = keep;
   }
+  // 岩石：碰撞体要跟着**足迹最低点**走，否则陡坡上会有一大半埋进土里。
+  //
+  // 为什么取最低点而不是中心：岩石本来就是"半埋在土里"的造型，可它的可视网格是以
+  // 中心为原点摆的（mesh(..., x, s*0.25, z)）。碰撞体若按足迹最高点取，坡下那一半
+  // 会整个陷进地形（实测山腰一块石头 4.68m 高差，埋了 3.98m）——那不是"岩石埋在
+  // 土里"，是"岩石大半不见了"。
   rock(x, z, s = 1, matName = 'rock', collide = true) {
     const g = new THREE.DodecahedronGeometry(s, 1);
     const p = g.attributes.position; const r = mulberry32(Math.floor(x * 31 + z * 17));
     for (let i = 0; i < p.count; i++) { const k = 0.75 + r() * 0.45; p.setXYZ(i, p.getX(i) * k, p.getY(i) * k * 0.7, p.getZ(i) * k); }
     g.computeVertexNormals();
+    const keep = this.baseY;
+    // 有地形时按足迹（1.4s 见方）取最低点，让石体坐在坡下沿——被土埋一半是它该有的样子。
+    if (this.terrain) {
+      const rr = s * 0.7;
+      this.baseY = Math.min(
+        this.groundY(x - rr, z - rr), this.groundY(x + rr, z - rr),
+        this.groundY(x - rr, z + rr), this.groundY(x + rr, z + rr)) - 0.15;
+    }
     const m = this.mesh(g, matName, x, s * 0.25, z);
     m.rotation.y = r() * 6;
     if (collide) this.collider(x - s * 0.7, 0, z - s * 0.7, x + s * 0.7, s * 0.8, z + s * 0.7);
+    this.baseY = keep;
   }
   lampPost(x, z, color = 0xffd8a0, rotY = 0, intensity = 18, light = true) {
     this.box(x, 0, z, 0.18, 6, 0.18, 'darkMetal');
@@ -386,22 +662,73 @@ export class World {
     }
   }
   watchtower(x, z, h = 4) {
-    for (const [dx, dz] of [[-1.3, -1.3], [1.3, -1.3], [-1.3, 1.3], [1.3, 1.3]]) this.box(x + dx, 0, z + dz, 0.2, h + 1.2, 0.2, 'wood');
+    // 有地形时塔腿要各自踩在脚下那一块的地面上 —— 塔立在斜坡上时，四条腿
+    // 下的地面高度并不相同（早一版统一用一个 baseY，斜坡上就有腿悬空）。
+    const keep = this.baseY;
+    const ground = this.terrain;
+    const legY = (dx, dz) => ground ? ground.height(x + dx, z + dz) - 0.2 : keep;
+    for (const [dx, dz] of [[-1.3, -1.3], [1.3, -1.3], [-1.3, 1.3], [1.3, 1.3]]) {
+      this.baseY = legY(dx, dz);
+      this.box(x + dx, 0, z + dz, 0.2, h + 1.2, 0.2, 'wood');
+    }
+    // 平台取四条腿最高的那点，保证平台水平（平台斜了整座塔就歪）
+    this.baseY = ground ? Math.max(legY(-1.3, -1.3), legY(1.3, -1.3), legY(-1.3, 1.3), legY(1.3, 1.3)) : keep;
     this.box(x, h, z, 3.2, 0.2, 3.2, 'wood');
     this.box(x, h + 0.2, z - 1.55, 3.2, 1.0, 0.1, 'wood');
     this.box(x, h + 0.2, z + 1.55, 3.2, 1.0, 0.1, 'wood');
     this.box(x - 1.55, h + 0.2, z, 0.1, 1.0, 3.2, 'wood');
     this.box(x + 1.55, h + 0.2, z, 0.1, 1.0, 3.2, 'wood');
     this.box(x, h + 2.2, z, 3.6, 0.15, 3.6, 'metalRoof');
-    for (const [dx, dz] of [[-1.4, -1.4], [1.4, -1.4], [-1.4, 1.4], [1.4, 1.4]]) this.box(x + dx, h + 1.2, z + dz, 0.12, 1.0, 0.12, 'wood', { collide: false });
+    // 顶棚的四根支柱：**必须有碰撞**。它们是纯装饰时（collide:false）塔顶在碰撞层
+    // 里是悬空的 7.5m —— 视觉上有人托着，子弹却直接从塔顶穿过去。
+    // 这是"碰撞体必须与可见结构一致"的典型：眼看不见的不等于可以穿过的。
+    for (const [dx, dz] of [[-1.4, -1.4], [1.4, -1.4], [-1.4, 1.4], [1.4, 1.4]]) {
+      this.box(x + dx, h + 1.2, z + dz, 0.12, 1.0, 0.12, 'wood');
+    }
+    this.baseY = keep;   // 还原：调用方（build()）接着还要摆别的东西
   }
-  tent(x, z, w, d, rotY = 0) {
-    const g = new THREE.CylinderGeometry(w / 2, w / 2, d, 3, 1, true);
-    g.rotateZ(Math.PI / 2); g.rotateY(Math.PI / 2 + rotY);
-    const m = this.mesh(g, 'tarp', x, w * 0.25, z);
-    m.rotation.x = 0;
+  // 军用帐篷（A 字顶）：脊线水平、**顶点朝上**、两坡斜到地面。
+  //
+  // 早一版是 `CylinderGeometry(w/2, w/2, d, 3, 1, true)` 加两次旋转，结果是
+  // 一片**竖着的绿色三角板**（用户报"三棱柱形绿色片状物，意义不明"）：
+  // 三棱柱的截面三角形在rotateZ后底边变成了**竖直边**，顶点指向水平方向。
+  // 判据 B12钉这个：帐篷的脊线必须水平、顶点必须在 Y 最高处。
+  //
+  // 现在直接构造顶点，不再靠旋转猜 —— 少一层间接就少一类"转错方向"的 bug。
+  // 截面（沿 YZ，脊线沿 Z）：
+  //   (0, H)         顶点
+  //   (±w/2, 0)      底边两端
+  // 沿 Z 从 -d/2 到 +d/2 拉伸，再加两个三角端盖（不拉伸就是"纸片屋"）。
+  tent(x, z, w, d, rotY = 0, opt = {}) {
+    const H = opt.h ?? Math.max(2.2, w * 0.62);   // 脊高：太扁会趴在地上
+    const hw = w / 2, hd = d / 2;
+    // 8 个侧面顶点：4 个在 -hd，4 个在 +hd
+    const v = [];
+    for (const sz of [-hd, hd]) {
+      v.push(-hw, 0, sz, hw, 0, sz, 0, H, sz);          // 底-左, 底-右, 顶
+    }
+    const idx = [
+      0, 1, 2,            // -hd 端面
+      3, 5, 4,            // +hd 端面
+      0, 3, 4, 0, 4, 1,   // 左坡
+      2, 5, 3, 2, 0, 5,   // 右坡
+      0, 2, 5, 0, 5, 3,   // -hd 三角盖
+      1, 4, 5, 1, 5, 2,   // +hd 三角盖
+    ];
+    const pos = new Float32Array(idx.length * 3);
+    for (let i = 0; i < idx.length; i++) {
+      pos[i * 3] = v[idx[i] * 3]; pos[i * 3 + 1] = v[idx[i] * 3 + 1]; pos[i * 3 + 2] = v[idx[i] * 3 + 2];
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.computeVertexNormals();
+    if (rotY) g.rotateY(rotY);
+    this.mesh(g, 'tarp', x, 0, z);
+    // 碰撞盒：底面贴地，**容得下**视觉包围盒（不多不少，判据 B8/B12）。
+    // 帐篷是实心的（玩家进不去），所以盒就是 w × d × H。
     const along = Math.abs(Math.sin(rotY)) > 0.7;
-    this.collider(x - (along ? d / 2 : w / 2) * 0.9, 0, z - (along ? w / 2 : d / 2) * 0.9, x + (along ? d / 2 : w / 2) * 0.9, w * 0.6, z + (along ? w / 2 : d / 2) * 0.9);
+    const ex = along ? hd : hw, ez = along ? hw : hd;
+    this.collider(x - ex, 0, z - ez, x + ex, H, z + ez);
   }
 
   // ---------- 环境 ----------
@@ -470,6 +797,9 @@ export class World {
     this.root.add(m);
   }
   ground(matName, size) {
+    // 有地形：那张 y=0 大平板**不能要**。它会把整个丘陵埋掉（z -fighting 且挡住坡面），
+    // 地面网格改由 finalize() 按高度场生成。
+    if (this.terrain) return;
     const s = size || this.def.size + 80;
     this.box(0, -1, 0, s, 1, s, matName, { texScale: mat(matName).userData.texScale });
   }
@@ -494,8 +824,36 @@ export class World {
       this.root.add(mesh);
     }
     this.geoLists.clear();
+    this.buildTerrainMesh();
     this.buildGrid();
     this.buildTopDown();
+  }
+
+  // 地形网格。与 terrain.render() 的三角形一一对应 —— 采样用的面和画出来的面必须是
+  // 同一张（terrain.js 开头纪律①），否则视觉与着地判定分家。
+  buildTerrainMesh() {
+    const T = this.terrain;
+    if (!T) return;
+    const cfn = this.def.terrainColor;
+    const { pos, uv, idx, col } = T.render(this.def.terrainStride || 6, cfn);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    // 逐顶点色：道路与岩面靠它画出来。一条压着坡面的路没法用平板去铺（会一段段翘起来），
+    // 而逐顶点色天然贴合每一张面。
+    if (col) g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    g.computeVertexNormals();
+    // 基底贴图取 def.terrainBase（默认 surface）。逐顶点色是**乘**在贴图上的，
+    // 所以底图要浅：拿 dirt（深棕）乘草绿会得到一片发黑的泥地（实测截图里
+    // 整片丘陵糊成深褐色，起伏全读不出来）。草/土的底图 + 浅色顶点色才立得住。
+    const base = mat(this.def.terrainBase || this.def.surface || 'dirt');
+    const m = new THREE.Mesh(g, col ? base.clone() : base);
+    if (col) { m.material.vertexColors = true; m.material.color.set(0xffffff); }
+    m.castShadow = true;
+    m.receiveShadow = true;
+    this.root.add(m);
+    this.terrainMesh = m;
   }
 
   update(dt, t, camPos) {
@@ -614,11 +972,31 @@ export class World {
       const t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, best);
       if (t >= 0 && t < best) { best = t; hit = b; }
     }
+    // 地形：盒子全部判完之后再比一次，取更近的那个命中点。放在最后而不是穿插在
+    // 循环里，是为了让**无地形图走的那条路径一个字节都不变**（best/hit 的赋值序不变）。
+    if (this.terrain) {
+      const th = this.terrain.ray(o.x, o.y, o.z, d.x, d.y, d.z, best);
+      if (th) {
+        best = th.t;
+        // 地形命中盒挂实例、不挂模块级 —— 一个进程里有多个 World（服务端多房间），
+        // 模块级 scratch 会被下一间房的查询当场改写，而返回值还捏在调用方手里。
+        const hb = this._terrainHit;
+        hb.mat = this.def.surface || 'dirt';
+        hb.terrain = true; hb.slope = th.slope;
+        hit = hb;
+      }
+    }
     if (!hit) return null;
     const px = o.x + d.x * best, py = o.y + d.y * best, pz = o.z + d.z * best;
     const e = 0.002;
     let nx = 0, ny = 0, nz = 0;
-    if (Math.abs(px - hit.x0) < e) nx = -1; else if (Math.abs(px - hit.x1) < e) nx = 1;
+    if (hit.terrain) {
+      // 地形法线取坡面梯度（指向“上坡”），与盒面那套 ±1 分量法不同源
+      const g = this.terrain.grad(px, pz);
+      const m = Math.hypot(g.x, 1, g.z) || 1;
+      nx = -g.x / m; ny = 1 / m; nz = -g.z / m;
+    }
+    else if (Math.abs(px - hit.x0) < e) nx = -1; else if (Math.abs(px - hit.x1) < e) nx = 1;
     else if (Math.abs(py - hit.y0) < e) ny = -1; else if (Math.abs(py - hit.y1) < e) ny = 1;
     else if (Math.abs(pz - hit.z0) < e) nz = -1; else nz = 1;
     return { t: best, point: new THREE.Vector3(px, py, pz), normal: new THREE.Vector3(nx, ny, nz), box: hit };
@@ -644,6 +1022,8 @@ export class World {
       if (!axisZero && (bx.y0 > ymax || bx.y1 < ymin)) continue;
       if (rayAABB(a.x, a.y, a.z, ix, iy, iz, bx, endT) >= 0) return true;
     }
+    // 地形遮挡：山脊后面的人得看不见 —— 否则 bot 会隔着整座丘陵开火。
+    if (this.terrain && this.terrain.ray(a.x, a.y, a.z, ix, iy, iz, endT)) return true;
     return false;
   }
   // 圆柱体与方块碰撞，修改 pos，返回是否着地
@@ -653,6 +1033,11 @@ export class World {
     // 盒子。所以推挤全程记包络（min/max），出包络就还原入参、包络翻倍整轮重来 ——
     // 最终候选集收敛到全量，结果与旧实现逐位一致。正常几何一轮都出不了包络，重试是零成本。
     const ox = pos.x, oy = pos.y, oz = pos.z, ovx = vel.x, ovz = vel.z;
+    // 坐标非有限就什么都别做：下面 `min/max` 包络与 `>=` 收敛判定在 NaN 下恒为 false，
+    // 重试永远不会收敛（那是个永不返回的函数 —— 判据 test/world-equiv.mjs 的 col 段
+    // 用"把玩家塞进盒子里"的样本撞到过，pos.z 已是 NaN 时整个判据卡死）。
+    // 上层照旧处理 NaN；这里只保证不把模拟挂住。
+    if (!Number.isFinite(ox) || !Number.isFinite(oz) || !Number.isFinite(oy)) return;
     let M = 1.5;
     for (;;) {
       pos.x = ox; pos.y = oy; pos.z = oz; vel.x = ovx; vel.z = ovz;
@@ -686,12 +1071,47 @@ export class World {
           }
         }
       }
-      if (minX >= ox - M && maxX <= ox + M && minZ >= oz - M && maxZ <= oz + M) return;
+      if (minX >= ox - M && maxX <= ox + M && minZ >= oz - M && maxZ <= oz + M) {
+        // 陡坡挡人：坡度超过 ROLLING 就把人推回坡下、并吃掉朝坡上的速度分量。
+        // 盒子推挤是"硬墙"，地形没有盒面可撞，但"爬不上去"这件事必须一样成立 ——
+        // 不挡的话玩家会顺着 45° 的陡坡一路滑上去，两处高地的意义就没了。
+        //
+        // **必须在入口挡掉非有限坐标**：入参 pos 若含 NaN（模拟里任何一处算错、
+        // 或者外部传进来一个坏值），下面 `m > 1e-9` 对 NaN 是 false，倒不至于推挤，
+        // 可 `_query(NaN…)` 拿不到候选、min/max 恒为 NaN，`>=` 比较恒 false ——
+        // 于是 `for(;;)` 的收敛条件永远不成立，这个函数**永不返回**（判据
+        // test/world-equiv.mjs 的 col 段撞到过：pos.z 已是 NaN 时卡死）。
+        // 一次查询只要有一处坐标非有限就直接返回，让上层照旧处理 NaN，
+        // 而不是在这里把整个模拟挂住。
+        if (Number.isFinite(pos.x) && Number.isFinite(pos.z) && this.terrain) {
+          const g = this.terrain.slope(pos.x, pos.z);
+          if (g > SLOPE.ROLLING) {
+            const gr = this.terrain.grad(pos.x, pos.z);
+            const m = Math.hypot(gr.x, gr.z);
+            if (m > 1e-9) {
+              const ux = gr.x / m, uz = gr.z / m;      // 上坡单位方向
+              const pen = (g - SLOPE.ROLLING) / g;      // 越陡推得越远
+              pos.x -= ux * radius * pen * 2;
+              pos.z -= uz * radius * pen * 2;
+              const vn = vel.x * ux + vel.z * uz;
+              if (vn > 0) { vel.x -= vn * ux; vel.z -= vn * uz; }
+            }
+          }
+        }
+        return;
+      }
+      // 包络翻倍的重试没有上限：正常几何一轮就收敛，可一旦坐标变成 NaN/Infinity
+      // 就再也收敛不了（上面已挡，但这里仍留一道上限当兜底 —— 一个永不返回的
+      // 碰撞函数会挂住整个权威端，比少推一次严重得多）。
+      if (M > 1e6) { pos.x = ox; pos.y = oy; pos.z = oz; vel.x = ovx; vel.z = ovz; return; }
       M *= 2;
     }
   }
   groundHeight(x, z, feetY, radius, step = 0.45) {
-    let g = 0;
+    // 地形是**地面本身**，不吃 step 限制 —— step 是"跨上箱子"用的，而坡面连续，
+    // 逐帧高差远小于 0.45。陡坡挡人在 collide() 里做（见该函数），不靠这里夹高度：
+    // 在这里夹会让玩家卡在崖脚却脚踩在坡里面（高度对不上视觉）。
+    let g = this.terrain ? this.terrain.height(x, z) : 0;
     const r = radius * 0.7;
     const cand = this._query(x - r, z - r, x + r, z + r);
     for (let k = 0; k < cand.length; k++) {
@@ -724,8 +1144,82 @@ export class World {
     const n = this.gn = Math.ceil(this.def.size / cs);
     this.grid = new Uint8Array(n * n);
     const inf = 0.4;
+
+    // ── 路廊表：先算出来，后面两处都要用 ──
+    //
+    // 盘山路是"修"出来的路：它从营区门洞穿出去、从山腰的岩壁间切过去。
+    // 所以**路廊中心的墙体不该当障碍** —— 否则墙一进网格，盘山路立刻断成两截
+    // （实测营区北墙把第一条路拦腰截断，17 个采样点不可走，高地成孤岛）。
+    //
+    // **两个半径，各管各的（这是本段最容易踩的坑）：**
+    //   roadR  = terrainRoadHalf（30m）→ 给**坡度**用。坡度连续，30m 内都属于
+    //            "路的过渡带"，放宽无害。
+    //   gateHalf = 8m                 → 给**墙体豁免**用。障碍是二值的：
+    //            30m 半宽会把营区北墙整整 60m 标成可走（实测北墙只剩 9/60
+    //            不可走，等于给bot 开了一整面墙的门）。
+    //
+    // 8m 也不该用"采样点方块"膨胀 —— 折线按 6m 步长采样，采样点之间的墙
+    // 会被漏掉豁免、而采样点附近的墙被多豁免（实测漏网段分布在 x=-34..-22、
+    // -14..-6、10..14、18..22、26..34，正是采样点落点附近）。
+    // 正确口径：**按格心到折线的真实距离**判定。
+    const roads = this.def.terrainRoads || [];
+    const roadR = this.def.terrainRoadHalf || 20;    // 坡度判定（宽）
+    const gateHalf = def_gateHalf(this.def);          // 墙体豁免（窄）
+    const roadCells = new Set();      // 坡度：宽（按 6m 采样方块，查表快）
+    const gateCells = new Set();      // 墙体豁免：窄（按真实距离）
+    // 折线段缓存：给"格心到折线距离"用
+    const segList = [];
+    for (const path of roads) {
+      for (let i = 0; i + 1 < path.length; i++) {
+        const ax = path[i][0], az = path[i][1], vx = path[i + 1][0] - ax, vz = path[i + 1][1] - az;
+        const L2 = vx * vx + vz * vz;
+        segList.push([ax, az, vx, vz, L2]);
+        const steps = Math.max(1, Math.ceil(L2 / (6 * 6)));
+        for (let s = 0; s <= steps; s++) {
+          const t = steps ? s / steps : 0;
+          const px = ax + vx * t, pz = az + vz * t;
+          // 宽表：坡度豁免（每 6m 一格，查表比每次重算折线距离快得多）
+          const i0 = Math.floor((px - roadR + this.half) / cs), i1 = Math.floor((px + roadR + this.half) / cs);
+          const j0 = Math.floor((pz - roadR + this.half) / cs), j1 = Math.floor((pz + roadR + this.half) / cs);
+          for (let j = j0; j <= j1; j++) for (let k = i0; k <= i1; k++) {
+            if (k >= 0 && j >= 0 && k < n && j < n) roadCells.add(j * n + k);
+          }
+        }
+      }
+    }
+    // 窄表：只标"格心到某条折线段 ≤ gateHalf"的格。
+    // 遍历折线段的包围盒（而不是全图），格数与折线总长成正比，不是 n²。
+    if (segList.length && gateHalf > 0) {
+      for (const [ax, az, vx, vz, L2] of segList) {
+        const bx = ax + vx, bz = az + vz;
+        const i0 = Math.floor((Math.min(ax, bx) - gateHalf + this.half) / cs);
+        const i1 = Math.floor((Math.max(ax, bx) + gateHalf + this.half) / cs);
+        const j0 = Math.floor((Math.min(az, bz) - gateHalf + this.half) / cs);
+        const j1 = Math.floor((Math.max(az, bz) + gateHalf + this.half) / cs);
+        for (let j = j0; j <= j1; j++) for (let k = i0; k <= i1; k++) {
+          if (k < 0 || j < 0 || k >= n || j >= n) continue;
+          const wx = (k + 0.5) * cs - this.half, wz = (j + 0.5) * cs - this.half;
+          // 点到线段的距离
+          const t = L2 > 0 ? Math.max(0, Math.min(1, ((wx - ax) * vx + (wz - az) * vz) / L2)) : 0;
+          const dx = wx - (ax + vx * t), dz2 = wz - (az + vz * t);
+          if (dx * dx + dz2 * dz2 <= gateHalf * gateHalf) gateCells.add(j * n + k);
+        }
+      }
+    }
+
     for (const b of this.boxes) {
-      if (b.y1 <= 0.45 || b.y0 >= 1.7) continue;
+      // 判定"能不能挡住人"必须用**相对当地地面的高度**，不能用世界 y。
+      //
+      // 早一版写的是 `b.y1 <= 0.45 || b.y0 >= 1.7` —— 那是"地面在 y=0"的假设，
+      // 只对无地形图成立。有地形时营区在海拔 10m 的台地上，围墙的
+      // y0 = 9.9，于是 `y0 >= 1.7` 成立，**整圈围墙被当成"高处的平台"跳过**：
+      // 实测营区 72×54m 内 4015 个导航格**零个**不可走，bot 直接穿墙进营区。
+      //
+      // 正确口径：盒底/盒顶与**当地地面**比。
+      //   y0 - ground < 1.7：盒子从地面往上不到 1.7m → 人能撞到（墙、箱子、卡车）
+      //   y1 - ground > 0.45：盒子底面高于地面 0.45m 以上 → 人在下面钻过
+      const gy = this.terrain ? this.terrain.height((b.x0 + b.x1) / 2, (b.z0 + b.z1) / 2) : 0;
+      if (b.y1 - gy <= 0.45 || b.y0 - gy >= 1.7) continue;
       const ix0 = Math.floor((b.x0 - inf + this.half) / cs), ix1 = Math.floor((b.x1 + inf + this.half) / cs);
       const iz0 = Math.floor((b.z0 - inf + this.half) / cs), iz1 = Math.floor((b.z1 + inf + this.half) / cs);
       for (let z = Math.max(0, iz0); z <= Math.min(n - 1, iz1); z++)
@@ -733,11 +1227,76 @@ export class World {
           // 细检查：单元中心是否在膨胀盒内
           const wx = (x + 0.5) * cs - this.half, wz = (z + 0.5) * cs - this.half;
           if (wx > b.x0 - inf - 0.5 && wx < b.x1 + inf + 0.5 && wz > b.z0 - inf - 0.5 && wz < b.z1 + inf + 0.5) {
-            if (wx >= b.x0 - inf && wx <= b.x1 + inf && wz >= b.z0 - inf && wz <= b.z1 + inf) this.grid[z * n + x] = 1;
+            if (wx >= b.x0 - inf && wx <= b.x1 + inf && wz >= b.z0 - inf && wz <= b.z1 + inf) {
+              // 路廊**中心8m** 内不封格：路是修出来的，本来就该从门洞/岩壁间穿过。
+              // 用 gateCells（窄）而不是 roadCells（宽）—— 见上面那段注释。
+              if (!gateCells.has(z * n + x)) this.grid[z * n + x] = 1;
+            }
           }
         }
     }
     for (let i = 0; i < n; i++) { this.grid[i] = 1; this.grid[(n - 1) * n + i] = 1; this.grid[i * n] = 1; this.grid[i * n + n - 1] = 1; }
+    // 坡度封锁：astarPath 只读这一个数组，所以陡坡要在这里就变成"不可走"。
+    // 用格子四角的最陡值判定（取最保守的那个），免得一条 45° 的坡从格子中央穿过去。
+    //
+    // **路廊内用更宽的上限。** 盘山路是"修"出来的：它的坡度由shape() 里的
+    // ramp() 显式指定，本来就可以比野地陡（现实里的盘山公路坡度远大于步行越野）。
+    // 若对全图一律用 SLOPE.ROLLING(0.42)，那条被精心修出来的路会在导航网格里
+    // 被判成断路 —— 实测两条路各有 9%~12% 的格子超限，南丘因此变成孤岛。
+    // 地图通过 def.terrainRoads 声明"路在哪、半宽多少"，这里对圈内放宽到
+    // SLOPE.ROAD；圈外仍守 ROLLING，玩家想抄近路爬陡坡仍然走不通。
+    if (this.terrain) {
+      const T = this.terrain;
+      const roadSlope = SLOPE.ROAD || 0.62;
+      // roadCells 已在上面算好（要给墙体豁免用），这里直接查表
+      for (let z = 1; z < n - 1; z++) {
+        for (let x = 1; x < n - 1; x++) {
+          if (this.grid[z * n + x]) continue;
+          const wx = (x + 0.5) * cs - this.half, wz = (z + 0.5) * cs - this.half;
+          const d = cs * 0.5;
+          const lim = roadCells.has(z * n + x) ? roadSlope : SLOPE.ROLLING;
+          if (T.slope(wx - d, wz - d) > lim || T.slope(wx + d, wz - d) > lim ||
+              T.slope(wx - d, wz + d) > lim || T.slope(wx + d, wz + d) > lim) {
+            this.grid[z * n + x] = 1;
+          }
+        }
+      }
+    }
+
+    // ── 出生点清场：玩家不能卡在出生点旁边 ──
+    //
+    // 出生平台上有沙袋、岩石这些战术物件（它们是"出生平台"的装饰）。
+    // 障碍盒一旦真的进网格（见上面的"相对地面高度"修正），就可能出现
+    // **某一个 spawn 格子被沙袋压住** —— 实测 A 队 (-150,18) 那个点
+    // 落在主连通域外，玩家一出生就被判成"出不去"（判据 C5 报红）。
+    //
+    // 为什么在这里清而不是让地图别摆：地图物件是"看起来对"的（出生平台
+    // 本来就该有掩体），而"每个 spawn 格子必须可达"是**硬规则**。
+    // 所以让规则赢：spawn 点 1.5m 半径内的格子强制可走。
+    //
+    // 半径 1.5m：只清"人站的那个格"，不清出一片空地（否则掩体就不挡枪了）。
+    // 只清 grid（导航），**不动 boxes（碰撞）** —— 玩家还是撞得到沙袋。
+    if (this.spawns) {
+      for (const list of [this.spawns.A || [], this.spawns.B || []]) {
+        for (const p of list) {
+          const [pix, piz] = [Math.floor((p.x + this.half) / cs), Math.floor((p.z + this.half) / cs)];
+          for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+            const x = pix + dx, z = piz + dz;
+            if (x < 1 || z < 1 || x >= n - 1 || z >= n - 1) continue;
+            // 圆盘形（3×3 的角上那四格不算）
+            if (dx * dx + dz * dz > 2) continue;
+            // 不许清掉"图缘封锁"和"真的太高/太陡"的格：那两种是硬边界
+            const wx = (x + 0.5) * cs - this.half, wz = (z + 0.5) * cs - this.half;
+            if (this.terrain) {
+              const d = cs * 0.5;
+              const lim = roadCells.has(z * n + x) ? (SLOPE.ROAD || 0.62) : SLOPE.ROLLING;
+              if (this.terrain.slope(wx, wz) > lim) continue;
+            }
+            this.grid[z * n + x] = 0;
+          }
+        }
+      }
+    }
   }
   cellOf(x, z) { return [Math.floor((x + this.half) / this.cs), Math.floor((z + this.half) / this.cs)]; }
   walkable(ix, iz) { return ix >= 0 && iz >= 0 && ix < this.gn && iz < this.gn && this.grid[iz * this.gn + ix] === 0; }
@@ -746,9 +1305,9 @@ export class World {
       // 出生点/巡逻点/空袭落点都走这里 —— 玩法流，必须由服务端决定
       const x = cx + (rng.next() * 2 - 1) * Math.min(rad, this.half - 2), z = cz + (rng.next() * 2 - 1) * Math.min(rad, this.half - 2);
       const [ix, iz] = this.cellOf(x, z);
-      if (this.walkable(ix, iz) && this.ceilingHeight(x, z, 0, 0.3) > 2) return new THREE.Vector3(x, 0, z);
+      if (this.walkable(ix, iz) && this.ceilingHeight(x, z, 0, 0.3) > 2) return new THREE.Vector3(x, this.terrain ? this.terrain.height(x, z) : 0, z);
     }
-    return new THREE.Vector3(cx, 0, cz);
+    return new THREE.Vector3(cx, this.terrain ? this.terrain.height(cx, cz) : 0, cz);
   }
   // 寻路本体在 pathfind.js（性能审查 C5 抽核）：那里是纯模块，寻路 Worker 装的是
   // 同一份 astarPath + 本格的拷贝 —— 两条路的路径点逐位一致，判据 test/worker-core.mjs。
@@ -765,6 +1324,25 @@ export class World {
     const ctx = cv.getContext('2d');
     ctx.fillStyle = 'rgba(30,34,30,0.9)'; ctx.fillRect(0, 0, N, N);
     const k = N / this.def.size;
+    // 地形先铺：一张没有高程的小地图在丘陵图上等于废图（两处高地看起来一样）。
+    if (this.terrain) {
+      const img = ctx.createImageData(N, N), d = img.data;
+      const lo = this.terrain.min, hi = this.terrain.max;
+      const base = hexRGB(this.def.surfaceColor || 0x6a7a4a);
+      const rock = hexRGB(0xa8a294), sand = hexRGB(0xc4b489);
+      this.terrain.paintHeight((px, py, y, lit, water) => {
+        const t = Math.max(0, Math.min(1, (y - lo) / ((hi - lo) || 1)));
+        // 高处偏岩、低处偏土；再叠一点坡向明暗让脊线读得出来
+        let r = base[0] + (rock[0] - base[0]) * t, g2 = base[1] + (rock[1] - base[1]) * t, b = base[2] + (rock[2] - base[2]) * t;
+        if (t < 0.18) { const k2 = (0.18 - t) / 0.18; r += (sand[0] - r) * k2; g2 += (sand[1] - g2) * k2; b += (sand[2] - b) * k2; }
+        const sh = 0.72 + lit * 0.5;
+        const o = (py * N + px) * 4;
+        if (water) { d[o] = 40; d[o + 1] = 70; d[o + 2] = 96; }
+        else { d[o] = r * sh; d[o + 1] = g2 * sh; d[o + 2] = b * sh; }
+        d[o + 3] = 235;
+      }, N);
+      ctx.putImageData(img, 0, 0);
+    }
     const sorted = [...this.boxes].filter(b => b.y1 > 0.3 && b.y1 < 40 && (b.x1 - b.x0) < this.def.size).sort((a, b) => a.y1 - b.y1);
     for (const b of sorted) {
       const v = Math.min(200, 70 + b.y1 * 12);

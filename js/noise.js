@@ -19,7 +19,10 @@ export class TileNoise {
   }
   get(x, y, freq) {
     // x,y in [0,1)
-    const p = Math.min(this.p, freq);
+    // freq 取整：它下面是 `(ix % p) + p) % p` 的整数取模，p 带小数就会算出带小数的
+    // 下标，拿去索引 Float32Array 得到 undefined，值静悄悄变成 NaN（terrain.js 的
+    // hillNoise 踩过这一脚）。格数本来只能是整数，在这里夹一下比在每个调用点提防便宜。
+    const p = Math.max(1, Math.min(this.p, Math.round(freq)));
     const fx = x * p, fy = y * p;
     const ix = Math.floor(fx), iy = Math.floor(fy);
     const tx = fx - ix, ty = fy - iy;

@@ -69,7 +69,7 @@ const buildMap = async (id) => {
   return { w, boxes: w.boxes || [], colliders: w.colliders || [] };
 };
 
-const MAP_IDS = ['dune', 'frost', 'neon', 'yard'];
+const MAP_IDS = ['dune', 'frost', 'neon', 'yard', 'ridges'];
 
 const imports = await stage('1 import 每个 sim 模块', async () => {
   const out = {};

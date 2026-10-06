@@ -272,6 +272,7 @@ export const MP_MAPS = [
   { id: 'frost', name: '寒霜炼厂', desc: '暴风雪中的废弃炼油厂，仓库、储油罐与集装箱构成多层次战场。', style: '雪地 · 阴天', grad: 'linear-gradient(135deg,#c9d6e3,#4f6275)' },
   { id: 'neon', name: '霓虹街区', desc: '雨夜中的都市街区，霓虹灯下的湿滑街道与狭窄小巷，近距离激战。', style: '都市 · 雨夜', grad: 'linear-gradient(135deg,#ff3fa4,#1b1f5e)' },
   { id: 'yard', name: '货柜场', desc: '夕阳下的小型集装箱堆场，节奏极快的混战地图。', style: '港口 · 黄昏', grad: 'linear-gradient(135deg,#ff9a3c,#5a2a3a)' },
+  { id: 'ridges', name: '双丘战区', desc: '超大丘陵战场：两处高地各有一座瞭望塔，高地之间的鞍部是必经的交战区，中央平整台地上扎着一座军营。', style: '丘陵 · 正午', grad: 'linear-gradient(135deg,#8aa85c,#3f5230)' },
 ];
 
 // net = **权威服务端判得出这一模式的胜负**，不是"代码里有这个名字"。三种都判得了：

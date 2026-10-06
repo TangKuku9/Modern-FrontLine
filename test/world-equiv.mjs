@@ -38,11 +38,22 @@ function bruteRaycast(w, o, d, maxT) {
     const t = rayAABB(o.x, o.y, o.z, d.x, d.y, d.z, b, best);
     if (t >= 0 && t < best) { best = t; hit = b; }
   }
+  // 地形也要进基准：被测实现把地形算进去了，基准不跟上的话每一次地形命中都会
+  // 被报成"分歧"—— 那样这张表就变成了恒红的摆设，而不是差分器。
+  if (w.terrain) {
+    const th = w.terrain.ray(o.x, o.y, o.z, d.x, d.y, d.z, best);
+    if (th) { best = th.t; hit = w._terrainHit; }
+  }
   if (!hit) return null;
   const px = o.x + d.x * best, py = o.y + d.y * best, pz = o.z + d.z * best;
   const e = 0.002;
   let nx = 0, ny = 0, nz = 0;
-  if (Math.abs(px - hit.x0) < e) nx = -1; else if (Math.abs(px - hit.x1) < e) nx = 1;
+  if (hit.terrain) {
+    const g = w.terrain.grad(px, pz);
+    const m = Math.hypot(g.x, 1, g.z) || 1;
+    nx = -g.x / m; ny = 1 / m; nz = -g.z / m;
+  }
+  else if (Math.abs(px - hit.x0) < e) nx = -1; else if (Math.abs(px - hit.x1) < e) nx = 1;
   else if (Math.abs(py - hit.y0) < e) ny = -1; else if (Math.abs(py - hit.y1) < e) ny = 1;
   else if (Math.abs(pz - hit.z0) < e) nz = -1; else nz = 1;
   return { t: best, point: { x: px, y: py, z: pz }, normal: { x: nx, y: ny, z: nz }, box: hit };
@@ -56,6 +67,7 @@ function bruteLineBlocked(w, a, b) {
   for (let i = 0; i < bx.length; i++) {
     if (rayAABB(a.x, a.y, a.z, ix, iy, iz, bx[i], L - 0.05) >= 0) return true;
   }
+  if (w.terrain && w.terrain.ray(a.x, a.y, a.z, ix, iy, iz, L - 0.05)) return true;
   return false;
 }
 function bruteCollide(w, pos, vel, radius, height, step = 0.45) {
@@ -83,9 +95,26 @@ function bruteCollide(w, pos, vel, radius, height, step = 0.45) {
       }
     }
   }
+  // 陡坡推挤：被测实现在包络收敛之后做这一步，基准照做一次（阈值同 world.js 的
+  // SLOPE.ROLLING=0.42）。这段不属于宽相 —— 它对不对由 test/terrain.mjs 的正面判据盯；
+  // 这里跟做，是为了让"盒命中/推挤逐位一致"这条仍然只测宽相，不被坡度规则搅进来。
+  if (w.terrain) {
+    const g = w.terrain.slope(pos.x, pos.z);
+    if (g > 0.42) {
+      const gr = w.terrain.grad(pos.x, pos.z);
+      const m = Math.hypot(gr.x, gr.z);
+      if (m > 1e-9) {
+        const ux = gr.x / m, uz = gr.z / m, pen = (g - 0.42) / g;
+        pos.x -= ux * radius * pen * 2;
+        pos.z -= uz * radius * pen * 2;
+        const vn = vel.x * ux + vel.z * uz;
+        if (vn > 0) { vel.x -= vn * ux; vel.z -= vn * uz; }
+      }
+    }
+  }
 }
 function bruteGround(w, x, z, feetY, radius, step = 0.45) {
-  let g = 0;
+  let g = w.terrain ? w.terrain.height(x, z) : 0;
   const bx = w.boxes;
   const r = radius * 0.7;
   for (let i = 0; i < bx.length; i++) {
@@ -117,7 +146,8 @@ const mkGame = () => ({
 const eq = (a, b) => a === b || (Number.isNaN(a) && Number.isNaN(b));
 let diverge = 0;   // 差分计数（R1 反证臂要它 > 0）
 
-function sweep(w, tag, rnd, N) {
+function sweep(w, tag, rnd, N, scale = 1) {
+  const _t0=Date.now(); const _log=(k)=>console.error(`  [sweep ${tag}] ${k} ${Date.now()-_t0}ms`);
   const half = w.half;
   const diff = (label) => { diverge++; ok(label, false, `第 ${diverge} 处分歧`); };
   for (let i = 0; i < N.ray; i++) {
@@ -156,8 +186,14 @@ function sweep(w, tag, rnd, N) {
     if (bruteGround(w, x, z, feetY, radius) !== w.groundHeight(x, z, feetY, radius)) diff(`${tag} groundHeight 一致 #${i}`);
     if (bruteCeiling(w, x, z, feetY, radius) !== w.ceilingHeight(x, z, feetY, radius)) diff(`${tag} ceilingHeight 一致 #${i}`);
   }
+  _log("前四段完成");
   // 边缘用例：原点贴盒面（内/外/正上）× 轴向/对角方向 × 几档 maxT —— 两类真 bug 都在这里
-  const stride = Math.max(1, (w.boxes.length / 60) | 0);
+  // 这一段是**基准侧**（全量线性扫）成本最高的地方：盒数 × 6 面 × 3 eps × 8 方向 × 3 maxT
+  // 每次都要两遍全量扫。大图（ridges 444 盒）跑到 27648 次组合要几分钟。
+  // 所以给遍历的盒数封个顶：边缘用例的价值在"原点贴面"这个**形态**上，
+  // 60~80 个盒足够覆盖各种面朝向；再多只是重复同一形态。
+  const cap = Math.max(12, Math.round(64 * scale));
+  const stride = Math.max(1, Math.ceil(w.boxes.length / cap));
   for (let bi = 0; bi < w.boxes.length; bi += stride) {
     const b = w.boxes[bi];
     const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, cz = (b.z0 + b.z1) / 2;
@@ -184,13 +220,21 @@ function sweep(w, tag, rnd, N) {
   }
 }
 
-// ── 真地图差分（dune 盒最多、kaldash 地图最大，覆盖两类剪枝形态）──
-for (const id of ['dune', 'kaldash']) {
+// ── 真地图差分（dune 盒最多、kaldash 地图最大、ridges 唯一带地形）──
+// ridges 的采样数比另两张少一档：它是 360m 的大图，基准侧（全量线性扫 + 逐点地形
+// 射线）本身是 O(盒数 × 采样数)，按另两张的量级会跑到分钟级。
+// 少一档不等于放水 —— 差异比对本身是逐位的，采样少只影响"覆盖了多少种情形"，
+// 而地形那条路径另有 test/terrain.mjs 的 A/C/D 三段专门盯。
+for (const id of ['dune', 'kaldash', 'ridges']) {
+  const scale = id === 'ridges' ? 0.25 : 1;
   const def = MAPS[id];
   const w = new World(mkGame(), def);
   def.build(w, w.game);
   w.finalize();
-  sweep(w, id, mulberry32(def.seed || 7), { ray: 5000, los: 2500, col: 3500, gc: 3500 });
+  sweep(w, id, mulberry32(def.seed || 7), {
+    ray: Math.round(5000 * scale), los: Math.round(2500 * scale),
+    col: Math.round(3500 * scale), gc: Math.round(3500 * scale),
+  }, scale);
   ok(`${id} 宽相候选确实在剪（40m 射线候选 < 盒数的 1/4）`, (() => {
     let cand = 0;
     const rnd = mulberry32(1);
@@ -255,6 +299,30 @@ for (const id of ['dune', 'kaldash']) {
 }
 
 const bad = out.filter(([g]) => !g);
+
+// ── 盒面有限性：非有限的盒会污染宽相格网 ──
+// 踩过的坑：某张图里一个 `w.box(x, z, h, w, d, mat)` 少写了 y0 参数（box 的签名是
+// (cx, y0, cz, w, h, d, mat)），参数整体错位，造出一个 z 为 NaN 的碰撞盒。
+// 症状不是"那个盒子坏了"，而是**它所在那一格的 ceilingHeight/raycast 全部漏命中**
+// —— 差分判据报出 6 处分歧，追下去是一张 NaN 盒。所以这里正向钉一道：
+// 六张图的每一个碰撞盒，六个面都必须有限。
+{
+  let nanBoxes = 0, total = 0;
+  for (const id of ['dune', 'frost', 'neon', 'yard', 'kaldash', 'ridges']) {
+    const w = new World(mkGame(), MAPS[id]);
+    MAPS[id].build(w, w.game);
+    w.finalize();
+    for (const b of w.boxes) {
+      total++;
+      if (!Number.isFinite(b.x0) || !Number.isFinite(b.y0) || !Number.isFinite(b.z0) ||
+          !Number.isFinite(b.x1) || !Number.isFinite(b.y1) || !Number.isFinite(b.z1)) nanBoxes++;
+    }
+  }
+  ok('六张图的碰撞盒面全部有限（一张 NaN 盒就会污染整格宽相，让邻域查询漏命中）',
+    nanBoxes === 0, `${total} 张盒里 ${nanBoxes} 张非有限`);
+  // 先决臂：得真的检查了一批盒，否则上面那条是"遍历了空集合"的恒绿
+  ok('盒面检查确实覆盖了一批盒子（不是空集合）', total > 1000, `共 ${total} 张`);
+}
 for (const [g, label] of out) console.log(`  ${g ? '✅' : '❌'} ${label}`);
 console.log(`\n  ${bad.length ? 'RED' : 'GREEN'}  ${out.length - bad.length}/${out.length} 通过（差分分歧 ${diverge} 处，R1 之外必须为 0）`);
 process.exit(bad.length ? 1 : 0);
