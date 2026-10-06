@@ -1,7 +1,10 @@
 // 菜单系统：主菜单、战役简报、多人大厅、配装、枪匠、设置、暂停、结算
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
+import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, DOM_SCORES, scoreOptions, mapAllowed, mapsForMode, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
+// DEFAULT_SCORE_LIMIT：切模式时旧的目标偏好不在新模式的档位表里，就落回那个模式的默认。
+// 默认只此一份（规则内核的家），界面不要自己再写一个 200/50。
+import { DEFAULT_SCORE_LIMIT } from './match-rules.js';
 import { buildGun } from './gunmodel.js';
 import { createSoldierModel, animateSoldier } from './soldier.js';
 import { mat, camoSwatch } from './materials.js';
@@ -14,6 +17,10 @@ import { levelOf, totalXp, xpText, applyAccountXp } from './progress.mjs';
 
 const DIFF_NAMES = ['新兵', '正规军', '老兵'];
 const MAX_ATT = 5;
+// 目标档位两张表（tdm/ffa 的 MP_SCORES 与 dom 独有的 DOM_SCORES）的**并集**。渲染一次的
+// 选择器用它把全部候选先画出来，再按 js/data.js:scoreOptions 藏掉当前模式不收的值 ——
+// 监听器直接挂在 div 上，重建 innerHTML 会把它们一起丢掉，所以"画全集 + 藏"而不是"重画"。
+const SCORES_ALL = [...MP_SCORES, ...DOM_SCORES.filter(v => !MP_SCORES.includes(v))];
 
 // 联机能选的模式 = js/data.js 那张表上 net 为真的那几个（服务端判得出它们的胜负）。
 // 与 server/lobby.mjs:MODE_IDS 同源，两侧各筛各的话症状就是"界面上给了一格，点下去被拒"
@@ -90,7 +97,7 @@ export class Menu {
     this.camTarget = { pos: new THREE.Vector3(-0.3, 1.45, 4.2), look: new THREE.Vector3(0.6, 1.15, 0) };
     this.camLook = this.camTarget.look.clone();
     this.gunRotY = -Math.PI / 2; this.gunRotX = 0; this.gunSpin = true;
-    // score 是胜利目标那格（MP_SCORES 的一个值），单人对战与联机建房共用这一份偏好。
+    // score 是胜利目标那格（js/data.js:scoreOptions(mode) 里的一个值），单人对战与联机建房共用这一份偏好。
     // 默认 50：与 js/match-rules.js 的 DEFAULT_SCORE_LIMIT('tdm') 同值 —— 但它只是
     // "上次选了什么"的记忆，真正的默认/清洗在服务端（lobby.cleanScore）。
     this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, minutes: 10, score: 50, name: '士兵', team: 'A', room: '', title: '' };
@@ -342,7 +349,7 @@ export class Menu {
               <div class="tm-only">队友数量</div><div class="tm-only">${seg('allies', [3, 5], ['3', '5'])}</div>
               <div>敌人数量</div>${seg('enemies', [4, 6, 8], ['4', '6', '8'])}
               <div>时间限制</div>${seg('time', [5, 10, 15], ['5 分钟', '10 分钟', '15 分钟'])}
-              <div>胜利目标</div>${seg('score', MP_SCORES, MP_SCORES.map(String), L.score)}
+              <div>胜利目标</div>${seg('score', SCORES_ALL, SCORES_ALL.map(String), L.score)}
               <div id="limitTxt" class="note-wide" style="color:#777"></div>
             </div></div>
             <div class="panel">
@@ -360,11 +367,22 @@ export class Menu {
     const upd = () => {
       // 目标那格只写数字（"150 杀"这种双字后缀 ×6 会把它顶出 460 px 的面板 —— 量过，
       // 需要 ~380 px、只有 ~300 px）；"是杀还是分"的语义由下面那行说明文字说，
-      // 换模式时它跟着重写。选择本身在两种模式之间保留。
+      // 换模式时它跟着重写。档位按模式换表：不属于当前模式的值藏掉；旧偏好不在新表里
+      // 就落回该模式的默认（dom 200 分 / tdm 50 杀）—— 默认只问规则内核那一份。
+      if (!scoreOptions(L.mode).includes(L.score)) L.score = DEFAULT_SCORE_LIMIT(L.mode);
+      // 地图卡片同理按模式收放：专属图（ridges 只在占领）**藏掉**而不是置灰 ——
+      // 置灰会让人以为换个模式它就换图生效，藏掉才是"这个模式没有这张图"。
+      // 当前图不被新模式收 → 落回该模式第一张可用的图（dune 全模式可开，兜底恒存在）。
+      if (!mapAllowed(L.map, L.mode)) L.map = mapsForMode(L.mode)[0].id;
+      r.querySelectorAll('.mapc').forEach(c => {
+        c.style.display = mapAllowed(c.dataset.map, L.mode) ? '' : 'none';
+        c.classList.toggle('sel', c.dataset.map === L.map);
+      });
       const segEl = r.querySelector('.seg[data-k=score]');
-      if (segEl) segEl.querySelectorAll('div').forEach((d, i) => {
-        d.textContent = MP_SCORES[i];
-        d.classList.toggle('sel', MP_SCORES[i] == L.score);
+      if (segEl) segEl.querySelectorAll('div').forEach(d => {
+        const v = +d.dataset.v;
+        d.style.display = scoreOptions(L.mode).includes(v) ? '' : 'none';
+        d.classList.toggle('sel', v === L.score);
       });
       r.querySelector('#limitTxt').textContent = `先达到 ${L.score}${L.mode === 'dom' ? ' 分' : ' 击杀'}获胜，或时间结束时领先`;
       r.querySelectorAll('.tm-only').forEach(e => e.style.opacity = L.mode === 'ffa' ? 0.3 : 1);
@@ -566,7 +584,7 @@ export class Menu {
               <div>地图</div>${seg('segMap', MP_MAPS.map(m => m.id), MP_MAPS.map(m => m.name), L.map)}
               <div>模式</div>${seg('segMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), this.onlineMode())}
               <div>时长</div>${seg('segMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), L.minutes)}
-              <div>目标</div>${seg('segScore', MP_SCORES, MP_SCORES.map(v => this.scoreLabel(v, this.onlineMode())), L.score)}
+              <div>目标</div>${seg('segScore', SCORES_ALL, SCORES_ALL.map(v => this.scoreLabel(v, this.onlineMode())), L.score)}
               <div class="note-wide" id="lbErr"></div>
             </div></div>
           </div>
@@ -584,10 +602,29 @@ export class Menu {
           </div>
         </div>
       </div>`, 'solid', 'online');
+    // 模式与地图互相牵制（ridges 只在占领）：三行候选是渲染-once 的，这里按当前组合
+    // 藏掉不收的项、迁移落选的偏好（图 / 目标），再把 sel 与目标行的"杀/分"后缀拨回
+    // 真相 —— 与单机屏同一套"画全集 + 藏"的手法。点击任何一格后都要跑一遍。
+    const syncSegs = () => {
+      if (!mapAllowed(L.map, L.mode)) L.map = mapsForMode(L.mode)[0].id;
+      if (!scoreOptions(L.mode).includes(L.score)) L.score = DEFAULT_SCORE_LIMIT(L.mode);
+      const togg = (id, val, allow) => {
+        const el = r.querySelector(`#${id} div[data-v="${val}"]`);
+        if (el) el.style.display = allow ? '' : 'none';
+      };
+      for (const m of MP_MAPS) togg('segMap', m.id, mapAllowed(m.id, L.mode));
+      for (const m of ONLINE_MODES) togg('segMode', m.id, mapAllowed(L.map, m.id));
+      for (const v of SCORES_ALL) togg('segScore', v, scoreOptions(L.mode).includes(v));
+      r.querySelectorAll('#segScore div').forEach(x => { x.textContent = this.scoreLabel(+x.dataset.v, L.mode); });
+      for (const [id, val] of [['segMap', L.map], ['segMode', L.mode], ['segScore', L.score]])
+        r.querySelectorAll(`#${id} div`).forEach(x => x.classList.toggle('sel', x.dataset.v === String(val)));
+    };
+    syncSegs();
     r.querySelectorAll('.seg').forEach(sg => sg.querySelectorAll('div').forEach(d => d.addEventListener('click', () => {
       const key = sg.id === 'segMap' ? 'map' : sg.id === 'segMode' ? 'mode' : sg.id === 'segScore' ? 'score' : 'minutes';
       L[key] = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
       sg.querySelectorAll('div').forEach(x => x.classList.toggle('sel', x === d));
+      syncSegs();
     })));
     this.on(r, '[data-a=back]', () => this.leaveOnline());
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('online'));
@@ -1008,18 +1045,25 @@ export class Menu {
       // 三行"标签 + 选择器"，不用 .opts 那个 110px 标签列的两列网格：那一列是给
       // 大厅那种宽栏设计的，塞进房间中间这一栏（约 300 px）之后四张地图名被挤成竖排单字。
       const row = (label, id, vals, labels, cur) => `<div class="cfg-row"><span>${label}</span>${seg(id, vals, labels, cur, !me.isHost || playing)}</div>`;
+      // 模式牵制地图、地图也牵制模式（ridges 只在占领）：候选都按当前组合滤过。这一整块
+      // innerHTML 随每次房间状态推着重画（监听器跟着重挂），直接滤候选表就行，不需要
+      // 别处那套"画全集 + 藏"。服务端（server/lobby.mjs:mapGate）是后盾：绕过界面
+      // 发帧的组合会被当场拒掉，而不是悄悄换掉一边。
+      const roomMaps = MP_MAPS.filter(m => mapAllowed(m.id, room.mode));
+      const roomModes = ONLINE_MODES.filter(m => mapAllowed(room.map, m.id));
       cfg.innerHTML = `<div class="lb-hd"><span>${me.isHost ? '房间设置' : '本局设置'}</span><span>${me.isHost ? '改动立刻随列表广播' : '由房主决定'}</span></div>`
-        + row('地图', 'rmMap', MP_MAPS.map(m => m.id), MP_MAPS.map(m => m.name), room.map)
+        + row('地图', 'rmMap', roomMaps.map(m => m.id), roomMaps.map(m => m.name), room.map)
         // 只有一种玩法可选时不画选择器：一个撑满整行的亮块看着像"还能点出别的"，
         // 而它其实是一句陈述。id 两边同名，判据不必跟着形状改。
-        + (ONLINE_MODES.length > 1
-          ? row('模式', 'rmMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), room.mode)
-          : `<div class="cfg-row"><span>模式</span><div class="cfg-one" id="rmMode">${esc(mode.name)}</div></div>`)
+        + (roomModes.length > 1
+          ? row('模式', 'rmMode', roomModes.map(m => m.id), roomModes.map(m => m.name), room.mode)
+          : `<div class="cfg-row"><span>模式</span><div class="cfg-one" id="rmMode">${esc((roomModes[0] || mode).name)}</div></div>`)
         + row('时长', 'rmMin', MP_MINUTES, MP_MINUTES.map(v => v + ' 分'), room.time || 10)
-        // 胜利目标。六个候选值的这一行是 300 px 窄栏里最挤的一行 —— "150 杀"这种双字
-        // 后缀会把它顶出面板边框（nowrap 不许折行，flex 也不许缩过内容宽）。所以这一行
-        // 只写数字："是击杀还是占领分"由行标签与上面那行 meta（"150 杀 · …"）说。
-        + row('目标', 'rmScore', MP_SCORES, MP_SCORES.map(String), room.score || 50)
+        // 胜利目标，档位按模式换表（js/data.js:scoreOptions）。候选值的这一行是 300 px
+        // 窄栏里最挤的一行 —— "150 杀"这种双字后缀会把它顶出面板边框（nowrap 不许折行，
+        // flex 也不许缩过内容宽）。所以这一行只写数字："是击杀还是占领分"由行标签与
+        // 上面那行 meta（"150 杀 · …"）说。
+        + row('目标', 'rmScore', scoreOptions(room.mode), scoreOptions(room.mode).map(String), room.score || 50)
         // Bot 难度。改一格**全体 Bot 一起变**（服务端那条注释写了为什么不做成逐个改），
         // 所以这一行只在房里真有 Bot 时才画 —— 空房子里摆一个 Bot 难度选择器，
         // 玩家会以为"选了就会自动加 Bot"。

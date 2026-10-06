@@ -17,7 +17,7 @@
 // ── 权限在这里，不在界面上 ──
 // 谁能开局、开局要满足什么条件、聊天能发多快，全部在服务端判一遍。客户端把"开始"
 // 按钮置灰只是体验；改得动的东西不算权限（和 /api/rooms 的 401、WS 握手的 401 同源）。
-import { MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
+import { MP_MAPS, MP_MODES, MP_MINUTES, scoreOptions, mapAllowed, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
 import { DEFAULT_SCORE_LIMIT } from '../js/match-rules.js';
 
 // 一间的上限。和 net-server:pickRoom 里那个"人最多且没满"的 16 是同一个数 ——
@@ -84,8 +84,21 @@ const cleanMinutes = (v) => { const n = Number(v); return MIN_SET.has(n) ? n : 1
 // 胜利目标那格与时长同一套规矩：不认的值**退回该模式的默认**（DEFAULT_SCORE_LIMIT），
 // 而不是退回一个写死的数 —— 三种模式的目标语义不同（击杀数 / 占领分数）。
 // 静默换值的症状与时长那条一样：房间标题上写的数从此是假的。
-const SCORE_SET = new Set(MP_SCORES);
-const cleanScore = (v, mode) => { const n = Number(v); return SCORE_SET.has(n) ? n : DEFAULT_SCORE_LIMIT(mode); };
+// 档位本身也**按模式换表**（js/data.js:scoreOptions）：dom 是 100/200/500 那一档
+// （它从 50 起步、涨速与击杀数不同量纲），一张 Set 打天下会把 dom 房里的 50 分
+// 当成合法目标收下。
+const cleanScore = (v, mode) => { const n = Number(v); return scoreOptions(mode).includes(n) ? n : DEFAULT_SCORE_LIMIT(mode); };
+
+// 专属图的门，与 modeGate 同一形状：认得出的组合放行，不认识的**当场拒绝**（拒绝要
+// 说得具体 —— "「双丘战区」只在占领开放"，而不是一句"地图不对"）。选择器（js/menu.js）
+// 已经按 mapAllowed 藏了卡片，这里是后盾：绕过界面直接发帧的组合走不到房间里。
+const MAP_NAMES = Object.fromEntries(MP_MAPS.map(m => [m.id, m.name]));
+const mapGate = (mapId, mode) => {
+  if (mapAllowed(mapId, mode)) return null;
+  const m = MP_MAPS.find(x => x.id === mapId);
+  const names = ((m && m.modes) || []).map(id => MODE_NAMES[id] || id).join('、');
+  return `「${(m && m.name) || mapId}」只在${names}模式开放`;
+};
 
 let NEXT_SID = 1;
 // 一条连接的座位号在**进大厅那一刻**就发下去，不等它进哪间房。座位的键是它，
@@ -172,7 +185,7 @@ export class Lobby {
       // 否则它们和正常发言混在一格里，谁也归不了因。
       whisper: 0, whisperNoTarget: 0, whisperSelf: 0, whisperAmbiguous: 0,
       emote: 0, emoteBad: 0,
-      join: 0, full: 0, playing: 0, dupId: 0, badId: 0, quota: 0, badMode: 0,
+      join: 0, full: 0, playing: 0, dupId: 0, badId: 0, quota: 0, badMode: 0, badMap: 0,
       badMode: 0,
       starts: 0, notHost: 0, tooFew: 0, notReady: 0,
       seats: 0, leaves: 0, swept: 0,
@@ -425,12 +438,16 @@ export class Lobby {
     }
     const bad = modeGate(msg.mode);
     if (bad) { this.stat.badMode++; return { ok: false, message: bad }; }
+    // 地图×模式的组合也在落座前验完（拒绝项全过才动座位 —— 与上一条同一句）。
+    const mode = MODE_IDS.has(msg.mode) ? msg.mode : 'tdm';
+    const mapId = MAP_IDS.has(msg.map) ? msg.map : 'yard';
+    const badMap = mapGate(mapId, mode);
+    if (badMap) { this.stat.badMap++; return { ok: false, message: badMap }; }
     // 落座前先退掉别处的座位（判据与 joinRoom 那条同一句）。放在**全部拒绝项之后**：
     // 建房被拒的人不该把现在坐着的位子也一并丢了。
     const at = this.seat(ws);
     if (at) this.leaveRoom(ws);
-    const mode = MODE_IDS.has(msg.mode) ? msg.mode : 'tdm';
-    const room = this._mkRoom(id, flat(msg.title, 24), MAP_IDS.has(msg.map) ? msg.map : 'yard',
+    const room = this._mkRoom(id, flat(msg.title, 24), mapId,
       mode, cleanMinutes(msg.minutes), cleanScore(msg.scoreLimit, mode));
     room.hostKey = hostKey;
     const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks, msg.view);
@@ -551,12 +568,20 @@ export class Lobby {
     if (seat.sid !== room.hostSid) { this.stat.notHost++; this.send(ws, JSON.stringify({ t: 'err', msg: '只有房主能改房间设置' })); return; }
     const bad = modeGate(msg.mode);
     if (bad) { this.stat.badMode++; this.send(ws, JSON.stringify({ t: 'err', msg: bad })); return; }
+    // 地图与模式**并出"这一帧改完之后"的组合**再验：两格各自合法、拼在一起非法的
+    // 组合（ridges 房里把模式改成 tdm）必须当场拒，而不是悄悄换掉一边 —— 悄悄换的
+    // 症状与 modeGate 那条一样：房间里写的东西从此是假的。
+    const newMap = MAP_IDS.has(msg.map) ? msg.map : room.mapId;
+    const newMode = MODE_IDS.has(msg.mode) ? msg.mode : room.mode;
+    const badMap = mapGate(newMap, newMode);
+    if (badMap) { this.stat.badMap++; this.send(ws, JSON.stringify({ t: 'err', msg: badMap })); return; }
     if (msg.title != null) room.title = flat(msg.title, 24);
     if (MAP_IDS.has(msg.map)) room.mapId = msg.map;
     if (MODE_IDS.has(msg.mode)) room.mode = msg.mode;
     if (MIN_SET.has(Number(msg.minutes))) room.minutes = Number(msg.minutes);
     // 胜利目标。没带这格（老客户端 / 只改别的设置）就保持原值 —— 与地图/模式那两格同一句。
-    if (msg.scoreLimit != null) room.scoreLimit = cleanScore(msg.scoreLimit, room.mode);
+    // 档位按**这一帧要落成的模式**验：同帧同时改模式与目标的老客户端也要算对。
+    if (msg.scoreLimit != null) room.scoreLimit = cleanScore(msg.scoreLimit, newMode);
     // Bot 难度改一个就**全体一起改**：房间屏上那一格只有一个选择器，而"后来加的 Bot 更凶"
     // 这种半新半旧的状态没有任何界面能表达出来，玩家只会觉得"这几个 Bot 手感不一样"。
     if (BOT_SKILLS.includes(Number(msg.botSkill))) {

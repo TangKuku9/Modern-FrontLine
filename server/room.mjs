@@ -453,6 +453,7 @@ export class NetRoom {
             c.book.setDiscount(c.pl.hasPerk('hardline') ? 1 : 0);
           }
           c.pl.respawn(sp.pos, sp.yaw);
+          this.rules.onRespawn(c.pl.team);   // dom：阵营每复活一人 -1（tdm/ffa 是空操作）
           // 排队里那些"死亡期间产生"的输入必须丢掉：客户端在重生那一刻会把日记本清空
           // （服务端整体重置，旧日记本没有可比性），留着它们只会让接下来好几包的
           // ack 指到一个已经没有日记本的拍上。
@@ -494,6 +495,7 @@ export class NetRoom {
       if (b.__respawnT <= 0) {
         const sp = this.spawnPoint(b.team);
         b.respawn(sp.pos, sp.yaw);
+        this.rules.onRespawn(b.team);         // dom：Bot 的复活同样扣队伍的分（与真人同一句）
         b.__respawnT = null;
         this.game.dmgBy.delete(b);            // 上一条命的伤害账不许算进下一条命的助攻
       }

@@ -11,7 +11,7 @@
 // 每一节都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。下面每条的措辞写的就是"这条红了说明什么坏了"。
 import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
-import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE } from '../js/match-rules.js';
+import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE, DOM_SCORE_PER_SEC } from '../js/match-rules.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD, teamIndex, teamId } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
@@ -916,6 +916,67 @@ const oBoard = roomO.events.filter(e => e.e === 'board').pop();
 ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）',
   !!oBoard.flags && oBoard.flags.length === 3 && oBoard.flags.find(f => f.name === fA.name).owner === OA.pl.team,
   JSON.stringify(oBoard.flags));
+
+// —— dom 的积分节奏：底分 50 / 涨速 0.3/秒 / 复活扣 1。单机与联机跑同一份规则内核，
+// 这里在权威端量；单机那条路（js/mp.js 的 respawns 队列）复活时调的是同一个 onRespawn。
+{
+  const roomR = new NetRoom({ id: 'rules-domrate', mapId: 'yard', seed: 7, mode: 'dom' });
+  await roomR.start();
+  const RA = roomR.addClient({ name: '甲', team: 'A' });
+  ok('O8 dom 开局底分 50:50（从 0 起步的话复活扣分无处可扣）',
+    roomR.rules.scores.A === 50 && roomR.rules.scores.B === 50, JSON.stringify(roomR.rules.scores));
+  ok('O9 默认胜利目标仍是 200（新档位 100/200/500 的中档）', roomR.rules.scoreLimit === 200, String(roomR.rules.scoreLimit));
+
+  // 涨速：旗子归属直接置成 A（占领进度那一半是 O2-O4 的账），之后每拍只剩
+  // "按 DOM_SCORE_PER_SEC 涨"这一条路。10 拍的增量必须严丝合缝 —— 这条红了，
+  // 就是有人动了涨速没同步判据（0.6 的旧值或随手拍的新值都会在这里现形）。
+  const fR = roomR.flags[0];
+  fR.owner = 'A';
+  const g0 = roomR.rules.scores.A;
+  for (let i = 0; i < 10; i++) roomR.step();
+  const gain = roomR.rules.scores.A - g0;
+  ok('O10 基础涨速 = 0.3/秒/点（从 0.6 整体调低一半，配 100/200/500 的新档位）',
+    Math.abs(gain - 10 * DT * DOM_SCORE_PER_SEC) < 1e-9, `gain=${gain.toFixed(6)} 期望=${(10 * DT * DOM_SCORE_PER_SEC).toFixed(6)}`);
+
+  // 复活扣分。旗子先摘了（owner=null），让这一段的"分"只来自 onRespawn 一条路。
+  fR.owner = null;
+  // 死而未复的那一拍：respawnT 还剩 0.5s，step 只把它减掉，不扣分 ——
+  // 扣的是"复活"这个动作，不是"死"这个状态。
+  const q0 = roomR.rules.scores.A;
+  RA.pl.alive = false; RA.respawnT = 0.5;
+  roomR.step();
+  ok('O11【反证】死而未复不扣分（这条红了 = 扣分挂在了死亡而不是复活上）',
+    roomR.rules.scores.A === q0, `${q0} → ${roomR.rules.scores.A}`);
+  RA.respawnT = 0;
+  roomR.step();
+  ok('O12 真人复活一人 -1（白给的复活在把队伍的分往回送）',
+    roomR.rules.scores.A === q0 - 1, `${q0} → ${roomR.rules.scores.A}`);
+
+  // Bot 的复活走另一条路（__respawnT），不接上的话 Bot 死一次就是给对面白送 1 分差。
+  const wR = roomR.game.world;
+  const botR = roomR.addBot(new Bot(roomR.game, {
+    team: 'B', name: '哨兵', style: 'enemy', weaponId: 'ak', att: {}, difficulty: 1,
+    pos: (wR.spawns.B[0] || wR.randomWalkable()).clone(), yaw: 0, role: 'guard', group: 'domrate',
+  }));
+  botR.alive = false; botR.__respawnT = 0;
+  const b0 = roomR.rules.scores.B;
+  roomR.step();
+  ok('O13 Bot 复活同样 -1（Bot 也在给队伍挣分，它的复活不记账就是单向出血）',
+    roomR.rules.scores.B === b0 - 1, `${b0} → ${roomR.rules.scores.B}`);
+
+  // 底分扣穿钳在 0：负分在记分板上没有意义，离到线只远不近的队不需要再罚。
+  while (roomR.rules.scores.B > 0) roomR.rules.onRespawn('B');
+  roomR.rules.onRespawn('B');
+  ok('O14 复活扣分钳在 0（不许扣成负数）', roomR.rules.scores.B === 0, String(roomR.rules.scores.B));
+  const rulesT = new MatchRules({ mode: 'tdm' });
+  rulesT.addScore('A', 5);
+  ok('O15【反证】tdm 里复活不扣分（死亡的代价由对面的击杀数结算过了）',
+    rulesT.onRespawn('A') === 5, String(rulesT.scores.A));
+  // 新档位收口：100 也判得出来（不是只有 200/500 才是真目标）。
+  const rulesW = new MatchRules({ mode: 'dom', scoreLimit: 100 });
+  rulesW.addScore('A', 50);
+  ok('O16 dom 到 100 也判胜（三档都是真目标）', rulesW.checkEnd() === 'A', JSON.stringify(rulesW.scores));
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 sec('P. 结算停摆：matchOver 之后这一局不再有战斗');

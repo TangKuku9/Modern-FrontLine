@@ -267,13 +267,27 @@ export const DEFAULT_CLASSES = [
 
 export const DEFAULT_STREAKS = ['uav', 'cluster', 'heli'];
 
+// modes = **模式专属**：缺省 = 全模式可开；给了就只有列出的模式能选这张图。选择器
+// （js/menu.js）按它藏卡片、服务端（server/lobby.mjs:mapGate）按它拒 —— 判断本身
+// 走下面的 mapAllowed，两端都不许自己抄一份"这张图配不配"。
 export const MP_MAPS = [
   { id: 'dune', name: '沙丘镇', desc: '烈日下的中东小镇，集市街道与土坯民居交错，中远距离交火。', style: '沙漠 · 白昼', grad: 'linear-gradient(135deg,#d9a55b,#7a4f25)' },
   { id: 'frost', name: '寒霜炼厂', desc: '暴风雪中的废弃炼油厂，仓库、储油罐与集装箱构成多层次战场。', style: '雪地 · 阴天', grad: 'linear-gradient(135deg,#c9d6e3,#4f6275)' },
   { id: 'neon', name: '霓虹街区', desc: '雨夜中的都市街区，霓虹灯下的湿滑街道与狭窄小巷，近距离激战。', style: '都市 · 雨夜', grad: 'linear-gradient(135deg,#ff3fa4,#1b1f5e)' },
   { id: 'yard', name: '货柜场', desc: '夕阳下的小型集装箱堆场，节奏极快的混战地图。', style: '港口 · 黄昏', grad: 'linear-gradient(135deg,#ff9a3c,#5a2a3a)' },
-  { id: 'ridges', name: '双丘战区', desc: '超大丘陵战场：两处高地各有一座瞭望塔，高地之间的鞍部是必经的交战区，中央平整台地上扎着一座军营。', style: '丘陵 · 正午', grad: 'linear-gradient(135deg,#8aa85c,#3f5230)' },
+  // 双丘战区是 360m 的超大图，只有占点那种"围绕据点慢慢磨"的节奏撑得起它的尺度 ——
+  // 死斗/混战塞进来就是满地图找人。专属占领，选择器藏、服务端拒，双保险。
+  { id: 'ridges', name: '双丘战区', modes: ['dom'], desc: '超大丘陵战场：两处高地各有一座瞭望塔，高地之间的鞍部是必经的交战区，中央平整台地上扎着一座军营。', style: '丘陵 · 正午', grad: 'linear-gradient(135deg,#8aa85c,#3f5230)' },
 ];
+
+// "这张图配不配这个模式"。没登记 modes 的图对一切模式放行 —— 加新图不用想起这里。
+export const mapAllowed = (mapId, mode) => {
+  const m = MP_MAPS.find(x => x.id === mapId);
+  return !m || !m.modes || m.modes.includes(mode);
+};
+// 某个模式下挑得出来的图。界面按它过滤；"当前图被新模式收了之后落回哪张"也问它
+// （取第一张 —— dune 全模式可开，兜底恒存在）。
+export const mapsForMode = (mode) => MP_MAPS.filter(m => mapAllowed(m.id, mode));
 
 // net = **权威服务端判得出这一模式的胜负**，不是"代码里有这个名字"。三种都判得了：
 // tdm 按击杀加分（server/room.mjs:onKill）、ffa 杀到目标数或时间到按名次（NetRoom.ffaWinner）、
@@ -295,10 +309,18 @@ export const MP_MODES = [
 export const MP_MINUTES = [3, 5, 10, 15];
 
 // 房主能选的**胜利目标**。与 MP_MINUTES 同一套规矩：两端共读，服务端验、界面画。
-// 三种模式共用一张表，语义随模式走 —— tdm/ffa 的目标是"率先达到的击杀数"（一杀一分），
-// dom 是"率先达到的占领分数"。默认值不在这里：那一份在 js/match-rules.js 的
-// DEFAULT_SCORE_LIMIT（规则内核才是"一局什么时候算赢"的家）。
+// 目标**按模式换表**（下面的 scoreOptions）：tdm/ffa 的目标是"率先达到的击杀数"
+// （一杀一分）；dom 是"率先达到的占领分"—— 它从 DOM_START_SCORE 起步、复活还会
+// 回吐（js/match-rules.js 的 DOM_* 三格），量纲与击杀数不同，共用一张表的话
+// "tdm 的 25 杀"与"dom 的 25 分"总有一边不合适。
 export const MP_SCORES = [25, 50, 75, 100, 150, 200];
+
+// 占领的目标档位：100 快局 / 200 标准局（也是 DEFAULT_SCORE_LIMIT 给的默认）/ 500 马拉松局。
+export const DOM_SCORES = [100, 200, 500];
+
+// 模式 → 该模式能选的目标档位。三处选择器（js/menu.js 的单机开战、联机建房、房内改设置）
+// 与服务端校验（server/lobby.mjs:cleanScore）都问这一句，不要各写一份三元。
+export const scoreOptions = (mode) => mode === 'dom' ? DOM_SCORES : MP_SCORES;
 
 export const BOT_NAMES = ['猎鹰', '蝮蛇', '雷霆', '北极狐', '老炮', '独狼', '夜莺', '铁拳', '野马', '黑曼巴', '响尾蛇', '秃鹫', '猎户', '灰熊', '刺刀', '暴风', '渡鸦', '钢锯', '寒鸦', '猛犸', '火蜥', '毒刺', '沙暴', '白鲨'];
 // Bot 难度三档。**下标即难度值**，与 js/ai.js 的 DIFF 表一一对应（0 新兵 / 1 正规军 / 2 老兵）。

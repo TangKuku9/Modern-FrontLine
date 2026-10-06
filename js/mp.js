@@ -343,6 +343,7 @@ export class MPMatch {
           // 老代码没有换职业时根本不 equip，于是捡来的枪一路带到下一次死亡。
           else if (pl.loadout) pl.equip(pl.loadout);
           pl.respawn(sp.pos, sp.yaw);
+          this.rules.onRespawn(pl.team);   // dom：阵营每复活一人 -1（tdm/ffa 是空操作）
           game.dead = false;
           document.getElementById('deathScreen').classList.add('hidden');
           game.menu.hideClassSelect();
@@ -352,6 +353,7 @@ export class MPMatch {
       } else if (r.t <= 0) {
         const sp = this.spawnPoint(r.e.team);
         r.e.respawn(sp.pos, sp.yaw);
+        this.rules.onRespawn(r.e.team);   // Bot 的复活同样记账（与真人同一条规则）
         this.respawns.splice(i, 1);
       }
     }

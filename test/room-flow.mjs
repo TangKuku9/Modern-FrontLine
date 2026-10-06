@@ -307,6 +307,35 @@ try {
   const dftS = await h.until(j => j.t === 'room' && j.room && j.room.score === 25, 6000);
   ok('不认的目标值退回**该模式**默认（ffa → 25），不是原样收下也不是写死的 50',
     !!dftS, JSON.stringify(dftS && dftS.room.score));
+
+  // ── 专属图与档位按模式走（js/data.js 的 modes / scoreOptions；服务端 mapGate 把关）──
+  // 建房是重帧，两次之间按 M7 歇 300ms（与上面同一条理由）。
+  await sleep(300);
+  h.send({ t: 'createRoom', room: 'ridge', name: '壬2', map: 'ridges', mode: 'tdm' });
+  const rejR = await h.until(j => j.t === 'err', 4000);
+  ok('ridges 只在占领开放：配 tdm 建房当场被拒（话说得具体，不是一句"地图不对"）',
+    !!rejR && /双丘战区/.test(rejR.msg || '') && /占领/.test(rejR.msg || ''), JSON.stringify(rejR && rejR.msg));
+  ok('【反证】被拒的建房没有留下开成一半的房',
+    !(await apiRooms(srv3.base)).some(x => x.id === 'ridge'), '');
+  await sleep(300);
+  h.send({ t: 'createRoom', room: 'ridge', name: '壬2', map: 'ridges', mode: 'dom' });
+  const okR2 = await h.until(j => j.t === 'room' && j.room && j.room.id === 'ridge', 6000);
+  ok('dom 配 ridges 开得起来（专属是单向门：占领要用它时给用）',
+    !!okR2 && okR2.room.map === 'ridges', JSON.stringify(okR2 && okR2.room));
+  h.send({ t: 'roomCfg', scoreLimit: 500 });
+  const ok500 = await h.until(j => j.t === 'room' && j.room && j.room.score === 500, 6000);
+  ok('dom 的档位是 100/200/500：500 收得下', !!ok500, JSON.stringify(ok500 && ok500.room && ok500.room.score));
+  h.send({ t: 'roomCfg', scoreLimit: 50 });
+  const dft200 = await h.until(j => j.t === 'room' && j.room && j.room.score === 200, 6000);
+  ok('dom 里 50 不再是合法目标（退回 dom 的默认 200，不是收下也不是 tdm 的 50）',
+    !!dft200, JSON.stringify(dft200 && dft200.room && dft200.room.score));
+  h.send({ t: 'roomCfg', mode: 'tdm' });
+  const errT = await h.until(j => j.t === 'err', 4000);
+  ok('ridges 房里把模式改成 tdm 被拒（两格各自合法、拼在一起非法也要拦）',
+    !!errT && /占领/.test(errT.msg || ''), JSON.stringify(errT && errT.msg));
+  // 被拒的 setCfg 直接 return、不推状态 —— 这里读清单，不等帧（与上面 mode 那组同一样）。
+  const rowT2 = (await apiRooms(srv3.base)).find(x => x.id === 'ridge') || {};
+  ok('拒完之后这间还是占领（没有偷偷换玩法）', rowT2.mode === 'dom', JSON.stringify(rowT2));
   h.close();
   srv3.kill();
 

@@ -128,6 +128,19 @@ export class StreakBook {
 // 这一句 —— 默认只此一份，抄一份的话"没选目标的开房"与"选了目标的开房"会打出两种胜负。
 export const DEFAULT_SCORE_LIMIT = (mode) => mode === 'dom' ? 200 : mode === 'ffa' ? 25 : 50;
 
+// 占领模式的积分节奏，三格一起定（单机 MPMatch 与联机 NetRoom 跑同一份账，
+// 别处不许再出现这三个数的字面量）：
+//   DOM_SCORE_PER_SEC —— 每个据点每秒的基础涨速（flagsTick 里那条）。从 0.6 整体调低
+//      一半：胜利目标改成 100/200/500 的档位（js/data.js:DOM_SCORES）之后，0.6/秒 配
+//      500 分的局三旗全占也要十几分钟纯占点才到线，涨速不降档位就没有意义。
+//   DOM_START_SCORE   —— 开局双方各拿的底分。占点的分是"攒"出来的，从 0 起步的话
+//      前几分钟记分板上一片空白，复活扣分（下一条）也无处可扣。
+//   DOM_RESPAWN_COST  —— 阵营每复活一人扣掉的分（onRespawn）。死人也要记账：白给
+//      的复活在把队伍的分往回送，"占着点就稳赢"的滚雪球被这条压住。
+export const DOM_SCORE_PER_SEC = 0.3;
+export const DOM_START_SCORE = 50;
+export const DOM_RESPAWN_COST = 1;
+
 export class MatchRules {
   constructor(cfg = {}) {
     const mode = cfg.mode || 'tdm';
@@ -135,7 +148,10 @@ export class MatchRules {
     this.mode = mode;
     this.scoreLimit = cfg.scoreLimit || DEFAULT_SCORE_LIMIT(mode);
     this.timeLimit = cfg.timeLimit || 10;         // 分钟
-    this.scores = { A: 0, B: 0 };
+    // dom 从底分起步（DOM_START_SCORE）；tdm/ffa 的分是"挣"出来的，照旧从 0 起步。
+    this.scores = mode === 'dom'
+      ? { A: DOM_START_SCORE, B: DOM_START_SCORE }
+      : { A: 0, B: 0 };
     this.uav = new Map();                          // team -> 剩余拍
     this.wpTicks = 0;
     this.clock = new TickClock();
@@ -192,6 +208,16 @@ export class MatchRules {
   resetChains() { this.chainBy.clear(); }
 
   addScore(team, v) { this.scores[team] = (this.scores[team] || 0) + v; }
+
+  // 复活扣分（只在 dom 生效，tdm/ffa 里死亡的代价已经由对面的击杀数结算过了）。
+  // 下限钳在 0：负分在记分板上没有意义，而且离"到线获胜"只远不近的队不需要再罚。
+  // 返回扣完之后的分值，调用方的判据好断言。调用点：单机 js/mp.js 的 respawns 队列、
+  // 联机 server/room.mjs 的真人/Bot 两条复活路 —— 四个字：复活必扣。
+  onRespawn(team) {
+    if (this.mode !== 'dom') return this.scores[team] || 0;
+    this.scores[team] = Math.max(0, (this.scores[team] || 0) - DOM_RESPAWN_COST);
+    return this.scores[team];
+  }
 
   // 结束判定。返回 winner（'A'/'B'/'draw'/null）。调用方负责播报与收尾 ——
   // 规则只说"谁赢了"，不说"怎么显示"。
@@ -497,7 +523,8 @@ export function pickupAction(game, pl, inp, apply = true) {
 
 // ---------- 占领点（dom） ----------
 // 与单机 MPMatch.update 里那段同规则：4.5 m 半径（高度差 3 m 内）、0.18+0.07×人数 的
-// 占领速度（3 人封顶）、没人时 0.1/秒 的回退、每个据点 0.6/秒 的得分。两端共用：
+// 占领速度（3 人封顶）、没人时 0.1/秒 的回退、每个据点 DOM_SCORE_PER_SEC/秒 的得分。
+// 两端共用：
 // 单机在 MPMatch.update、联机在 NetRoom.step 都调它。**只有状态与分数** —— 网格、
 // 颜色、进度条、播报全归调用方（返回值告诉它们发生了什么、点里站着谁）。
 // 返回 { caps: [{f, team, inRange}], flags: [{f, teams, cnt, inRange, capped}] }。
@@ -542,8 +569,8 @@ export function flagsTick(flags, rules, entities, dt) {
       if (f.capTeam && teams.length === 0) f.prog = Math.max(0, f.prog - dt * 0.1);
     }
     slot.capped = capped;
-    // 得分挂在**旗**上不挂在人上：谁占着谁涨，0.6/秒/点（与单机同一条式子）。
-    if (f.owner) rules.addScore(f.owner, dt * 0.6);
+    // 得分挂在**旗**上不挂在人上：谁占着谁涨，DOM_SCORE_PER_SEC/秒/点（单机联机同一条式子）。
+    if (f.owner) rules.addScore(f.owner, dt * DOM_SCORE_PER_SEC);
     out.flags[fi++] = slot;
   }
   out.flags.length = fi;
