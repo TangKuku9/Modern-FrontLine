@@ -899,6 +899,8 @@ const mkGame = () => ({
 
   // 岩石：实例化在 finalize() 里合成，量的是共享基底几何 + 实例数
   w.rock(0, 0, 2.2);
+  // 建模路床（B20d）：一段 40m 直路，finalize 后从上往下打射线量板面
+  w.roadbed([[-20, 0], [20, 0]], 3.4, 'concrete');
   w.finalize();
   const rockMesh = w.root.children.find(m => m.isInstancedMesh && m.geometry.type === 'DodecahedronGeometry');
   ok('B19 岩石基底角点副本同位移（闭合岩石，不是一片一片的碎石）+ 实例化生效',
@@ -906,6 +908,18 @@ const mkGame = () => ({
     rockMesh ? `唯一角点 ${uniquePts(rockMesh.geometry)}（应为 ${nPristine}），实例 ${rockMesh.count}` : 'root 里没有岩石 InstancedMesh');
   ok('B19a【反证臂】逐顶点独立随机的老算法必须被 B19 抓住', uniquePts(torn) > nPristine,
     `老算法唯一角点 ${uniquePts(torn)}`);
+
+  const slab = w.root.children.find(m => m.material === mat('concrete'));
+  const ray = new THREE.Raycaster();
+  let covered = 0;
+  const NS = 9;
+  for (let i = 0; i < NS; i++) {
+    ray.set(new THREE.Vector3(-18 + i * 4.5, 5, 0.3), new THREE.Vector3(0, -1, 0));
+    const h = ray.intersectObject(slab, false)[0];
+    if (h && h.point.y > 0.05 && h.point.y < 0.2) covered++;
+  }
+  ok('B20d 盘山路是真几何路床（板面沿折线连续覆盖、悬在基准面上方 ~0.12m）',
+    !!slab && covered === NS, `${covered}/${NS} 采样命中板面`);
 }
 
 // ══════════════ B20：地表色带（ridges.color 纯函数，直接采样世界坐标）══════════════

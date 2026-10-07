@@ -613,6 +613,98 @@ export class World {
   // 中心为原点摆的（mesh(..., x, s*0.25, z)）。碰撞体若按足迹最高点取，坡下那一半
   // 会整个陷进地形（实测山腰一块石头 4.68m 高差，埋了 3.98m）——那不是"岩石埋在
   // 土里"，是"岩石大半不见了"。
+  // 建模路床：沿折线铺一条**真有几何**的路——混凝土板 + 两侧路缘裙边 + 中线虚线。
+  // 顶点色路（terrainColor）只是把颜色"画"在地形上，16m 顶点网格下近看是糊的；
+  // 路床是实板：横向拉平到**路中心高**（真实修路的削/填断面），裙边垂直接到地形——
+  // 挖方一侧成挡墙、填方一侧成路堤，坡地上的穿模被裙边吃掉。
+  // 无碰撞、不进导航（板面取断面三处地形最高值 + 12cm 抬升，脚下就是它，物理仍走
+  // 地形）；折线点 [x, z, y?]，有地形时一律取地形高（视觉必须坐在真地面上）。走
+  // geoLists 合并进同材质批次，不增加 draw call。判据 test/props.mjs B20d。
+  roadbed(pts, halfW = 3.4, matName = 'concrete', opt = {}) {
+    const LIFT = 0.12, DASH_W = 0.22, DASH_ON = 3, DASH_OFF = 3;
+    // 路面板纹理放大一档（3m→6m）：3m 的混凝土拼缝在 7m 宽的路面上碎得像地砖
+    const ts = (mat(matName).userData.texScale || 3) * 2;
+    const tsDash = mat('plasterWhite').userData.texScale || 4;
+    // 稀疏折线 → ~3m 等距采样（虚线 3m 通/3m 断正好贴着采样步长）
+    const S = [];
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const ax = pts[i][0], az = pts[i][1], bx = pts[i + 1][0], bz = pts[i + 1][1];
+      const len = Math.hypot(bx - ax, bz - az);
+      const n = Math.max(1, Math.round(len / 3));
+      for (let k = 0; k < n; k++) S.push([ax + (bx - ax) * k / n, az + (bz - az) * k / n]);
+    }
+    S.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]);
+    const gY = (x, z) => (this.terrain ? this.groundY(x, z) : 0);
+    const pos = [], uvs = [], idx = [];
+    const dpos = [], duvs = [], didx = [];
+    let dvi = 0, dist = 0, prevDist = 0;
+    let slabPrev = null;                                 // 上一断面板面顶点号
+    let skirtPrev = {};                                  // 每侧上一断面 top/bot 顶点号
+    for (let i = 0; i < S.length; i++) {
+      const [x, z] = S[i];
+      const q = S[Math.min(i + 1, S.length - 1)], r = S[Math.max(i - 1, 0)];
+      let tx = q[0] - r[0], tz = q[1] - r[1];
+      const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
+      const px = -tz, pz = tx;                           // 左法线
+      if (i > 0) { prevDist = dist; dist += Math.hypot(x - S[i - 1][0], z - S[i - 1][1]); }
+      const lx = x + px * halfW, lz = z + pz * halfW;
+      const rx = x - px * halfW, rz = z - pz * halfW;
+      // 断面横向拉平，但高度取**左右缘与中心三处地形的最高值** + 抬升 —— 横坡上
+      // 挖方侧的地形永远不会盖回板面（否则板面与地形穿插出拉链纹，实测西坡道）；
+      // 挖出的高差交给地形自己显形，填方侧的高差由裙边接住。
+      const hC = Math.max(gY(x, z), gY(lx, lz), gY(rx, rz)) + LIFT;
+      // 板面：横向拉平（两侧同高）。绕向用切线左法线构造，任何走向都朝上。
+      // 顶点号必须显式记 —— pos 里每断面混着 4 个裙边顶点，靠 +2 差值数会指到
+      // 裙边上（实测板面退化成竖鳍三角）。
+      const iL = pos.length / 3, iR = iL + 1;
+      pos.push(lx, hC, lz, rx, hC, rz);
+      uvs.push(dist / ts, halfW / ts, dist / ts, -halfW / ts);
+      if (slabPrev) idx.push(slabPrev.L, iL, slabPrev.R, slabPrev.R, iL, iR);
+      slabPrev = { L: iL, R: iR };
+      // 裙边：板缘垂直接到地形。挖方（地形高于板缘）= 挡墙，露面朝路心；
+      // 填方（地形低于板缘）= 路堤，露面朝外 —— 两种绕向都要，按 cut 翻三角。
+      for (const [sgn, ex, ez] of [[1, lx, lz], [-1, rx, rz]]) {
+        const hE = gY(ex, ez) + 0.02;
+        const iTop = pos.length / 3, iBot = iTop + 1;
+        pos.push(ex, hC, ez, ex, hE, ez);                // [0]=板缘 [1]=地形脚
+        uvs.push(dist / ts, 0, dist / ts, Math.abs(hE - hC) / ts);
+        const key = sgn > 0 ? 'L' : 'R', prev = skirtPrev[key];
+        if (prev) {
+          const cut = hE > hC + 0.01;
+          const flip = (sgn > 0) !== cut;                // A 绕向法线=朝路心
+          if (!flip) idx.push(prev.top, iTop, prev.bot, prev.bot, iTop, iBot);
+          else idx.push(prev.top, prev.bot, iTop, prev.bot, iBot, iTop);
+        }
+        skirtPrev[key] = { top: iTop, bot: iBot };
+      }
+      // 中线虚线：3m 通 3m 断，相位跟里程走（断面起点在"通"相位才连三角形）。
+      // v 向采满整张贴图 —— 条带只有 0.22m 宽，按世界尺度采样会只取到贴图底部
+      // 一行像素（实测颜色与混凝土同化，虚线隐形）。
+      const hD = hC + 0.02, dw = DASH_W / 2;
+      dpos.push(x + px * dw, hD, z + pz * dw, x - px * dw, hD, z - pz * dw);
+      duvs.push(dist / tsDash, 0, dist / tsDash, 1);
+      if (i > 0 && (prevDist % (DASH_ON + DASH_OFF)) < DASH_ON) {
+        didx.push(dvi - 2, dvi, dvi - 1, dvi - 1, dvi, dvi + 1);
+      }
+      dvi += 2;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+    g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2));
+    g.setIndex(idx);
+    g.computeVertexNormals();
+    if (!this.geoLists.has(mat(matName))) this.geoLists.set(mat(matName), []);
+    this.geoLists.get(mat(matName)).push(g);
+    if (dvi) {
+      const gd = new THREE.BufferGeometry();
+      gd.setAttribute('position', new THREE.BufferAttribute(new Float32Array(dpos), 3));
+      gd.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(duvs), 2));
+      gd.setIndex(didx);
+      gd.computeVertexNormals();
+      if (!this.geoLists.has(mat('plasterWhite'))) this.geoLists.set(mat('plasterWhite'), []);
+      this.geoLists.get(mat('plasterWhite')).push(gd);
+    }
+  }
   rock(x, z, s = 1, matName = 'rock', collide = true) {
     const r = mulberry32(Math.floor(x * 31 + z * 17));
     const variant = Math.floor(r() * ROCK_VARIANTS);
@@ -795,7 +887,9 @@ export class World {
       sky.scale.setScalar(1800);
       const u = sky.material.uniforms;
       u.turbidity.value = env.turbidity ?? 6; u.rayleigh.value = env.rayleigh ?? 1.5;
-      u.mieCoefficient.value = env.mie ?? 0.005; u.mieDirectionalG.value = 0.85;
+      // mieDirectionalG：前向散射峰值宽度（0~1，越大光晕越窄越亮）——"太阳周围
+      // 一片锥形白斑"的直接旋钮。默认 0.85 是 addon 出厂值，偏宽。
+      u.mieCoefficient.value = env.mie ?? 0.005; u.mieDirectionalG.value = env.mieG ?? 0.85;
       u.sunPosition.value.copy(sd);
       skyMesh = sky;
     }
