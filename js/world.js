@@ -22,6 +22,32 @@ function boxGeo(w, h, d, s) {
 
 const _asc = (a, b) => a - b;
 
+// 岩石实例化的基底几何：全部岩石共享这 ROCK_VARIANTS 个形状，多样性由
+// 变体 + 每块自己的旋转/缩放承担（旧做法逐块独建几何，双丘 240+ 份顶点数据和
+// 240+ 个 draw call）。实例化要求**共享几何**，所以逐块随机会挪进变体里。
+const ROCK_VARIANTS = 8;
+const _rockBase = new Map();
+function rockBaseGeo(v) {
+  if (_rockBase.has(v)) return _rockBase.get(v);
+  const g = new THREE.DodecahedronGeometry(1, 1);
+  const p = g.attributes.position; const r = mulberry32(913 + v * 137);
+  // 非索引几何里同一角点被复制了 ~6 份（432 顶点只有 74 个唯一角点），随机 k 必须
+  // **按角点共享**：逐顶点独立取 k 会把共享角点撕向不同位置，岩石碎成满地三角薄片
+  // （边界 3.2m 大石头裂口实测最大 1.4m，远看就是"大石头周围一片一片的碎石堆"）。
+  // 量化到 1e-4：相邻面算共享棱中点时 lerp 实参顺序不同、末位浮点会差一 bit；
+  // 真角点间距 ≥0.1，不会误并。判据 test/props.mjs B19。
+  const kByCorner = new Map();
+  for (let i = 0; i < p.count; i++) {
+    const key = p.getX(i).toFixed(4) + ',' + p.getY(i).toFixed(4) + ',' + p.getZ(i).toFixed(4);
+    if (!kByCorner.has(key)) kByCorner.set(key, 0.75 + r() * 0.45);
+    const k = kByCorner.get(key);
+    p.setXYZ(i, p.getX(i) * k, p.getY(i) * k * 0.7, p.getZ(i) * k);
+  }
+  g.computeVertexNormals();
+  _rockBase.set(v, g);
+  return g;
+}
+
 // 小地图配色用：#rrggbb → [r,g,b]（0..255）。放模块级是因为它无状态、纯函数。
 const hexRGB = (h) => [(h >> 16) & 255, (h >> 8) & 255, h & 255];
 
@@ -40,6 +66,9 @@ export class World {
     this.def = def;
     this.boxes = [];
     this.geoLists = new Map();
+    // 岩石实例化队列：rock() 只记 {x,y,z,s,ry}，finalize() 按（材质|变体）分组
+    // 合成 InstancedMesh —— 双丘 240+ 块岩石从 240+ 个 draw call 降到 ROCK_VARIANTS 个。
+    this.rockInst = new Map();
     this.root = new THREE.Group();
     this.scene.add(this.root);
     this.half = def.size / 2;
@@ -377,7 +406,7 @@ export class World {
     this.box(x, y, z, w + 0.04, 0.12, d + 0.04, 'darkMetal', { collide: false });
     this.baseY = keep;
   }
-  sandbags(x, z, len, rotY = 0, h = 1.0) {
+  sandbags(x, z, len, rotY = 0, h = 1.2) {
     const along = Math.abs(Math.sin(rotY)) > 0.7;
     const rows = Math.round(h / 0.25);
     // 有地形时按**整条沙袋的足迹**取地面：4~5m 长的一排在坡上按中心点摆，
@@ -394,16 +423,19 @@ export class World {
       this.baseY = lo - 0.1;
     }
     for (let r = 0; r < rows; r++) {
-      const off = (r % 2) * 0.25;
-      const n = Math.floor((len - off) / 0.55);
-      // 视觉
+      const off = (r % 2) * 0.27;
+      const n = Math.floor((len - off) / 0.60);
+      // 视觉。袋体 0.65×0.26×0.40（旧 0.58×0.22×0.32，用户实测"偏瘦小"）。
+      // 墙高 1.2（P2b 用户拍板：站姿也能靠的胸位掩体），5 排排距 0.235 ——
+      // 墙顶 ≈1.202m 只许压线不许冒出 h=1.2 碰撞盒（冒头 = 打得中看得见的袋体
+      // 却没盒可撞，判据 test/props.mjs B19b/c）。
       for (let i = 0; i < n; i++) {
-        const t = -len / 2 + off + 0.28 + i * 0.55;
-        const g = new THREE.CapsuleGeometry(0.13, 0.32, 3, 8);
-        g.rotateZ(Math.PI / 2); g.scale(1, 0.85, 1.25);
+        const t = -len / 2 + off + 0.30 + i * 0.60;
+        const g = new THREE.CapsuleGeometry(0.155, 0.34, 3, 8);
+        g.rotateZ(Math.PI / 2); g.scale(1, 0.85, 1.30);
         if (along) g.rotateY(Math.PI / 2);
         const px = along ? x : x + t, pz = along ? z + t : z;
-        g.translate(px, r * 0.24 + 0.12, pz);
+        g.translate(px, r * 0.235 + 0.13, pz);
         const m = mat('sandbag');
         if (!this.geoLists.has(m)) this.geoLists.set(m, []);
         this.geoLists.get(m).push(g);
@@ -582,10 +614,9 @@ export class World {
   // 会整个陷进地形（实测山腰一块石头 4.68m 高差，埋了 3.98m）——那不是"岩石埋在
   // 土里"，是"岩石大半不见了"。
   rock(x, z, s = 1, matName = 'rock', collide = true) {
-    const g = new THREE.DodecahedronGeometry(s, 1);
-    const p = g.attributes.position; const r = mulberry32(Math.floor(x * 31 + z * 17));
-    for (let i = 0; i < p.count; i++) { const k = 0.75 + r() * 0.45; p.setXYZ(i, p.getX(i) * k, p.getY(i) * k * 0.7, p.getZ(i) * k); }
-    g.computeVertexNormals();
+    const r = mulberry32(Math.floor(x * 31 + z * 17));
+    const variant = Math.floor(r() * ROCK_VARIANTS);
+    const ry = r() * 6;
     const keep = this.baseY;
     // 有地形时按足迹（1.4s 见方）取最低点，让石体坐在坡下沿——被土埋一半是它该有的样子。
     if (this.terrain) {
@@ -594,8 +625,10 @@ export class World {
         this.groundY(x - rr, z - rr), this.groundY(x + rr, z - rr),
         this.groundY(x - rr, z + rr), this.groundY(x + rr, z + rr)) - 0.15;
     }
-    const m = this.mesh(g, matName, x, s * 0.25, z);
-    m.rotation.y = r() * 6;
+    // 视觉进实例化队列（finalize 合成），位置口径与旧逐块 mesh 一致：中心抬 s*0.25。
+    const key = matName + '|' + variant;
+    if (!this.rockInst.has(key)) this.rockInst.set(key, []);
+    this.rockInst.get(key).push({ x, y: s * 0.25 + this.baseY, z, s, ry });
     if (collide) this.collider(x - s * 0.7, 0, z - s * 0.7, x + s * 0.7, s * 0.8, z + s * 0.7);
     this.baseY = keep;
   }
@@ -824,6 +857,23 @@ export class World {
       this.root.add(mesh);
     }
     this.geoLists.clear();
+    // 岩石实例化：按（材质|变体）一组一个 InstancedMesh。包围球必须按实例矩阵算 ——
+    // 默认包围球只包原点附近的基底网格，散到全图的实例会被视锥错误剔除（凭空消失）。
+    for (const [key, list] of this.rockInst) {
+      const sep = key.lastIndexOf('|');
+      const im = new THREE.InstancedMesh(rockBaseGeo(+key.slice(sep + 1)), mat(key.slice(0, sep)), list.length);
+      const M = new THREE.Matrix4(), P = new THREE.Vector3(), Q = new THREE.Quaternion(), E = new THREE.Euler(), S = new THREE.Vector3();
+      list.forEach((it, idx) => {
+        E.set(0, it.ry, 0); Q.setFromEuler(E);
+        P.set(it.x, it.y, it.z); S.setScalar(it.s);
+        im.setMatrixAt(idx, M.compose(P, Q, S));
+      });
+      im.instanceMatrix.needsUpdate = true;
+      im.computeBoundingSphere();
+      im.castShadow = true; im.receiveShadow = true;
+      this.root.add(im);
+    }
+    this.rockInst.clear();
     this.buildTerrainMesh();
     this.buildGrid();
     this.buildTopDown();

@@ -17,7 +17,7 @@ installBrowserShim();
 const { World } = await import('../js/world.js');
 const { MAPS } = await import('../js/maps.js');
 const { SLOPE } = await import('../js/terrain.js');
-const { initTextures } = await import('../js/materials.js');
+const { initTextures, mat } = await import('../js/materials.js');
 await initTextures();
 
 const out = [];
@@ -854,6 +854,58 @@ const mkGame = () => ({
       `门梁底面离地 ${(beam.y0 - T.height((beam.x0 + beam.x1) / 2, WZc)).toFixed(2)}m，` +
       `门洞内 ${gateCellsN} 格全可走`);
   }
+}
+
+// ══════════════ B19：岩石网格不撕裂 / 沙袋袋体不缩水 ══════════════
+// 两把钉子都问**被画出来的量**：
+//   岩石 —— 岩石已实例化（全部共享 ROCK_VARIANTS 个基底几何），基底是 detail=1 的
+//          非索引十二面体（432 顶点只有 ~74 个唯一角点，每个角点被复制 ~6 份），
+//          随机缩放后**唯一角点数必须与原始网格一致**：逐顶点独立随机会把共享
+//          角点撕向不同位置，岩石碎成满地三角薄片（远看"大石头周围一片一片的
+//          碎石堆"）。实例化本体（count、包围球）一并量到。
+//   沙袋 —— 袋体量的是 geoLists 里**合并前**的单袋几何（生成现场记录，躲开合并后
+//          无法分袋的死角）：尺寸下限防"改回瘦香肠"，视觉顶 ≤ 碰撞盒顶防
+//          "打得中看得见的袋体却打不中盒"。
+{
+  const { mulberry32 } = await import('../js/util.js');
+  const uniquePts = (g, q = 1e-4) => {
+    const p = g.attributes.position, set = new Set();
+    for (let i = 0; i < p.count; i++)
+      set.add(Math.round(p.getX(i) / q) + ',' + Math.round(p.getY(i) / q) + ',' + Math.round(p.getZ(i) / q));
+    return set.size;
+  };
+  const nPristine = uniquePts(new THREE.DodecahedronGeometry(1, 1));
+  // 反证臂：老算法（逐顶点独立 k）必须被 B19 抓住，判据不是恒绿
+  const torn = new THREE.DodecahedronGeometry(1, 1);
+  { const p = torn.attributes.position, rr = mulberry32(7);
+    for (let i = 0; i < p.count; i++) { const k = 0.75 + rr() * 0.45; p.setXYZ(i, p.getX(i) * k, p.getY(i) * k * 0.7, p.getZ(i) * k); } }
+
+  const w = new World(mkGame(), { id: 'b19', size: 60, seed: 3 });
+  // 沙袋先量后 finalize：finalize 会把 geoLists 合并并清空
+  w.sandbags(0, 0, 4, 0);
+  const bagList = w.geoLists.get(mat('sandbag'));
+  const bagBB = bagList && bagList.length ? (bagList[0].computeBoundingBox(), bagList[0].boundingBox) : null;
+  const sz = new THREE.Vector3();
+  if (bagBB) bagBB.getSize(sz);
+  ok('B19b 沙袋袋体不缩水（长≥0.62 高≥0.24，旧瘦袋 0.58×0.22 必须过不了）',
+    !!bagBB && sz.x >= 0.62 && sz.y >= 0.24,
+    bagBB ? `单袋 ${sz.x.toFixed(2)}×${sz.y.toFixed(2)}×${sz.z.toFixed(2)}` : 'geoLists 里没有沙袋几何');
+  const collider = w.boxes.find(b => b.mat === 'sandbag');
+  let topY = -Infinity;
+  if (bagList) for (const g of bagList) { g.computeBoundingBox(); topY = Math.max(topY, g.boundingBox.max.y); }
+  ok('B19c 沙袋视觉顶不高于碰撞盒顶（打得中看得见的袋体必有盒可撞）',
+    !!collider && isFinite(topY) && topY <= collider.y1 + 0.02,
+    isFinite(topY) ? `视觉顶 ${topY.toFixed(2)} vs 盒顶 ${collider ? collider.y1.toFixed(2) : '无盒'}` : '没有沙袋几何');
+
+  // 岩石：实例化在 finalize() 里合成，量的是共享基底几何 + 实例数
+  w.rock(0, 0, 2.2);
+  w.finalize();
+  const rockMesh = w.root.children.find(m => m.isInstancedMesh && m.geometry.type === 'DodecahedronGeometry');
+  ok('B19 岩石基底角点副本同位移（闭合岩石，不是一片一片的碎石）+ 实例化生效',
+    !!rockMesh && uniquePts(rockMesh.geometry) === nPristine && rockMesh.count >= 1,
+    rockMesh ? `唯一角点 ${uniquePts(rockMesh.geometry)}（应为 ${nPristine}），实例 ${rockMesh.count}` : 'root 里没有岩石 InstancedMesh');
+  ok('B19a【反证臂】逐顶点独立随机的老算法必须被 B19 抓住', uniquePts(torn) > nPristine,
+    `老算法唯一角点 ${uniquePts(torn)}`);
 }
 // ══════════════ 输出 ══════════════
 let pass = 0;
