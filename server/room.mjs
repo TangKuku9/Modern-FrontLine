@@ -13,7 +13,7 @@ import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput, unpackStreak, uavBit, WORLD } from '../js/quant.js';
 import { sanitizeLoadout, kitsOf } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
-import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, domBotGoal, SAY, ANNOUNCE } from '../js/match-rules.js';
+import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, domBotGoal, spawnWavesTick, SAY, ANNOUNCE, DOM_RADIUS_WEAK, DOM_SPAWN_WAVE } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
 import { Sentry, Heli, BOT_WEAPONS, randomAtt } from '../js/mp.js';
 import { KILLSTREAKS, DEFAULT_STREAKS, BOT_NAMES } from '../js/data.js';
@@ -275,6 +275,91 @@ export class NetRoom {
     return { pos, yaw: Math.atan2(pos.x, pos.z) };
   }
 
+  // ── 占领的"在已占点重生"（与单机 js/mp.js:flagSpawn 同一规矩）──
+  // 真人：死亡画面里选的点记在 c.spawnFlag（requestSpawnSel 收帧），**等那面旗的
+  // 下一波**（spawnWavesTick，DOM_SPAWN_WAVE 一档，不管有没有人排都照转）到点随批
+  // 部署；点在这段等着的时间里被抢走了就退回默认出生点，不许落在敌占点上。
+  // 落点在**弱占领圈**内随机散布（js/world.js:flagSpawnSpot），朝向沿用 spawnPoint 的式子。
+  flagSpot(team, fi) {
+    const f = this.flags && this.flags[fi];
+    if (!f || f.owner !== team) return null;
+    const pos = this.game.world.flagSpawnSpot(f.pos.x, f.pos.z, DOM_RADIUS_WEAK);
+    return { pos, yaw: Math.atan2(pos.x, pos.z) };
+  }
+  flagSpawn(c) { return this.flagSpot(c.pl.team, c.spawnFlag); }
+
+  // Bot 的选点与真人同一规矩，"选哪个"替它拿主意：优先离它当前目标（botGoal 给的旗子）
+  // 最近的已占点 —— 前沿压力；没有目标就随机一个。队里没有已占点 → null，走默认出生。
+  // **死这一刻就定下**（botFlagIdx），之后排进那面旗的波次等批 —— 不再走即时的倒计时部署。
+  botFlagIdx(b) {
+    if (!this.flags) return null;
+    const owned = [];
+    for (let i = 0; i < this.flags.length; i++) if (this.flags[i].owner === b.team) owned.push(i);
+    if (!owned.length) return null;
+    if (b.goal) {
+      let best = owned[0], bd = 1e9;
+      for (const i of owned) {
+        const d = Math.hypot(this.flags[i].pos.x - b.goal.x, this.flags[i].pos.z - b.goal.z);
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    }
+    return owned[(rng.next() * owned.length) | 0];
+  }
+
+  // 真人的部署收尾：respawnT 倒计时到点（默认出生）与波次到点（随批部署）两条路
+  // 共用同一份簿记 —— 少抄一份的话，某条路上换装/清账少一步是查不出来的那种错。
+  respawnClient(c, sp) {
+    // 局内换的配装到这一刻才生效（"死亡画面里选的装备，下次部署时到手"）。
+    // 顺序讲究：先换枪再 respawn —— respawn 会 fullAmmo()/清状态，反过来的话
+    // 新枪拿在手上、弹匣却是照旧枪补的。强硬路线的减 1 也要跟着重算（成本变了，
+    // 客户端 HUD 上那三个槽的"要几杀"是同一份账）。
+    if (c.nextLoadout) {
+      c.loadout = c.nextLoadout; c.nextLoadout = null;
+      c.pl.equip(c.loadout);
+      c.book.setDiscount(c.pl.hasPerk('hardline') ? 1 : 0);
+    }
+    c.pl.respawn(sp.pos, sp.yaw);
+    this.rules.onRespawn(c.pl.team);   // dom：阵营每复活一人 -1（tdm/ffa 是空操作）
+    c.spawnFlag = null;                // 选点兑现即清（下一次死再重选）
+    // 排队里那些"死亡期间产生"的输入必须丢掉：客户端在重生那一刻会把日记本清空
+    // （服务端整体重置，旧日记本没有可比性），留着它们只会让接下来好几包的
+    // ack 指到一个已经没有日记本的拍上。
+    // （这里原来写着"实测 12 次窗口不够长全是这个"，那句归因错了：后来带着
+    //  拍号读数重测，那些空窗全是"服务端刚好消费到我最新那一拍"的边界情形，
+    //  与重生无关，已单独立账为 caughtUp。）
+    c.q.length = 0;
+    c.rep = 0;          // 客户端在重生那一刻清空日记本，重复计数也要跟着归零
+    c.lastHp = c.pl.hp;
+    this.game.dmgBy.delete(c.pl);      // 上一条命的伤害账不许算进下一条命的助攻
+    this.events.push({
+      e: 'respawn', cid: c.cid, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw,
+      // 装备回声：让客户端手上那把枪与权威端一致 —— 换了职业时，这一格才是"生效"的证据；
+      // 没换时它保证"对局中捡来的枪不跟到重生"这条规矩在联机侧同样成立。
+      loadout: c.loadout,
+      delay: RESPAWN_DELAY,
+    });
+  }
+
+  // 波次到点：把排在这面旗上的死者（真人 + Bot）整体放行 —— 同一批走，等的本来就是
+  // 同一趟车。点在等着的时候被抢走的，随同一批退到默认出生点，不落敌占圈。
+  deployFlagWave(fi) {
+    for (const c of this.clients.values()) {
+      if (c.pl.alive || c.spawnFlag !== fi) continue;
+      this.respawnClient(c, this.flagSpot(c.pl.team, fi) || this.spawnPoint(c.pl.team));
+    }
+    if (!this.game) return;
+    for (const b of this.game.bots) {
+      if (b.alive || b.__spawnFlag !== fi) continue;
+      const sp = this.flagSpot(b.team, fi) || this.spawnPoint(b.team);
+      b.respawn(sp.pos, sp.yaw);
+      this.rules.onRespawn(b.team);         // dom：Bot 的复活同样扣队伍的分（与真人同一句）
+      b.__spawnFlag = null;
+      b.__respawnT = null;
+      this.game.dmgBy.delete(b);            // 上一条命的伤害账不许算进下一条命的助攻
+    }
+  }
+
   addClient({ name = '士兵', team = 'A', loadout = null, streaks = null, account = null, view = null } = {}) {
     const cid = NEXT_CID++;
     // 自由混战：每人一支独立"队"（与单机的 'P' / 'F'+i 同义）。这不是显示用的标签 ——
@@ -308,6 +393,8 @@ export class NetRoom {
     // 其余的人靠 NetRoom.step 传的 pairs 列表被推进。
     const c = {
       cid, pl, name, team, loadout: lo, lastInput: EMPTY_INPUT, q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0,
+      // 占领的"在已占点重生"：死亡画面里选的旗子下标（requestSpawnSel 记账，部署那拍清零）。
+      spawnFlag: null,
       // —— 对局规则的簿记（每个人一份）——
       // streakDefs：他自带的三项。welcome 回显的就是这一份，HUD 按它画三个槽。
       // book：连杀槽。成本里含"强硬路线"的减 1 —— 那是装备带来的，所以要在装好装备之后
@@ -439,39 +526,10 @@ export class NetRoom {
     for (let i = n; i < ins.length; i++) { ins[i].c = null; ins[i].inp = null; }
     for (let i = 0; i < n; i++) {
       const c = ins[i].c;
-      if (!c.pl.alive) {
+      // 排了已占点的死者不在这条路上：倒计时**冻结**，等那面旗的下一波（deployFlagWave）。
+      if (!c.pl.alive && c.spawnFlag == null) {
         c.respawnT -= DT;
-        if (c.respawnT <= 0) {
-          const sp = this.spawnPoint(c.pl.team);
-          // 局内换的配装到这一刻才生效（"死亡画面里选的装备，下次部署时到手"）。
-          // 顺序讲究：先换枪再 respawn —— respawn 会 fullAmmo()/清状态，反过来的话
-          // 新枪拿在手上、弹匣却是照旧枪补的。强硬路线的减 1 也要跟着重算（成本变了，
-          // 客户端 HUD 上那三个槽的"要几杀"是同一份账）。
-          if (c.nextLoadout) {
-            c.loadout = c.nextLoadout; c.nextLoadout = null;
-            c.pl.equip(c.loadout);
-            c.book.setDiscount(c.pl.hasPerk('hardline') ? 1 : 0);
-          }
-          c.pl.respawn(sp.pos, sp.yaw);
-          this.rules.onRespawn(c.pl.team);   // dom：阵营每复活一人 -1（tdm/ffa 是空操作）
-          // 排队里那些"死亡期间产生"的输入必须丢掉：客户端在重生那一刻会把日记本清空
-          // （服务端整体重置，旧日记本没有可比性），留着它们只会让接下来好几包的
-          // ack 指到一个已经没有日记本的拍上。
-          // （这里原来写着"实测 12 次窗口不够长全是这个"，那句归因错了：后来带着
-          //  拍号读数重测，那些空窗全是"服务端刚好消费到我最新那一拍"的边界情形，
-          //  与重生无关，已单独立账为 caughtUp。）
-          c.q.length = 0;
-          c.rep = 0;          // 客户端在重生那一刻清空日记本，重复计数也要跟着归零
-          c.lastHp = c.pl.hp;
-          this.game.dmgBy.delete(c.pl);      // 上一条命的伤害账不许算进下一条命的助攻
-          this.events.push({
-            e: 'respawn', cid: c.cid, pos: [sp.pos.x, sp.pos.y, sp.pos.z], yaw: sp.yaw,
-            // 装备回声：让客户端手上那把枪与权威端一致 —— 换了职业时，这一格才是"生效"的证据；
-            // 没换时它保证"对局中捡来的枪不跟到重生"这条规矩在联机侧同样成立。
-            loadout: c.loadout,
-            delay: RESPAWN_DELAY,
-          });
-        }
+        if (c.respawnT <= 0) this.respawnClient(c, this.spawnPoint(c.pl.team));
       }
     }
     // {pl, inp} 对同样复用。game.step 同步遍历整个数组，所以数组长度必须**正好是 n**
@@ -483,14 +541,24 @@ export class NetRoom {
     }
     pairs.length = n;
     this.game.step(DT, n ? ins[0].inp : EMPTY_INPUT, pairs);
+    // 占领的波次复活：每面旗自己循环 DOM_SPAWN_WAVE 一档 CD，到点把排在该点的死者
+    // （真人 + Bot，同一趟车）整体放行。CD **不管有没有人排都照转** —— 节奏是全房
+    // 可预期的，选点者等的就是自己那面旗的下一波。
+    if (this.flags) for (const fi of spawnWavesTick(this.flags, DT)) this.deployFlagWave(fi);
     // Bot 的重生。单机那一半长在 MPMatch.update 的 respawns 队列里（js/mp.js:317，
     // 死了的人按 4 + rng.next()*2 秒排队），而联机权威端没有那份名单 ——
     // 少了它的症状是"Bot 死一个少一个"：一局打到后半段场上只剩真人，
     // 而那看起来像"对面不来了"，谁都不会把它当成 bug 去查。
     // 延迟刻意与单机同一条式子：抄成"更合理"的版本会让两端的手感分叉，且没人会去查。
+    // 队里有已占点时 Bot 改走波次（死这一刻由 botFlagIdx 定旗入队），与真人同一趟车。
     if (this.game) for (const b of this.game.bots) {
       if (b.alive) continue;
-      if (b.__respawnT == null) b.__respawnT = 4 + rng.next() * 2;      // 刚死的这一拍排上队
+      if (b.__respawnT == null && b.__spawnFlag == null) {
+        const idx = this.botFlagIdx(b);
+        if (idx != null) { b.__spawnFlag = idx; continue; }   // 入队等波，不走倒计时
+        b.__respawnT = 4 + rng.next() * 2;      // 刚死的这一拍排上队
+      }
+      if (b.__spawnFlag != null) continue;      // 排了波次的 Bot 不吃倒计时
       b.__respawnT -= DT;
       if (b.__respawnT <= 0) {
         const sp = this.spawnPoint(b.team);
@@ -1044,8 +1112,9 @@ export class NetRoom {
       scores: { A: Math.round(this.rules.scores.A), B: Math.round(this.rules.scores.B) },
       timeLeft: Math.round(this.rules.timeLeft()),
       uav: { A: this.rules.uavActive('A'), B: this.rules.uavActive('B') },
-      // 占领点的归属/进度随记分板走（2 秒一份）；换旗那一拍另有 flagCap 事件顶着即时性
-      flags: this.flags ? this.flags.map(f => ({ name: f.name, owner: f.owner, prog: Math.round(f.prog * 100) / 100 })) : undefined,
+      // 占领点的归属/进度随记分板走（2 秒一份）；换旗那一拍另有 flagCap 事件顶着即时性。
+      // cd 是波次复活的那一档倒计时（向上取整到秒）—— 死亡画面的选点卡片拿它画"下波几秒"。
+      flags: this.flags ? this.flags.map(f => ({ name: f.name, owner: f.owner, prog: Math.round(f.prog * 100) / 100, cd: Math.ceil(f.spawnCd == null ? DOM_SPAWN_WAVE : f.spawnCd) })) : undefined,
       rows,
     });
   }
@@ -1070,8 +1139,23 @@ export class NetRoom {
   requestRespawn(cid) {
     const c = this.clients.get(cid);
     // 结算停摆之后没有"下一条件"可部署：这一局的名单已经封盘（endMatch 落库的就是它）。
-    if (!c || this.matchOverSent || c.pl.alive || c.respawnT > 0.12) return false;
+    // 排了已占点的同样不认"提前部署"—— 他等的是那面旗的下一波，空格在等待期里是空按。
+    if (!c || this.matchOverSent || c.pl.alive || c.respawnT > 0.12 || c.spawnFlag != null) return false;
     c.respawnT = 0;
+    return true;
+  }
+
+  // 占领：死亡画面里选"在哪个已占点重生"（{t:'spawnSel', flag}，net-server 路由进来）。
+  // 只认"确实躺着的人"与"这一刻仍归他队所有"的点；**再选同一面旗 = 取消**（回默认
+  // 倒计时）。选完不立即动身 —— 波次到点由 deployFlagWave 随批放行，点在等着的时候
+  // 被抢走了也是那一刻退默认出生点。与 respawn 同一纪律：结算封盘后不认，活着的人选不动。
+  requestSpawnSel(cid, flag) {
+    const c = this.clients.get(cid);
+    if (!c || this.matchOverSent || c.pl.alive) return false;
+    if (!Number.isInteger(flag) || !this.flags || !this.flags[flag]) return false;
+    if (c.spawnFlag === flag) { c.spawnFlag = null; return true; }   // 再选一次 = 取消
+    if (this.flags[flag].owner !== c.pl.team) return false;
+    c.spawnFlag = flag;
     return true;
   }
 

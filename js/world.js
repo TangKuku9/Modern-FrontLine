@@ -1481,6 +1481,18 @@ export class World {
     }
     return new THREE.Vector3(cx, this.terrain ? this.terrain.height(cx, cz) : 0, cz);
   }
+  // 占领模式"在已占点重生"的落点：**圆内均匀采样**（r = R·√u，方形采样会在角上
+  // 超出弱圈半径），落点判据与 randomWalkable 同一条（走得动 + 头顶不压顶）。
+  // 30 次都不行就退回旗心 —— 旗子立得住的地方必然站得下人。
+  flagSpawnSpot(cx, cz, radius) {
+    for (let i = 0; i < 30; i++) {
+      const a = rng.next() * Math.PI * 2, r = radius * Math.sqrt(rng.next());
+      const x = cx + Math.cos(a) * r, z = cz + Math.sin(a) * r;
+      const [ix, iz] = this.cellOf(x, z);
+      if (this.walkable(ix, iz) && this.ceilingHeight(x, z, 0, 0.3) > 2) return new THREE.Vector3(x, this.terrain ? this.terrain.height(x, z) : 0, z);
+    }
+    return new THREE.Vector3(cx, this.terrain ? this.terrain.height(cx, cz) : 0, cz);
+  }
   // 寻路本体在 pathfind.js（性能审查 C5 抽核）：那里是纯模块，寻路 Worker 装的是
   // 同一份 astarPath + 本格的拷贝 —— 两条路的路径点逐位一致，判据 test/worker-core.mjs。
   // nearestWalkable/gridLOS 随本体一起迁了过去（全仓无其他调用点；cellOf/walkable 留守，

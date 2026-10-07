@@ -7,7 +7,7 @@ import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, comput
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
-import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, SAY, SAY_START, ANNOUNCE } from './match-rules.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, spawnWavesTick, SAY, SAY_START, ANNOUNCE, DOM_RADIUS_WEAK, DOM_SPAWN_WAVE } from './match-rules.js';
 import { addLocalXp } from './progress.mjs';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
@@ -29,6 +29,8 @@ export function randomAtt(wid) {
 // 位置来自两端共读的地图（w.flagPos），只有归属状态靠事件/记分板同步。
 export function flagMesh(game, p) {
   const g = new THREE.Group();
+  // 这里画的是**强占领圈**（4.5m，DOM_RADIUS_STRONG 的实体视觉）。弱占领圈（15m）
+  // 刻意不画实体 —— 满地都是圈等于没有圈，它唯一的视觉在小地图上（hud.drawMinimap）。
   const ring = new THREE.Mesh(new THREE.RingGeometry(4.3, 4.6, 48), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6, side: THREE.DoubleSide }));
   ring.rotation.x = -Math.PI / 2; ring.position.y = 0.05; g.add(ring);
   const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 3.2, 8), mat('steel')); pole.position.y = 1.6; g.add(pole);
@@ -52,6 +54,9 @@ export class MPMatch {
     this.scores = this.rules.scores;
     this.respawns = [];
     this.flags = null;
+    // 占领的"在已占点重生"：死了之后按 1/2/3 选旗（下标），部署那拍兑现；点丢了由
+    // flagSpawn 退回默认出生点。死亡时清零 —— 上一次命的选择不跟到下一次。
+    this.spawnFlag = null;
     this.active = [];
     this.canChangeClass = true;
     this.nextLoadout = null;
@@ -140,6 +145,103 @@ export class MPMatch {
     const yaw = Math.atan2(pos.x, pos.z); // 面向中心
     return { pos, yaw };
   }
+  // 在已占领的旗子的**弱占领圈**内挑一个重生点（js/world.js:flagSpawnSpot）。
+  // 旗子索引无效 / 不归该队所有（部署前被抢走了）→ 返回 null，调用方退回默认出生点。
+  // 朝向沿用 spawnPoint 的"面向中心"同一条式子。
+  flagSpawn(team, idx) {
+    const f = this.flags && this.flags[idx];
+    if (!f || f.owner !== team) return null;
+    const w = this.game.world;
+    const pos = w.flagSpawnSpot(f.pos.x, f.pos.z, DOM_RADIUS_WEAK);
+    return { pos, yaw: Math.atan2(pos.x, pos.z) };
+  }
+  // Bot 的选点与真人同一规矩，只是"选哪个点"替它拿主意：优先离它当前目标最近的
+  // 已占点（前沿压力 —— Bot 的目标就是占点内核给的旗子），没有目标就随机一个。
+  // 返回旗子下标；队里没有已占点时返回 null。**死这一刻就定下**，之后排进那面旗的
+  // 波次等批（respawns 队列里的 r.flag），不再走即时的倒计时部署。
+  botFlagSpawn(bot) {
+    if (!this.flags) return null;
+    const owned = [];
+    for (let i = 0; i < this.flags.length; i++) if (this.flags[i].owner === bot.team) owned.push(i);
+    if (!owned.length) return null;
+    if (bot.goal) {
+      let best = owned[0], bd = 1e9;
+      for (const i of owned) {
+        const d = Math.hypot(this.flags[i].pos.x - bot.goal.x, this.flags[i].pos.z - bot.goal.z);
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    }
+    return owned[(rng.next() * owned.length) | 0];
+  }
+  // 玩家部署的收尾：默认倒计时到点（空格）与波次到点（随批）两条路共用同一份簿记 ——
+  // 换装/清选点/收死亡画面哪一步都不能只长在一条路上。
+  deployPlayer(sp) {
+    const game = this.game, pl = game.player;
+    if (this.nextLoadout) { pl.equip(this.nextLoadout); this.nextLoadout = null; this.streakBook.setDiscount(pl.hasPerk('hardline') ? 1 : 0); }
+    // 没换职业也要把装备拨回自己那一套：对局中从地上捡来的枪是**临时**的，
+    // 重生握住的应该是 class 里配置好的那把。player.js 那条注释说的
+    // "loadout 对局中不变"指的是"以 class 为准"，不是"死了还攥着刚捡的那把" ——
+    // 老代码没有换职业时根本不 equip，于是捡来的枪一路带到下一次死亡。
+    else if (pl.loadout) pl.equip(pl.loadout);
+    pl.respawn(sp.pos, sp.yaw);
+    this.rules.onRespawn(pl.team);   // dom：阵营每复活一人 -1（tdm/ffa 是空操作）
+    this.spawnFlag = null;           // 选择兑现即清（下一次死再重选）
+    this._spKeys = null;
+    game.dead = false;
+    document.getElementById('deathScreen').classList.add('hidden');
+    game.menu.hideClassSelect();
+    game.hud.spawnSelect(null);
+    game.lock();
+  }
+  // 波次到点：把排在这面旗上的死者（玩家 + Bot）整体放行 —— 同一批走，等的本来就是
+  // 同一趟车。点在等着的时候被抢走的，随同一批退到默认出生点，不落敌占圈。
+  deployFlagWave(fi) {
+    for (let i = this.respawns.length - 1; i >= 0; i--) {
+      const r = this.respawns[i];
+      const want = r.e.isPlayer ? this.spawnFlag : r.flag;
+      if (want !== fi || r.e.alive) continue;
+      const sp = this.flagSpawn(r.e.team, fi) || this.spawnPoint(r.e.team);
+      if (r.e.isPlayer) this.deployPlayer(sp);
+      else {
+        r.e.respawn(sp.pos, sp.yaw);
+        this.rules.onRespawn(r.e.team);   // dom：Bot 的复活同样记账（与真人同一条规则）
+      }
+      this.respawns.splice(i, 1);
+    }
+  }
+  // 死亡画面每帧的一小段（单机）：选点键（1/2/3 的**边沿**，再按一次取消）、主文案、
+  // 选点卡片。边沿自记 keys 的上一帧状态 —— pressed 在 snapshotInput 末尾就清了，
+  // update 里读不到。联机那一份同形状的东西长在 main.js:netRespawnTick。
+  deathUiTick(r) {
+    const game = this.game, pl = game.player;
+    const el = document.getElementById('respawnText');
+    if (!this.flags) {
+      if (el) el.textContent = r.t > 0 ? `${Math.ceil(r.t)} 秒后重新部署…` : '按 [空格] 重新部署';
+      return;
+    }
+    const prev = this._spKeys || {};
+    for (let k = 0; k < this.flags.length; k++) {
+      const down = !!game.input.keys['Digit' + (k + 1)];
+      if (down && !prev[k] && this.flags[k].owner === pl.team) this.spawnSelectPick(k);
+    }
+    this._spKeys = this.flags.map((f, k) => !!game.input.keys['Digit' + (k + 1)]);
+    if (this.spawnFlag != null && this.flags[this.spawnFlag].owner !== pl.team) this.spawnFlag = null;
+    const cd = f => Math.ceil(f.spawnCd == null ? DOM_SPAWN_WAVE : f.spawnCd);
+    const sel = this.spawnFlag != null ? this.flags[this.spawnFlag] : null;
+    if (el) el.textContent = sel
+      ? `已选 ${sel.name} 点 · 下波 ${cd(sel)} 秒集体部署`
+      : (r.t > 0 ? `${Math.ceil(r.t)} 秒后重新部署…` : '按 [空格] 重新部署');
+    game.hud.spawnSelect(this.flags.map(f => ({ name: f.name, mine: f.owner === pl.team, cd: cd(f) })), this.spawnFlag);
+  }
+  // 单机选点的唯一入口（键与卡片点击都走它）：再选同一面旗 = 取消，回默认倒计时。
+  // 联机那份在 main.js:spawnSelectPick —— 服务端把"再选同一面旗"当取消（requestSpawnSel）。
+  spawnSelectPick(i) {
+    if (!this.game.dead) return;
+    if (i === -1) { this.spawnFlag = null; return; }
+    if (!this.flags || !this.flags[i] || this.flags[i].owner !== this.game.player.team) return;
+    this.spawnFlag = this.spawnFlag === i ? null : i;
+  }
   uavActive(team) { return this.rules.uavActive(team); }
 
   // ---------- 机器人目标 ----------
@@ -190,6 +292,7 @@ export class MPMatch {
     // 复活安排
     if (victim.isPlayer) {
       game.dead = true; game.deathKiller = killer;
+      this.spawnFlag = null;          // 上一条命的选点不跟到这一次
       this.respawns.push({ e: victim, t: 4.5 });
       const el = document.getElementById('deathScreen');
       el.classList.remove('hidden');
@@ -202,7 +305,9 @@ export class MPMatch {
       if (document.pointerLockElement) document.exitPointerLock();
     } else {
       victim.streak = 0;
-      this.respawns.push({ e: victim, t: 4 + rng.next() * 2 });
+      // Bot 的去向死这一刻就定下：队里有已占点 → 排进那面旗的波次（r.flag），与真人
+      // 同一趟车；没有 → null，走默认的倒计时。
+      this.respawns.push({ e: victim, t: 4 + rng.next() * 2, flag: this.botFlagSpawn(victim) });
     }
     // FFA 分数
     if (this.ffa && killer && killer !== victim) {
@@ -331,32 +436,25 @@ export class MPMatch {
     // 完全脱拍的），但"早一拍照样是晚一拍"这件事值得写下来，免得以后有人拿
     // "投弹数对不对"去查时序。
     this.rules.step();
-    // 复活
+    // 复活。占领的波次先走：每面旗自己循环 DOM_SPAWN_WAVE 一档 CD，到点把排在该点的
+    // 死者（玩家 + Bot，同一趟车）整体放行 —— CD 不管有没有人排都照转。
+    if (this.flags) for (const fi of spawnWavesTick(this.flags, dt)) this.deployFlagWave(fi);
     for (let i = this.respawns.length - 1; i >= 0; i--) {
       const r = this.respawns[i];
-      r.t -= dt;
+      // 排了已占点的（玩家 this.spawnFlag / Bot r.flag）不吃倒计时 —— 冻结到波次；
+      // 取消选点（再按一次 / 点"默认部署"）后从冻结处接着走默认路。
+      const queued = this.flags && (r.e.isPlayer ? this.spawnFlag : r.flag) != null;
+      if (!queued) r.t -= dt;
       if (r.e.isPlayer) {
-        document.getElementById('respawnText').textContent = r.t > 0 ? `${Math.ceil(r.t)} 秒后重新部署…` : '按 [空格] 重新部署';
-        if (r.t <= 0 && (game.input.keys.Space || r.t < -4)) {
-          const sp = this.spawnPoint(pl.team);
-          if (this.nextLoadout) { pl.equip(this.nextLoadout); this.nextLoadout = null; this.streakBook.setDiscount(pl.hasPerk('hardline') ? 1 : 0); }
-          // 没换职业也要把装备拨回自己那一套：对局中从地上捡来的枪是**临时**的，
-          // 重生握住的应该是 class 里配置好的那把。player.js 那条注释说的
-          // "loadout 对局中不变"指的是"以 class 为准"，不是"死了还攥着刚捡的那把" ——
-          // 老代码没有换职业时根本不 equip，于是捡来的枪一路带到下一次死亡。
-          else if (pl.loadout) pl.equip(pl.loadout);
-          pl.respawn(sp.pos, sp.yaw);
-          this.rules.onRespawn(pl.team);   // dom：阵营每复活一人 -1（tdm/ffa 是空操作）
-          game.dead = false;
-          document.getElementById('deathScreen').classList.add('hidden');
-          game.menu.hideClassSelect();
+        this.deathUiTick(r);
+        if (!queued && r.t <= 0 && (game.input.keys.Space || r.t < -4)) {
+          this.deployPlayer(this.spawnPoint(pl.team));
           this.respawns.splice(i, 1);
-          game.lock();
         }
-      } else if (r.t <= 0) {
+      } else if (!queued && r.t <= 0) {
         const sp = this.spawnPoint(r.e.team);
         r.e.respawn(sp.pos, sp.yaw);
-        this.rules.onRespawn(r.e.team);   // Bot 的复活同样记账（与真人同一条规则）
+        this.rules.onRespawn(r.e.team);   // dom：Bot 的复活同样记账（与真人同一条规则）
         this.respawns.splice(i, 1);
       }
     }
@@ -366,7 +464,9 @@ export class MPMatch {
       // 跑的是同一份。这一段只剩表现：进度条、旗帜颜色、+200 弹窗与播报。
       const ft = flagsTick(this.flags, this.rules, game.entities, dt);
       for (const { f, teams, inRange, capped } of ft.flags) {
-        const pd = pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < 4.5;
+        // "我在圈里"的口径跟弱圈走（两层圈里都出力，都该看见进度条）；高度差由
+        // flagsTick 那侧裁，这里只管水平距离。
+        const pd = pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < DOM_RADIUS_WEAK;
         if (capped) {
           const mine = capped === pl.team;
           game.hud.announce(`${mine ? '已占领' : '失去'} ${f.name} 点`, '', 2);

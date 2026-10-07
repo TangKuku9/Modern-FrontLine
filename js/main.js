@@ -104,6 +104,13 @@ class Game {
     // 客户端把自己标成"已登录"改不动任何东西。这一点是设计，不是遗漏。
     this.account = new Account();
     this.entities = []; this.bots = []; this.projectiles = []; this.pickups = []; this.noises = [];
+    // 死亡画面·选点卡片的点击（单机与联机共用这一份 DOM，路也共用：spawnSelectPick）。
+    // 监听器挂在容器上做委托 —— 卡片的 innerHTML 每秒都在换，挂到卡片上会随手一换就丢。
+    const spSel = document.getElementById('spawnSelect');
+    if (spSel) spSel.addEventListener('click', e => {
+      const c = e.target.closest('[data-i]');
+      if (c) this.spawnSelectPick(+c.dataset.i);
+    });
     this.mat = mat;
     this.input = { keys: {}, pressed: {}, mdx: 0, mdy: 0, buttons: 0, wheel: 0 };
   }
@@ -479,6 +486,8 @@ class Game {
     // **先按 cid 找**（重名时按名字会转向另一个同名的人，指一个假方向比不指更糟），
     // 拿不到 cid 再退回名字。找不到的（哨戒机枪 / 直升机 / 已经走了的人）留 null，只有沉镜头。
     this.deathKiller = killerRemote(ev, this.identCtx());
+    this._spawnSel = null;             // 上一条命的选点不跟到这一次
+    this._spKeys = null;               // 选点键的边沿表一并作废
     const el = document.getElementById('deathScreen');
     el.classList.remove('hidden');
     document.getElementById('killerInfo').innerHTML = ev.killer && ev.killer !== ev.victim
@@ -505,7 +514,8 @@ class Game {
     // **必须在 respawn 之前**：respawn 会 fullAmmo()，反过来的话新枪拿在手上、弹匣是照旧枪补的。
     if (ev.loadout) pl.equip(ev.loadout);
     pl.respawn(new THREE.Vector3(ev.pos[0], ev.pos[1], ev.pos[2]), ev.yaw);
-    this.dead = false; this.deathKiller = null; this._respawnAsked = false;
+    this.dead = false; this.deathKiller = null; this._respawnAsked = false; this._spawnSel = null; this._spKeys = null;
+    this.hud.spawnSelect(null);
     document.getElementById('deathScreen').classList.add('hidden');
     document.getElementById('respawnText').textContent = '';
     this.menu.hideClassSelect();
@@ -517,6 +527,31 @@ class Game {
   // 能做的事：把那个数字画出来，以及把"时间到了"转成一条上行请求。
   // 倒计时走完之前**不发**：服务端那条闸门会把它丢掉（server/room.mjs:requestRespawn），
   // 而"发了却没生效"在客户端是完全看不见的 —— 那正是这个仓库最讨厌的一类失效。
+  // 死亡画面选点的唯一入口（卡片点击与 1/2/3 键都走它）：i = 旗下标，-1 = 回默认部署。
+  // 再选同一面旗 = 取消。联机改本地 _spawnSel 并把选择递给服务端 —— 服务端把"再选
+  // 同一面旗"当取消（requestSpawnSel），两端各自重验归属，客户端不预判结果；单机直接
+  // 改 game.mode.spawnFlag（MPMatch.spawnSelectPick），波次到点由 deployFlagWave 放行。
+  spawnSelectPick(i) {
+    if (!this.dead || this.ending) return;
+    const netFlags = this.net && this.net.modeId === 'dom' ? this.net.flags : null;
+    const mpFlags = this.mode && this.mode.flags ? this.mode.flags : null;
+    if (!netFlags && !mpFlags) return;
+    if (!this.player) return;
+    if (i === -1) {
+      if (netFlags) { if (this._spawnSel != null) { this.net.requestSpawnSel(this._spawnSel); this._spawnSel = null; } }
+      else if (this.mode) this.mode.spawnFlag = null;
+      return;
+    }
+    const flags = netFlags || mpFlags;
+    if (!flags[i] || flags[i].owner !== this.player.team) return;
+    const cur = netFlags ? this._spawnSel : this.mode.spawnFlag;
+    const next = cur === i ? null : i;
+    if (netFlags) { this.net.requestSpawnSel(i); this._spawnSel = next; }
+    else this.mode.spawnFlag = next;
+  }
+  // 死亡画面的一帧（联机）：倒计时/波次等待的文案、选点键（1/2/3 的**边沿**）与卡片。
+  // 边沿自记 keys 的上一帧状态 —— pressed 在 snapshotInput 末尾就被清了，这里读不到；
+  // 排了点的死者不吃默认倒计时，也不发提前部署（服务端同判），等那面旗的下一波随批走。
   netRespawnTick() {
     const el = document.getElementById('respawnText');
     if (!el) return;
@@ -525,10 +560,31 @@ class Game {
     if (this.dead && !this.ending) {
       const delay = (this.net && this.net.welcome && this.net.welcome.respawnDelay) || 3;
       const left = delay - (performance.now() / 1000 - (this.deathAt || 0));
-      if (left > 0) { text = `${Math.ceil(left)} 秒后重新部署…`; this._respawnAsked = false; }
-      else {
-        text = '按 [空格] 重新部署';
-        if (!this._respawnAsked) { this._respawnAsked = true; if (this.net && this.net.requestRespawn) this.net.requestRespawn(); }
+      const flags = this.net && this.net.modeId === 'dom' && this.net.flags ? this.net.flags : null;
+      if (flags && this.player) {
+        // 选点键的边沿（再按同一面旗 = 取消，由 spawnSelectPick 折成一次"重发同旗"）。
+        const prev = this._spKeys || (this._spKeys = {});
+        for (let i = 0; i < flags.length; i++) {
+          const down = !!this.input.keys['Digit' + (i + 1)];
+          if (down && !prev[i]) this.spawnSelectPick(i);
+          prev[i] = down;
+        }
+        if (this._spawnSel != null && flags[this._spawnSel] && flags[this._spawnSel].owner !== this.player.team) this._spawnSel = null;
+        // 卡片上的"下波几秒"：记分板 2 秒一班，直接读 cd 会一跳一跳 —— 用"上一次读数
+        // + 本地流逝"插值（cdAt 是 setFlagState 记下的到表时刻）。
+        const now = performance.now() / 1000;
+        const cdOf = f => Math.max(0, Math.ceil((f.cd || 0) - (now - (f.cdAt || now))));
+        this.hud.spawnSelect(flags.map(f => ({ name: f.name, mine: f.owner === this.player.team, cd: cdOf(f) })), this._spawnSel);
+        if (this._spawnSel != null) text = `已选 ${flags[this._spawnSel].name} 点 · 下波 ${cdOf(flags[this._spawnSel])} 秒集体部署`;
+      } else {
+        this.hud.spawnSelect(null);
+      }
+      if (text === '') {
+        if (left > 0) { text = `${Math.ceil(left)} 秒后重新部署…`; this._respawnAsked = false; }
+        else {
+          text = '按 [空格] 重新部署';
+          if (!this._respawnAsked) { this._respawnAsked = true; if (this.net && this.net.requestRespawn) this.net.requestRespawn(); }
+        }
       }
     }
     // 只在**文字变了**的时候写 DOM：这条按渲染帧走，144Hz 上每帧赋一次 textContent

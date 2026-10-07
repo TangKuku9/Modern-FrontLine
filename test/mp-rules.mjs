@@ -11,7 +11,7 @@
 // 每一节都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。下面每条的措辞写的就是"这条红了说明什么坏了"。
 import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
-import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE, DOM_SCORE_PER_SEC } from '../js/match-rules.js';
+import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE, DOM_SCORE_PER_SEC, DOM_CAP_RATE, DOM_POWER_STRONG, DOM_POWER_WEAK, DOM_RADIUS_WEAK, DOM_SPAWN_WAVE } from '../js/match-rules.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD, teamIndex, teamId } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
@@ -877,19 +877,22 @@ const roomO = new NetRoom({ id: 'rules-o', mapId: 'yard', seed: 20260926, mode: 
 await roomO.start();
 const OA = roomO.addClient({ name: '甲', team: 'A' });
 const OB = roomO.addClient({ name: '乙', team: 'B' });
+// 弱圈翻倍到 30m 之后，yard 上旗与旗之间近得多，默认出生点会落进彼此的弱圈 ——
+// 不把乙挪出去的话，A 点从第一拍起就是两队在圈的僵持，O2-O6 的"独占"前提立不起来。
+OB.pl.pos.copy(roomO.flags[0].pos).add(new THREE.Vector3(60, 0, 0));
 ok('O1 先决：dom 房里有据点（地图给的 A/B/C）', !!roomO.flags && roomO.flags.length === 3, `flags=${roomO.flags && roomO.flags.length}`);
 
 const fA = roomO.flags[0];
 OA.pl.pos.copy(fA.pos);
 roomO.step();
-ok('O2 独占开始涨进度（0.18+0.07×1/秒那条式子）', fA.prog > 0 && fA.capTeam === OA.pl.team, `prog=${fA.prog.toFixed(4)} capTeam=${fA.capTeam}`);
+ok('O2 独占开始涨进度（内圈强占领：1 人 = 2 点力 × DOM_CAP_RATE，大幅放缓后的账）', fA.prog > 0 && fA.capTeam === OA.pl.team, `prog=${fA.prog.toFixed(4)} capTeam=${fA.capTeam}`);
 OB.pl.pos.copy(fA.pos);
 const prog0 = fA.prog;
 roomO.step();
 // 反证臂：这条红了 = 两边都站在点里也在涨 —— 混战的点被"抢穿"，谁人多谁永远占得住
 ok('O3【反证】两边都站在点里：进度一格不动', fA.prog === prog0, `prog=${fA.prog.toFixed(4)}`);
-OB.pl.pos.copy(fA.pos.clone().add(new THREE.Vector3(20, 0, 0)));
-for (let i = 0; i < 300 && !fA.owner; i++) roomO.step();   // 0.25/秒 ⇒ ~240 拍到线
+OB.pl.pos.copy(fA.pos.clone().add(new THREE.Vector3(60, 0, 0)));   // 挪出 30m 弱圈，让 A 独自占点
+for (let i = 0; i < 1200 && !fA.owner; i++) roomO.step();   // 独占内圈 0.06/秒 ⇒ ~1000 拍到线（放缓是有意的）
 const capEv = roomO.events.find(e => e.e === 'flagCap');
 ok('O4 独占到线：换旗 + flagCap 事件（客户端旗子的颜色靠它立刻翻）',
   fA.owner === OA.pl.team && !!capEv && capEv.name === fA.name && capEv.owner === OA.pl.team,
@@ -907,7 +910,7 @@ ok('O5c【反证臂】语音与大字确实不同（否则这条判据恒绿）'
 
 const s0 = roomO.rules.scores[OA.pl.team];
 roomO.step(); roomO.step();
-ok('O6 占领得分挂在旗上（0.6/秒/点，两拍之后 A 队涨了）',
+ok('O6 占领得分挂在旗上（DOM_SCORE_PER_SEC/秒/点，两拍之后 A 队涨了）',
   roomO.rules.scores[OA.pl.team] > s0, `${s0.toFixed(3)} → ${roomO.rules.scores[OA.pl.team].toFixed(3)}`);
 
 roomO.pushBoard();
@@ -976,6 +979,123 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
   const rulesW = new MatchRules({ mode: 'dom', scoreLimit: 100 });
   rulesW.addScore('A', 50);
   ok('O16 dom 到 100 也判胜（三档都是真目标）', rulesW.checkEnd() === 'A', JSON.stringify(rulesW.scores));
+
+  // —— 同心双圈的占领力：内圈 2 / 外圈 1 / 不封顶。量 B 点（全程没人碰过）的 prog
+  // 增量（10 拍，必须严丝合缝）；先把闲人（roomR 里只有 botR 一个）挪出弱圈，
+  // 让账只算下面摆进来的人。
+  const fw = roomR.flags[1];
+  fw.owner = null;
+  botR.pos.copy(fw.pos).add(new THREE.Vector3(60, 0, 0));
+  RA.pl.pos.copy(fw.pos).add(new THREE.Vector3(10, 0, 0));   // RA：只在外圈（弱占领）
+  const p0 = fw.prog;
+  for (let i = 0; i < 10; i++) roomR.step();
+  ok('O17 弱圈单人 = 1 点力（0.03/秒；这条红了 = 双圈的权重没进内核）',
+    Math.abs(fw.prog - p0 - 10 * DT * DOM_CAP_RATE * DOM_POWER_WEAK) < 1e-12,
+    `Δ=${(fw.prog - p0).toFixed(6)} 期望=${(10 * DT * DOM_CAP_RATE * DOM_POWER_WEAK).toFixed(6)}`);
+
+  const botA1 = roomR.addBot(new Bot(roomR.game, {
+    team: 'A', name: '甲卫1', style: 'enemy', weaponId: 'ak', att: {}, difficulty: 1,
+    pos: fw.pos.clone(), yaw: 0, role: 'guard', group: 'domrate',
+  }));
+  const p1 = fw.prog;
+  for (let i = 0; i < 10; i++) roomR.step();
+  ok('O18 内圈强圈 = 2 点力且可叠加（+1 内圈人 → 1+2=3 点力，0.09/秒）',
+    Math.abs(fw.prog - p1 - 10 * DT * DOM_CAP_RATE * (DOM_POWER_WEAK + DOM_POWER_STRONG)) < 1e-12,
+    `Δ=${(fw.prog - p1).toFixed(6)}`);
+
+  // 不封顶：旧的"3 人封顶"式子到这里会停住，新的按人线性涨 —— 4 个人 = 1+2+2+2 = 7 点力。
+  const mkA = (n) => roomR.addBot(new Bot(roomR.game, {
+    team: 'A', name: '甲卫' + n, style: 'enemy', weaponId: 'ak', att: {}, difficulty: 1,
+    pos: fw.pos.clone().add(new THREE.Vector3(n * 0.8, 0, 0)), yaw: 0, role: 'guard', group: 'domrate',
+  }));
+  mkA(2); mkA(3);
+  const p2 = fw.prog;
+  for (let i = 0; i < 10; i++) roomR.step();
+  ok('O19 占领力不封顶（4 人 = 7 点力，人数就是硬道理）',
+    Math.abs(fw.prog - p2 - 10 * DT * DOM_CAP_RATE * 7) < 1e-12,
+    `Δ=${(fw.prog - p2).toFixed(6)} 期望=${(10 * DT * DOM_CAP_RATE * 7).toFixed(6)}`);
+
+  // 争点僵持：两支队伍都在圈里（B 从弱圈进来），谁也不涨 —— 与旧模型同一句。
+  botR.alive = true;
+  botR.pos.copy(fw.pos).add(new THREE.Vector3(6, 0, 0));
+  const p3 = fw.prog;
+  for (let i = 0; i < 5; i++) roomR.step();
+  ok('O20【反证】两队在圈 = 僵持一格不动（这条红了 = 混战的点被"抢穿"）',
+    fw.prog === p3, `Δ=${(fw.prog - p3).toFixed(6)}`);
+
+  // —— 在已占点重生：选点（spawnSel）与部署（respawn）是两帧；选完等那面旗的
+  //     **下一波**（DOM_SPAWN_WAVE 一档 CD，不管有没有人排都照转，到点集体放行）。——
+  const f0 = roomR.flags[0];
+  f0.owner = 'A';
+  ok('O21 spawnSel 的门：活着的人选不动、不存在的旗子选不动',
+    roomR.requestSpawnSel(RA.cid, 0) === false && roomR.requestSpawnSel(RA.cid, 9) === false);
+  RA.pl.alive = false; RA.respawnT = 3;
+  ok('O22 躺着 + 点仍归我队：选点收下（不立即动身，默认倒计时冻结）',
+    roomR.requestSpawnSel(RA.cid, 0) === true && RA.respawnT === 3 && RA.pl.alive === false);
+  ok('O23 选了点连"提前部署"也拒（等波的人不被空格拽成抢先出发）',
+    roomR.requestRespawn(RA.cid) === false);
+  for (let i = 0; i < 5; i++) roomR.step();
+  ok('O24【反证】选了点之后默认倒计时不再放人（冻结到波次；这条红了 = 还在走 respawnT 那条路）',
+    RA.pl.alive === false);
+  // 把 A 旗的 CD 手动拨到线（局内就是 20 秒循环的下一拍），验随批部署。
+  f0.spawnCd = DT * 0.5;
+  roomR.step();
+  const evR = roomR.events.filter(e => e.e === 'respawn' && e.cid === RA.cid).pop();
+  const dR = evR ? Math.hypot(evR.pos[0] - f0.pos.x, evR.pos[2] - f0.pos.z) : 1e9;
+  ok('O25 波次到点集体放行，落点在所选点的弱占领圈内（随机散布，可走性由 world.flagSpawnSpot 裁）',
+    !!evR && RA.pl.alive && dR <= DOM_RADIUS_WEAK + 0.01 && Math.abs(f0.spawnCd - DOM_SPAWN_WAVE) < DT,
+    `dist=${dR.toFixed(2)} cd=${f0.spawnCd.toFixed(3)}`);
+
+  // 一批一批：两个死者排同一面旗，同一拍放行 —— 不是谁先选谁先走。
+  // RA2 是 roomR 的第二个 A 队真人（roomO 的乙是 B 队，选不动 A 的旗）。
+  const RA2 = roomR.addClient({ name: '甲二', team: 'A' });
+  f0.owner = 'A';
+  RA.pl.alive = false; RA.respawnT = 3;
+  roomR.requestSpawnSel(RA.cid, 0);
+  RA2.pl.alive = false; RA2.respawnT = 3;
+  roomR.requestSpawnSel(RA2.cid, 0);
+  f0.spawnCd = DT * 0.5;
+  roomR.step();
+  ok('O26 排同一面旗的两人同拍部署（集体复活）', RA.pl.alive && RA2.pl.alive, '');
+
+  // 取消：再选同一面旗 = 撤单，回默认倒计时那条路。
+  RA.pl.alive = false; RA.respawnT = 3;
+  roomR.requestSpawnSel(RA.cid, 0);
+  roomR.requestSpawnSel(RA.cid, 0);
+  ok('O27 再选一次 = 取消（选点清空，回默认路）', RA.spawnFlag === null && RA.pl.alive === false);
+  RA.respawnT = 0;
+  roomR.step();
+  ok('O28 取消之后照默认出生点部署（选点排队与默认路真的是两条路）', RA.pl.alive === true);
+
+  // 点在等着的时候被抢走 → 波次照样放行，但落点退回默认出生点。
+  RA.pl.alive = false; RA.respawnT = 3;
+  roomR.requestSpawnSel(RA.cid, 0);
+  f0.owner = 'B';
+  ok('O29【反证】选的点丢了：flagSpawn 退 null（绝不落进敌占圈）',
+    roomR.flagSpawn({ pl: { team: 'A' }, spawnFlag: 0 }) === null);
+  f0.spawnCd = DT * 0.5;
+  roomR.step();
+  ok('O30 点丢之后波次照样放行（人活着回来了，而不是卡死在失效的选点上）',
+    RA.pl.alive === true);
+
+  // 波次**不管有没有人排都照转**：空转一拍，CD 照样归满重排。
+  roomR.flags[1].spawnCd = DT * 0.5;
+  roomR.step();
+  ok('O31 点的 CD 不看人数（空转一拍就归满，下一波仍是整档 DOM_SPAWN_WAVE）',
+    Math.abs(roomR.flags[1].spawnCd - DOM_SPAWN_WAVE) < DT, roomR.flags[1].spawnCd.toFixed(3));
+
+  // Bot 与真人同一规矩：队里有已占点 → 死这一刻入队等波，同一趟车（不再即时部署抢跑）。
+  f0.owner = 'B'; roomR.flags[2].owner = 'B';          // B 队手里两面旗
+  botR.alive = false; botR.__respawnT = null; botR.__spawnFlag = null;
+  roomR.step();
+  ok('O32 Bot 死后入队等波（不再吃 4 秒倒计时；这条红了 = Bot 抢跑占了真人的便宜）',
+    !botR.alive && botR.__spawnFlag != null, `spawnFlag=${botR.__spawnFlag}`);
+  const flagB = roomR.flags[botR.__spawnFlag];
+  flagB.spawnCd = DT * 0.5;
+  roomR.step();
+  const dB = Math.hypot(botR.pos.x - flagB.pos.x, botR.pos.z - flagB.pos.z);
+  ok('O33 Bot 随波部署、落在弱圈内（与真人同一趟车，绝不落进敌占点）',
+    botR.alive && dB <= DOM_RADIUS_WEAK + 0.01, `dist=${dB.toFixed(2)}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

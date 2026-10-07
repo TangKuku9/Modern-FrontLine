@@ -380,6 +380,20 @@ html, body { position: fixed; inset: 0; }
 #killerInfo { font-size: 18px; margin-top: 10px; }
 #killerInfo b { color: var(--enemy); }
 #respawnText { margin-top: 14px; color: #bbb; }
+/* 死亡画面·选点（占领）：三张旗卡 + 默认部署一行。弱圈在世界里没有实体，这里就是
+   "弱圈在哪、下一波几秒"的全部信息；:empty 时整块塌掉 —— 非 dom 模式什么都不画。 */
+#spawnSelect { margin-top: 12px; pointer-events: auto; }
+#spawnSelect:empty { display: none; }
+.sp-hint { font-size: 12px; color: #888; letter-spacing: 2px; margin-bottom: 8px; }
+.sp-row { display: flex; gap: 10px; justify-content: center; }
+.sp-flag { min-width: 96px; padding: 10px 14px; background: rgba(0,0,0,.5); border: 1px solid rgba(255,255,255,.22); cursor: pointer; user-select: none; }
+.sp-flag b { display: block; font-size: 22px; font-weight: 900; letter-spacing: 2px; }
+.sp-flag span { display: block; font-size: 12px; color: #aaa; margin-top: 4px; white-space: nowrap; }
+.sp-flag:not(.dis):hover { border-color: var(--ally, #4fb4ff); }
+.sp-flag.sel { border-color: var(--ally, #4fb4ff); box-shadow: 0 0 12px rgba(79,180,255,.45); }
+.sp-flag.dis { opacity: .35; cursor: default; }
+.sp-def { margin-top: 10px; display: inline-block; padding: 6px 18px; font-size: 13px; color: #bbb; background: rgba(0,0,0,.4); border: 1px solid rgba(255,255,255,.15); cursor: pointer; user-select: none; }
+.sp-def:hover { border-color: var(--ally, #4fb4ff); color: #eee; }
 .death-btns { margin-top: 16px; pointer-events: auto; }
 #scoreboard { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); z-index: 30; width: 820px; background: rgba(8,10,12,.9); padding: 20px; }
 .sbt { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 14px; }

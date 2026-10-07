@@ -141,6 +141,29 @@ export const DOM_SCORE_PER_SEC = 0.3;
 export const DOM_START_SCORE = 50;
 export const DOM_RESPAWN_COST = 1;
 
+// 占领圈是**同心两层**，占领力按人算、不封顶（单机 MPMatch 与联机 NetRoom 跑同一份账，
+// 半径/力度不许在别处再写字面量）：
+//   DOM_RADIUS_STRONG —— 内圈（强占领圈）。世界里有实体环画着它（js/mp.js:flagMesh 的
+//      RingGeometry），进圈即为"站在点上"。
+//   DOM_RADIUS_WEAK   —— 外圈（弱占领圈），比内圈大得多。它**刻意不在世界里画**：
+//      满地都是圈等于没有圈 —— 唯一的视觉在小地图上（js/hud.js:drawMinimap 的虚线圆）。
+//      两件事吃这个半径：弱占领力、以及"在已占点重生"的散布范围。
+//   DOM_POWER_*       —— 每人的占领力：内圈 2、仅在外圈 1。旧模型的"3 人封顶"已删：
+//      圈里的每个人都出力，人数就是硬道理。
+//   DOM_CAP_RATE      —— 每 1 点占领力的进度/秒。整体大幅放缓：旧式子独占内圈 0.18/秒
+//      （约 5.6 秒占完），现在独占内圈 0.06/秒、蹲外圈只有 0.03/秒 —— 想快速拿下就
+//      得往里圈堆人。没人时按 DOM_CAP_DECAY 回退（也随涨速一起放慢）。
+//   DOM_SPAWN_WAVE    —— 占领的**波次复活**：每面旗各自循环这一档 CD（秒），到点把
+//      "排在该点的死者"整体放行 —— 一批一批，不管有没有人排，CD 都照转（spawnWavesTick）。
+//      选了点的玩家等的就是自己那面旗的下一波；默认出生点不走波次，照旧倒计时。
+export const DOM_RADIUS_STRONG = 4.5;
+export const DOM_RADIUS_WEAK = 30;
+export const DOM_POWER_STRONG = 2;
+export const DOM_POWER_WEAK = 1;
+export const DOM_CAP_RATE = 0.03;
+export const DOM_CAP_DECAY = 0.03;
+export const DOM_SPAWN_WAVE = 20;
+
 export class MatchRules {
   constructor(cfg = {}) {
     const mode = cfg.mode || 'tdm';
@@ -522,8 +545,11 @@ export function pickupAction(game, pl, inp, apply = true) {
 }
 
 // ---------- 占领点（dom） ----------
-// 与单机 MPMatch.update 里那段同规则：4.5 m 半径（高度差 3 m 内）、0.18+0.07×人数 的
-// 占领速度（3 人封顶）、没人时 0.1/秒 的回退、每个据点 DOM_SCORE_PER_SEC/秒 的得分。
+// 同心双圈的占领力模型（半径/力度/涨速在 DOM_* 那组常量上）：内圈强圈每人 2 点力、
+// 外圈弱圈每人 1 点力、不封顶（人数就是硬道理）；进度 = DOM_CAP_RATE × 占领力，
+// 整体比旧式子（0.18+0.07×人数、3 人封顶）大幅放缓。两层共用同一道高度差 3m 的门槛
+// （塔上/坡下不算进圈），两支队伍都有人在圈里就是僵持 —— 谁也不涨。空点的回退按
+// DOM_CAP_DECAY/秒。每个据点 DOM_SCORE_PER_SEC/秒 的得分（挂归属不挂人）。
 // 两端共用：
 // 单机在 MPMatch.update、联机在 NetRoom.step 都调它。**只有状态与分数** —— 网格、
 // 颜色、进度条、播报全归调用方（返回值告诉它们发生了什么、点里站着谁）。
@@ -548,8 +574,15 @@ export function flagsTick(flags, rules, entities, dt) {
     for (const k in cnt) delete cnt[k];
     for (const e of entities) {
       if (!e.alive || !e.pos || e.targetable === false || e.isTurret) continue;
-      if (Math.hypot(e.pos.x - f.pos.x, e.pos.z - f.pos.z) < 4.5 && Math.abs(e.pos.y - f.pos.y) < 3) {
-        cnt[e.team] = (cnt[e.team] || 0) + 1;
+      // 两层同心圆共用一道高度门槛；cnt[team] 累的是**占领力**（内圈 2 / 外圈 1），
+      // 不再是人数 —— 消费方只拿它判"有没有人在占"，别拿它数人头。
+      const d = Math.hypot(e.pos.x - f.pos.x, e.pos.z - f.pos.z);
+      if (Math.abs(e.pos.y - f.pos.y) >= 3) continue;
+      if (d < DOM_RADIUS_STRONG) {
+        cnt[e.team] = (cnt[e.team] || 0) + DOM_POWER_STRONG;
+        slot.inRange.push(e);
+      } else if (d < DOM_RADIUS_WEAK) {
+        cnt[e.team] = (cnt[e.team] || 0) + DOM_POWER_WEAK;
         slot.inRange.push(e);
       }
     }
@@ -559,14 +592,14 @@ export function flagsTick(flags, rules, entities, dt) {
     if (teams.length === 1 && teams[0] !== f.owner) {
       const t = teams[0];
       if (f.capTeam !== t) { f.capTeam = t; f.prog = 0; }
-      f.prog += dt * (0.18 + 0.07 * Math.min(3, cnt[t]));
+      f.prog += dt * DOM_CAP_RATE * cnt[t];
       if (f.prog >= 1) {
         f.owner = t; f.prog = 0; f.capTeam = null;
         capped = t;
         out.caps.push({ f, team: t, inRange: slot.inRange });
       }
     } else if (teams.length !== 1) {
-      if (f.capTeam && teams.length === 0) f.prog = Math.max(0, f.prog - dt * 0.1);
+      if (f.capTeam && teams.length === 0) f.prog = Math.max(0, f.prog - dt * DOM_CAP_DECAY);
     }
     slot.capped = capped;
     // 得分挂在**旗**上不挂在人上：谁占着谁涨，DOM_SCORE_PER_SEC/秒/点（单机联机同一条式子）。
@@ -575,6 +608,23 @@ export function flagsTick(flags, rules, entities, dt) {
   }
   out.flags.length = fi;
   return out;
+}
+
+// ---------- 占领的波次复活（dom） ----------
+// 每面旗各自循环 DOM_SPAWN_WAVE 一档 CD，**不管有没有人排都照转**；归零的那一拍把
+// "排在该点的死者"整体交还给调用方部署 —— 一批一批。旗对象上的 spawnCd 由本函数
+// 独占（懒初始化：开局第一拍从满档起转，所以所有旗开局同步）。谁排在哪面旗是
+// 调用方的账（服务端 = clients 的 spawnFlag + Bot 的 __spawnFlag；单机 = respawns
+// 队列），这里只负责"哪几面旗这一拍到点"。
+// 返回本拍到点的旗下标数组（调用方逐旗 deploy；拍了点但点已易主的，由调用方退默认出生）。
+export function spawnWavesTick(flags, dt) {
+  const fired = [];
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i];
+    f.spawnCd = (f.spawnCd == null ? DOM_SPAWN_WAVE : f.spawnCd) - dt;
+    if (f.spawnCd <= 0) { f.spawnCd = DOM_SPAWN_WAVE; fired.push(i); }
+  }
+  return fired;
 }
 
 // ---------- Bot 占点目标（dom，单机 MPMatch 与联机 NetRoom 共用） ----------

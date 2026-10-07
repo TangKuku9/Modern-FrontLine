@@ -4,6 +4,8 @@ import { KILLSTREAKS } from './data.js';
 import { fmtTime, clamp } from './util.js';
 import { parseChatCommand, toggleMute, chatRowHtml, isImeKey } from './net/chat.mjs';
 import { escHtml } from './escape.js';
+// 弱占领圈半径：小地图上那个虚线圆是它的**唯一**视觉（世界里刻意不画，见 flagMesh）。
+import { DOM_RADIUS_WEAK } from './match-rules.js';
 
 const $ = id => document.getElementById(id);
 const _v = new THREE.Vector3();
@@ -403,6 +405,22 @@ export class HUD {
     for (const id in this.markerEls) if (!seen.has(id)) { this.markerEls[id].remove(); delete this.markerEls[id]; }
   }
 
+  // 死亡画面·选点卡片（占领）。单一渲染点：签名没变就不写 DOM（respawnText 同一招）。
+  // flagsView = [{name, mine, cd}]；sel = 当前选中的旗下标或 null；flagsView 为 null 清空容器
+  // （非 dom 模式与重生之后都落在这条路上 —— :empty 的容器整块塌掉，不留空框）。
+  spawnSelect(flagsView, sel) {
+    const el = this._spSel || (this._spSel = document.getElementById('spawnSelect'));
+    if (!el) return;
+    let html = '';
+    if (flagsView && flagsView.length) {
+      const card = (f, i) => `<div class="sp-flag${sel === i ? ' sel' : ''}${f.mine ? '' : ' dis'}" data-i="${i}"><b>${f.name}</b><span>${f.mine ? `下波 ${f.cd}s` : '未占领'}</span></div>`;
+      html = `<div class="sp-hint">点击卡片或按 1/2/3 选择在已占点重生 · 再选一次取消</div>`
+        + `<div class="sp-row">${flagsView.map(card).join('')}</div>`
+        + `<div class="sp-def${sel == null ? ' sel' : ''}" data-i="-1">默认部署${sel == null ? '（按 [空格] 或倒计时自动）' : ' · 点击取消选点'}</div>`;
+    }
+    if (el.dataset.sig !== html) { el.innerHTML = html; el.dataset.sig = html; }
+  }
+
   drawMinimap() {
     const game = this.game, pl = game.player, world = game.world;
     const ctx = this.mm, S = 220, R = 45; // 显示半径（米）
@@ -431,6 +449,12 @@ export class HUD {
       const px = (f.pos.x - pl.pos.x) * scale, pz = (f.pos.z - pl.pos.z) * scale;
       ctx.save(); ctx.translate(px, pz); ctx.rotate(-pl.yaw);
       ctx.fillStyle = f.owner === pl.team ? '#4fb4ff' : f.owner ? '#ff4a3d' : '#fff';
+      // 弱占领圈（DOM_RADIUS_WEAK）：世界里刻意不画，这里的小地图虚线圆是它唯一的视觉。
+      // 颜色跟着归属走，半径用与地图同一把 米→px 的换算（15m ≈ 37px）。
+      ctx.setLineDash([3, 3]);
+      ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(0, 0, DOM_RADIUS_WEAK * scale, 0, 7); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
       ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.beginPath(); ctx.arc(0, 0, 9, 0, 7); ctx.strokeStyle = ctx.fillStyle; ctx.lineWidth = 2; ctx.stroke();
       ctx.fillText(f.name, 0, 1);

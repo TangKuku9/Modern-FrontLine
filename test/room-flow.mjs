@@ -283,13 +283,16 @@ try {
   // 不是这一条要量的东西。人手也不可能 250 ms 内点两次"创建房间"。
   // 歇在这里而不是把闸放宽：判据的前提要跟着被测对象的语义走，别为让它绿去改源码。
   await sleep(300);
-  h.send({ t: 'createRoom', room: 'cap', name: '壬1', mode: 'dom' });
+  // 占领已经与双丘战区**互为专属**（js/data.js 的 maps/modes 双向绑定），这一段的
+  // "改模式"流程要在一个不绑图的房里做 —— tdm 建房不填地图，兜底照旧落 yard。
+  h.send({ t: 'createRoom', room: 'cap', name: '壬1', mode: 'tdm' });
   const rH = await h.until(j => j.t === 'room' && j.room && j.room.id === 'cap', 6000);
-  ok('三种模式都开得起来（tdm / ffa / dom 的胜负权威端都判得了）', !!rH && rH.room.mode === 'dom', JSON.stringify(rH && rH.room.mode));
+  ok('房间开得起来（tdm 不填图兜底 yard；dom 的专属绑定在下面那间专门验）',
+    !!rH && rH.room.mode === 'tdm' && rH.room.map === 'yard', JSON.stringify(rH && rH.room));
   h.frames.length = 0;
   h.send({ t: 'roomCfg', mode: 'ffa' });
   const okF = await h.until(j => j.t === 'room' && j.room && j.room.mode === 'ffa', 6000);
-  ok('房主把设置改成「自由混战」：接得下（服务端判得出它的胜负了）', !!okF, JSON.stringify(okF && okF.room.mode));
+  ok('房主把设置改成「自由混战」：接得下（yard 不绑模式，服务端判得出它的胜负）', !!okF, JSON.stringify(okF && okF.room.mode));
   h.send({ t: 'roomCfg', mode: 'conquest' });
   const errF = await h.until(j => j.t === 'err', 4000);
   ok('改成不存在的模式仍被拒（放行三种不等于放行一切）', !!errF && /conquest/.test(errF.msg || ''), JSON.stringify(errF && errF.msg));
@@ -311,17 +314,11 @@ try {
   // ── 专属图与档位按模式走（js/data.js 的 modes / scoreOptions；服务端 mapGate 把关）──
   // 建房是重帧，两次之间按 M7 歇 300ms（与上面同一条理由）。
   await sleep(300);
-  h.send({ t: 'createRoom', room: 'ridge', name: '壬2', map: 'ridges', mode: 'tdm' });
-  const rejR = await h.until(j => j.t === 'err', 4000);
-  ok('ridges 只在占领开放：配 tdm 建房当场被拒（话说得具体，不是一句"地图不对"）',
-    !!rejR && /双丘战区/.test(rejR.msg || '') && /占领/.test(rejR.msg || ''), JSON.stringify(rejR && rejR.msg));
-  ok('【反证】被拒的建房没有留下开成一半的房',
-    !(await apiRooms(srv3.base)).some(x => x.id === 'ridge'), '');
-  await sleep(300);
-  h.send({ t: 'createRoom', room: 'ridge', name: '壬2', map: 'ridges', mode: 'dom' });
+  // 占领只认双丘战区：dom 建房**不填地图**也要兜到 ridges 上（"没填"与"填错"是两回事）。
+  h.send({ t: 'createRoom', room: 'ridge', name: '壬2', mode: 'dom' });
   const okR2 = await h.until(j => j.t === 'room' && j.room && j.room.id === 'ridge', 6000);
-  ok('dom 配 ridges 开得起来（专属是单向门：占领要用它时给用）',
-    !!okR2 && okR2.room.map === 'ridges', JSON.stringify(okR2 && okR2.room));
+  ok('dom 建房不填图兜到「双丘战区」（占领的专属图由服务端给默认）',
+    !!okR2 && okR2.room.mode === 'dom' && okR2.room.map === 'ridges', JSON.stringify(okR2 && okR2.room));
   h.send({ t: 'roomCfg', scoreLimit: 500 });
   const ok500 = await h.until(j => j.t === 'room' && j.room && j.room.score === 500, 6000);
   ok('dom 的档位是 100/200/500：500 收得下', !!ok500, JSON.stringify(ok500 && ok500.room && ok500.room.score));
@@ -336,6 +333,24 @@ try {
   // 被拒的 setCfg 直接 return、不推状态 —— 这里读清单，不等帧（与上面 mode 那组同一样）。
   const rowT2 = (await apiRooms(srv3.base)).find(x => x.id === 'ridge') || {};
   ok('拒完之后这间还是占领（没有偷偷换玩法）', rowT2.mode === 'dom', JSON.stringify(rowT2));
+  h.send({ t: 'roomCfg', map: 'yard' });
+  const errMap = await h.until(j => j.t === 'err', 4000);
+  ok('反向同样拦：占领房里把地图改成 yard 被拒（占领只在「双丘战区」打）',
+    !!errMap && /双丘战区/.test(errMap.msg || ''), JSON.stringify(errMap && errMap.msg));
+  // 被拒的 setCfg 直接 return、不推状态 —— 读清单，不等帧。
+  const rowD = (await apiRooms(srv3.base)).find(x => x.id === 'ridge') || {};
+  ok('拒完之后这间还是双丘战区（没有偷偷换图）', rowD.map === 'ridges', JSON.stringify(rowD));
+  // 图侧的绑定在 createRoom 那条路上同样拦（换一条连接，绕开 h 的建房配额）。
+  const h3c = client(srv3.ws, '壬3');
+  await h3c.opened;
+  h3c.frames.length = 0;
+  h3c.send({ t: 'createRoom', room: 'ridge2', name: '壬3', map: 'ridges', mode: 'tdm' });
+  const rejR2 = await h3c.until(j => j.t === 'err', 4000);
+  ok('ridges 配 tdm 建房当场被拒（图侧绑定在 createRoom 同样生效）',
+    !!rejR2 && /双丘战区/.test(rejR2.msg || '') && /占领/.test(rejR2.msg || ''), JSON.stringify(rejR2 && rejR2.msg));
+  ok('【反证】被拒的建房没有留下开成一半的房',
+    !(await apiRooms(srv3.base)).some(x => x.id === 'ridge2'), '');
+  h3c.close();
   h.close();
   srv3.kill();
 

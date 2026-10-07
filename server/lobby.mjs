@@ -17,7 +17,7 @@
 // ── 权限在这里，不在界面上 ──
 // 谁能开局、开局要满足什么条件、聊天能发多快，全部在服务端判一遍。客户端把"开始"
 // 按钮置灰只是体验；改得动的东西不算权限（和 /api/rooms 的 401、WS 握手的 401 同源）。
-import { MP_MAPS, MP_MODES, MP_MINUTES, scoreOptions, mapAllowed, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
+import { MP_MAPS, MP_MODES, MP_MINUTES, scoreOptions, mapAllowed, mapsForMode, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
 import { DEFAULT_SCORE_LIMIT } from '../js/match-rules.js';
 
 // 一间的上限。和 net-server:pickRoom 里那个"人最多且没满"的 16 是同一个数 ——
@@ -90,14 +90,18 @@ const cleanMinutes = (v) => { const n = Number(v); return MIN_SET.has(n) ? n : 1
 const cleanScore = (v, mode) => { const n = Number(v); return scoreOptions(mode).includes(n) ? n : DEFAULT_SCORE_LIMIT(mode); };
 
 // 专属图的门，与 modeGate 同一形状：认得出的组合放行，不认识的**当场拒绝**（拒绝要
-// 说得具体 —— "「双丘战区」只在占领开放"，而不是一句"地图不对"）。选择器（js/menu.js）
-// 已经按 mapAllowed 藏了卡片，这里是后盾：绕过界面直接发帧的组合走不到房间里。
+// 说得具体 —— "「双丘战区」只在占领开放"，而不是一句"地图不对"）。绑定是**双向**的
+// （js/data.js:mapAllowed）：图绑模式（ridges 只在占领）与模式绑图（占领只在 ridges）
+// 各说各的话。选择器（js/menu.js）已经按 mapAllowed 藏了卡片，这里是后盾：绕过
+// 界面直接发帧的组合走不到房间里。
 const MAP_NAMES = Object.fromEntries(MP_MAPS.map(m => [m.id, m.name]));
 const mapGate = (mapId, mode) => {
   if (mapAllowed(mapId, mode)) return null;
   const m = MP_MAPS.find(x => x.id === mapId);
-  const names = ((m && m.modes) || []).map(id => MODE_NAMES[id] || id).join('、');
-  return `「${(m && m.name) || mapId}」只在${names}模式开放`;
+  if (m && m.modes) return `「${m.name}」只在${m.modes.map(id => MODE_NAMES[id] || id).join('、')}模式开放`;
+  const md = MP_MODES.find(x => x.id === mode);
+  const names = ((md && md.maps) || []).map(id => MAP_NAMES[id] || id).join('、');
+  return `「${(md && md.name) || mode}」只在「${names}」这张图上打`;
 };
 
 let NEXT_SID = 1;
@@ -440,7 +444,11 @@ export class Lobby {
     if (bad) { this.stat.badMode++; return { ok: false, message: bad }; }
     // 地图×模式的组合也在落座前验完（拒绝项全过才动座位 —— 与上一条同一句）。
     const mode = MODE_IDS.has(msg.mode) ? msg.mode : 'tdm';
-    const mapId = MAP_IDS.has(msg.map) ? msg.map : 'yard';
+    // 没带地图（老客户端 / 直连）时的兜底跟着模式走：占领只认 ridges —— 别把"没填"
+    // 兜到 yard 上再被 mapGate 拒掉，"没填"与"填错"是两回事，前者拿该模式的默认图。
+    const allowed = mapsForMode(mode);
+    const mapId = MAP_IDS.has(msg.map) ? msg.map
+      : (allowed.some(m => m.id === 'yard') ? 'yard' : allowed[0].id);
     const badMap = mapGate(mapId, mode);
     if (badMap) { this.stat.badMap++; return { ok: false, message: badMap }; }
     // 落座前先退掉别处的座位（判据与 joinRoom 那条同一句）。放在**全部拒绝项之后**：

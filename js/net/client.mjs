@@ -1303,7 +1303,9 @@ export class NetClient {
     if (!this.flags) return;
     for (const s of list) {
       const f = this.flags.find(x => x.name === s.name);
-      if (f) { f.owner = s.owner; f.prog = s.prog; }
+      // cd/cdAt：波次复活的倒计时 + 到表时刻 —— 死亡画面的卡片拿"读数 + 本地流逝"
+      // 插值出"下波几秒"（记分板 2 秒一班，直接读会一跳一跳）。
+      if (f) { f.owner = s.owner; f.prog = s.prog; if (s.cd != null) { f.cd = s.cd; f.cdAt = performance.now() / 1000; } }
     }
   }
 
@@ -1411,6 +1413,13 @@ export class NetClient {
   // 闸门必须留在服务端。
   requestRespawn() {
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'respawn' }));
+  }
+  // 占领：死亡画面里选"在哪个已占点重生"（1/2/3）。选择与部署是两帧 —— 这条只递
+  // 选择，空格照旧走 requestRespawn。认不认由服务端重验（躺着 + 点这一刻仍归他队），
+  // 点在部署前被抢走就退回默认出生点 —— 客户端不预判这个结果，respawn 事件的位置
+  // 到了就是真相。
+  requestSpawnSel(flag) {
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'spawnSel', flag }));
   }
 
   // 小地图的 UAV 效果。hud.drawMinimap 拿它决定"要不要把敌人画出来"，

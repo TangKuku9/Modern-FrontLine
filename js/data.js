@@ -276,14 +276,21 @@ export const MP_MAPS = [
   { id: 'neon', name: '霓虹街区', desc: '雨夜中的都市街区，霓虹灯下的湿滑街道与狭窄小巷，近距离激战。', style: '都市 · 雨夜', grad: 'linear-gradient(135deg,#ff3fa4,#1b1f5e)' },
   { id: 'yard', name: '货柜场', desc: '夕阳下的小型集装箱堆场，节奏极快的混战地图。', style: '港口 · 黄昏', grad: 'linear-gradient(135deg,#ff9a3c,#5a2a3a)' },
   // 双丘战区是 360m 的超大图，只有占点那种"围绕据点慢慢磨"的节奏撑得起它的尺度 ——
-  // 死斗/混战塞进来就是满地图找人。专属占领，选择器藏、服务端拒，双保险。
+  // 死斗/混战塞进来就是满地图找人。这张图与「占领」是**互为专属**的绑定（模式侧的
+  // maps 也只认它），选择器藏、服务端拒，双保险。
   { id: 'ridges', name: '双丘战区', modes: ['dom'], desc: '超大丘陵战场：两处高地各有一座瞭望塔，高地之间的鞍部是必经的交战区，中央平整台地上扎着一座军营。', style: '丘陵 · 正午', grad: 'linear-gradient(135deg,#8aa85c,#3f5230)' },
 ];
 
-// "这张图配不配这个模式"。没登记 modes 的图对一切模式放行 —— 加新图不用想起这里。
+// "这张图配不配这个模式"，**双向**各查一半：图侧的 modes（这张图只给哪些模式）与
+// 模式侧的 maps（这个模式只用哪些图）。两边都缺省 = 全组合放行 —— 加新图/新模式
+// 不用想起这里。选择器（js/menu.js）按它藏卡片，服务端（server/lobby.mjs:mapGate）
+// 按它拒，两端都不许自己抄一份"这张图配不配"。
 export const mapAllowed = (mapId, mode) => {
   const m = MP_MAPS.find(x => x.id === mapId);
-  return !m || !m.modes || m.modes.includes(mode);
+  if (m && m.modes && !m.modes.includes(mode)) return false;
+  const md = MP_MODES.find(x => x.id === mode);
+  if (md && md.maps && !md.maps.includes(mapId)) return false;
+  return true;
 };
 // 某个模式下挑得出来的图。界面按它过滤；"当前图被新模式收了之后落回哪张"也问它
 // （取第一张 —— dune 全模式可开，兜底恒存在）。
@@ -297,9 +304,12 @@ export const mapsForMode = (mode) => MP_MAPS.filter(m => mapAllowed(m.id, mode))
 // 为什么值得专门立一个标记：房主选了「占领」而服务器里没有据点、没有占领得分时，
 // 比分就 0:0 走到时间耗尽，而房间标题上那一格从头到尾是假的 —— 玩家据此挑房。
 // 少了这一格，症状要到有人真开了一局才看得见。
+// maps = **模式专属图**（与地图那侧的 modes 互为反面）：缺省 = 全图可开；给了就只能在
+// 列出的图上打。占领只在双丘战区 —— 360m 的丘陵图配三层据点才有占点的纵深，其余四张
+// 小图塞进去就是"两点一墙"的贴脸抢点。判断走下面的 mapAllowed（双向各查一半）。
 export const MP_MODES = [
   { id: 'tdm', name: '团队死斗', desc: '两支队伍对抗，率先达到击杀目标的队伍获胜。', net: true },
-  { id: 'dom', name: '占领', desc: '夺取并守住 A、B、C 三个据点以获取分数。', net: true },
+  { id: 'dom', name: '占领', maps: ['ridges'], desc: '夺取并守住 A、B、C 三个据点以获取分数。', net: true },
   { id: 'ffa', name: '自由混战', desc: '人人为敌，率先达到击杀目标者获胜。', net: true },
 ];
 

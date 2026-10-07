@@ -8,7 +8,7 @@
 // 协议：
 //   上行 二进制 = 若干个 16 字节输入包（server/codec.mjs:INPUT_SIZE，按 tick 打时间戳，攒一帧一起发）
 //        文本   = {t:'join'|'ping'} 控制帧
-//               | 对局内：{t:'loadout'|'respawn'|'streak'}（换配装 / 提前部署 / 集束选点确认）
+//               | 对局内：{t:'loadout'|'respawn'|'streak'|'spawnSel'}（换配装 / 提前部署 / 集束选点确认 / 占领选已占点重生）
 //               | 大厅与房间：{t:'lobby'|'say'|'createRoom'|'joinRoom'|'quickRoom'|
 //                 'leaveRoom'|'ready'|'team'|'roomCfg'|'start'|'report'}（判据在 server/lobby.mjs）
 //   下行 二进制 = 快照（server/codec.mjs 的定长格式，头 12 B + 每实体 26 B）
@@ -1267,8 +1267,8 @@ wss.on('connection', (ws, req) => {
         // 投掷物还剩几颗：**每连接一份**，所以搭 pong 而不是进那块全房共享的快照
         //（理由与移植到 server/fanout.mjs 的原因，见 fanout.mjs:nadeCounts 那段）。
         ws.send(JSON.stringify({ t: 'pong', c: msg.c, s: Date.now(), tick: ws.__room?.tick ?? 0, nades: nadeCounts(ws.__room, ws.__cid) }));
-      } else if (msg.t === 'loadout' || msg.t === 'respawn' || msg.t === 'streak') {
-        // 对局内的三条**窄**控制帧。它们都只认"这条连接当前在哪个房间的哪个座位"，
+      } else if (msg.t === 'loadout' || msg.t === 'respawn' || msg.t === 'streak' || msg.t === 'spawnSel') {
+        // 对局内的四条**窄**控制帧。它们都只认"这条连接当前在哪个房间的哪个座位"，
         // 而那个座位是握手时定下的 ⇒ 客户端报不了别人的 cid，也没有越权的余地。
         const room = ws.__room;
         if (!room || ws.__cid == null) return;
@@ -1277,14 +1277,15 @@ wss.on('connection', (ws, req) => {
           // 曾经只受总闸管 —— 一条连接拿满总闸灌 loadout，每帧一次 sanitizeLoadout
           // （js/loadout.mjs：两个 new Set + 一整棵配装对象树）。正常玩家从死亡画面/
           // 暂停菜单确认一次才发一条，150ms 谁都碰不到；同配装的连发重复帧被丢也不损
-          // 语义（客户端 applyClass 每次选择只发一条）。respawn/streak 的 sim 侧守卫
-          // （respawnT/槽位就绪）本来就是 O(1) 的，不另设闸。
+          // 语义（客户端 applyClass 每次选择只发一条）。respawn/streak/spawnSel 的 sim
+          // 侧守卫（respawnT/槽位就绪/躺着+点归属）本来就是 O(1) 的，不另设闸。
           const now3 = Date.now();
           if (now3 - (ws.__loadoutAt || 0) < 150) { lobby.stat.loadoutRate++; return; }
           ws.__loadoutAt = now3;
           room.applyLoadout(ws.__cid, msg.loadout || null);
         }
         else if (msg.t === 'respawn') room.requestRespawn(ws.__cid);
+        else if (msg.t === 'spawnSel') room.requestSpawnSel(ws.__cid, msg.flag);
         else room.requestStreak(ws.__cid, msg.slot, { x: msg.x, z: msg.z });
       } else if (LOBBY_FRAMES.has(msg.t)) {
         // ── 大厅与房间：这一层只接线，判据全在 server/lobby.mjs ──
