@@ -435,7 +435,10 @@ export class World {
         g.rotateZ(Math.PI / 2); g.scale(1, 0.85, 1.30);
         if (along) g.rotateY(Math.PI / 2);
         const px = along ? x : x + t, pz = along ? z + t : z;
-        g.translate(px, r * 0.235 + 0.13, pz);
+        // y 必须带 baseY：胶囊进 geoLists 是**绝对坐标**，而碰撞盒走 box() 的
+        // baseY 机制 —— 有地形图（双丘）地面在 8~30m，漏了 baseY 视觉就整体
+        // 埋在 y≈0~1 的地形底下，只剩看不见的碰撞盒（用户实测）。
+        g.translate(px, this.baseY + r * 0.235 + 0.13, pz);
         const m = mat('sandbag');
         if (!this.geoLists.has(m)) this.geoLists.set(m, []);
         this.geoLists.get(m).push(g);

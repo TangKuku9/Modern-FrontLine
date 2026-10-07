@@ -920,6 +920,20 @@ const mkGame = () => ({
   }
   ok('B20d 盘山路是真几何路床（板面沿折线连续覆盖、悬在基准面上方 ~0.12m）',
     !!slab && covered === NS, `${covered}/${NS} 采样命中板面`);
+
+  // 有地形图的沙袋埋地回归（用户实测双丘"只有碰撞盒没有视觉"）：8m 平地上摆一排
+  // 沙袋，视觉必须跟着 baseY 抬到地面附近，而不是埋在 y≈0~1 的地形底下。
+  {
+    const wt = new World(mkGame(), { id: 'b19t', size: 60, seed: 3, terrain: { shape: (x, z) => 8, cell: 2 } });
+    wt.sandbags(0, 0, 4, 0);
+    wt.finalize();
+    const sb = wt.root.children.find(m => m.material === mat('sandbag'));
+    sb.geometry.computeBoundingBox();
+    const bmin = sb.geometry.boundingBox.min.y, bmax = sb.geometry.boundingBox.max.y;
+    ok('B19e 有地形图沙袋视觉跟随地面（baseY 不丢，埋地旧实现必挂）',
+      !!sb && bmin > 7.5 && bmax > 8.9 && bmax < 9.6,
+      sb ? `视觉 y ∈ [${bmin.toFixed(2)}, ${bmax.toFixed(2)}]（地面 8m）` : '没有沙袋网格');
+  }
 }
 
 // ══════════════ B20：地表色带（ridges.color 纯函数，直接采样世界坐标）══════════════
