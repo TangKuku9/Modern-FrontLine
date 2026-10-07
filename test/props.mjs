@@ -907,6 +907,44 @@ const mkGame = () => ({
   ok('B19a【反证臂】逐顶点独立随机的老算法必须被 B19 抓住', uniquePts(torn) > nPristine,
     `老算法唯一角点 ${uniquePts(torn)}`);
 }
+
+// ══════════════ B20：地表色带（ridges.color 纯函数，直接采样世界坐标）══════════════
+// 用户拍板的视觉契约：草不是一张死绿（色斑噪声）、盘山路是水泥灰（蓝通道补偿
+// 抵消草底图的绿）、旗位有磨损环。判据问"画出来的量"——同款坐标直接采样。
+{
+  const { color, CORRIDOR, FLAG_POS, SITE } = await import('../js/maps/ridges.js');
+  const d2 = (x, z, p) => Math.hypot(x - p[0], z - p[1]);
+
+  // 草地色斑：同坡度、不同位置的两点颜色必须不同（旧代码草色是常数，必挂）。
+  const c1 = color(90, -60, 6, 0.10), c2 = color(-100, 60, 6, 0.10);
+  const dGrass = Math.abs(c1[0] - c2[0]) + Math.abs(c1[1] - c2[1]) + Math.abs(c1[2] - c2[2]);
+  ok('B20 草地有色斑（同坡度异地颜色不同，不是一张死绿）', dGrass > 0.02, `Δ=${dGrass.toFixed(3)}`);
+
+  // 水泥路：路带中点必在路心（onRoad=1），旁移 14m 必出路。水泥 = 蓝通道补偿：
+  // 路心输出的 b/r 比须 ≥ 路外草地的 1.6 倍（比值判据对整体明度不敏感）。
+  let best = null, bd = Infinity;
+  for (const c of CORRIDOR) for (let i = 0; i + 1 < c.length; i++) {
+    const mx = (c[i][0] + c[i + 1][0]) / 2, mz = (c[i][1] + c[i + 1][1]) / 2;
+    if (d2(mx, mz, [SITE.camp.x, SITE.camp.z]) < 52) continue;               // 别选进营区
+    if (FLAG_POS.some(([fx, fz]) => d2(mx, mz, [fx, fz]) < 15)) continue;    // 别撞磨损环
+    const dd = Math.hypot(mx, mz);
+    if (dd < bd) { bd = dd; best = [c[i], c[i + 1], mx, mz]; }
+  }
+  const [ax, az, mx, mz] = [best[0][0], best[0][1], best[2], best[3]];
+  const ddx = best[1][0] - ax, ddz = best[1][1] - az, LL = Math.hypot(ddx, ddz) || 1;
+  const onRoad = color(mx, mz, 8, 0.10);
+  const offRoad = color(mx - ddz / LL * 14, mz + ddx / LL * 14, 8, 0.10);
+  const ratioOn = onRoad[2] / onRoad[0], ratioOff = offRoad[2] / offRoad[0];
+  ok('B20b 盘山路是水泥灰（路心 b/r 比 ≥ 路外草地 1.6 倍，绿底图被抵掉）',
+    ratioOn >= ratioOff * 1.6, `路内 ${ratioOn.toFixed(2)} vs 路外 ${ratioOff.toFixed(2)}`);
+
+  // 磨损环：旗心比 40m 外的参照点更"土"（r 高 g 低）。
+  const [fx, fz] = FLAG_POS[1];
+  const cf = color(fx, fz, 10, 0.05);
+  const gf = color(fx + 40, fz + 40, 10, 0.05);
+  ok('B20c 旗位有磨损环（旗心比远处草地更土）', cf[0] > gf[0] && cf[1] < gf[1],
+    `旗心 (${cf[0].toFixed(2)},${cf[1].toFixed(2)}) vs 草地 (${gf[0].toFixed(2)},${gf[1].toFixed(2)})`);
+}
 // ══════════════ 输出 ══════════════
 let pass = 0;
 for (const [good, label] of out) {

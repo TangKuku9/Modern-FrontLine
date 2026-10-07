@@ -15,6 +15,7 @@
 // 顺序不能换：台地必须早于盘山路（路要改台边的坡），路面精修必须晚于走廊
 //（否则会被走廊的基准面重新削平）。判据在 test/terrain.mjs。
 import { TileNoise, hillNoise, mound, terrace, rampFrom, falloff } from '../terrain.js';
+import { clamp } from '../util.js';
 
 // 半张图 180m。营区/高地的坐标都以它为参照系。
 const HALF = 180;
@@ -35,6 +36,14 @@ export const SITE = {
   spawnA: { x: -158, z: 6, r: 17 },     // A 队出生平台
   spawnB: { x: 156, z: -6, r: 17 },     // B 队出生平台
 };
+
+// 占点旗位（北岭顶塔下 / 营区门内 / 南丘顶）：原坐标硬编码在 maps.js 的 build() 里，
+// color() 的"据点磨损环"要画在同一处 —— 提出来共用，别两边各写一个。
+export const FLAG_POS = [
+  [SITE.north.x + 11, SITE.north.z - 11],
+  [SITE.camp.x + 18, SITE.camp.z + 10],
+  [SITE.south.x - 12, SITE.south.z + 12],
+];
 
 // 高度预算（米）。营区比高地低一档，让"上高地"是一条明确的上坡路。
 export const Y = {
@@ -259,21 +268,55 @@ h += mound(x, z, SITE.north.x, SITE.north.z, SITE.north.r * 2.6, 24);
   }
   return h;
 }
-// 逐顶点色：草 → 碎石 → 裸岩（按坡度）→ 高处踩秃的土面 → 路面 → 营区夯土。
+// 逐顶点色：草（噪声色斑）→ 碎石 → 裸岩（按坡度）→ 高处踩秃的土面 → 水泥盘山路
+// → 据点磨损环/出生平台夯土 → 营区夯土。
 // 路的画法与 CORRIDOR 是同一份坐标表 —— 颜色画在路上、物件摆在路旁，两边不会漂。
+//
+// color() 是逐顶点调用的（terrainStride 16m 一格），表达得动的最小斑块 ~30m：
+// 双频值噪声，低频(~90m)定"这片坡是青是枯"，中频(~24m)碎裂亮度；更细的颗粒
+// 交给 grass 底图（6m 一格）。再细就超出顶点网格了，硬塞只会采样成脏斑。
+const cNoise = new TileNoise(71, 64);
+const nAt = (x, z, freq) => cNoise.get(x / SIZE, z / SIZE, freq);
+const sstep = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
 export function color(x, z, y, slope) {
   // 这组值是**乘在草贴图上的**，所以整体偏亮：顶点色压得太暗，360m 图上一整片
   // 丘陵就会糊成一块深褐（截图实测）。往 1.0 附近收，起伏与色带才读得出来。
+  //
+  // 草不再是一个死值（用户实测"山和地一片均匀绿"）：低频在 青草↔草↔枯草 之间
+  // 挑大斑块，中频 ±5% 碎裂亮度。
+  const macro = nAt(x, z, 4), mid = nAt(x, z, 15);
   let r, g, b;
-  if (slope > 0.62) { r = 0.86; g = 0.82; b = 0.76; }        // 裸岩
-  else if (slope > 0.34) { r = 0.90; g = 0.83; b = 0.62; }   // 碎石坡
-  else { r = 0.74; g = 0.88; b = 0.58; }                     // 草
+  if (macro < 0.5) {                       // 青草 (0.60,0.80,0.52) → 草
+    const t = macro * 2;
+    r = 0.60 + 0.14 * t; g = 0.80 + 0.08 * t; b = 0.52 + 0.06 * t;
+  } else {                                 // 草 → 枯草 (0.88,0.82,0.55)
+    const t = macro * 2 - 1;
+    r = 0.74 + 0.14 * t; g = 0.88 - 0.06 * t; b = 0.58 - 0.03 * t;
+  }
+  const br = 1 + (mid - 0.5) * 0.10;
+  r *= br; g *= br; b *= br;
+
+  // 坡度带：碎石档从 0.34 下探到 ~0.28（噪声抖动 ±0.05，别在网格上画出"等高线"），
+  // 让丘陵上部普遍带一点碎石色；裸岩档保持 0.62 —— 视觉语义与物理对齐
+  // （0.42 起是阻力带、0.85 以上真崖：裸岩"可以慢慢爬"，崖看着就不可爬）。
+  // 裸岩加明度噪声，别是一块死灰。
+  const j = (nAt(x + 31.7, z - 17.3, 22) - 0.5) * 0.10;
+  const scree = sstep(0.26 + j, 0.34 + j, slope);
+  const rockF = sstep(0.60 + j, 0.66 + j, slope);
+  r += (0.90 - r) * scree; g += (0.83 - g) * scree; b += (0.62 - b) * scree;
+  const rk = 1 + (nAt(x - 11.1, z + 23.9, 30) - 0.5) * 0.14;
+  r += (0.86 * rk - r) * rockF; g += (0.82 * rk - g) * rockF; b += (0.76 * rk - b) * rockF;
 
   // 高处草稀（风大 + 踩秃），往土色偏
   const alt = Math.max(0, Math.min(1, (y - 16) / (Y.ridgeTop - 16 + 1)));
   r += (0.88 - r) * alt * 0.5; g += (0.82 - g) * alt * 0.5; b += (0.62 - b) * alt * 0.5;
 
-  // 路面：土黄。半宽 3.4m、边缘 1.7m 过渡 —— 硬边会在坡上显出"刷子印"。
+  // 盘山路：**水泥硬化路面**（用户点名的方案）。草底图的蓝通道只有红的一半
+  //（生成器里 b≈0.18、r≈0.47），纯灰顶点色乘出来仍偏绿 —— 蓝通道按底图色相
+  // 反向补偿（×2.4，实拍定值）才能把绿抵成灰；路面再叠中频明度噪声，别一条死灰带。
+  // 半宽 1.7/3.4 → 2.2/4.2：16m 顶点采样下 3.4m 的路被稀释得快看不见（俯瞰实测），
+  // 加宽才读得出"有条能走车的路"。
   let onRoad = 0;
   for (const c of CORRIDOR) {
     for (let i = 0; i + 1 < c.length; i++) {
@@ -282,12 +325,26 @@ export function color(x, z, y, slope) {
       const L2 = vx * vx + vz * vz;
       const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * vx + (z - az) * vz) / L2)) : 0;
       const d = Math.hypot(x - (ax + vx * t), z - (az + vz * t));
-      const w = 1 - falloff(d, 1.7, 3.4);
+      const w = 1 - falloff(d, 2.2, 4.2);
       if (w > onRoad) onRoad = w;
     }
   }
   if (onRoad > 0) {
-    r += (0.94 - r) * onRoad; g += (0.85 - g) * onRoad; b += (0.64 - b) * onRoad;
+    const cem = 0.80 + mid * 0.10;         // 0.80..0.90 磨损明度（水泥是中灰，不是白）
+    r += (cem - r) * onRoad;
+    g += (cem * 0.95 - g) * onRoad;
+    b += (cem * 3.0 - b) * onRoad;
+  }
+
+  // 据点磨损环：旗子周围人踩车碾的秃斑 —— 顺带把"点在哪"画在地上（占点可读性）。
+  for (const [fx, fz] of FLAG_POS) {
+    const wf = 1 - falloff(Math.hypot(x - fx, z - fz), 5.5, 10.5);
+    if (wf > 0) { r += (0.90 - r) * wf; g += (0.82 - g) * wf; b += (0.62 - b) * wf; }
+  }
+  // 出生平台夯土：与营区同款 —— 出站这一圈是"压过的地"，不再是草地上凭空一片平。
+  for (const sp of [SITE.spawnA, SITE.spawnB]) {
+    const wf = 1 - falloff(Math.hypot(x - sp.x, z - sp.z), sp.r * 0.75, sp.r * 1.08);
+    if (wf > 0) { r += (0.90 - r) * wf; g += (0.82 - g) * wf; b += (0.62 - b) * wf; }
   }
 
   // 营区是"平整"的，地面被压成夯土：半径内往土黄偏

@@ -1,7 +1,7 @@
 // 地图定义
 import * as THREE from 'three';
 import { mulberry32, pick } from './util.js';
-import { shape as ridgeShape, color as ridgeColor, SITE as RIDGE, Y as RIDGE_Y, CORRIDOR as RIDGE_ROADS, RAMPS as RIDGE_RAMPS } from './maps/ridges.js';
+import { shape as ridgeShape, color as ridgeColor, SITE as RIDGE, Y as RIDGE_Y, CORRIDOR as RIDGE_ROADS, RAMPS as RIDGE_RAMPS, FLAG_POS as RIDGE_FLAGS } from './maps/ridges.js';
 
 const V = (x, z) => new THREE.Vector3(x, 0, z);
 
@@ -711,16 +711,29 @@ export const MAPS = {
         w.rock(x, z, 1.6 + r() * 1.6, 'rock');
       }
 
+      // 崖脚碎石：坡地与崖脚撒一层小石片，跟 ridges.color 的碎石/裸岩色带接上 ——
+      // 色带从远处读，这层从近处摸。无碰撞、不进导航（纯视觉），复用岩石实例化
+      // 管线：一百来块只多一两个 draw call。也避开旗位圈（磨损环上别长石头）。
+      for (let i = 0; i < 260; i++) {
+        const x = (r() - 0.5) * 336, z = (r() - 0.5) * 336;
+        const s = flat(x, z);
+        if (s < 0.38 || s > 0.92) continue;
+        if (Math.hypot(x - RIDGE.camp.x, z - RIDGE.camp.z) < 44) continue;
+        if (Math.hypot(x - RIDGE.spawnA.x, z - RIDGE.spawnA.z) < 24) continue;
+        if (Math.hypot(x - RIDGE.spawnB.x, z - RIDGE.spawnB.z) < 24) continue;
+        if (RIDGE_FLAGS.some(([fx, fz]) => Math.hypot(x - fx, z - fz) < 12)) continue;
+        if (!free(x, z, 1.0)) continue;
+        P(x, z);
+        w.rock(x, z, 0.22 + r() * 0.38, 'rock', false);
+      }
+
       // ===== 出生点与据点（高度取自地形，两端共用）=====
       w.spawns.A = spawnRing(RIDGE.spawnA.x, RIDGE.spawnA.z, 1).map(([x, z]) => V(x, z).setY(T.height(x, z)));
       w.spawns.B = spawnRing(RIDGE.spawnB.x, RIDGE.spawnB.z, -1).map(([x, z]) => V(x, z).setY(T.height(x, z)));
       // 据点：一处在北岭顶（塔下）、一处在南丘顶、一处在营区门内 —— 三点连线正好
       // 把两个高地和中央连起来，占领模式下会自然形成"抢高地→切中路"的节奏。
-      w.flagPos = [
-        V(RIDGE.north.x + 11, RIDGE.north.z - 11).setY(T.height(RIDGE.north.x + 11, RIDGE.north.z - 11)),
-        V(RIDGE.camp.x + 18, RIDGE.camp.z + 10).setY(T.height(RIDGE.camp.x + 18, RIDGE.camp.z + 10)),
-        V(RIDGE.south.x - 12, RIDGE.south.z + 12).setY(T.height(RIDGE.south.x - 12, RIDGE.south.z + 12)),
-      ];
+      // 坐标在 ridges.js 的 FLAG_POS（color() 的磨损环画同一份，别各写一个）。
+      w.flagPos = RIDGE_FLAGS.map(([x, z]) => V(x, z).setY(T.height(x, z)));
       w.baseY = 0;
     },
   },
