@@ -405,18 +405,26 @@ export class HUD {
     for (const id in this.markerEls) if (!seen.has(id)) { this.markerEls[id].remove(); delete this.markerEls[id]; }
   }
 
-  // 死亡画面·选点卡片（占领）。单一渲染点：签名没变就不写 DOM（respawnText 同一招）。
-  // flagsView = [{name, mine, cd}]；sel = 当前选中的旗下标或 null；flagsView 为 null 清空容器
-  // （非 dom 模式与重生之后都落在这条路上 —— :empty 的容器整块塌掉，不留空框）。
-  spawnSelect(flagsView, sel) {
+  // 死亡画面·复活点卡片（占领）。单一渲染点：签名没变就不写 DOM（respawnText 同一招）。
+  // flagsView = [{name, mine, cd, label}]，sel = 当前选中的旗下标（null = 基地），
+  // baseCd = 我方基地下一波还有几秒（dom 里基地也是复活点，占位永远可选）。
+  // flagsView 为 null 清空容器（非 dom 模式与重生之后都落在这条路上 —— :empty 的容器
+  // 整块塌掉，不留空框）。
+  spawnSelect(flagsView, sel, baseCd) {
     const el = this._spSel || (this._spSel = document.getElementById('spawnSelect'));
     if (!el) return;
     let html = '';
     if (flagsView && flagsView.length) {
-      const card = (f, i) => `<div class="sp-flag${sel === i ? ' sel' : ''}${f.mine ? '' : ' dis'}" data-i="${i}"><b>${f.name}</b><span>${f.mine ? `下波 ${f.cd}s` : '未占领'}</span></div>`;
-      html = `<div class="sp-hint">点击卡片或按 1/2/3 选择在已占点重生 · 再选一次取消</div>`
-        + `<div class="sp-row">${flagsView.map(card).join('')}</div>`
-        + `<div class="sp-def${sel == null ? ' sel' : ''}" data-i="-1">默认部署${sel == null ? '（按 [空格] 或倒计时自动）' : ' · 点击取消选点'}</div>`;
+      // 基地卡（data-i=-1）在"没选据点"（sel==null）时高亮 —— 它就是默认那格。
+      const card = (name, mine, sub, i) => {
+        const on = i === -1 ? sel == null : sel === i;
+        return `<div class="sp-flag${on ? ' sel' : ''}${mine ? '' : ' dis'}" data-i="${i}"><b>${name}</b><span>${sub}</span></div>`;
+      };
+      html = `<div class="sp-hint">点击卡片或按 1/2/3 选择复活点 · 再选一次取消 · 据点越多波间隔越长</div>`
+        + `<div class="sp-row">`
+        + (baseCd != null ? card('基地', true, `下波 ${baseCd}s`, -1) : '')
+        + flagsView.map((f, i) => card(f.name, f.mine, f.mine ? `下波 ${f.cd}s` : (f.label || '未占领'), i)).join('')
+        + `</div>`;
     }
     if (el.dataset.sig !== html) { el.innerHTML = html; el.dataset.sig = html; }
   }

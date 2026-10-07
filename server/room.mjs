@@ -13,7 +13,7 @@ import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput, unpackStreak, uavBit, WORLD } from '../js/quant.js';
 import { sanitizeLoadout, kitsOf } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
-import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, domBotGoal, spawnWavesTick, SAY, ANNOUNCE, DOM_RADIUS_WEAK, DOM_SPAWN_WAVE } from '../js/match-rules.js';
+import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, domBotGoal, spawnWavesTick, SAY, ANNOUNCE, DOM_RADIUS_WEAK } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
 import { Sentry, Heli, BOT_WEAPONS, randomAtt } from '../js/mp.js';
 import { KILLSTREAKS, DEFAULT_STREAKS, BOT_NAMES } from '../js/data.js';
@@ -186,6 +186,9 @@ export class NetRoom {
     this.flags = (this.rules.mode === 'dom' && this.game.world.flagPos)
       ? this.game.world.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null }))
       : null;
+    // 每队基地的波次倒计时（spawnWavesTick 独占、懒初始化）。dom 里**基地也是复活点**：
+    // 档位跟该队占有的据点个数走（0 点只有基地 ⇒ 5s/波…），与旗下据点的波各转各的。
+    this.baseCd = this.flags ? { A: null, B: null } : null;
     this.started = true;
     return this;
   }
@@ -277,8 +280,9 @@ export class NetRoom {
 
   // ── 占领的"在已占点重生"（与单机 js/mp.js:flagSpawn 同一规矩）──
   // 真人：死亡画面里选的点记在 c.spawnFlag（requestSpawnSel 收帧），**等那面旗的
-  // 下一波**（spawnWavesTick，DOM_SPAWN_WAVE 一档，不管有没有人排都照转）到点随批
-  // 部署；点在这段等着的时间里被抢走了就退回默认出生点，不许落在敌占点上。
+  // 下一波**（spawnWavesTick，档位按该队占有数：0点基地5s/1点10s/2点20s/3点30s，
+  // 不管有没有人排都照转）到点随批部署；点在这段等着的时间里被抢走了就退回默认
+  // 出生点，不许落在敌占点上。
   // 落点在**弱占领圈**内随机散布（js/world.js:flagSpawnSpot），朝向沿用 spawnPoint 的式子。
   flagSpot(team, fi) {
     const f = this.flags && this.flags[fi];
@@ -357,6 +361,25 @@ export class NetRoom {
       b.__spawnFlag = null;
       b.__respawnT = null;
       this.game.dmgBy.delete(b);            // 上一条命的伤害账不许算进下一条命的助攻
+    }
+  }
+
+  // 基地波到点：把"没排据点"的死者（真人 spawnFlag==null / Bot __spawnFlag===-1，Bot 的
+  // -1 = 死时决策"队里没有已占点，去基地"）整体放行。每队基地的档位跟该队占有数走。
+  deployBase(team) {
+    for (const c of this.clients.values()) {
+      if (c.pl.alive || c.spawnFlag != null || c.pl.team !== team) continue;
+      this.respawnClient(c, this.spawnPoint(team));
+    }
+    if (!this.game) return;
+    for (const b of this.game.bots) {
+      if (b.alive || b.__spawnFlag !== -1 || b.team !== team) continue;
+      const sp = this.spawnPoint(team);
+      b.respawn(sp.pos, sp.yaw);
+      this.rules.onRespawn(b.team);
+      b.__spawnFlag = null;
+      b.__respawnT = null;
+      this.game.dmgBy.delete(b);
     }
   }
 
@@ -526,8 +549,9 @@ export class NetRoom {
     for (let i = n; i < ins.length; i++) { ins[i].c = null; ins[i].inp = null; }
     for (let i = 0; i < n; i++) {
       const c = ins[i].c;
-      // 排了已占点的死者不在这条路上：倒计时**冻结**，等那面旗的下一波（deployFlagWave）。
-      if (!c.pl.alive && c.spawnFlag == null) {
+      // dom 的复活全程走波次（基地 + 据点同档 CD）——deployBase / deployFlagWave 放行；
+      // 这条个人倒计时只属于 tdm/ffa。
+      if (!c.pl.alive && !this.flags && c.spawnFlag == null) {
         c.respawnT -= DT;
         if (c.respawnT <= 0) this.respawnClient(c, this.spawnPoint(c.pl.team));
       }
@@ -541,24 +565,31 @@ export class NetRoom {
     }
     pairs.length = n;
     this.game.step(DT, n ? ins[0].inp : EMPTY_INPUT, pairs);
-    // 占领的波次复活：每面旗自己循环 DOM_SPAWN_WAVE 一档 CD，到点把排在该点的死者
-    // （真人 + Bot，同一趟车）整体放行。CD **不管有没有人排都照转** —— 节奏是全房
-    // 可预期的，选点者等的就是自己那面旗的下一波。
-    if (this.flags) for (const fi of spawnWavesTick(this.flags, DT)) this.deployFlagWave(fi);
+    // 占领的波次复活：基地与每面旗各按**该队占有据点个数**的档位（domWaveCd：
+    // 0点5s/1点10s/2点20s/3点30s）循环，到点把排在它的死者（真人 + Bot，同一趟车）
+    // 整体放行。CD **不管有没有人排都照转** —— 节奏是全房可预期的。
+    if (this.flags) {
+      const w = spawnWavesTick(this.flags, this.baseCd, DT);
+      for (const fi of w.flags) this.deployFlagWave(fi);
+      for (const t of w.bases) this.deployBase(t);
+    }
     // Bot 的重生。单机那一半长在 MPMatch.update 的 respawns 队列里（js/mp.js:317，
     // 死了的人按 4 + rng.next()*2 秒排队），而联机权威端没有那份名单 ——
     // 少了它的症状是"Bot 死一个少一个"：一局打到后半段场上只剩真人，
     // 而那看起来像"对面不来了"，谁都不会把它当成 bug 去查。
     // 延迟刻意与单机同一条式子：抄成"更合理"的版本会让两端的手感分叉，且没人会去查。
-    // 队里有已占点时 Bot 改走波次（死这一刻由 botFlagIdx 定旗入队），与真人同一趟车。
+    // dom 里 Bot 全程波次：死这一刻决策一次 —— 队里有已占点 → 定旗入队（botFlagIdx）；
+    // 没有 → __spawnFlag=-1 排基地波（-1 与 null 分家：null 是"还没决策"）。
     if (this.game) for (const b of this.game.bots) {
       if (b.alive) continue;
-      if (b.__respawnT == null && b.__spawnFlag == null) {
-        const idx = this.botFlagIdx(b);
-        if (idx != null) { b.__spawnFlag = idx; continue; }   // 入队等波，不走倒计时
-        b.__respawnT = 4 + rng.next() * 2;      // 刚死的这一拍排上队
+      if (this.flags) {
+        if (b.__spawnFlag == null && b.__respawnT == null) {
+          const idx = this.botFlagIdx(b);
+          b.__spawnFlag = idx != null ? idx : -1;
+        }
+        continue;                               // 放行权在波次（deployFlagWave / deployBase）
       }
-      if (b.__spawnFlag != null) continue;      // 排了波次的 Bot 不吃倒计时
+      if (b.__respawnT == null) b.__respawnT = 4 + rng.next() * 2;      // 刚死的这一拍排上队
       b.__respawnT -= DT;
       if (b.__respawnT <= 0) {
         const sp = this.spawnPoint(b.team);
@@ -1114,7 +1145,9 @@ export class NetRoom {
       uav: { A: this.rules.uavActive('A'), B: this.rules.uavActive('B') },
       // 占领点的归属/进度随记分板走（2 秒一份）；换旗那一拍另有 flagCap 事件顶着即时性。
       // cd 是波次复活的那一档倒计时（向上取整到秒）—— 死亡画面的选点卡片拿它画"下波几秒"。
-      flags: this.flags ? this.flags.map(f => ({ name: f.name, owner: f.owner, prog: Math.round(f.prog * 100) / 100, cd: Math.ceil(f.spawnCd == null ? DOM_SPAWN_WAVE : f.spawnCd) })) : undefined,
+      // baseCd 同理：每队基地的下一波还有几秒（基地也是复活点）。
+      flags: this.flags ? this.flags.map(f => ({ name: f.name, owner: f.owner, prog: Math.round(f.prog * 100) / 100, cd: Math.ceil(f.spawnCd == null ? 0 : f.spawnCd) })) : undefined,
+      baseCd: this.baseCd ? { A: Math.ceil(this.baseCd.A == null ? 0 : this.baseCd.A), B: Math.ceil(this.baseCd.B == null ? 0 : this.baseCd.B) } : undefined,
       rows,
     });
   }
@@ -1139,8 +1172,11 @@ export class NetRoom {
   requestRespawn(cid) {
     const c = this.clients.get(cid);
     // 结算停摆之后没有"下一条件"可部署：这一局的名单已经封盘（endMatch 落库的就是它）。
-    // 排了已占点的同样不认"提前部署"—— 他等的是那面旗的下一波，空格在等待期里是空按。
-    if (!c || this.matchOverSent || c.pl.alive || c.respawnT > 0.12 || c.spawnFlag != null) return false;
+    if (!c || this.matchOverSent || c.pl.alive || c.spawnFlag != null) return false;
+    // dom 的复活**全程走波次**（基地 5/10/20/30s 档）——没有"提前部署"这条路：
+    // 基地也是复活点，插队会把波次的意义打掉。
+    if (this.flags) return false;
+    if (c.respawnT > 0.12) return false;
     c.respawnT = 0;
     return true;
   }

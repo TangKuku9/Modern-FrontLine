@@ -1090,6 +1090,9 @@ export class NetClient {
         this.scores.A = ev.scores.A; this.scores.B = ev.scores.B;
         this.timeLeft = ev.timeLeft;
         this.setFlagState(ev.flags);
+        // 每队基地的下一波读数（dom）：与旗下 cd 同一口径 —— 记下到表时刻，死亡画面
+        // 用"读数 + 本地流逝"插值（server/room.mjs:pushBoard 每 2 秒一班）。
+        if (ev.baseCd) { this.baseCd = ev.baseCd; this.baseCdAt = performance.now() / 1000; }
         const me = (ev.rows || []).find(r => r.cid === this.cid);
         this.streakProgress = me ? (me.sk | 0) : 0;
       } else if (ev.e === 'flagCap') {

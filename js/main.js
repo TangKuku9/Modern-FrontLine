@@ -549,17 +549,16 @@ class Game {
     if (netFlags) { this.net.requestSpawnSel(i); this._spawnSel = next; }
     else this.mode.spawnFlag = next;
   }
-  // 死亡画面的一帧（联机）：倒计时/波次等待的文案、选点键（1/2/3 的**边沿**）与卡片。
-  // 边沿自记 keys 的上一帧状态 —— pressed 在 snapshotInput 末尾就被清了，这里读不到；
-  // 排了点的死者不吃默认倒计时，也不发提前部署（服务端同判），等那面旗的下一波随批走。
+  // 死亡画面的一帧（联机）：等待文案、选点键（1/2/3 的**边沿**）与复活点卡片。
+  // 边沿自记 keys 的上一帧状态 —— pressed 在 snapshotInput 末尾就被清了，这里读不到。
+  // dom 里**全程等波**（基地 5/10/20/30s 档，随阵营占有数走）：不发提前部署，
+  // 服务端同判（requestRespawn 在 dom 全拒）；tdm/ffa 照旧个人倒计时 + 空格提前部署。
   netRespawnTick() {
     const el = document.getElementById('respawnText');
     if (!el) return;
     // 结算停摆之后不再请求重生：这一局的名单已经封盘，服务端（matchOverSent 闸）也不会认。
     let text = '';
     if (this.dead && !this.ending) {
-      const delay = (this.net && this.net.welcome && this.net.welcome.respawnDelay) || 3;
-      const left = delay - (performance.now() / 1000 - (this.deathAt || 0));
       const flags = this.net && this.net.modeId === 'dom' && this.net.flags ? this.net.flags : null;
       if (flags && this.player) {
         // 选点键的边沿（再按同一面旗 = 取消，由 spawnSelectPick 折成一次"重发同旗"）。
@@ -570,16 +569,24 @@ class Game {
           prev[i] = down;
         }
         if (this._spawnSel != null && flags[this._spawnSel] && flags[this._spawnSel].owner !== this.player.team) this._spawnSel = null;
-        // 卡片上的"下波几秒"：记分板 2 秒一班，直接读 cd 会一跳一跳 —— 用"上一次读数
-        // + 本地流逝"插值（cdAt 是 setFlagState 记下的到表时刻）。
+        // "下波几秒"：记分板 2 秒一班，直接读 cd 会一跳一跳 —— 用"上一次读数 + 本地流逝"
+        // 插值（cdAt/baseCdAt 是 client.mjs 记下的到表时刻）。基地与据点同一口径。
         const now = performance.now() / 1000;
-        const cdOf = f => Math.max(0, Math.ceil((f.cd || 0) - (now - (f.cdAt || now))));
-        this.hud.spawnSelect(flags.map(f => ({ name: f.name, mine: f.owner === this.player.team, cd: cdOf(f) })), this._spawnSel);
-        if (this._spawnSel != null) text = `已选 ${flags[this._spawnSel].name} 点 · 下波 ${cdOf(flags[this._spawnSel])} 秒集体部署`;
+        const left1 = (cd, at) => Math.max(0, Math.ceil((cd || 0) - (now - (at || now))));
+        const cdOf = f => left1(f.cd, f.cdAt);
+        const net = this.net;
+        const baseLeft = left1(net.baseCd && net.baseCd[this.player.team], net.baseCdAt);
+        this.hud.spawnSelect(flags.map(f => ({
+          name: f.name, mine: f.owner === this.player.team, cd: cdOf(f),
+          label: f.owner == null ? '未占领' : '敌方',
+        })), this._spawnSel, baseLeft);
+        text = this._spawnSel != null
+          ? `已选 ${flags[this._spawnSel].name} 点 · 下波 ${cdOf(flags[this._spawnSel])} 秒集体部署`
+          : `基地 · 下波 ${baseLeft} 秒`;
       } else {
         this.hud.spawnSelect(null);
-      }
-      if (text === '') {
+        const delay = (this.net && this.net.welcome && this.net.welcome.respawnDelay) || 3;
+        const left = delay - (performance.now() / 1000 - (this.deathAt || 0));
         if (left > 0) { text = `${Math.ceil(left)} 秒后重新部署…`; this._respawnAsked = false; }
         else {
           text = '按 [空格] 重新部署';

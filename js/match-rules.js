@@ -153,16 +153,20 @@ export const DOM_RESPAWN_COST = 1;
 //   DOM_CAP_RATE      —— 每 1 点占领力的进度/秒。整体大幅放缓：旧式子独占内圈 0.18/秒
 //      （约 5.6 秒占完），现在独占内圈 0.06/秒、蹲外圈只有 0.03/秒 —— 想快速拿下就
 //      得往里圈堆人。没人时按 DOM_CAP_DECAY 回退（也随涨速一起放慢）。
-//   DOM_SPAWN_WAVE    —— 占领的**波次复活**：每面旗各自循环这一档 CD（秒），到点把
-//      "排在该点的死者"整体放行 —— 一批一批，不管有没有人排，CD 都照转（spawnWavesTick）。
-//      选了点的玩家等的就是自己那面旗的下一波；默认出生点不走波次，照旧倒计时。
+//   DOM_WAVE_BY_FLAGS —— 占领的**波次复活**档位：CD 按阵营**占有的据点个数**取（秒），
+//      占得越少补员越快（落后补偿，压住滚雪球）：0 个点只剩基地 ⇒ 5s/波、1 个点 ⇒ 10s、
+//      2 个点 ⇒ 20s、3 个点 ⇒ 30s。基地与名下每个据点都是复活点、共用同一档 CD、
+//      各自独立循环 —— 一批一批，不管有没有人排，CD 都照转（spawnWavesTick）。
+//      基地不再是"个人倒计时"：dom 里人人都等波（tdm/ffa 才走老倒计时）。
 export const DOM_RADIUS_STRONG = 4.5;
 export const DOM_RADIUS_WEAK = 30;
 export const DOM_POWER_STRONG = 2;
 export const DOM_POWER_WEAK = 1;
 export const DOM_CAP_RATE = 0.03;
 export const DOM_CAP_DECAY = 0.03;
-export const DOM_SPAWN_WAVE = 20;
+export const DOM_WAVE_BY_FLAGS = [5, 10, 20, 30];
+// 下属标即"占有几个据点"。超出档位表（未来加到 4 面旗）按末档收口 —— 不许出 undefined。
+export const domWaveCd = (owned) => DOM_WAVE_BY_FLAGS[Math.max(0, Math.min(DOM_WAVE_BY_FLAGS.length - 1, owned | 0))];
 
 export class MatchRules {
   constructor(cfg = {}) {
@@ -611,20 +615,36 @@ export function flagsTick(flags, rules, entities, dt) {
 }
 
 // ---------- 占领的波次复活（dom） ----------
-// 每面旗各自循环 DOM_SPAWN_WAVE 一档 CD，**不管有没有人排都照转**；归零的那一拍把
-// "排在该点的死者"整体交还给调用方部署 —— 一批一批。旗对象上的 spawnCd 由本函数
-// 独占（懒初始化：开局第一拍从满档起转，所以所有旗开局同步）。谁排在哪面旗是
-// 调用方的账（服务端 = clients 的 spawnFlag + Bot 的 __spawnFlag；单机 = respawns
-// 队列），这里只负责"哪几面旗这一拍到点"。
-// 返回本拍到点的旗下标数组（调用方逐旗 deploy；拍了点但点已易主的，由调用方退默认出生）。
-export function spawnWavesTick(flags, dt) {
-  const fired = [];
+// CD 按**阵营占有的据点个数**分档（domWaveCd / DOM_WAVE_BY_FLAGS）：占得越少补员越快。
+// 基地与名下每个据点都是复活点、共用同一档 CD、各自独立循环 —— **不管有没有人排都照转**；
+// 归零的那一拍把"排在该复活点的死者"整体交还给调用方部署 —— 一批一批。旗挂在
+// f.spawnCd、每队基地挂在调用方给的 baseCd 对象（两者都由本函数独占、懒初始化；
+// 档位变短时把剩余量**夹到新档** —— 丢了点的人不该空等旧的长 CD）。谁排在哪面旗是
+// 调用方的账（服务端 = clients 的 spawnFlag + Bot 的 __spawnFlag；单机 = respawns 队列）。
+// 返回值是**模块级复用**的（与 flagsTick 同款：dom 房每拍一次、60Hz，别留下分配）；
+// 消费方同步读完即弃，不许留到下一拍。
+const WAVE_OUT = { flags: [], bases: [] };
+const WAVE_OWNED = {};
+export function spawnWavesTick(flags, baseCd, dt) {
+  const out = WAVE_OUT;
+  out.flags.length = 0; out.bases.length = 0;
+  const owned = WAVE_OWNED;
+  for (const k in owned) delete owned[k];
+  for (const f of flags) if (f.owner) owned[f.owner] = (owned[f.owner] || 0) + 1;
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i];
-    f.spawnCd = (f.spawnCd == null ? DOM_SPAWN_WAVE : f.spawnCd) - dt;
-    if (f.spawnCd <= 0) { f.spawnCd = DOM_SPAWN_WAVE; fired.push(i); }
+    const cd = domWaveCd(f.owner ? owned[f.owner] : 0);
+    f.spawnCd = (f.spawnCd == null ? cd : f.spawnCd) - dt;
+    if (f.spawnCd > cd) f.spawnCd = cd;
+    if (f.spawnCd <= 0) { f.spawnCd = cd; out.flags.push(i); }
   }
-  return fired;
+  if (baseCd) for (const team in baseCd) {
+    const cd = domWaveCd(owned[team] || 0);
+    baseCd[team] = (baseCd[team] == null ? cd : baseCd[team]) - dt;
+    if (baseCd[team] > cd) baseCd[team] = cd;
+    if (baseCd[team] <= 0) { baseCd[team] = cd; out.bases.push(team); }
+  }
+  return out;
 }
 
 // ---------- Bot 占点目标（dom，单机 MPMatch 与联机 NetRoom 共用） ----------

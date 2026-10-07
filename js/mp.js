@@ -7,7 +7,7 @@ import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, comput
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
-import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, spawnWavesTick, SAY, SAY_START, ANNOUNCE, DOM_RADIUS_WEAK, DOM_SPAWN_WAVE } from './match-rules.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, spawnWavesTick, SAY, SAY_START, ANNOUNCE, DOM_RADIUS_WEAK } from './match-rules.js';
 import { addLocalXp } from './progress.mjs';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
@@ -94,6 +94,9 @@ export class MPMatch {
     const mname = { tdm: '团队死斗', dom: '占领', ffa: '自由混战' }[this.type];
     if (this.type === 'dom') {
       this.flags = w.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null, mesh: flagMesh(game, p) }));
+      // 每队基地的波次倒计时（spawnWavesTick 独占、懒初始化）。dom 里基地也是复活点：
+      // 档位跟该队占有的据点个数走（0 点只有基地 ⇒ 5s/波…）。
+      this.baseCd = { A: null, B: null };
     }
     game.hud.reset();
     game.hud.announce(mname, `${def.name} · ${this.ffa ? '率先达到 ' + this.scoreLimit + ' 次击杀' : '目标分数 ' + this.scoreLimit}`, 4);
@@ -210,6 +213,22 @@ export class MPMatch {
       this.respawns.splice(i, 1);
     }
   }
+  // 基地波到点：把"没排据点"的死者（玩家 spawnFlag==null / Bot r.flag==null）整体放行。
+  deployBase(team) {
+    for (let i = this.respawns.length - 1; i >= 0; i--) {
+      const r = this.respawns[i];
+      if (r.e.team !== team || r.e.alive) continue;
+      const want = r.e.isPlayer ? this.spawnFlag : r.flag;
+      if (want != null) continue;                 // 排了据点的走据点波
+      const sp = this.spawnPoint(team);
+      if (r.e.isPlayer) this.deployPlayer(sp);
+      else {
+        r.e.respawn(sp.pos, sp.yaw);
+        this.rules.onRespawn(r.e.team);
+      }
+      this.respawns.splice(i, 1);
+    }
+  }
   // 死亡画面每帧的一小段（单机）：选点键（1/2/3 的**边沿**，再按一次取消）、主文案、
   // 选点卡片。边沿自记 keys 的上一帧状态 —— pressed 在 snapshotInput 末尾就清了，
   // update 里读不到。联机那一份同形状的东西长在 main.js:netRespawnTick。
@@ -220,6 +239,8 @@ export class MPMatch {
       if (el) el.textContent = r.t > 0 ? `${Math.ceil(r.t)} 秒后重新部署…` : '按 [空格] 重新部署';
       return;
     }
+    // dom：复活全程走波次（基地与据点同档 CD）。选点键的边沿自记 keys 的上一帧；
+    // 主文案给"当前等的那一趟"读数，卡片给全部复活点（含基地）。
     const prev = this._spKeys || {};
     for (let k = 0; k < this.flags.length; k++) {
       const down = !!game.input.keys['Digit' + (k + 1)];
@@ -227,12 +248,16 @@ export class MPMatch {
     }
     this._spKeys = this.flags.map((f, k) => !!game.input.keys['Digit' + (k + 1)]);
     if (this.spawnFlag != null && this.flags[this.spawnFlag].owner !== pl.team) this.spawnFlag = null;
-    const cd = f => Math.ceil(f.spawnCd == null ? DOM_SPAWN_WAVE : f.spawnCd);
+    const cd = f => Math.max(0, Math.ceil(f.spawnCd == null ? 0 : f.spawnCd));
+    const baseLeft = Math.max(0, Math.ceil(this.baseCd[pl.team] == null ? 0 : this.baseCd[pl.team]));
     const sel = this.spawnFlag != null ? this.flags[this.spawnFlag] : null;
     if (el) el.textContent = sel
       ? `已选 ${sel.name} 点 · 下波 ${cd(sel)} 秒集体部署`
-      : (r.t > 0 ? `${Math.ceil(r.t)} 秒后重新部署…` : '按 [空格] 重新部署');
-    game.hud.spawnSelect(this.flags.map(f => ({ name: f.name, mine: f.owner === pl.team, cd: cd(f) })), this.spawnFlag);
+      : `基地 · 下波 ${baseLeft} 秒`;
+    game.hud.spawnSelect(this.flags.map(f => ({
+      name: f.name, mine: f.owner === pl.team, cd: cd(f),
+      label: f.owner == null ? '未占领' : '敌方',
+    })), this.spawnFlag, baseLeft);
   }
   // 单机选点的唯一入口（键与卡片点击都走它）：再选同一面旗 = 取消，回默认倒计时。
   // 联机那份在 main.js:spawnSelectPick —— 服务端把"再选同一面旗"当取消（requestSpawnSel）。
@@ -436,22 +461,28 @@ export class MPMatch {
     // 完全脱拍的），但"早一拍照样是晚一拍"这件事值得写下来，免得以后有人拿
     // "投弹数对不对"去查时序。
     this.rules.step();
-    // 复活。占领的波次先走：每面旗自己循环 DOM_SPAWN_WAVE 一档 CD，到点把排在该点的
-    // 死者（玩家 + Bot，同一趟车）整体放行 —— CD 不管有没有人排都照转。
-    if (this.flags) for (const fi of spawnWavesTick(this.flags, dt)) this.deployFlagWave(fi);
+    // 复活。占领全程走波次：基地与每面旗各按**该队占有据点个数**的档位（0点5s/1点10s/
+    // 2点20s/3点30s）循环，到点把排在该复活点的死者（玩家 + Bot，同一趟车）整体放行 ——
+    // CD 不管有没有人排都照转。tdm/ffa 不碰这条，照旧走个人倒计时。
+    if (this.flags) {
+      const w = spawnWavesTick(this.flags, this.baseCd, dt);
+      for (const fi of w.flags) this.deployFlagWave(fi);
+      for (const t of w.bases) this.deployBase(t);
+    }
     for (let i = this.respawns.length - 1; i >= 0; i--) {
       const r = this.respawns[i];
-      // 排了已占点的（玩家 this.spawnFlag / Bot r.flag）不吃倒计时 —— 冻结到波次；
-      // 取消选点（再按一次 / 点"默认部署"）后从冻结处接着走默认路。
-      const queued = this.flags && (r.e.isPlayer ? this.spawnFlag : r.flag) != null;
-      if (!queued) r.t -= dt;
+      if (this.flags) {                    // dom：放行权全在波次，这里只画死亡画面
+        if (r.e.isPlayer) this.deathUiTick(r);
+        continue;
+      }
+      r.t -= dt;
       if (r.e.isPlayer) {
-        this.deathUiTick(r);
-        if (!queued && r.t <= 0 && (game.input.keys.Space || r.t < -4)) {
+        this.deathUiTick(r);               // 内部按模式分支：dom 波次文案 / tdm 倒计时
+        if (r.t <= 0 && (game.input.keys.Space || r.t < -4)) {
           this.deployPlayer(this.spawnPoint(pl.team));
           this.respawns.splice(i, 1);
         }
-      } else if (!queued && r.t <= 0) {
+      } else if (r.t <= 0) {
         const sp = this.spawnPoint(r.e.team);
         r.e.respawn(sp.pos, sp.yaw);
         this.rules.onRespawn(r.e.team);   // dom：Bot 的复活同样记账（与真人同一条规则）

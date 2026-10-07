@@ -11,7 +11,7 @@
 // 每一节都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。下面每条的措辞写的就是"这条红了说明什么坏了"。
 import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
-import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE, DOM_SCORE_PER_SEC, DOM_CAP_RATE, DOM_POWER_STRONG, DOM_POWER_WEAK, DOM_RADIUS_WEAK, DOM_SPAWN_WAVE } from '../js/match-rules.js';
+import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE, DOM_SCORE_PER_SEC, DOM_CAP_RATE, DOM_POWER_STRONG, DOM_POWER_WEAK, DOM_RADIUS_WEAK, DOM_WAVE_BY_FLAGS } from '../js/match-rules.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD, teamIndex, teamId } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
@@ -942,30 +942,39 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
     Math.abs(gain - 10 * DT * DOM_SCORE_PER_SEC) < 1e-9, `gain=${gain.toFixed(6)} 期望=${(10 * DT * DOM_SCORE_PER_SEC).toFixed(6)}`);
 
   // 复活扣分。旗子先摘了（owner=null），让这一段的"分"只来自 onRespawn 一条路。
+  // dom 里复活**全程等波**（基地也是复活点）—— 死着没到波的那一拍不扣分：扣的是
+  // "复活"这个动作，不是"死"这个状态。
   fR.owner = null;
-  // 死而未复的那一拍：respawnT 还剩 0.5s，step 只把它减掉，不扣分 ——
-  // 扣的是"复活"这个动作，不是"死"这个状态。
   const q0 = roomR.rules.scores.A;
   RA.pl.alive = false; RA.respawnT = 0.5;
+  roomR.baseCd.A = DOM_WAVE_BY_FLAGS[0];        // 基地波拨到远处，确保这一拍不放行
   roomR.step();
   ok('O11【反证】死而未复不扣分（这条红了 = 扣分挂在了死亡而不是复活上）',
-    roomR.rules.scores.A === q0, `${q0} → ${roomR.rules.scores.A}`);
-  RA.respawnT = 0;
+    roomR.rules.scores.A === q0 && !RA.pl.alive, `${q0} → ${roomR.rules.scores.A}`);
+  ok('O11b dom 里没选点的人也不吃 3 秒个人倒计时、也拒提前部署（基地也是波：respawnT 冻结）',
+    RA.respawnT === 0.5 && roomR.requestRespawn(RA.cid) === false, `respawnT=${RA.respawnT}`);
+  roomR.baseCd.A = DT * 0.5;                    // 基地波到点（A 队无点 ⇒ 5 秒档）
   roomR.step();
-  ok('O12 真人复活一人 -1（白给的复活在把队伍的分往回送）',
-    roomR.rules.scores.A === q0 - 1, `${q0} → ${roomR.rules.scores.A}`);
+  ok('O12 基地波到点集体放行、阵营 -1（只有基地时每 5 秒一波）',
+    RA.pl.alive && roomR.rules.scores.A === q0 - 1, `${q0} → ${roomR.rules.scores.A}`);
 
-  // Bot 的复活走另一条路（__respawnT），不接上的话 Bot 死一次就是给对面白送 1 分差。
+  // Bot 同一条波次（dom 里 Bot 不再走 4~6 秒个人倒计时）：B 队此刻无点，死时决策
+  // 排基地波（__spawnFlag=-1，与 null 分家：null 是"还没决策"），基地波到点随批放行。
   const wR = roomR.game.world;
   const botR = roomR.addBot(new Bot(roomR.game, {
     team: 'B', name: '哨兵', style: 'enemy', weaponId: 'ak', att: {}, difficulty: 1,
     pos: (wR.spawns.B[0] || wR.randomWalkable()).clone(), yaw: 0, role: 'guard', group: 'domrate',
   }));
-  botR.alive = false; botR.__respawnT = 0;
-  const b0 = roomR.rules.scores.B;
+  roomR.baseCd.B = DOM_WAVE_BY_FLAGS[0];
+  botR.alive = false; botR.__respawnT = null; botR.__spawnFlag = null;
   roomR.step();
-  ok('O13 Bot 复活同样 -1（Bot 也在给队伍挣分，它的复活不记账就是单向出血）',
-    roomR.rules.scores.B === b0 - 1, `${b0} → ${roomR.rules.scores.B}`);
+  ok('O13a Bot 死时决策：队里无已占点 → 排基地波（__spawnFlag=-1，不吃个人倒计时）',
+    !botR.alive && botR.__spawnFlag === -1 && botR.__respawnT == null, `flag=${botR.__spawnFlag}`);
+  const b0 = roomR.rules.scores.B;
+  roomR.baseCd.B = DT * 0.5;
+  roomR.step();
+  ok('O13 Bot 随基地波复活、同样 -1（Bot 也在给队伍挣分，它的复活不记账就是单向出血）',
+    botR.alive && roomR.rules.scores.B === b0 - 1, `${b0} → ${roomR.rules.scores.B}`);
 
   // 底分扣穿钳在 0：负分在记分板上没有意义，离到线只远不近的队不需要再罚。
   while (roomR.rules.scores.B > 0) roomR.rules.onRespawn('B');
@@ -1024,7 +1033,8 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
     fw.prog === p3, `Δ=${(fw.prog - p3).toFixed(6)}`);
 
   // —— 在已占点重生：选点（spawnSel）与部署（respawn）是两帧；选完等那面旗的
-  //     **下一波**（DOM_SPAWN_WAVE 一档 CD，不管有没有人排都照转，到点集体放行）。——
+  //     **下一波**（CD 按该队占有据点个数分档，见 domWaveCd / DOM_WAVE_BY_FLAGS，
+  //     不管有没有人排都照转，到点集体放行）。——
   const f0 = roomR.flags[0];
   f0.owner = 'A';
   ok('O21 spawnSel 的门：活着的人选不动、不存在的旗子选不动',
@@ -1037,13 +1047,13 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
   for (let i = 0; i < 5; i++) roomR.step();
   ok('O24【反证】选了点之后默认倒计时不再放人（冻结到波次；这条红了 = 还在走 respawnT 那条路）',
     RA.pl.alive === false);
-  // 把 A 旗的 CD 手动拨到线（局内就是 20 秒循环的下一拍），验随批部署。
+  // 把 A 旗的 CD 手动拨到线，验随批部署。此刻 A 队占 1 点 ⇒ 该点的波是 10 秒档。
   f0.spawnCd = DT * 0.5;
   roomR.step();
   const evR = roomR.events.filter(e => e.e === 'respawn' && e.cid === RA.cid).pop();
   const dR = evR ? Math.hypot(evR.pos[0] - f0.pos.x, evR.pos[2] - f0.pos.z) : 1e9;
-  ok('O25 波次到点集体放行，落点在所选点的弱占领圈内（随机散布，可走性由 world.flagSpawnSpot 裁）',
-    !!evR && RA.pl.alive && dR <= DOM_RADIUS_WEAK + 0.01 && Math.abs(f0.spawnCd - DOM_SPAWN_WAVE) < DT,
+  ok('O25 波次到点集体放行，落点在所选点的弱占领圈内（复位到该队当前档：占 1 点 ⇒ 10 秒）',
+    !!evR && RA.pl.alive && dR <= DOM_RADIUS_WEAK + 0.01 && Math.abs(f0.spawnCd - DOM_WAVE_BY_FLAGS[1]) < DT,
     `dist=${dR.toFixed(2)} cd=${f0.spawnCd.toFixed(3)}`);
 
   // 一批一批：两个死者排同一面旗，同一拍放行 —— 不是谁先选谁先走。
@@ -1058,14 +1068,14 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
   roomR.step();
   ok('O26 排同一面旗的两人同拍部署（集体复活）', RA.pl.alive && RA2.pl.alive, '');
 
-  // 取消：再选同一面旗 = 撤单，回默认倒计时那条路。
+  // 取消：再选同一面旗 = 撤单，回**基地波**那条路（dom 里默认路也是波）。
   RA.pl.alive = false; RA.respawnT = 3;
   roomR.requestSpawnSel(RA.cid, 0);
   roomR.requestSpawnSel(RA.cid, 0);
-  ok('O27 再选一次 = 取消（选点清空，回默认路）', RA.spawnFlag === null && RA.pl.alive === false);
-  RA.respawnT = 0;
+  ok('O27 再选一次 = 取消（选点清空，回基地路）', RA.spawnFlag === null && RA.pl.alive === false);
+  roomR.baseCd.A = DT * 0.5;
   roomR.step();
-  ok('O28 取消之后照默认出生点部署（选点排队与默认路真的是两条路）', RA.pl.alive === true);
+  ok('O28 取消之后随基地波部署（据点在排与不排真的是两条路）', RA.pl.alive === true);
 
   // 点在等着的时候被抢走 → 波次照样放行，但落点退回默认出生点。
   RA.pl.alive = false; RA.respawnT = 3;
@@ -1078,11 +1088,11 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
   ok('O30 点丢之后波次照样放行（人活着回来了，而不是卡死在失效的选点上）',
     RA.pl.alive === true);
 
-  // 波次**不管有没有人排都照转**：空转一拍，CD 照样归满重排。
+  // 波次**不管有没有人排都照转**：空转一拍，CD 照样归满重排（无主点按 0 点档 = 5 秒）。
   roomR.flags[1].spawnCd = DT * 0.5;
   roomR.step();
-  ok('O31 点的 CD 不看人数（空转一拍就归满，下一波仍是整档 DOM_SPAWN_WAVE）',
-    Math.abs(roomR.flags[1].spawnCd - DOM_SPAWN_WAVE) < DT, roomR.flags[1].spawnCd.toFixed(3));
+  ok('O31 点的 CD 不看人数（空转一拍就归满，复位到所在队当前档 —— 无主点按 0 点档 5 秒）',
+    Math.abs(roomR.flags[1].spawnCd - DOM_WAVE_BY_FLAGS[0]) < DT, roomR.flags[1].spawnCd.toFixed(3));
 
   // Bot 与真人同一规矩：队里有已占点 → 死这一刻入队等波，同一趟车（不再即时部署抢跑）。
   f0.owner = 'B'; roomR.flags[2].owner = 'B';          // B 队手里两面旗
@@ -1096,6 +1106,57 @@ ok('O7【反证】记分板带据点归属/进度（大部队那条同步线）'
   const dB = Math.hypot(botR.pos.x - flagB.pos.x, botR.pos.z - flagB.pos.z);
   ok('O33 Bot 随波部署、落在弱圈内（与真人同一趟车，绝不落进敌占点）',
     botR.alive && dB <= DOM_RADIUS_WEAK + 0.01, `dist=${dB.toFixed(2)}`);
+
+  // —— 波次档位随"阵营占有据点个数"走（0→5s / 1→10s / 2→20s / 3→30s），基地同档 ——
+  ok('O34 档位表：0/1/2/3 个据点 ⇒ 5/10/20/30 秒', DOM_WAVE_BY_FLAGS.join(',') === '5,10,20,30', DOM_WAVE_BY_FLAGS.join(','));
+
+  const roomW = new NetRoom({ id: 'rules-wave', mapId: 'yard', seed: 11, mode: 'dom' });
+  await roomW.start();
+  const WA = roomW.addClient({ name: '戊', team: 'A' });
+  ok('O35 先决：全新 dom 房全中立（A 队只有基地）', roomW.flags.every(f => !f.owner));
+  WA.pl.alive = false; WA.respawnT = 3;
+  roomW.step();
+  ok('O36 基地 CD 懒初始化 = 该队当前档（无点 ⇒ 5 秒）且当拍已转',
+    roomW.baseCd.A != null && roomW.baseCd.A <= DOM_WAVE_BY_FLAGS[0] && roomW.baseCd.A > DOM_WAVE_BY_FLAGS[0] - 2 * DT,
+    `base=${roomW.baseCd.A}`);
+  // 占 1 点：基地与名下据点同 10 秒档（复位值就是档位本身）
+  roomW.baseCd.A = DT * 0.5;
+  roomW.step();
+  ok('O37 无点时刻的基地波到点：随批放行（"只有基地时每 5 秒一波"）', WA.pl.alive, `base=${roomW.baseCd.A.toFixed(2)}`);
+  WA.pl.alive = false; WA.respawnT = 3;
+  roomW.flags[0].owner = 'A';
+  roomW.baseCd.A = DT * 0.5;
+  roomW.step();
+  ok('O38 占 1 点 ⇒ 基地波复位到 10 秒档（包括基地在内的复活点同档）',
+    Math.abs(roomW.baseCd.A - DOM_WAVE_BY_FLAGS[1]) < 1e-9 && WA.pl.alive, roomW.baseCd.A.toFixed(3));
+  roomW.flags[1].owner = 'A';
+  roomW.baseCd.A = DT * 0.5;
+  roomW.step();
+  ok('O39 占 2 点 ⇒ 20 秒档', Math.abs(roomW.baseCd.A - DOM_WAVE_BY_FLAGS[2]) < DT, roomW.baseCd.A.toFixed(3));
+  roomW.flags[2].owner = 'A';
+  roomW.baseCd.A = DT * 0.5;
+  roomW.step();
+  ok('O40 占 3 点 ⇒ 30 秒档', Math.abs(roomW.baseCd.A - DOM_WAVE_BY_FLAGS[3]) < DT, roomW.baseCd.A.toFixed(3));
+  // 丢点变短：剩余量夹到新档，不空等旧的长 CD（30 → 剩 25，丢到 1 点后下一拍 ≤10）
+  roomW.flags[1].owner = null; roomW.flags[2].owner = null;
+  roomW.baseCd.A = 25;
+  roomW.step();
+  ok('O41 档位变短（丢点）时把剩余量夹到新档（补员立刻提速 —— 落后补偿的方向）',
+    roomW.baseCd.A <= DOM_WAVE_BY_FLAGS[1] + DT, roomW.baseCd.A.toFixed(3));
+  roomW.flags[0].spawnCd = 99;                  // 超长剩余 → 下一拍夹到所在队当前档
+  roomW.step();
+  ok('O42 A 旗作为"名下据点"的复活点同样按 10 秒档循环（与基地同档）',
+    roomW.flags[0].spawnCd === DOM_WAVE_BY_FLAGS[1], roomW.flags[0].spawnCd.toFixed(3));
+
+  // 反证臂：tdm/ffa 不走波次 —— 个人倒计时与提前部署照旧（"波次只属于 dom"）
+  const roomT2 = new NetRoom({ id: 'rules-tdm2', mapId: 'yard', seed: 12 });
+  await roomT2.start();
+  const TA = roomT2.addClient({ name: '己', team: 'A' });
+  TA.pl.alive = false; TA.respawnT = 0;
+  roomT2.step();
+  ok('O43【反证】tdm 里复活照旧走个人倒计时（波次只属于 dom）', TA.pl.alive === true);
+  TA.pl.alive = false; TA.respawnT = 0;
+  ok('O44【反证】tdm 里提前部署（空格那条路）照旧可用', roomT2.requestRespawn(TA.cid) === true);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
