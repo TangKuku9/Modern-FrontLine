@@ -300,6 +300,46 @@ export const MAPS = {
       // 记下新摆的装饰，让后面的装饰也知道这里已被占（但不去碰前面的人工建筑快照）
       const claim = (x, z, rad) => taken.push([x - rad, z - rad, x + rad, z + rad]);
 
+      // ══ 路面净空：装饰不许压在硬化路面上 ══
+      //
+      // 用户报"硬化路面上还有些石头和树"。这张图上有**两套路**，都得让开：
+      //   · 盘山路的混凝土路床 —— w.roadbed(path, 3.4) 的几何板，半宽 3.4m
+      //   · 走廊的着色路面     —— ridges.js color() 里半宽 2.2/4.2m 的水泥色带
+      // 早一版只有"避开营区矩形"和"避开建筑"，**没有任何一条与路有关**，
+      // 于是石头/树按全图随机撒（`r()` 驱动），落在哪儿全看运气。
+      // 实测：盘山路床上 4 块石头 + 6 棵树（其中 (-88.3,-59.3) 距路心 0.13m、
+      // 正压在路中间；(-90.8,-54.3) 0.46m），走廊路面上 1 块石头 + 2 棵树。
+      //
+      // 判据口径：**到折线的真实距离**（点到线段），不是"采样点方块膨胀"。
+      // 折线按 6m 步长采样再按方块膨胀，会在采样点之间漏掉路面 ——
+      // 判据自己踩过这个坑（world.js:buildGrid 的 gateCells 注释）。
+      //
+      // 两个半径要分开：路床**有几何**（3.4m 板），路面宽 6.8m；
+      // 走廊只有**顶点色**（4.2m 衰减到 0），比路床窄。取各自的值，
+      // 再加上"物件自身半径"，这样大石头（s 可达 2.5，半径 1.75m）也不会骑到路肩上。
+      const roadDist = (x, z, path) => {
+        let lo = Infinity;
+        for (let i = 0; i + 1 < path.length; i++) {
+          const ax = path[i][0], az = path[i][1];
+          const vx = path[i + 1][0] - ax, vz = path[i + 1][1] - az;
+          const L2 = vx * vx + vz * vz;
+          const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * vx + (z - az) * vz) / L2)) : 0;
+          const d = Math.hypot(x - (ax + vx * t), z - (az + vz * t));
+          if (d < lo) lo = d;
+        }
+        return lo;
+      };
+      // ROAD_HALF_BED = w.roadbed 的半宽（几何板）；ROAD_HALF_CORR = color() 的 4.2m。
+      // 两者都从各自的数据源推出来，别写死成另一个数。
+      const ROAD_HALF_BED = 3.4, ROAD_HALF_CORR = 4.2;
+      // 路面必须净空：到任一条路的中心线都不得近于"路面半宽 + 物件半径"。
+      const clearOfRoad = (x, z, objR) => {
+        const bed = ROAD_HALF_BED + objR, corr = ROAD_HALF_CORR + objR;
+        for (const p of RIDGE_RAMPS) if (roadDist(x, z, p) < bed) return false;
+        for (const p of RIDGE_ROADS) if (roadDist(x, z, p) < corr) return false;
+        return true;
+      };
+
       // ===== 地形网格（小地图的底色由 buildTopDown 画，这里不管）=====
 
       // ===== 出生平台 =====
@@ -346,6 +386,9 @@ export const MAPS = {
           const a = i / 9 * Math.PI * 2;
           const rx = cx + Math.cos(a) * (site.r * 0.62), rz = cz + Math.sin(a) * (site.r * 0.62);
           if (flat(rx, rz) > 0.42) continue;
+          // 台缘这一圈正好在盘山路的末段上（路从台缘爬到塔基）——
+          // 石头压在路面上是用户报的第一条问题。s 最大 2.6 → 半径 1.82。
+          if (!clearOfRoad(rx, rz, 1.82)) continue;
           P(rx, rz);
           w.rock(rx, rz, 1.1 + r() * 1.5, 'rock');
         }
@@ -369,10 +412,27 @@ export const MAPS = {
         // 沙袋在指挥所**西侧**（x -12 那一列），不在它正南 ——
         // 早一版摆在 (s.x-4, OUT+11) = (-4,-11)，正落在指挥所肚子里
         // （指挥所 x ∈ [-7.2, 11.2]、z ∈ [-15.2, -2.8]，实测压 5.0×0.6m）。
-        P(s.x - 12, OUT + 11); w.sandbags(s.x - 12, OUT + 11, 5, 0);
+        //
+        // **长轴必须顺着南北（rotY = π/2），不能横着（rotY = 0）。**
+        // 这是用户报的"bot 卡住"的第二个实例，与门柱那处同源：
+        // 5m 长的一排横在 x ∈ [-14.5, -9.5]，而营区大门在 x=-18、门内正对的就是
+        // 这片空地 —— 于是"进门 → 往南进营区"这条主路被横排沙袋拦腰截断。
+        // 沙袋只 0.6m 深，导航网格按中心线判定时它**只封一格**（inf 0.4 < 半长 2.5），
+        // A* 于是给出一条**从沙袋正上方穿过的路点** (-10.5,-5.5)：
+        // bot 顺路点直走，撞上沙袋侧面，被沿墙的推力与朝路点的驱动力
+        // 两向抵消 → 位移恒为 0（实测卡死在 (-10.57,-11.70)，离沙袋 0.400m）。
+        //
+        // 竖过来之后沙袋的 0.6m 厚度横在 5m 的**南北跨度**上，两侧各留 2.5m 绕行净空；
+        // 而且它离 HQ 西墙（x=-7.2）还有 2.3m，不再压在门口动线上。
+        // 这是"掩体要顺着墙放、别横在通路上"—— 与出生点沙袋那次的教训同类。
+        P(s.x - 12, OUT + 11); w.sandbags(s.x - 12, OUT + 11, 5, Math.PI / 2);
         P(s.x + 26, OUT - 4); w.crateStack(s.x + 26, OUT - 4);
-        P(s.x - 24, OUT + 2); w.rock(s.x - 24, OUT + 2, 1.6);
-        P(s.x + 12, OUT - 7); w.rock(s.x + 12, OUT - 7, 1.3);
+        // 鞍部这两块石头：路面净空。鞍部是营区正北，而第一条盘山路正好从
+        // 营区大门（x=-18）往西北爬出去 —— 石头离路心太近就压上路了
+        // （实测 (-24,-20) 那块：盘山路半宽 3.4 + 石半径 1.12 → 距路心仅 2.6m）。
+        // 判据按**石头自身半径**给，不是一刀切。
+        if (clearOfRoad(s.x - 24, OUT + 2, 1.6 * 0.7)) { P(s.x - 24, OUT + 2); w.rock(s.x - 24, OUT + 2, 1.6); }
+        if (clearOfRoad(s.x + 12, OUT - 7, 1.3 * 0.7)) { P(s.x + 12, OUT - 7); w.rock(s.x + 12, OUT - 7, 1.3); }
       }
       // ===== 中央军营：用户要求"旁边一处较为平整的地方坐落着一个军营" =====
       //
@@ -413,8 +473,20 @@ export const MAPS = {
         });
         P(cx, hqZ);
         w.box(cx, 5.3, hqZ, 4, 2.4, 4, 'concreteDark');   // 屋顶哨台基座
-        w.lampPost(cx + 9.4, hqZ, 0xffd8a0, Math.PI / 2, 14);
-        w.lampPost(cx - 9.4, hqZ, 0xffd8a0, -Math.PI / 2, 14);
+        //
+        // **灯杆必须避开三面的门轴线。**
+        // `building` 的门开在**墙的正中**（doors 的 c = len/2 + 偏移，这里偏移都是 0），
+        // 门洞净宽只有 1.5m（world.js:building 的 mk() 里 w: 1.5）。
+        // 早一版灯杆摆在 (cx±9.4, hqZ) —— x 距外墙 0.4m、**z 正好是门轴**，
+        // 于是从东门/西门出来 first 一步就撞在灯杆上：门在，门口一根杆，
+        // 门洞的 1.5m 净宽被杆子（0.18m 宽但带 0.18 盒）顶掉大半（实测门外
+        // 2.2m 内就有 darkMetal 盒，门轴线净空 = 被挡）。
+        //
+        // 改法：**沿 z 挪到门轴两侧 3.4m**（= 门半宽 0.75 + 杆半宽 0.09 + 2.5m 余量），
+        // 位置仍贴着外墙（x 距墙 0.4m），灯照得到门但不挡门。南北两侧不放杆 ——
+        // 南门在 (cx, hqZ+6)，北面是屋顶哨台基座，两处都不需要额外照明。
+        w.lampPost(cx + 9.4, hqZ - 3.4, 0xffd8a0, Math.PI / 2, 14);
+        w.lampPost(cx - 9.4, hqZ + 3.4, 0xffd8a0, -Math.PI / 2, 14);
 
         // ── 2) 兵营：中带东西两列，各两间；门朝中央集结地 ──
         // 列位 cx±23：兵营 9m 宽 → 内缘 cx±18.5，中央留 37m 集结地（够装甲车调动）。
@@ -446,8 +518,17 @@ export const MAPS = {
         for (let i = 0; i < 4; i++) {
           const tx = cx - 30 + i * 10;
           P(tx, cz + 27);
-          w.truck(tx, cz + 27, Math.PI / 2 + (r() - 0.5) * 0.08, [0xd9d4c4, 0xb8b0a0, 0xa8a49a][i % 3]);
-          w.truckCollider(tx, cz + 27, Math.PI / 2);
+          // **碰撞盒的角度必须与视觉同一个值。**
+          // 视觉带 ±0.04 rad 的随机偏摆（免得四辆一模一样），早一版碰撞盒却写死
+          // π/2 —— 于是偏摆大的那辆，视觉的世界轴对齐包围盒短边会胀到 2.38m，
+          // 而 2.30m 的碰撞盒短边**容不下它**（判据 B8 报红）。
+          // 这不是判据苛刻：旋转体的外接盒随角度变大，±0.036 rad 就让 2.1m 的
+          // 车身胀出 0.28m。玩家撞到的是看不见的空气，视觉却穿模 ——
+          // 与"虚空碰撞箱"（MEMORY 里 B8 那条铁律）是同一个病。
+          // 存下同一个 rotY 变量，视觉与碰撞都用它，两边逐位一致。
+          const trot = Math.PI / 2 + (r() - 0.5) * 0.08;
+          w.truck(tx, cz + 27, trot, [0xd9d4c4, 0xb8b0a0, 0xa8a49a][i % 3]);
+          w.truckCollider(tx, cz + 27, trot);
         }
         // 集装箱：6m 长，按足迹贴地。摆在车场**南侧** cz+33 一线
         // （足迹 z ∈ [cz+31.75, cz+34.25]），三面都不咬。
@@ -575,10 +656,28 @@ export const MAPS = {
         // 于是两根门柱一根卡在门洞里、一根骑在墙上（判据 B13 钉这个）。
         const gateX = GATE_X, gateW = gateW2;
         const postX = gateW / 2 + 0.3;              // 门柱内侧留 0.3m 贴门洞边
-        w.padTo(gateX - postX, WALL_Z0, 0.6, 0.6);
-        w.box(gateX - postX, 0, WALL_Z0, 0.6, 4.2, 0.6, 'concreteDark');
-        w.padTo(gateX + postX, WALL_Z0, 0.6, 0.6);
-        w.box(gateX + postX, 0, WALL_Z0, 0.6, 4.2, 0.6, 'concreteDark');
+        //
+        // **门柱的进深必须与墙一样（0.35），不能 thicker。**
+        // 这是用户报的"bot 经常在大门口旁边的角落里卡住"的根因，三个因素叠加：
+        //   ① 导航网格把门柱那格标成**可走** —— buildGrid 的墙体豁免是"格心到
+        //      盘山路折线 ≤ 8m"，门柱格心 (-26.5,-16.5) 离路廊只有 6.70m，
+        //      于是被豁免（判据 B15 要求的：路要从门洞穿出去，墙不能封格）。
+        //   ② 门柱 0.6m 见方 vs 墙 0.35m 厚 → 柱**凸出墙 0.125m**，
+        //      在墙的末端形成一个 0.6m 宽、0.125m 深的**凹角口袋**。
+        //   ③ bot 半径 0.4m ≫ 0.125m 台阶：它挤进凹角后被墙（推它向北）
+        //      和门柱（推它向西北）**两个互相垂直的约束同时夹住**，
+        //      位移恒为 0 —— 实测卡死在 (-26.89,-16.58)，moved 连续 1.5s 为 0.0000。
+        //
+        // 早一版试过"把门柱挪进墙里"（改 postX），那会让门柱与门洞两侧脱开、
+        // 门洞看起来没有柱（B13 钉的就是柱要贴住洞口边）。正解是**让柱不进深**：
+        // 柱宽仍是 0.6（贴着门洞边不变，B13 过），进深收到墙的 0.35 ——
+        // 柱在 z 方向与墙**共面**，凹角消失，贴墙走的 bot 一路畅通。
+        // 视觉上柱仍高出墙 1.6m（4.2 vs 2.6），读起来仍是门柱。
+        const postD = 0.35;                        // = 围墙厚度，柱墙共面
+        w.padTo(gateX - postX, WALL_Z0, 0.6, postD);
+        w.box(gateX - postX, 0, WALL_Z0, 0.6, 4.2, postD, 'concreteDark');
+        w.padTo(gateX + postX, WALL_Z0, 0.6, postD);
+        w.box(gateX + postX, 0, WALL_Z0, 0.6, 4.2, postD, 'concreteDark');
         // 门梁：**先P() 归位再摆**。
         //
         // `box(cx, y0, ...)` 的 y0 是相对 `this.baseY` 的高度，而 baseY 是
@@ -642,7 +741,12 @@ export const MAPS = {
                 pz > RIDGE.camp.z - 28 && pz < RIDGE.camp.z + 34) continue;
             P(px, pz);
             if (k % 2) { w.sandbags(px, pz, 4, Math.atan2(bz - az, bx - ax)); w.crate(px + 1.6, pz, 1); }
-            else if (free(px, pz, 1.6)) { claim(px, pz, 2.0); w.rock(px, pz, 1.2 + r() * 0.7, 'rock'); }
+            else if (free(px, pz, 1.6) && clearOfRoad(px, pz, 1.9)) {
+              // clearOfRoad 的 1.9 = 石头最大碰撞半径（s 1.9 × 0.7）。
+              // 这一段本来是**沿走廊**偏 6.5m 摆的，但走廊在盘山路附近与盘山路
+              // 交叉/贴近，只按走廊判会漏掉盘山路那一条 —— 两套都要查。
+              claim(px, pz, 2.0); w.rock(px, pz, 1.2 + r() * 0.7, 'rock');
+            }
           }
         }
       }
@@ -662,6 +766,9 @@ export const MAPS = {
           if (Math.hypot(x - RIDGE.camp.x, z - RIDGE.camp.z) < 44) continue;
           if (Math.hypot(x - RIDGE.spawnA.x, z - RIDGE.spawnA.z) < 24) continue;
           if (Math.hypot(x - RIDGE.spawnB.x, z - RIDGE.spawnB.z) < 24) continue;
+          // 树冠比树干宽得多：留 2.6m 净空，树冠才不会探到路面上。
+          // 树是玩家最容易认出来的路障（"路上有棵树"），所以这条比石头更严。
+          if (!clearOfRoad(x, z, 2.6)) continue;
           if (!free(x, z, 2.6)) continue;                          // 不许压在建筑/围墙上
           claim(x, z, 3.2);
           P(x, z);
@@ -688,6 +795,7 @@ export const MAPS = {
         const s = flat(x, z);
         if (s < 0.1 && r() > 0.25) continue;                    // 平地上少放，坡地上多放
         if (Math.hypot(x - RIDGE.camp.x, z - RIDGE.camp.z) < 40) continue;
+        if (!clearOfRoad(x, z, 1.75)) continue;                 // 路面净空（s 最大 2.5 → 半径 1.75）
         if (!free(x, z, 2.0)) continue;                          // 不许压在建筑/围墙上
         claim(x, z, 2.4);
         P(x, z);
@@ -701,6 +809,7 @@ export const MAPS = {
           const x = site.x + Math.cos(a) * d, z = site.z + Math.sin(a) * d;
           if (Math.abs(x) > 170 || Math.abs(z) > 170) continue;
           if (flat(x, z) > 0.5) continue;
+          if (!clearOfRoad(x, z, 2.1)) continue;                 // 路面净空（s 最大 3.0）
           if (!free(x, z, 2.6)) continue;                        // 高地设施（塔/沙袋）也要避让
           claim(x, z, 3.0);
           P(x, z);
@@ -727,6 +836,8 @@ export const MAPS = {
         if (Math.hypot(x - RIDGE.spawnA.x, z - RIDGE.spawnA.z) < 24) continue;
         if (Math.hypot(x - RIDGE.spawnB.x, z - RIDGE.spawnB.z) < 24) continue;
         if (RIDGE_FLAGS.some(([fx, fz]) => Math.hypot(x - fx, z - fz) < 12)) continue;
+        // 路面净空：石片无碰撞，但压在水泥路上一样是"路面上有东西"（用户原话）。
+        if (!clearOfRoad(x, z, 0.6)) continue;
         if (!free(x, z, 1.0)) continue;
         P(x, z);
         w.rock(x, z, 0.22 + r() * 0.38, 'rock', false);

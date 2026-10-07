@@ -521,11 +521,29 @@ export class World {
     // —— 碰撞盒给 2.2 时两侧各差 0.01m，判据B8 报"容不下"。
     // 碰撞盒的原则是"宁可略大不可略小"：略小会让玩家的子弹/身体
     // 从后视镜那里穿过去（视觉上打中了车却没中）。
-    const W = 2.3, L = 6.2, H = 1.9;
-    const along = Math.abs(Math.sin(rotY)) > 0.7;   // 车头朝 x → 长轴在 x
-    this.collider(
-      x - (along ? L / 2 : W / 2), 0, z - (along ? W / 2 : L / 2),
-      x + (along ? L / 2 : W / 2), H, z + (along ? W / 2 : L / 2));
+    //
+    // **而且要按 rotY 的实际旋转量放大，不能只取"沿 x 还是沿 z"。**
+    // 地图会给卡车加 ±0.04 rad 的随机偏摆（免得四辆一模一样），
+    // 而盒是**轴对齐**的、不跟着转 —— 旋转体的世界轴对齐包围盒会随角度胀大：
+    // 偏摆 0.036 rad 就让 2.1m 的车宽胀到 2.38m（+0.28m）。
+    // 早一版只判 `|sin(rotY)| > 0.7` 选长轴、短边恒给 2.3，于是偏摆大的那辆
+    // 必然"碰撞盒容不下视觉"（判据 B8 在 ridges 车场报红）。
+    //
+    // 正确做法：短边按"旋转后的投影"算。半宽 a、半长 b 的矩形绕 y 转θ后，
+    // 世界轴对齐的半宽 = a·|cosθ| + b·|sinθ|（θ 是相对正交的偏角）。
+    // 车长 6.04/2 = 3.02、车宽 2.22/2 = 1.11，取 |sinθ| 与 |cosθ| 里的大者做长轴。
+    const HW = 2.22 / 2, HL = 6.04 / 2;          // 视觉半宽（含后视镜）/ 半长
+    // truck() 里 rotY 是**朝向角**：rotY=0 车头朝 -z（长轴在 z），rotY=π/2 车头朝 x（长轴在 x）。
+    // 半长 HL 沿车头方向、半宽 HW 垂直于它，所以：
+    //   x 方向的投影半宽 = HL·|sinθ| + HW·|cosθ|
+    //   z 方向的投影半宽 = HL·|cosθ| + HW·|sinθ|
+    // θ=π/2 → ex = HL（长轴在 x）、ez = HW（短边在 z），与 `along` 旧判一致。
+    const c = Math.abs(Math.cos(rotY)), s = Math.abs(Math.sin(rotY));
+    const ex = HL * s + HW * c, ez = HL * c + HW * s;
+    // 留 2cm 余量（判据容差 0.01m，但地图若再微调视觉尺寸也不至于立刻红）
+    const padX = ex + 0.02, padZ = ez + 0.02;
+    const H = 1.9;
+    this.collider(x - padX, 0, z - padZ, x + padX, H, z + padZ);
   }
   barrel(x, z, matName = 'containerBlue', fire = false) {
     const keep = this.baseY;

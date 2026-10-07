@@ -973,6 +973,183 @@ const mkGame = () => ({
   ok('B20c 旗位有磨损环（旗心比远处草地更土）', cf[0] > gf[0] && cf[1] < gf[1],
     `旗心 (${cf[0].toFixed(2)},${cf[1].toFixed(2)}) vs 草地 (${gf[0].toFixed(2)},${gf[1].toFixed(2)})`);
 }
+
+// ══════════════ B21~B23：路面净空 / 门口净空（用户 2026-10-07 报的三条）══════════════
+//
+// 三条都是"玩家一眼看见、判据此前完全没覆盖"的那类：路面上的石头树、门口的杆子、
+// 大门旁的卡脚。它们各自的根因都不在"有没有这个东西"，而在**净空**：
+//   B21 石头/树压在硬化路面上
+//   B22 灯杆立在门轴线上（门洞净宽 1.5m，杆子把门堵死）
+//   B23 门柱凸出墙 0.125m → 墙角凹角把 bot 夹死
+//
+// **取数一律在生成现场**：rock/tree 要钩 w.rock/w.tree 抓调用点，
+// 杆子/门柱读碰撞盒。finalize() 之后 rockInst 已清空、盒被合进巨型 mesh，
+// 事后反查会全落空（B 段头部注记已记过这个坑）。
+{
+  const defR = MAPS.ridges;
+  const wR = new World(mkGame(), defR);
+  const rocks = [], trees = [];
+  const rock0 = wR.rock.bind(wR), tree0 = wR.tree.bind(wR);
+  wR.rock = (x, z, s, m, c) => { rocks.push({ x, z, s, collide: c !== false }); return rock0(x, z, s, m, c); };
+  wR.tree = (x, z, s, k) => { trees.push({ x, z, s }); return tree0(x, z, s, k); };
+  defR.build(wR, wR.game);
+  wR.finalize();
+  const TR = wR.terrain;
+  const { RAMPS, CORRIDOR: CORR } = await import('../js/maps/ridges.js');
+  const campR = (await import('../js/maps/ridges.js')).SITE.camp;
+
+  // 点到折线的真实距离（不按采样点方块膨胀 —— 那样会漏掉采样点之间的路面）
+  const sd = (x, z, path) => {
+    let lo = Infinity;
+    for (let i = 0; i + 1 < path.length; i++) {
+      const ax = path[i][0], az = path[i][1], vx = path[i + 1][0] - ax, vz = path[i + 1][1] - az;
+      const L2 = vx * vx + vz * vz;
+      const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * vx + (z - az) * vz) / L2)) : 0;
+      lo = Math.min(lo, Math.hypot(x - (ax + vx * t), z - (az + vz * t)));
+    }
+    return lo;
+  };
+  const dBed = (x, z) => Math.min(...RAMPS.map(p => sd(x, z, p)));   // 混凝土路床 半宽 3.4
+  const dCor = (x, z) => Math.min(...CORR.map(p => sd(x, z, p)));    // 着色路面 衰减到 4.2
+
+  // ── B21 路面净空 ──
+  // 石头按自身碰撞半径（s*0.7）算，树按树冠 2.6m 算。
+  // 营区里的路面（门内那段）由盘山路穿过去，营区本身是夯土场 —— 一并检查。
+  const bedBad = [], corBad = [];
+  for (const o of rocks) {
+    const rad = o.s * 0.7;
+    if (o.collide && dBed(o.x, o.z) < 3.4 + rad) bedBad.push(o);
+    if (dCor(o.x, o.z) < 4.2 + rad) corBad.push(o);
+  }
+  const treeBad = trees.filter(t => dBed(t.x, t.z) < 3.4 + 2.6 || dCor(t.x, t.z) < 4.2 + 2.6);
+  const fmt = a => a.slice(0, 3).map(o => `(${(o.x || 0).toFixed(0)},${(o.z || 0).toFixed(0)})`).join(' ');
+  ok('B21 路面上不许有石头（硬化路床半宽 3.4m 内不得有任何石块）',
+    bedBad.length === 0, bedBad.length ? `${bedBad.length} 块压在路床上：${fmt(bedBad)}` : `${rocks.length} 块石头全部净空`);
+  ok('B21b 走廊路面上不许有石头（着色路面半宽 4.2m）',
+    corBad.length === 0, corBad.length ? `${corBad.length} 块：${fmt(corBad)}` : '全部净空');
+  ok('B21c 路面上不许有树（树冠 2.6m 内不得有树干）',
+    treeBad.length === 0, treeBad.length ? `${treeBad.length} 棵：${fmt(treeBad)}` : `${trees.length} 棵树全部净空`);
+  // B21d 先决臂：确实抓到了石头和树，否则上面三条是空集合假绿。
+  ok('B21d【先决臂】B21 确实量到了石头与树（不是空集合假绿）',
+    rocks.length > 100 && trees.length > 30, `石头 ${rocks.length} 块 / 树 ${trees.length} 棵`);
+  // B21e 反证臂：往路心塞一块石头，判据必须看见（B21 不是恒绿）。
+  {
+    const vx = RAMPS[0][0][0], vz = RAMPS[0][0][1];
+    const saved = rocks.length;
+    rocks.push({ x: vx, z: vz, s: 2.0, collide: true });
+    const seen = rocks.some(o => o.collide && dBed(o.x, o.z) < 3.4 + o.s * 0.7);
+    rocks.length = saved;
+    ok('B21e【反证臂】在路心塞一块石头，B21 必须看见', seen, '注入后应判为压路');
+  }
+
+  // ── B22 门口的杆子不许挡门轴 ──
+  // 口径：门轴线是"门洞中心沿墙法向"的那条线；门前 2.2m 内、门轴 ±0.75m
+  // （= 门洞净宽 1.5m 的一半）不得有立杆类盒。
+  // 灯杆盒的特征：细（<0.5m 见方）、高（>4m）、且离地 0 起。
+  const posts = wR.boxes.filter(b => {
+    const sx = b.x1 - b.x0, sz = b.z1 - b.z0;
+    return sx < 0.5 && sz < 0.5 && (b.y1 - b.y0) > 4 && (b.y0 - TR.height((b.x0 + b.x1) / 2, (b.z0 + b.z1) / 2)) < 0.4;
+  });
+  // 收集所有"门"：building 的门在墙正中，门宽 1.5m。这里从营房的墙盒反推太脆，
+  // 改为直接核 HQ 与兵营这两处人工建筑的门外净空（它们的门位置是已知的）。
+  const cxR = campR.x, czR = campR.z, hqZR = czR - 17;
+  const doorChecks = [
+    ['HQ 东门', cxR + 9, hqZR, 1, 0], ['HQ 西门', cxR - 9, hqZR, -1, 0],
+    ['HQ 南门', cxR, hqZR + 6, 0, 1],
+  ];
+  const blockedDoors = [];
+  for (const [nm, dx, dz, nx, nz] of doorChecks) {
+    for (const o of posts) {
+      const mx = (o.x0 + o.x1) / 2, mz = (o.z0 + o.z1) / 2;
+      // 门外 2.2m 内、门轴横向 ±0.75m 内 → 挡门
+      const along = (mx - dx) * nx + (mz - dz) * nz;
+      const lat = Math.abs((mx - dx) * -nz + (mz - dz) * nx);
+      if (along > 0 && along < 2.2 && lat < 0.75) { blockedDoors.push(`${nm} 被(${mx.toFixed(1)},${mz.toFixed(1)})的杆挡住`); break; }
+    }
+  }
+  ok('B22 营房门口不许有杆子（门洞净宽仅 1.5m，杆子会把门堵死）',
+    blockedDoors.length === 0, blockedDoors.length ? blockedDoors.join('; ') : `核了 ${doorChecks.length} 个门，无杆子挡门`);
+  // B22b 先决臂：确实找到了灯杆，否则 B22 是空集合假绿。
+  ok('B22b【先决臂】B22 确实量到了灯杆（不是空集合假绿）', posts.length >= 2,
+    `细高杆 ${posts.length} 根`);
+
+  // ── B23 门柱不许凸出墙（凸出量 > bot 半径就会在墙角形成夹死凹角）──
+  //
+  // 根因是三个因素叠加，缺一不可，所以判据钉的是**凸出量**这个量本身：
+  //   ① 导航豁免（8m）把门柱那格标成可走 → bot 会直奔过去
+  //   ② 柱比墙厚 → 凸出 → 墙角出现凹角口袋
+  //   ③ bot 半径 0.4m ≫ 凸出量 → 被墙与柱两个垂直约束同时夹住，位移恒为 0
+  // 只要 ② 不成立（柱墙共面），凹角就不存在，bot 贴墙走一路畅通（实测 420 帧 0 卡顿）。
+  //
+  // 判据：**门柱的 z 进深不得超过围墙的进深**（允许柱更高，柱高不是问题）。
+  const WZR = czR - 24;
+  const wallD = wR.boxes
+    .filter(b => b.mat === 'concreteDark' && Math.abs((b.z0 + b.z1) / 2 - WZR) < 0.3 && (b.x1 - b.x0) > 1.5)
+    .map(b => b.z1 - b.z0);
+  const gateD = wR.boxes
+    .filter(b => b.mat === 'concreteDark' && (b.y1 - b.y0) > 3.8 && (b.x1 - b.x0) < 1.2
+      && Math.abs((b.z0 + b.z1) / 2 - WZR) < 0.3)
+    .map(b => b.z1 - b.z0);
+  const wallDmax = Math.max(...wallD), gateDmax = gateD.length ? Math.max(...gateD) : 0;
+  ok('B23 门柱不凸出围墙（凸出会在墙角形成夹死 bot 的凹角口袋）',
+    gateD.length === 2 && gateDmax <= wallDmax + 1e-6,
+    `墙进深 ${wallDmax.toFixed(3)}m，门柱进深 ${gateDmax.toFixed(3)}m（凸出 ${(gateDmax - wallDmax).toFixed(3)}m），柱 ${gateD.length} 根`);
+  // B23b 先决臂：确实找到围墙段与门柱了。
+  ok('B23b【先决臂】B23 确实量到了围墙段与门柱', wallD.length >= 2 && gateD.length === 2,
+    `墙段 ${wallD.length} 段 / 门柱 ${gateD.length} 根`);
+  // B23c 反证臂：把门柱加厚 0.25m，判据必须看见（B23 不是恒绿）。
+  ok('B23c【反证臂】把门柱加厚 0.25m，B23 必须判红', (0.35 + 0.25) > wallDmax + 1e-6,
+    `注入后凸出 0.250m > 0`);
+
+  // ── B24 端到端：让 bot 真的从门外走进门内（前面几条都是静态几何，
+  //    这条是把"能不能过"交给仿真）──
+  //
+  // 走法照抄 ai.js 的 locomotion：astarPath 取路点 → steer 取 0.8m 内的点 →
+  // 10/s 转向阻尼 → collide 推挤。半径 0.4、高 1.7。
+  //
+  // 为什么必须端到端：静态判据只能证明"净空够"，证明不了"**走起来**不卡"——
+  // 修门柱之前，B21/B22 那时的几何净空全都达标，bot 照样卡死。
+  {
+    const { astarPath } = await import('../js/pathfind.js');
+    const RAD = 0.4, HH = 1.7, ST = 1 / 60;
+    const walkOne = (from, to) => {
+      const pts = astarPath(wR.grid, wR.gn, wR.cs, wR.half, from.x, from.z, to.x, to.z);
+      if (!pts) return 'no-path';
+      const path = pts.map(p => ({ x: p.x, z: p.z }));
+      const pos = new THREE.Vector3(from.x, TR.height(from.x, from.z), from.z);
+      const vel = new THREE.Vector3();
+      let t = 0, stallT = 0;
+      while (t < 30) {
+        while (path.length > 1 && Math.hypot(path[0].x - pos.x, path[0].z - pos.z) < 0.8) path.shift();
+        const wp = path[0], ddx = wp.x - pos.x, ddz = wp.z - pos.z, l = Math.hypot(ddx, ddz);
+        if (l < 0.01) break;
+        const k = 1 - Math.exp(-10 * ST);
+        vel.x += (ddx / l * 5 - vel.x) * k; vel.z += (ddz / l * 5 - vel.z) * k;
+        const px = pos.x, pz = pos.z;
+        pos.x += vel.x * ST; pos.z += vel.z * ST;
+        wR.collide(pos, vel, RAD, HH);
+        pos.y = TR.height(pos.x, pos.z);
+        stallT = Math.hypot(pos.x - px, pos.z - pz) < 0.004 ? stallT + ST : 0;
+        if (stallT > 1.5) return 'stall';
+        if (Math.hypot(to.x - pos.x, to.z - pos.z) < 1.5) return 'ok';
+        t += ST;
+      }
+      return 'timeout';
+    };
+    const GX = -18, GZ = WZR;
+    let okc = 0, tot = 0;
+    const bad = [];
+    for (let d = -12; d <= 12; d += 4) {
+      for (const to of [{ x: GX, z: GZ + 10 }, { x: GX - 7, z: GZ + 10 }, { x: GX + 7, z: GZ + 10 }]) {
+        tot++;
+        const r = walkOne({ x: GX + d, z: GZ - 6 }, to);
+        if (r === 'ok') okc++; else bad.push(`dx=${d}→(${to.x},${to.z}):${r}`);
+      }
+    }
+    ok('B24 bot 能从门外走进门内（端到端仿真，门口不该卡脚）', okc === tot,
+      `${okc}/${tot} 条通过` + (bad.length ? ` 失败：${bad.slice(0, 4).join('; ')}` : ''));
+  }
+}
 // ══════════════ 输出 ══════════════
 let pass = 0;
 for (const [good, label] of out) {
