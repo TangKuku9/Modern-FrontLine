@@ -95,20 +95,27 @@ function bruteCollide(w, pos, vel, radius, height, step = 0.45) {
       }
     }
   }
-  // 陡坡推挤：被测实现在包络收敛之后做这一步，基准照做一次（阈值同 world.js 的
-  // SLOPE.ROLLING=0.42）。这段不属于宽相 —— 它对不对由 test/terrain.mjs 的正面判据盯；
-  // 这里跟做，是为了让"盒命中/推挤逐位一致"这条仍然只测宽相，不被坡度规则搅进来。
+  // 陡坡分级：被测实现在包络收敛之后做这一步，基准照做一次（阈值与阻力公式同
+  // world.js collide 的两挡：ROLLING..STEEP 阻力、>STEEP 硬挡）。这段不属于宽相 ——
+  // 它对不对由 test/terrain.mjs 的正面判据盯；这里跟做，是为了让"盒命中/推挤逐位
+  // 一致"这条仍然只测宽相，不被坡度规则搅进来。
   if (w.terrain) {
     const g = w.terrain.slope(pos.x, pos.z);
     if (g > 0.42) {
       const gr = w.terrain.grad(pos.x, pos.z);
       const m = Math.hypot(gr.x, gr.z);
       if (m > 1e-9) {
-        const ux = gr.x / m, uz = gr.z / m, pen = (g - 0.42) / g;
-        pos.x -= ux * radius * pen * 2;
-        pos.z -= uz * radius * pen * 2;
-        const vn = vel.x * ux + vel.z * uz;
-        if (vn > 0) { vel.x -= vn * ux; vel.z -= vn * uz; }
+        const ux = gr.x / m, uz = gr.z / m, vn = vel.x * ux + vel.z * uz;
+        if (g > 0.85) {
+          const pen = (g - 0.85) / g;
+          pos.x -= ux * radius * pen * 2;
+          pos.z -= uz * radius * pen * 2;
+          if (vn > 0) { vel.x -= vn * ux; vel.z -= vn * uz; }
+        } else if (vn > 0) {
+          const keep = 1 - 0.9 * (g - 0.42) / (0.85 - 0.42);
+          vel.x -= vn * (1 - keep) * ux;
+          vel.z -= vn * (1 - keep) * uz;
+        }
       }
     }
   }

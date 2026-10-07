@@ -1072,9 +1072,25 @@ export class World {
         }
       }
       if (minX >= ox - M && maxX <= ox + M && minZ >= oz - M && maxZ <= oz + M) {
-        // 陡坡挡人：坡度超过 ROLLING 就把人推回坡下、并吃掉朝坡上的速度分量。
-        // 盒子推挤是"硬墙"，地形没有盒面可撞，但"爬不上去"这件事必须一样成立 ——
-        // 不挡的话玩家会顺着 45° 的陡坡一路滑上去，两处高地的意义就没了。
+        // 陡坡分级（用户实测"山坡像撞墙一样卡住"后从一挡改两挡）：
+        //
+        //   ≤ ROLLING(0.42)       自由行走（导航网格的野地口径，一路）
+        //   ROLLING..STEEP(0.85)  不挡，只吃掉部分上坡速度 —— keep 随坡度从 1
+        //                         线性降到 0.1，稳态爬速大约 4.7 → 1 m/s：
+        //                         缓坡只是"有点累"，贴近 STEEP 就是一步一滑的
+        //                         攀爬。设计意图与逐顶点色对得上：>0.62 的坡
+        //                         画成裸岩（ridges.color），裸岩可以慢慢爬，
+        //                         草坡碎石坡更不在话下。
+        //   > STEEP               硬挡：推回坡下 + 吃光上坡速度。真崖（全图
+        //                         约 7% 面积）仍然拦人，两处高地的地形意义保留。
+        //
+        // 阈值为什么取 STEEP 而不是更低：导航网格给路廊放宽到 SLOPE.ROAD(0.62)
+        // （buildGrid 的 roadCells），而 A* 的 LOS 平滑路点是**格子级**判定、
+        // 玩家走的是**连续坐标** —— 路面接缝处同一点两套采样能差出 0.1+（实测
+        // 北坡道接缝 0.25~0.70）。物理墙只压到 0.62 的话，bot 沿 A* 路线走到缝上
+        // 会被自己的物理墙钉死（实测 A1→北岭在 (-51,-26)、营区→南丘在 (77,112)
+        // 两处复现）。墙取 STEEP 之后，导航说能走的格子物理一定走得动，
+        // "爬不上去的"只剩双方口径都公认的崖。
         //
         // **必须在入口挡掉非有限坐标**：入参 pos 若含 NaN（模拟里任何一处算错、
         // 或者外部传进来一个坏值），下面 `m > 1e-9` 对 NaN 是 false，倒不至于推挤，
@@ -1090,11 +1106,20 @@ export class World {
             const m = Math.hypot(gr.x, gr.z);
             if (m > 1e-9) {
               const ux = gr.x / m, uz = gr.z / m;      // 上坡单位方向
-              const pen = (g - SLOPE.ROLLING) / g;      // 越陡推得越远
-              pos.x -= ux * radius * pen * 2;
-              pos.z -= uz * radius * pen * 2;
               const vn = vel.x * ux + vel.z * uz;
-              if (vn > 0) { vel.x -= vn * ux; vel.z -= vn * uz; }
+              if (g > SLOPE.STEEP) {
+                const pen = (g - SLOPE.STEEP) / g;      // 越陡推得越远
+                pos.x -= ux * radius * pen * 2;
+                pos.z -= uz * radius * pen * 2;
+                if (vn > 0) { vel.x -= vn * ux; vel.z -= vn * uz; }
+              } else if (vn > 0) {
+                // 爬坡阻力：只削上坡分量，横向与下坡不受影响。下一帧 _sim 的
+                // 速度增益再把 vel 往目标拉回来，两相平衡出连续的稳态爬速 ——
+                // 慢但走得动，没有任何"撞墙"点。
+                const keep = 1 - 0.9 * (g - SLOPE.ROLLING) / (SLOPE.STEEP - SLOPE.ROLLING);
+                vel.x -= vn * (1 - keep) * ux;
+                vel.z -= vn * (1 - keep) * uz;
+              }
             }
           }
         }

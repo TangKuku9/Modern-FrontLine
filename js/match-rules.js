@@ -577,4 +577,42 @@ export function flagsTick(flags, rules, entities, dt) {
   return out;
 }
 
+// ---------- Bot 占点目标（dom，单机 MPMatch 与联机 NetRoom 共用） ----------
+//
+// 用户实测"bot 明明就在点旁边都不占点跑去打人"。两个病因：
+//   ① 联机 NetRoom **根本没有 botGoal** —— js/ai.js:behave 问 game.mode.botGoal，
+//      问不到就退回 world.randomWalkable() 乱逛，单机那一套占点目标只活在浏览器里；
+//   ② 交战分支无条件压过一切 —— 目标一可见就走战斗走位，人被拉出圈，占领进度
+//      永远攒不满（4.5m 圈、独占 4 秒才能占完，来回跑等于白站）。
+// 修法分两层：选点内核在这里（本函数），"进了圈就不被远敌拉走"的驻守在
+// js/ai.js（每帧问 domBotHoldFlag）。判圈口径与 flagsTick 一致再放宽 1.5m：
+// 真正攒进度要站在 4.5m 内，4.5~6m 的圈边也算占点态 —— bot 会被驻守分支朝旗心
+// 推进圈，而不是停在圈外装样子。高度差沿用 flagsTick 的 3m（塔上/坡下不算进圈）。
+export function domBotHoldFlag(flags, x, y, z, team) {
+  let best = null, bestD = 6;
+  for (const f of flags) {
+    if (f.owner === team) continue;
+    const d = Math.hypot(x - f.pos.x, z - f.pos.z);
+    if (d < bestD && Math.abs(y - f.pos.y) < 3) { best = f; bestD = d; }
+  }
+  return best;
+}
+export function domBotGoal(flags, x, y, z, team, rand) {
+  // ① 已在圈内：钉住（hold=true，调用方只微调站位，不许换目标）。
+  // ② 否则 85% 就近挑一个"本队还没占下"的点，15% 随机挑一个（错开人流）。
+  // ③ 全占下了：回防最近的本队点（list 退回全旗）。
+  const hold = domBotHoldFlag(flags, x, y, z, team);
+  if (hold) return { f: hold, hold: true };
+  let near = null, nearD = 1e9, owned = null, ownedD = 1e9;
+  const open = [];
+  for (const f of flags) {
+    const d = Math.hypot(x - f.pos.x, z - f.pos.z);
+    if (f.owner !== team) { open.push(f); if (d < nearD) { near = f; nearD = d; } }
+    else if (d < ownedD) { owned = f; ownedD = d; }
+  }
+  if (near && rand() < 0.85) return { f: near, hold: false };
+  const list = open.length ? open : flags;
+  return { f: list[(rand() * list.length) | 0] || owned, hold: false };
+}
+
 export { WORLD };

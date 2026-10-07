@@ -7,7 +7,7 @@ import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, comput
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
-import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, SAY, SAY_START, ANNOUNCE } from './match-rules.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, SAY, SAY_START, ANNOUNCE } from './match-rules.js';
 import { addLocalXp } from './progress.mjs';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
@@ -145,12 +145,15 @@ export class MPMatch {
   // ---------- 机器人目标 ----------
   botGoal(bot) {
     const w = this.game.world;
-    if (this.type === 'dom' && rng.next() < 0.75) {
-      const cands = this.flags.filter(f => f.owner !== bot.team);
-      const list = cands.length ? cands : this.flags;
-      list.sort((a, b) => a.pos.distanceTo(bot.pos) - b.pos.distanceTo(bot.pos));
-      const f = rng.next() < 0.7 ? list[0] : pick(list);
-      return f.pos.clone().add(new THREE.Vector3(rand(-2.5, 2.5), 0, rand(-2.5, 2.5)));
+    if (this.type === 'dom' && this.flags) {
+      // 占点优先：选点内核在 match-rules.js（与联机 NetRoom.botGoal 共用同一份）——
+      // 圈内钉住 / 85% 就近未占点 / 全占下回防。这里只负责"怎么走到那儿"：
+      // 钉住时 ±1.2m 微调站位，赶路时 ±2.5m 散位（不挤成一个点）。
+      const r = domBotGoal(this.flags, bot.pos.x, bot.pos.y, bot.pos.z, bot.team, () => rng.next());
+      if (r) {
+        const j = r.hold ? 1.2 : 2.5;
+        return r.f.pos.clone().add(new THREE.Vector3(rand(-j, j), 0, rand(-j, j)));
+      }
     }
     const enemies = this.enemiesOf(bot.team);
     if (enemies.length && rng.next() < 0.55) {

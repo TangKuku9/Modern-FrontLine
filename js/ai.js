@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { createSoldierModel, animateSoldier, makeNameTag, applyFlashTex } from './soldier.js';
 import { computeStats, WEAPONS } from './data.js';
 import { fireHitscan, Projectile, hitTestPlayer } from './combat.js';
+import { domBotHoldFlag } from './match-rules.js';
 import { clamp, damp, rand, angleDiff, spreadDir, DEG, pick, rng } from './util.js';
 
 const DIFF = [
@@ -256,6 +257,14 @@ export class Bot {
     const t = this.target;
     const stunned = this.stunT > 0;
     let wantCrouch = false;
+    // dom 占点驻守（用户实测"明明就在点旁边都不占点跑去打人"）：人站在本队还没
+    // 占下的点圈内时，远处的敌人不把他拉出圈 —— 就地警戒/朝旗心站，占领进度照攒
+    // （flagsTick 只看"圈里有没有人"，站着就是进度）。近敌（<26m）照旧交战；
+    // 点占下来后这里返回 null，自然落回常规行为。非 dom 模式 game.mode.flags
+    // 为空，这一支整体不存在，战役/tdm/ffa 零影响。
+    const capFlag = game.mode && game.mode.flags
+      ? domBotHoldFlag(game.mode.flags, this.pos.x, this.pos.y, this.pos.z, this.team)
+      : null;
     // 冲刺:没在交火、不是站桩/被闪、要去的地方还远(>10m)—— 就跑起来(玩家 7.1×mob)。
     // 交火中永远不跑,侧移/蹲才是战斗步态;alerted 前的哨兵巡逻也不跑。goalDist 由
     // steer() 顺路记下;冲刺姿态(A.sprint)与快照位(this.sprinting)在函数尾部喂出。
@@ -266,7 +275,7 @@ export class Bot {
     if (stunned) {
       desired.set(Math.sin(game.time * 2 + this.id) * 1.2, 0, Math.cos(game.time * 1.7 + this.id) * 1.2);
       lookYaw = this.yaw + Math.sin(game.time * 3) * 0.05;
-    } else if (t && this.targetVisible && t.alive) {
+    } else if (t && this.targetVisible && t.alive && (!capFlag || this.pos.distanceTo(t.pos) < 26)) {
       // 战斗
       const eye = this.eyePos(_a);
       const tc = t.chestPos(_b);
@@ -313,6 +322,22 @@ export class Bot {
         if (game.highAlert) game.highAlert(t, this.pos);
         else game.hud.highAlert(this.pos);
       }
+    } else if (capFlag) {
+      // 占点驻守：目标可见就瞄着打（脚不动窝），目标没了就朝旗心站进圈里。
+      // 不走战斗分支的走位（侧移会把他晃出圈），也不走搜索分支（会朝最后目击点
+      // 追出去）。开火条件与战斗分支同一套，只是移动被钉在点上。
+      const d = Math.hypot(capFlag.pos.x - this.pos.x, capFlag.pos.z - this.pos.z);
+      if (d > 2.2) this.steer(capFlag.pos, 3.2, desired);
+      if (t && this.targetVisible && t.alive) {
+        const eye = this.eyePos(_a);
+        const tc = t.chestPos(_b);
+        const dx = tc.x - eye.x, dy = tc.y - eye.y, dz = tc.z - eye.z;
+        const dist = Math.hypot(dx, dz);
+        lookYaw = Math.atan2(-dx, -dz);
+        lookPitch = Math.atan2(dy, dist);
+        const facing = Math.abs(angleDiff(this.yaw, lookYaw)) < 0.25;
+        if (game.time > this.acquireT && facing && this.reloadT <= 0 && this.slideT <= 0) this.tryFire(dt, t, dist);
+      } else if (this.mag < this.stats.mag && this.reloadT <= 0) this.reload();
     } else if (this.lastSeenPos && game.time - this.lastSeenT < 12 && (this.alerted) && !this.static) {
       // 搜索
       const lp = this.lastSeenPos;

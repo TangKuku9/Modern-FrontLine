@@ -25,6 +25,10 @@ import { TileNoise, clamp } from './noise.js';
 //   FLAT0.18 ≈ 10°  路面/平地    ROLLING 0.42 ≈ 23°  可正常行走（导航门槛）
 //   ROAD  0.62 ≈ 32°  **修出来的路**（盘山公路本来就比野地陡，见world.js buildGrid）
 //   STEEP 0.85 ≈ 40°  需要攀爬    CLIFF 更大    挡人
+// 玩家物理（world.js collide）的两挡也用这张表：ROLLING..STEEP 是**爬坡阻力带**
+// （走得上去但越陡越慢，贴 STEEP 处一步一滑），> STEEP 才硬挡。墙取 STEEP 是因为
+// A* 的路点是格子级采样、玩家走连续坐标，路面接缝处两套读数能差 0.1+ —— 墙低于
+// 导航放行口径的话，bot 会被自己的物理墙钉死在缝上。
 export const SLOPE = { FLAT: 0.18, ROLLING: 0.42, ROAD: 0.62, STEEP: 0.85 };
 
 // 一格 cell 的米数。2m：细到能承住"上坡走着硌一下"的体感，粗到一张大图只有几万格。

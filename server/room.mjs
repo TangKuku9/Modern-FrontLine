@@ -13,7 +13,7 @@ import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput, unpackStreak, uavBit, WORLD } from '../js/quant.js';
 import { sanitizeLoadout, kitsOf } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
-import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, SAY, ANNOUNCE } from '../js/match-rules.js';
+import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, domBotGoal, SAY, ANNOUNCE } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
 import { Sentry, Heli, BOT_WEAPONS, randomAtt } from '../js/mp.js';
 import { KILLSTREAKS, DEFAULT_STREAKS, BOT_NAMES } from '../js/data.js';
@@ -733,6 +733,24 @@ export class NetRoom {
     return out;
   }
   enemiesOf(team) { return this.fillEnemies(team, []); }
+
+  // ── Bot 的目标（js/ai.js:behave 每 6~14s 来问一次 game.mode.botGoal）──
+  //
+  // **以前这里没有这个方法** —— ai.js 问不到就退回 world.randomWalkable() 乱逛。
+  // 症状正是用户报的那条：联机房里的 bot 站在占领点旁边也不进圈，满图追着人打
+  // （单机 MPMatch 有 botGoal，所以同一张图单机 bot 会占点、联机 bot 不占）。
+  // dom 走与单机共用的选点内核（js/match-rules.js:domBotGoal）：圈内钉住 /
+  // 85% 就近未占点 / 全占下回防；tdm/ffa 维持乱逛。
+  botGoal(bot) {
+    if (this.flags) {
+      const r = domBotGoal(this.flags, bot.pos.x, bot.pos.y, bot.pos.z, bot.team, () => rng.next());
+      if (r) {
+        const j = r.hold ? 1.2 : 2.5;
+        return new THREE.Vector3(r.f.pos.x + (rng.next() * 2 - 1) * j, r.f.pos.y, r.f.pos.z + (rng.next() * 2 - 1) * j);
+      }
+    }
+    return this.game.world.randomWalkable();
+  }
 
   // ── 往对局里放一个 Bot（房主在房间屏上点的那个「+」）──
   // 它和 addClient 是并列的两条路：真人走「连接 → addClient」，Bot 走「房主名单 → spawnBot」。

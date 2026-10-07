@@ -243,23 +243,28 @@ export const MAPS = {
     // 大起伏由顶点色/坡度交代，贴图只负责近处的质感。
     terrainStride: 16,
     surfaceColor: 0x6a7a4a,        // 小地图的地貌基色
-// 光照：太阳压到**低角度**（sunDir.y 0.28）。这是地形图与平面图最要紧的一处差别 ——
-    // 太阳高时坡面法线都差不多朝上，整片丘陵会被照成一块平色板（实测：截图里
-    // 连绵起伏全糊掉了，只剩剪影）。低角度太阳让朝阳坡亮、背阴坡暗，起伏才读得出来。
-    // 方位取东南偏南（+x/-z）：与图上 A→B 的推进方向大致同侧，开局时玩家面朝图内
-    // 看到的是**顺光**的坡，不用眯眼看地形。
+    // 光照。这张图的光分两层问题，**判据和药方都不一样**，别混：
     //
-    // **亮度三件事一起调，不能只动 sun。** 用户反馈"实在太刺眼"——
-    // 根因是 sun 4.2 + exposure 1.12（六张图里最亮的一组，直射光与曝光叠加）。
-    // 只降 sun 的话背阴坡会变成死黑（实测），因为低角度太阳本来就只点亮朝上的面。
-    // 所以：sun 4.2→2.6（降直射），hemi 0.95→1.5（补环境光），
-    // sky2 调亮让天空给更多漫射，exposure 1.12→0.95（压高光）。
-    // 判据：顺光坡不能过曝成白片，背阴坡要能读出起伏 —— 两者靠这个配比平衡。
+    //   ① 地面亮度/起伏可读性 —— 靠 sun/hemi/exposure 的配比。太阳要保留方向性
+    //      （sunDir.y 0.45 ≈ 30°），朝阳坡亮、背阴坡暗，连绵丘陵才读得出来；
+    //      只降 sun 背阴坡会死黑，所以 hemi 顶在 1.5。
+    //   ② 顺光方向的**天空眩光盘** —— 前两轮反复被报"刺眼"的真凶在这里：太阳低角度
+    //      + 高浊度时，Mie 前向散射把整条地平线糊成一面白墙（用户截图：画面一半
+    //      以上是白的）。降 sun 治不了它，得动天空模型那一组：
+    //      turbidity 3.5 / rayleigh 1.0 / mie 0.0012 + exposure 0.78。
+    //      另外方位角从 +x/-z 挪到**南偏东**（[0.3,0.45,0.72]）：早先的方位正好在
+    //      A 队出站的正前方（A 在西墙朝东看，太阳 dead ahead），开局就是逆光；
+    //      挪开后两队出站都与太阳错开 60° 以上，仰角抬高也把光晕抬离地平线带。
+    //
+    // **改这组数必须实拍验证**（探针做法：真客户端载入 ridges、镜头对准太阳方位
+    // 截屏、量"白斑率"）。实测记录：贴地平线向日 56.9% → 20.6%，直视太阳
+    // 30.6% → 2.9%，背对太阳对照 0.2% → 0.3%（场景均亮 182，不变暗）。
+    // 判据 test/props.mjs B11 盯配比区间；顺光坡不过曝、背阴坡读得出起伏靠这组配比。
     env: {
-      sky: 'day', sunDir: [0.62, 0.28, -0.42], sunColor: 0xffe6bc, sun: 2.6,
+      sky: 'day', sunDir: [0.3, 0.45, 0.72], sunColor: 0xffe6bc, sun: 1.7,
       hemi: 1.5, sky2: 0xd8e8fa, ground: 0x8a7a58, fog: 0xcfdae4, fogDensity: 0.0022,
-      turbidity: 5, rayleigh: 1.4, mie: 0.006, exposure: 0.95,
-      mountains: 'rock', envIntensity: 1.15, weather: 'wind', ambient: 'wind',
+      turbidity: 3.5, rayleigh: 1.0, mie: 0.0012, exposure: 0.78,
+      mountains: 'rock', envIntensity: 0.85, weather: 'wind', ambient: 'wind',
     },
     build(w) {
       const r = mulberry32(71);
@@ -300,14 +305,19 @@ export const MAPS = {
         [cx + dirX * 3, cz + 10], [cx - dirX * 3, cz + 13], [cx, cz - 12],
         [cx + dirX * 8, cz + 12],
       ];
-      for (const [x, z] of spawnRing(RIDGE.spawnA.x, RIDGE.spawnA.z, 1)) {
-        P(x, z);
-        w.sandbags(x + 3, z, 4, Math.PI / 2);
-      }
-      for (const [x, z] of spawnRing(RIDGE.spawnB.x, RIDGE.spawnB.z, -1)) {
-        P(x, z);
-        w.sandbags(x - 3, z, 4, Math.PI / 2);
-      }
+      // **沙袋只放"平台背后"（图缘一侧）两排，不放任何出生点的出站方向上。**
+      // 用户实测"刚复活往前走总卡住"：早一版每点正前方 3m 一排沙袋，7 个出生点
+      // 每个都撞；改成"每点背后 4m"后又踩了第二脚 —— 最外侧两个出生点的背后
+      // 沙袋正好砌在次外侧出生点的出站线上（A#6 的沙袋角压住 A#3/A#4 的直行
+      // 线）。环形排布下"某点的背后"必然是"另一点的侧前方"，逐点摆怎么摆都漏。
+      // 所以只按**平台中心**摆：两排 8m 沙袋贴在平台后缘，距最近的出生点 7m
+      // 以上、距所有出站线更远 —— 掩体感保留，出站方向完全净空。
+      w.sandbags(RIDGE.spawnA.x - 10, RIDGE.spawnA.z - 8, 8, Math.PI / 2);
+      w.sandbags(RIDGE.spawnA.x - 10, RIDGE.spawnA.z + 8, 8, Math.PI / 2);
+      w.sandbags(RIDGE.spawnB.x + 10, RIDGE.spawnB.z - 8, 8, Math.PI / 2);
+      w.sandbags(RIDGE.spawnB.x + 10, RIDGE.spawnB.z + 8, 8, Math.PI / 2);
+      for (const [x, z] of spawnRing(RIDGE.spawnA.x, RIDGE.spawnA.z, 1)) P(x, z);
+      for (const [x, z] of spawnRing(RIDGE.spawnB.x, RIDGE.spawnB.z, -1)) P(x, z);
 
       // ===== 高地 A：北岭 =====
       const buildRidge = (site, topY, faceOut) => {
