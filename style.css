@@ -319,6 +319,25 @@ html, body { position: fixed; inset: 0; }
 .sb-flag { width: 30px; height: 30px; border: 2px solid #fff; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; background: rgba(0,0,0,.4); position: relative; overflow: hidden; }
 .sb-flag.A { border-color: var(--ally); color: var(--ally); }
 .sb-flag.B { border-color: var(--enemy); color: var(--enemy); }
+.sb-flag b { position: relative; z-index: 1; }
+/* ── 据点水圈（占领）：圆容器里的"水" ──
+   底色水（sf-owner）= 归属方整圈染色；活水（sf-cap）= 正在占的队从底部涨上来，
+   水位 = 占领进度；两队同圈僵持（.contested）= 白圈脉冲 + 波浪加速。水位由
+   hud.flagWaters 直写 style（元素活着才有 CSS 过渡，见 hud.js 同名注释）。 */
+.sb-flag .sf-owner, .sb-flag .sf-cap { position: absolute; left: 0; bottom: 0; width: 100%; height: 0; }
+.sb-flag .sf-owner { opacity: .45; }
+.sb-flag.A .sf-owner { background: var(--ally); }
+.sb-flag.B .sf-owner { background: var(--enemy); }
+.sb-flag .sf-cap { opacity: .95; transition: height .25s linear; }
+.sb-flag .sf-cap::after {
+  content: ''; position: absolute; top: -2px; left: -60%; width: 220%; height: 4px;
+  border-radius: 50%; background: inherit;
+  animation: sfWave 2.4s ease-in-out infinite alternate;
+}
+@keyframes sfWave { from { transform: translateX(-12%); } to { transform: translateX(12%); } }
+.sb-flag.contested { border-color: #fff; animation: sfPulse .8s ease-in-out infinite; }
+.sb-flag.contested .sf-cap::after { animation-duration: .9s; }
+@keyframes sfPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); } 50% { box-shadow: 0 0 9px 2px rgba(255,255,255,.65); } }
 #killfeed { position: absolute; right: 24px; top: 24px; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 /* 对局内聊天条（差距 43）：左下角，收起时只有最近 12 秒的几行、不吃鼠标事件 */
 #chatBox { position: absolute; left: 18px; bottom: 132px; width: 360px; font-size: 12px; pointer-events: none; }
@@ -366,7 +385,10 @@ html, body { position: fixed; inset: 0; }
 #prompt { position: absolute; left: 50%; top: 62%; transform: translateX(-50%); font-size: 15px; background: rgba(0,0,0,.55); padding: 6px 16px; display: none; }
 #prompt b { color: var(--acc); border: 1px solid var(--acc); padding: 0 6px; margin-right: 6px; }
 #progress { position: absolute; left: 50%; top: 66%; width: 240px; margin-left: -120px; height: 6px; background: rgba(0,0,0,.6); display: none; }
-#progressFill { height: 100%; width: 0; background: var(--acc); }
+#progressFill { height: 100%; width: 0; background: var(--acc); transition: width .15s linear; }
+/* 混战时进度条冻在原地，颜色是唯一能回答"这是谁的动作"的东西：我方蓝 / 敌方红 */
+#progressFill.ally { background: var(--ally); }
+#progressFill.enemy { background: var(--enemy); }
 #subtitles { position: absolute; left: 50%; bottom: 110px; transform: translateX(-50%); text-align: center; max-width: 70%; font-size: 19px; text-shadow: 0 0 4px #000, 0 0 8px #000; }
 #subtitles .sp { color: var(--acc2); font-weight: 800; margin-right: 8px; }
 #announce { position: absolute; left: 50%; top: 22%; transform: translateX(-50%); text-align: center; font-size: 30px; font-weight: 900; letter-spacing: 6px; text-shadow: 0 0 8px #000; opacity: 0; transition: opacity .3s; white-space: nowrap; }

@@ -217,10 +217,17 @@ export class HUD {
     if (!text) { p.style.display = 'none'; return; }
     p.style.display = 'block'; p.innerHTML = text;
   }
-  progress(v) {
+  // v = 0..1；side = 'ally' | 'enemy'（可选）。混战时进度条会**停在原地不动** ——
+  // 颜色是唯一能回答"这是谁的动作"的东西：我方在占 = 蓝，敌方在夺 = 红。不传 side
+  // 走默认强调色（campaign 的下载/解密条共用这个元素）。
+  progress(v, side) {
     const p = $('progress');
     if (v === null || v === undefined) { p.style.display = 'none'; return; }
-    p.style.display = 'block'; $('progressFill').style.width = (v * 100) + '%';
+    p.style.display = 'block';
+    const f = $('progressFill');
+    f.style.width = (v * 100) + '%';
+    const cls = side === 'ally' ? 'ally' : side === 'enemy' ? 'enemy' : '';
+    if (f._side !== cls) { f._side = cls; f.className = cls; }
   }
   fade(v, dur = 1) { const f = $('fade'); f.style.transition = `opacity ${dur}s`; f.style.opacity = v; }
   scorebar(html) { $('scorebar').innerHTML = html; }
@@ -415,18 +422,57 @@ export class HUD {
     if (!el) return;
     let html = '';
     if (flagsView && flagsView.length) {
-      // 基地卡（data-i=-1）在"没选据点"（sel==null）时高亮 —— 它就是默认那格。
+      // 基地（-1）与据点同规矩：**亲手选了才亮**（sel === i）。没有"默认选中"——
+      // 不选不部署，等待画面里换装备不会被下一波拽走。
       const card = (name, mine, sub, i) => {
-        const on = i === -1 ? sel == null : sel === i;
+        const on = sel === i;
         return `<div class="sp-flag${on ? ' sel' : ''}${mine ? '' : ' dis'}" data-i="${i}"><b>${name}</b><span>${sub}</span></div>`;
       };
-      html = `<div class="sp-hint">点击卡片或按 1/2/3 选择复活点 · 再选一次取消 · 据点越多波间隔越长</div>`
+      html = `<div class="sp-hint">选择复活点（不选不部署）· 点击卡片或按 1/2/3 选据点 · 4 = 基地 · 再选一次取消</div>`
         + `<div class="sp-row">`
         + (baseCd != null ? card('基地', true, `下波 ${baseCd}s`, -1) : '')
         + flagsView.map((f, i) => card(f.name, f.mine, f.mine ? `下波 ${f.cd}s` : (f.label || '未占领'), i)).join('')
         + `</div>`;
     }
     if (el.dataset.sig !== html) { el.innerHTML = html; el.dataset.sig = html; }
+  }
+
+  // ── 顶部记分板的据点水圈（占领）──
+  // 一次调用做两件事：**结构**变了（归属/争夺态/数量）才重建 DOM；水位与水色每拍
+  // 直写 style。分开的原因：水位是"水"，靠 CSS transition 流动 —— 整条 scorebar 的
+  // innerHTML 一重建（约 1Hz）元素就换了人，过渡断成跳变。所以 scorebar 的 html 里
+  // 只放一个空的 #sbFlags 容器，水圈由这里养：scorebar 重建后元素身份变了（el !==
+  // _fwEl）当场重建并立刻写回水位，肉眼看不出接缝。
+  // view = [{ name, owner, cap, prog, contested, myT }]；view 为空清空容器。
+  //   owner  —— 归属方：整圈的"底色水"（己方蓝 / 敌方红，未占领透明），边框与字母沿用旧色。
+  //   cap    —— 正在占的队：从底部涨起来的"活水"，水位 = 占领进度。
+  //   contested —— 两队同圈（僵持，进度冻结）：白圈脉冲 + 波浪加速，一眼看出"正在争"。
+  flagWaters(view) {
+    const el = document.getElementById('sbFlags');
+    if (!el) { this._fwEl = null; return; }
+    if (!view || !view.length) {
+      if (this._fwEl) { el.innerHTML = ''; this._fwEl = null; this._fwSig = ''; this._fwNodes = null; }
+      return;
+    }
+    const sig = view.map(v => `${v.name}:${v.owner || ''}:${v.contested ? 1 : 0}`).join('|');
+    if (el !== this._fwEl || sig !== this._fwSig) {
+      this._fwEl = el; this._fwSig = sig;
+      el.innerHTML = view.map(v => {
+        const own = v.owner === v.myT ? 'A' : v.owner ? 'B' : '';
+        return `<div class="sb-flag ${own}${v.contested ? ' contested' : ''}">`
+          + `<div class="sf-owner" style="height:${v.owner ? 100 : 0}%"></div>`
+          + `<div class="sf-cap"></div><b>${escHtml(v.name)}</b></div>`;
+      }).join('');
+      this._fwNodes = [...el.querySelectorAll('.sf-cap')];
+    }
+    for (let i = 0; i < view.length; i++) {
+      const n = this._fwNodes && this._fwNodes[i];
+      if (!n) continue;
+      const v = view[i];
+      n.style.height = Math.round(clamp(v.prog || 0, 0, 1) * 100) + '%';
+      const col = v.cap === v.myT ? 'var(--ally)' : v.cap ? 'var(--enemy)' : 'transparent';
+      if (n._col !== col) { n._col = col; n.style.background = col; }
+    }
   }
 
   drawMinimap() {

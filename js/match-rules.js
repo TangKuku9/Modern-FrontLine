@@ -137,9 +137,18 @@ export const DEFAULT_SCORE_LIMIT = (mode) => mode === 'dom' ? 200 : mode === 'ff
 //      前几分钟记分板上一片空白，复活扣分（下一条）也无处可扣。
 //   DOM_RESPAWN_COST  —— 阵营每复活一人扣掉的分（onRespawn）。死人也要记账：白给
 //      的复活在把队伍的分往回送，"占着点就稳赢"的滚雪球被这条压住。
+//   DOM_SCORE_ROSTER_NORM —— 涨速的**基准人数**。复活税按人头走（人越多、每秒的
+//      复活扣分越多），产出若还是定速，大房（30v30/50v50）的净涨速就被吃穿 ——
+//      实测 60 人房比分在底分附近爬不动。所以每据点的实际涨速由 MatchRules.
+//      domScoreRate() 给出：DOM_SCORE_PER_SEC × max(1, roster/基准) —— ≤基准夹在
+//      原速（小房的调参一格不动、旧对局逐位复现），超出随总人数线性放大（60 人房
+//      1.5/秒/点、100 人房 2.5/秒/点），净涨速回到基准房的调参值。基准取本地默认
+//      6v6 = 12。rosterSize 由调用方上报：单机在 MPMatch.start（名单开场即定），
+//      联机在 NetRoom.step（逐拍对账真人 + Bot；对局中途进出也跟着走）。
 export const DOM_SCORE_PER_SEC = 0.3;
 export const DOM_START_SCORE = 50;
 export const DOM_RESPAWN_COST = 1;
+export const DOM_SCORE_ROSTER_NORM = 12;
 
 // 占领圈是**同心两层**，占领力按人算、不封顶（单机 MPMatch 与联机 NetRoom 跑同一份账，
 // 半径/力度不许在别处再写字面量）：
@@ -188,6 +197,9 @@ export class MatchRules {
     this.chainBy = new Map();                      // 连杀奖章（双杀/三杀…）的窗口，**按击杀者分账**（键 = 击杀者实体）
     // 判据要能区分"规则没接上"与"规则接上了但没触发"：这两个计数就是那个分界。
     this.kills = 0; this.charged = 0; this.calls = 0;
+    // 当场总人数（涨速用，见 DOM_SCORE_ROSTER_NORM）。0 = 调用方没上报 —— 按基准算，
+    // 裸 MatchRules 的判据与旧版逐位一致。
+    this.rosterSize = cfg.rosterSize || 0;
   }
 
   // 每拍调一次（必须与权威端的 tick 同一个节拍 —— 差一拍不会报错，只会让 UAV
@@ -235,6 +247,16 @@ export class MatchRules {
   resetChains() { this.chainBy.clear(); }
 
   addScore(team, v) { this.scores[team] = (this.scores[team] || 0) + v; }
+
+  // dom 每据点每秒的**实际**涨速（flagsTick 每拍读一次）。产出与当场总人数正相关：
+  // DOM_RESPAWN_COST 按"每复活一人 -1"记账，人数翻倍、每秒的死亡回吐也近似翻倍，
+  // 涨速若是定速，大房的净涨速就被复活税吃穿。≤基准（12）夹在原速 —— 小房调参与
+  // 旧对局逐位不动；超出按 roster/12 线性放大（60 人房 1.5/秒/点、100 人房 2.5/秒/点），
+  // 净涨速回到基准房的调参值。rosterSize 的上报点见 DOM_SCORE_ROSTER_NORM 那条注释。
+  domScoreRate() {
+    const n = this.rosterSize | 0;
+    return n > DOM_SCORE_ROSTER_NORM ? DOM_SCORE_PER_SEC * n / DOM_SCORE_ROSTER_NORM : DOM_SCORE_PER_SEC;
+  }
 
   // 复活扣分（只在 dom 生效，tdm/ffa 里死亡的代价已经由对面的击杀数结算过了）。
   // 下限钳在 0：负分在记分板上没有意义，而且离"到线获胜"只远不近的队不需要再罚。
@@ -553,7 +575,8 @@ export function pickupAction(game, pl, inp, apply = true) {
 // 外圈弱圈每人 1 点力、不封顶（人数就是硬道理）；进度 = DOM_CAP_RATE × 占领力，
 // 整体比旧式子（0.18+0.07×人数、3 人封顶）大幅放缓。两层共用同一道高度差 3m 的门槛
 // （塔上/坡下不算进圈），两支队伍都有人在圈里就是僵持 —— 谁也不涨。空点的回退按
-// DOM_CAP_DECAY/秒。每个据点 DOM_SCORE_PER_SEC/秒 的得分（挂归属不挂人）。
+// DOM_CAP_DECAY/秒。每个据点 domScoreRate()/秒 的得分（挂归属不挂人；基础 0.3，
+// 大房随当场总人数正相关）。
 // 两端共用：
 // 单机在 MPMatch.update、联机在 NetRoom.step 都调它。**只有状态与分数** —— 网格、
 // 颜色、进度条、播报全归调用方（返回值告诉它们发生了什么、点里站着谁）。
@@ -569,6 +592,10 @@ const FLAGS_POOL = [];
 export function flagsTick(flags, rules, entities, dt) {
   const out = FLAGS_OUT;
   out.caps.length = 0;
+  // 涨速整局每拍问一次规则内核（domScoreRate：基础 0.3，大房随当场总人数线性放大）。
+  // 带一道形状守卫：flagsTick 是导出的，判据端可能拿裸对象当 rules —— 那种调用按
+  // 基准速算，与旧版逐位一致。
+  const rate = rules.domScoreRate ? rules.domScoreRate() : DOM_SCORE_PER_SEC;
   let fi = 0;
   for (const f of flags) {
     const slot = FLAGS_POOL[fi] || (FLAGS_POOL[fi] = { f: null, teams: [], cnt: {}, inRange: [], capped: null });
@@ -606,8 +633,10 @@ export function flagsTick(flags, rules, entities, dt) {
       if (f.capTeam && teams.length === 0) f.prog = Math.max(0, f.prog - dt * DOM_CAP_DECAY);
     }
     slot.capped = capped;
-    // 得分挂在**旗**上不挂在人上：谁占着谁涨，DOM_SCORE_PER_SEC/秒/点（单机联机同一条式子）。
-    if (f.owner) rules.addScore(f.owner, dt * DOM_SCORE_PER_SEC);
+    // 得分挂在**旗**上不挂在人上：谁占着谁涨，涨速 = 上面问过的 rate（基础
+    // DOM_SCORE_PER_SEC/秒/点，大房随当场总人数正相关 —— domScoreRate 那条注释）。
+    // 单机联机同一条式子。
+    if (f.owner) rules.addScore(f.owner, dt * rate);
     out.flags[fi++] = slot;
   }
   out.flags.length = fi;

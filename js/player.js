@@ -13,7 +13,10 @@ export const J_PL = ['yaw', 'pitch', 'hp', 'crouchT', 'proneT', 'leanT', 'slideT
   'punchV', 'landDip', 'stepDist', 'revealT', 'sprintLock', 'stunT', 'interactHold',
   'alive', 'crouching', 'proning', 'sprinting', 'sliding', 'onGround'];
 export const J_WS = ['state', 'stateT', 'stateDur', 'adsT', 'cool', 'cycleT', 'triggerHeld', 'rp', 'lastShot',
-  'shotsInRow', 'bobPhase', 'sprintT', 'equipT', 'cooking', 'cookT', 'reloadStage', 'meleeHit'];
+  'shotsInRow', 'bobPhase', 'sprintT', 'equipT', 'cooking', 'cookT', 'reloadStage', 'meleeHit',
+  // swayT/X/Y 是高倍镜悬停漂移的裁决量：X/Y 就是"已经写进 yaw/pitch 的那部分"，
+  // 不登记的话回滚重放会拿滚后残留的漂移量算 delta，视线在每次纠正上抖一下。
+  'swayT', 'swayX', 'swayY'];
 export const J_EXCLUDE = {
   // —— Player ——
   game: '环境引用', ws: '由 J_WS + ammo + cur 覆盖', isPlayer: '常量', name: '常量', team: '常量',

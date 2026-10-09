@@ -28,6 +28,12 @@
 // 边沿旗挂在**连接**上（c.__stall）而不是房间上：挂在房间上时多人同时积压只有第一条
 // 能带 cid，日志读起来像"只有那一个人卡了"，而实际是"这一屋子人都在卡"
 // （房间级旗 + 印 cid 是两种口径混在一起）。
+//
+// buf 两种形态（dom 大房规模化，docs/dom-large-scale-plan.md 阶段 1）：
+//   · 一条共享 Buffer —— 小房（≤AOI 阈值）照旧，一条编码发所有人；
+//   · 一个 `(c) => Buffer` 回调 —— 大房按距离裁剪后的**每人一份**编码。回调排在
+//     背压闸**之后**调用：编码是大房每拍最贵的那一步，给一条马上要丢快照的连接
+//     编一份再丢掉，是把最贵的活花在最没用的地方。
 export function fanout(room, evMsg, buf, backlogBytes, directed = null) {
   let drops = 0;
   const stalls = [];
@@ -48,7 +54,7 @@ export function fanout(room, evMsg, buf, backlogBytes, directed = null) {
       continue;
     }
     c.__stall = false;
-    ws.send(buf, { binary: true });
+    ws.send(typeof buf === 'function' ? buf(c) : buf, { binary: true });
   }
   if (drops) room.__netDrops = (room.__netDrops | 0) + drops;
   return { drops, stalls };

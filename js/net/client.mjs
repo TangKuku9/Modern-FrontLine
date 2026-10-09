@@ -9,7 +9,7 @@ import * as THREE from 'three';
 import { NetPlayer, INTERP_DELAY, setInterpDelay } from './remote.mjs';
 import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
-import { uavFromFlags, SAY, streakOwn, SAY_START, medalSay } from '../match-rules.js';
+import { uavFromFlags, SAY, streakOwn, SAY_START, medalSay, DOM_RADIUS_WEAK } from '../match-rules.js';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { foldJudge } from './idle-ruler.mjs';
@@ -22,6 +22,10 @@ import { Projectile } from '../combat.js';
 import { openSocket, tabNonce } from '../account.js';
 
 const HISTORY = 240;                                 // 回滚窗口，4 秒
+// 快照协议版本（dom 大房规模化阶段 1，docs/dom-large-scale-plan.md）。join 帧带上去，
+// 服务端 ≥2 才对这个座位启用 AOI 裁剪 —— 那一半要客户端会处理"远端玩家暂时缺席"
+// （grace/setFar，见 onSnapshot 尾段），老服务端/老客户端的组合仍然收全量快照。
+const PROTO = 2;
 // 日记本里存得下、且和快照同一时刻可比的那几位旗标（见下面 jFlags 的注释）。
 const FLAG_BASE_MASK = FLAG.Alive | FLAG.Crouch | FLAG.Prone | FLAG.Sprint | FLAG.OnGround | FLAG.Sliding | FLAG.LeanL | FLAG.LeanR;
 // 队伍键的规范形。只放行 'B' 与 'P' 前缀（'P'+cid 是自由混战每人一支的独立队，是
@@ -118,7 +122,7 @@ export class NetClient {
         this._opened = true;
         const j = this._join;
         if (j) { clearTimeout(j.timer); j.timer = setTimeout(() => this.settleJoin(new Error('连接超时：8 秒没等到进场应答')), 8000); }
-        ws.send(JSON.stringify({ t: 'join', room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout, streaks: this.streaks, title: this.title || undefined, view: viewSettingsOf(this.game) }));
+        ws.send(JSON.stringify({ t: 'join', proto: PROTO, room: this.room || 'ffa-1', name: this.name, team: this.team, loadout: this.loadout, streaks: this.streaks, title: this.title || undefined, view: viewSettingsOf(this.game) }));
       };
       ws.onmessage = (m) => {
         if (typeof m.data === 'string') { this.onControl(JSON.parse(m.data)); return; }
@@ -449,9 +453,24 @@ export class NetClient {
         this.game.remotePlayers = [...this.remotes.values()];
       }
       if (r.weaponId === undefined) r.weaponId = 'm4';
+      r.__miss = 0;
+      if (r.far) r.setFar(false);          // AOI 缺席后回来了：藏过的人原样恢复
       r.push(e, now);
     }
-    for (const [id, r] of this.remotes) if (!seen.has(id)) this.beginLeave(r);
+    for (const [id, r] of this.remotes) {
+      if (seen.has(id)) continue;
+      // 快照里缺席的两种语义（proto≥2，服务端按 AOI 裁剪后才会缺席"活着的人"）：
+      //   · 暂时走出 200m —— 应当**藏起来**而不是告别；跑出视野边缘再折返是常态；
+      //   · 真的退房/掉线 —— 才走 beginLeave 的淡出。
+      // 区分只能靠时间：grace 15 份快照（20Hz ≈ 0.75s）。第一份缺席就 setFar(true)
+      //（省得这 0.75s 里留一个瞬移残留），超时仍缺席才按退房处理。proto<2 的老路径
+      // 服务端从不缺席活着的人，维持旧的立即淡出。对**老服务端**的新客户端：缺席仍然
+      // 只会是退房，代价只是淡出推迟 0.75s —— 两个世界都安全。
+      if (PROTO < 2) { this.beginLeave(r); continue; }
+      const miss = (r.__miss = (r.__miss || 0) + 1);
+      if (miss === 1) r.setFar(true);
+      else if (miss > 15) { r.__miss = 0; this.beginLeave(r); }
+    }
   }
 
   // 一个远端实体从权威世界里消失了（注销 / 掉线 / 断在半路）。
@@ -1100,6 +1119,15 @@ export class NetClient {
         this.ensureFlags();
         const f = this.flags && this.flags.find(x => x.name === ev.name);
         if (f) { f.owner = ev.owner; f.prog = ev.prog || 0; }
+      } else if (ev.e === 'domFlags') {
+        // 据点争夺读数（0.5s 一班的轻事件）：顶部水圈与圈内进度条的"实时"靠它 ——
+        // 记分板 2 秒一班太慢，快照是定长协议塞不下。n=名 o=归属 c=正在占的队
+        // p=进度 x=两队同圈（僵持，进度冻结）。
+        this.ensureFlags();
+        for (const s of ev.f || []) {
+          const f = this.flags && this.flags.find(x => x.name === s.n);
+          if (f) { f.owner = s.o; f.cap = s.c; f.prog = s.p; f.contested = !!s.x; }
+        }
       } else if (ev.e === 'matchStats') {
         // 终局个人战绩（权威端报的得分/击杀/死亡/助攻）。命中率不在这儿 —— 打出多少、
         // 命中多少是"我看到的"两个数，与单机同一口径，留在本地 pl.stats 上。
@@ -1132,28 +1160,52 @@ export class NetClient {
     // JSON 帧塞满上行（上行的大头是定长输入包）。
     if (!this.lost && (this.localTick % 60) === 0) this.sendPing();
     // 比分条按 6Hz 刷（每 10 拍）而不是每拍：它是 innerHTML 赋值，60Hz 刷会白掉帧。
-    // 时间条走到秒都看得见，6Hz 足够。
+    // 时间条走到秒都看得见，6Hz 足够。**加签名门**：比分/时间都没变的拍连 6Hz 也不写
+    // —— 重建会把水圈的 DOM 一起拆掉，水位过渡断成跳变（水圈要元素活着才能流动）。
     if ((this.localTick % 10) === 0) {
       const t = Math.max(0, this.timeLeft | 0);
       const mm = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+      let html;
       if (this.ffa) {
         // 自由混战的比分条：我的击杀 + 名次 + 榜首（与单机 MPMatch.hudScore 的 ffa 分支同形）。
         // 右格是**榜首的击杀**，榜首若就是我自己就改显第二名（mp.js:441 的同一守卫）——
         // 少了守卫，领跑者的左格右格是同一个数，看上去就成了"红蓝两队比分相同"。
+        // 大房裁剪（server/room.mjs:pushBoard）后榜单只带前 16 行 + 自己一行：名次读
+        // 服务端排好的 rank 字段，不再 findIndex 数行 —— 我在 16 名开外时行表里只有
+        // 我自己那一行，数行会永远量出"最后一名"。
         const rows = (this.board && this.board.rows) || [];
-        const me = rows.findIndex(r => r.cid === this.cid);
-        const mine = me >= 0 ? rows[me] : null;
+        const me = rows.find(r => r.cid === this.cid) || null;
         const lead = rows[0] && rows[0].cid !== this.cid ? rows[0] : rows[1];
-        hud.scorebar(`<div class="sb-team a"><small style="font-size:10px;color:#9cf">我</small> ${mine ? mine.k : 0}</div><div class="sb-time">${mm}<br><small style="font-size:11px;color:#aaa">第 ${me >= 0 ? me + 1 : '-'} 名</small></div><div class="sb-team b"><small style="font-size:10px;color:#f96">榜首</small> ${lead ? lead.k : 0}</div>`);
+        html = `<div class="sb-team a"><small style="font-size:10px;color:#9cf">我</small> ${me ? me.k : 0}</div><div class="sb-time">${mm}<br><small style="font-size:11px;color:#aaa">第 ${me ? me.rank : '-'} 名</small></div><div class="sb-team b"><small style="font-size:10px;color:#f96">榜首</small> ${lead ? lead.k : 0}</div>`;
       } else {
-        // 占领点的名字条挂在旗顶（与单机 MPMatch.update 的 hudScore/markers 同形）
-        let fl = '';
-        if (this.flags) {
-          const myT = this.game.player && this.game.player.team;
-          fl = `<div class="sb-flags">${this.flags.map(f => `<div class="sb-flag ${f.owner === myT ? 'A' : f.owner ? 'B' : ''}">${f.name}</div>`).join('')}</div>`;
-        }
-        hud.scorebar(`<div class="sb-team a">${Math.floor(this.scores.A)}</div>${fl}<div class="sb-time">${mm}</div><div class="sb-team b">${Math.floor(this.scores.B)}</div>`);
+        // 据点水圈不是普通 html：scorebar 里只放一个空容器，水圈由 hud.flagWaters 养
+        // （结构变了才重建、水位每拍直写 —— 见下面）。数据：domFlags 0.5s 一班 + 记分板兜底。
+        html = `<div class="sb-team a">${Math.floor(this.scores.A)}</div><div class="sb-flags" id="sbFlags"></div><div class="sb-time">${mm}</div><div class="sb-team b">${Math.floor(this.scores.B)}</div>`;
       }
+      if (html !== this._sbSig) { this._sbSig = html; hud.scorebar(html); }
+    }
+    // 据点水圈（dom）：归属/争夺态走结构重建，水位与水色每拍直写（hud.flagWaters 内有门）。
+    if (this.flags) {
+      const myT = this.game.player && this.game.player.team;
+      hud.flagWaters(this.flags.map(f => ({ name: f.name, owner: f.owner, cap: f.cap, prog: f.prog, contested: !!f.contested, myT })));
+      // 圈内占领进度条（dom）：与单机 mp.js 同一口径 —— 我人在弱圈内（高度差 3m 同门槛）
+      // 才显；我方在占（含混战冻结）= 蓝条；敌方在占/夺 = 红条（读作"我们快丢了多少"）。
+      // 联机此前**根本没有这条** —— 圈里争夺的进度对玩家是隐形的（用户报"进度条好像有错"
+      // 的一半真相：不是错，是没有）。
+      const pl0 = this.game.player;
+      let pv = null, side = null;
+      if (pl0 && pl0.alive) {
+        let nf = null;
+        for (const f of this.flags) {
+          if (Math.hypot(pl0.pos.x - f.pos.x, pl0.pos.z - f.pos.z) < DOM_RADIUS_WEAK && Math.abs(pl0.pos.y - f.pos.y) < 3) nf = f;
+        }
+        if (nf) {
+          if (nf.cap === pl0.team) { pv = nf.prog; side = 'ally'; }
+          else if (nf.cap) { pv = nf.prog; side = 'enemy'; }
+          // nf.cap 为空（两队同时进圈、从没人独占过）：没进度可显 —— 与单机同判
+        }
+      }
+      hud.progress(pv, side);
     }
     // 白磷弹的屏幕效果：权威端在放它时把 WhitePhosphorus 位置 10 秒，快照每拍带过来。
     // 这一位以前从来没被写过（server/room.mjs 的 worldFlags 硬编码 0），于是联机里
@@ -1308,7 +1360,13 @@ export class NetClient {
       const f = this.flags.find(x => x.name === s.name);
       // cd/cdAt：波次复活的倒计时 + 到表时刻 —— 死亡画面的卡片拿"读数 + 本地流逝"
       // 插值出"下波几秒"（记分板 2 秒一班，直接读会一跳一跳）。
-      if (f) { f.owner = s.owner; f.prog = s.prog; if (s.cd != null) { f.cd = s.cd; f.cdAt = performance.now() / 1000; } }
+      if (f) {
+        f.owner = s.owner; f.prog = s.prog;
+        if (s.cd != null) { f.cd = s.cd; f.cdAt = performance.now() / 1000; }
+        // cap/contested：谁在占 / 是否两队同圈（水圈与进度条的兜底源 —— 主源是 domFlags）
+        if (s.cap !== undefined) f.cap = s.cap;
+        if (s.contested !== undefined) f.contested = !!s.contested;
+      }
     }
   }
 
@@ -1491,9 +1549,13 @@ export class NetClient {
       + `<td>${r.rank || ''}</td><td>${escHtml(r.name)}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>${r.a || 0}</td></tr>`;
     const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>#</th><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
     const rows = (this.board && this.board.rows) || [];
+    // 大房裁剪的可见性：服务端只推前 16 行 + 自己一行（total 是全房人数）。不给这一句，
+    // "榜单怎么只有这么几个人"就是一条必然出现的客服工单。
+    const total = (this.board && this.board.total) || 0;
+    const cut = total > rows.length ? `<div class="sbnet">榜上 ${rows.length} 人 / 全房 ${total} 人（只列前 16 名与你自己）</div>` : '';
     // 自由混战：一张表按名次排（与单机 MPMatch.scoreboardHTML 同形）—— 分两队的表
     // 在 ffa 里是假的（"我方/敌方"根本不存在）。
-    if (this.ffa) return head('自由混战', 'A') + rows.map(row).join('') + '</table>';
+    if (this.ffa) return cut + head('自由混战', 'A') + rows.map(row).join('') + '</table>';
     const A = rows.filter(r => r.team === this.team), B = rows.filter(r => r.team !== this.team);
     const mine = this.team === 'A' ? this.scores.A : this.scores.B;
     const theirs = this.team === 'A' ? this.scores.B : this.scores.A;
@@ -1502,7 +1564,7 @@ export class NetClient {
     const net = `ping ${Math.round(this.rtt)} ms · 快照 ${this.snaps} 份`;
     return `<div class="sbnet">${net}</div>`
       + head(`我方 · ${Math.floor(mine)}`, 'A') + A.map(row).join('') + '</table>'
-      + head(`敌方 · ${Math.floor(theirs)}`, 'B') + B.map(row).join('') + '</table>';
+      + head(`敌方 · ${Math.floor(theirs)}`, 'B') + B.map(row).join('') + '</table>' + cut;
   }
 
   dispose(keepSocket = false) {

@@ -32,6 +32,11 @@ export const HURT_EVERY = 12;
 // 直升机损伤状态（头顶血量标记 / 七成以下冒烟）的同步节奏（拍）。0.2 s 一条、只在变化时发：
 // 那条百分比是给人看"我还在不在有效输出"的，不需要 60 Hz，而每拍发是纯浪费。
 export const HELI_HP_EVERY = 12;
+// 记分板事件最多带几行（docs/dom-large-scale-plan.md 阶段 0）。board 每 2 s 一班、
+// 全量行数 × 全房扇出是 O(N²)：100 人 ≈ 550 KB/s，仅次于快照的第二条大动脉。
+// 裁剪后每班只推**前 16 行 + 每人自己的一行**（定向事件，见 pushBoard）；终局那一班
+// （endMatch → pushBoard(true)）仍旧全量 —— 结算面板一生只画一次，不在热路径上。
+export const BOARD_MAX_ROWS = 16;
 
 // cid 必须是"这台进程范围内唯一"，不能每个房间各自从 1 开始编号。
 // 各房间自己数的话，房间 A 的 1 号和房间 B 的 1 号同名 —— 只看自己房间时不出事，
@@ -279,10 +284,11 @@ export class NetRoom {
   }
 
   // ── 占领的"在已占点重生"（与单机 js/mp.js:flagSpawn 同一规矩）──
-  // 真人：死亡画面里选的点记在 c.spawnFlag（requestSpawnSel 收帧），**等那面旗的
-  // 下一波**（spawnWavesTick，档位按该队占有数：0点基地5s/1点10s/2点20s/3点30s，
-  // 不管有没有人排都照转）到点随批部署；点在这段等着的时间里被抢走了就退回默认
-  // 出生点，不许落在敌占点上。
+  // 真人：死亡画面里选的点记在 c.spawnFlag —— **三态**：null = 还没选（不部署），
+  // -1 = 亲手选了基地，0..2 = 选了那面旗。选完**等那面旗的下一波**（spawnWavesTick，
+  // 档位按该队占有数：0点基地5s/1点10s/2点20s/3点30s，不管有没有人排都照转）到点
+  // 随批部署；点在这段等着的时间里被抢走了 → 换旗那一拍选点当场作废（见 step 的
+  // caps 循环），回"未选择"，改选之后再走 —— 部署必须出自本人的选择。
   // 落点在**弱占领圈**内随机散布（js/world.js:flagSpawnSpot），朝向沿用 spawnPoint 的式子。
   flagSpot(team, fi) {
     const f = this.flags && this.flags[fi];
@@ -346,7 +352,8 @@ export class NetRoom {
   }
 
   // 波次到点：把排在这面旗上的死者（真人 + Bot）整体放行 —— 同一批走，等的本来就是
-  // 同一趟车。点在等着的时候被抢走的，随同一批退到默认出生点，不落敌占圈。
+  // 同一趟车。选的点被抢走的那一拍选点已作废（step 的 caps 循环）—— 这里的
+  // flagSpot || spawnPoint 兜底是给 Bot 与"恰好同拍翻转"的保险，不落敌占圈。
   deployFlagWave(fi) {
     for (const c of this.clients.values()) {
       if (c.pl.alive || c.spawnFlag !== fi) continue;
@@ -364,11 +371,13 @@ export class NetRoom {
     }
   }
 
-  // 基地波到点：把"没排据点"的死者（真人 spawnFlag==null / Bot __spawnFlag===-1，Bot 的
-  // -1 = 死时决策"队里没有已占点，去基地"）整体放行。每队基地的档位跟该队占有数走。
+  // 基地波到点：把排在这趟车的死者放行。真人必须**亲手选了基地**（spawnFlag === -1）
+  // 才随基地波走 —— null 是"还没选"，不部署（等待画面里换装备/看战场不被波次拽走，
+  // 用户实测"还没来得及换装备就复活了"的根源就是 null 曾被当成"选了基地"）。
+  // Bot 的 -1 = 死时决策"队里没有已占点，去基地"，照旧随批放行。每队基地的档位跟该队占有数走。
   deployBase(team) {
     for (const c of this.clients.values()) {
-      if (c.pl.alive || c.spawnFlag != null || c.pl.team !== team) continue;
+      if (c.pl.alive || c.spawnFlag !== -1 || c.pl.team !== team) continue;
       this.respawnClient(c, this.spawnPoint(team));
     }
     if (!this.game) return;
@@ -416,7 +425,8 @@ export class NetRoom {
     // 其余的人靠 NetRoom.step 传的 pairs 列表被推进。
     const c = {
       cid, pl, name, team, loadout: lo, lastInput: EMPTY_INPUT, q: [], lastQueued: -1, ack: 0, rep: 0, got: false, dead: false, respawnT: 0,
-      // 占领的"在已占点重生"：死亡画面里选的旗子下标（requestSpawnSel 记账，部署那拍清零）。
+      // 占领的"在已占点重生"：**三态** —— null = 还没选（不部署）、-1 = 亲手选了基地、
+      // 0..2 = 选了那面旗（requestSpawnSel 记账，部署那拍清零）。
       spawnFlag: null,
       // —— 对局规则的簿记（每个人一份）——
       // streakDefs：他自带的三项。welcome 回显的就是这一份，HUD 按它画三个槽。
@@ -517,6 +527,11 @@ export class NetRoom {
     // 放在 game.step **之前**是为了让"这一拍排出来的炸弹"被这一拍的 projectiles.update
     // 推进 —— 排在世界前进之后的话，每颗弹都会晚一拍照面出现。
     this.rules.step();
+    // dom 的每据点涨速与**当场总人数**正相关（match-rules.js:domScoreRate）：复活
+    // 扣分按人头走，产出不跟人走的话大房会被复活税吃穿。名单 = 真人 + 士兵 Bot
+    // （直升机/哨戒机枪不复活，不计入）。逐拍对账 O(1) 零分配 —— 对局中途有人进出
+    // 或加减 Bot，下一拍就跟着走，不用在各进出点上散布通知。
+    this.rules.rosterSize = this.clients.size + (this.game.bots ? this.game.bots.length : 0);
     // 每步从队列里取一条；取不到就沿用上一份 —— 掉包时人是站住的，而不是回零乱走。
     // 收集进 scratch（性能审查 B2）：{c, inp, fresh} 包装与下面 game.step 的 {pl, inp}
     // 曾经每拍各分配一整套（60Hz × 每人 × 每房，多房满员时每秒上万个小对象）。
@@ -619,13 +634,31 @@ export class NetRoom {
     // 占领点：规则在 js/match-rules.js:flagsTick（单机跑的是同一份）。换旗那一刻编
     // 两条定向播报 + 一条 flagCap（旗子的颜色要立刻翻，等下一班记分板太慢）。
     if (this.flags) {
-      for (const cap of flagsTick(this.flags, this.rules, this.game.entities, DT).caps) {
+      const ft = flagsTick(this.flags, this.rules, this.game.entities, DT);
+      // 争夺态贴在旗上（domFlags 与记分板都读它）。flagsTick 返回的 teams 是**复用数组**，
+      // 必须当场抄成布尔 —— 留着引用的话下一拍就被覆盖。
+      for (let i = 0; i < this.flags.length; i++) this.flags[i].contested = ft.flags[i].teams.length > 1;
+      // 据点争夺读数（0.5s 一班的轻事件）：顶部水圈与圈内进度条的"实时"就靠这条 ——
+      // 记分板 2 秒一班太慢，快照是定长协议塞不下（协议线刻意不动）。字段压短：
+      // n=名 o=归属 c=正在占的队 p=进度 x=两队同圈（僵持，进度冻结）。
+      if (this.tick % 15 === 0) {
+        this.events.push({
+          e: 'domFlags',
+          f: this.flags.map(f => ({ n: f.name, o: f.owner, c: f.capTeam, p: Math.round(f.prog * 100) / 100, x: f.contested ? 1 : 0 })),
+        });
+      }
+      for (const cap of ft.caps) {
         this.events.push({ e: 'flagCap', name: cap.f.name, owner: cap.team, prog: 0 });
         // 占点两条：屏幕大字与语音**分开给**。以前 text 写成 `已占领 ${name} 点`（带空格），
         // 客户端拿它当语音念出来就是"已占领 A 点"—— 多出来的空格让 TTS 在字母名上
         // 顿一下。SAY 那一侧是模板函数，形状与单机 mp.js 的 `已占领${f.name}点` 逐字相同。
         this.events.push({ e: 'announce', team: cap.team, to: 'own', say: SAY.capOwn(cap.f.name), text: ANNOUNCE.capTitle(cap.f.name) });
         this.events.push({ e: 'announce', team: cap.team, to: 'foes', say: SAY.capFoe(cap.f.name), text: ANNOUNCE.capLostTitle(cap.f.name) });
+        // 换旗那一拍，排在这面旗上的真人选点**当场作废**（回"未选择"）—— 与客户端
+        // 死亡画面的本地清账同一拍；部署必须出自本人的选择，不再"随波退基地"。
+        // Bot 不重选：它那一路的兜底（flagSpot || spawnPoint）照旧退默认出生点。
+        const fi = this.flags.indexOf(cap.f);
+        for (const c of this.clients.values()) if (!c.pl.alive && c.spawnFlag === fi) c.spawnFlag = null;
         for (const e of cap.inRange) {
           if (!e.alive || e.team !== cap.team) continue;
           const cc = this.byPlayer.get(e);
@@ -1077,7 +1110,9 @@ export class NetRoom {
     this.events.push({ e: 'matchOver', winner });
     // 随手补一份**终局记分板**：平时它每 120 拍一班，撞线的那一杀往往落在两班之间 ——
     // 不补的话，结算面板上记分板的击杀列会比 matchStats 少最后一杀（相差的正是那一句）。
-    this.pushBoard();
+    // 终局这一班**必须全量**（pushBoard(true)）：结算面板一生只画一次，且每个要看
+    // "我打了几杀"的人都在名单里 —— 平时那班的 Top-16 裁剪不适用。
+    this.pushBoard(true);
     // ── 战绩**不在这里落库**，只把名单和数字挂到队列上 ──
     // 这里跑在 60 拍/秒的权威循环里。写账号这一步以后完全可能（也理应）变成一次
     // 真的磁盘/网络调用 —— 那时这一行就会吃掉每一拍。所以规则是：
@@ -1121,7 +1156,7 @@ export class NetRoom {
     return list.length ? list[0].cid : null;
   }
 
-  pushBoard() {
+  pushBoard(full = false) {
     const rows = [];
     for (const c of this.clients.values()) {
       // uav = 这个人自己的 UAV 还剩几秒。自由混战的队伍键是每人一支（'P'+cid），
@@ -1138,18 +1173,39 @@ export class NetRoom {
     // 名次是**排序结果**，不是自己算的位次：客户端数第几行就是第几名（排序在服务端做，
     // 两端各排一次的话"你的名次"会因为比较键不同而在两个地方不一样）。
     for (let i = 0; i < rows.length; i++) rows[i].rank = i + 1;
-    this.events.push({
-      e: 'board', tick: this.tick,
+    // 公共段（比分/时间/旗子/基地波次）对全房是同一份值；行表按下面的裁剪规则分装。
+    const base = {
       scores: { A: Math.round(this.rules.scores.A), B: Math.round(this.rules.scores.B) },
       timeLeft: Math.round(this.rules.timeLeft()),
       uav: { A: this.rules.uavActive('A'), B: this.rules.uavActive('B') },
-      // 占领点的归属/进度随记分板走（2 秒一份）；换旗那一拍另有 flagCap 事件顶着即时性。
+      // 占领点的归属/进度随记分板走（2 秒一份）；换旗那一拍另有 flagCap 事件顶着即时性，
+      // cap/contested（谁在占 / 是否两队同圈）是水圈与进度条的兜底同步源 —— 主源是 domFlags（0.5s 一班）。
       // cd 是波次复活的那一档倒计时（向上取整到秒）—— 死亡画面的选点卡片拿它画"下波几秒"。
       // baseCd 同理：每队基地的下一波还有几秒（基地也是复活点）。
-      flags: this.flags ? this.flags.map(f => ({ name: f.name, owner: f.owner, prog: Math.round(f.prog * 100) / 100, cd: Math.ceil(f.spawnCd == null ? 0 : f.spawnCd) })) : undefined,
+      flags: this.flags ? this.flags.map(f => ({ name: f.name, owner: f.owner, prog: Math.round(f.prog * 100) / 100, cd: Math.ceil(f.spawnCd == null ? 0 : f.spawnCd), cap: f.capTeam, contested: !!f.contested })) : undefined,
       baseCd: this.baseCd ? { A: Math.ceil(this.baseCd.A == null ? 0 : this.baseCd.A), B: Math.ceil(this.baseCd.B == null ? 0 : this.baseCd.B) } : undefined,
-      rows,
-    });
+      total: rows.length,
+    };
+    // 小房（行数没超）走**一条全房层事件**，形状与从前逐字节同形 —— 现有判据
+    // （test/room-flow 的 board 段）量的就是这条路。终局那班也走这里（全量）。
+    if (full || rows.length <= BOARD_MAX_ROWS) {
+      this.events.push({ e: 'board', tick: this.tick, ...base, rows });
+      return;
+    }
+    // 大房裁剪：前 16 行是人人相同的**共享行对象**（只 push 引用，不复制）；
+    // 每人自己的一行单独定向（fanout:splitEvents 的 to:'self' 通道）—— 自己那一行
+    // 不能省：连杀进度（sk）、FFA 的"我的名次/击杀"、死亡画面的读数都从它来。
+    // 每班 N 条定向事件的 JSON 是按连接各编各的（directedFor），这条 O(N) 的字符串
+    // 开销换来行表从 O(N²) 降到 O(N)。
+    const top = rows.slice(0, BOARD_MAX_ROWS);
+    const byCid = new Map(rows.map(r => [r.cid, r]));
+    for (const c of this.clients.values()) {
+      const me = byCid.get(c.cid);
+      this.events.push({
+        e: 'board', tick: this.tick, ...base, to: 'self', cid: c.cid,
+        rows: me && me.rank > BOARD_MAX_ROWS ? top.concat([me]) : top,
+      });
+    }
   }
 
   // ── 局内换配装（死亡画面 / 暂停菜单里的那一屏）──
@@ -1182,13 +1238,17 @@ export class NetRoom {
   }
 
   // 占领：死亡画面里选"在哪个已占点重生"（{t:'spawnSel', flag}，net-server 路由进来）。
-  // 只认"确实躺着的人"与"这一刻仍归他队所有"的点；**再选同一面旗 = 取消**（回默认
-  // 倒计时）。选完不立即动身 —— 波次到点由 deployFlagWave 随批放行，点在等着的时候
-  // 被抢走了也是那一刻退默认出生点。与 respawn 同一纪律：结算封盘后不认，活着的人选不动。
+  // 只认"确实躺着的人"与"这一刻仍归他队所有"的点；**再选同一面旗 = 取消**（回"未选择"）。
+  // flag === -1 是基地：也是一种**选择**（不再是"没选"的默认值 —— 不选不部署），
+  // 再选一次同样取消。选完不立即动身 —— 波次到点由 deployFlagWave / deployBase 随批
+  // 放行；选的点在等着的时候被抢走了，换旗那一拍选点作废（见 step 的 caps 循环）。
+  // 与 respawn 同一纪律：结算封盘后不认，活着的人选不动。
   requestSpawnSel(cid, flag) {
     const c = this.clients.get(cid);
     if (!c || this.matchOverSent || c.pl.alive) return false;
-    if (!Number.isInteger(flag) || !this.flags || !this.flags[flag]) return false;
+    if (!Number.isInteger(flag) || !this.flags) return false;
+    if (flag === -1) { c.spawnFlag = c.spawnFlag === -1 ? null : -1; return true; }   // 基地：选/取消
+    if (!this.flags[flag]) return false;
     if (c.spawnFlag === flag) { c.spawnFlag = null; return true; }   // 再选一次 = 取消
     if (this.flags[flag].owner !== c.pl.team) return false;
     c.spawnFlag = flag;

@@ -61,7 +61,7 @@ export const CFG = {
   map: process.env.MAP || 'yard',
   seed: int(process.env.SEED, 20260925),
   maxRooms: int(process.env.MAX_ROOMS, 32),            // 每进程房间数上限（每房间一份完整 sim）
-  maxClients: int(process.env.MAX_CLIENTS, 128),       // 每进程真人连接上限
+  maxClients: int(process.env.MAX_CLIENTS, 200),       // 每进程真人连接上限（64 座大房 + 候厅余量，见 docs/dom-large-scale-plan.md 阶段 0）
   maxPayload: int(process.env.MAX_PAYLOAD, 64 * 1024), // 单帧字节上限：正常一帧 ≤ 16×60 = 960 B
   roomIdleMs: int(process.env.ROOM_IDLE_MS, 60000),    // 空房间多久收掉
   // 单条连接的下行积压上限（字节）。ws.send 只是往内核缓冲排队，TCP 零窗（手机切后台、
@@ -738,6 +738,9 @@ function enterMatch(room, ws, { name, team, loadout, streaks, account, view = nu
     return null;
   }
   const c = room.addClient({ name, team, loadout, streaks, account, view });
+  // 协议版本（dom 大房规模化阶段 1）：join 帧上的 proto 戳到座位上。≥2 的客户端才会
+  // 收到 AOI 裁剪后的快照 —— 它有 grace/setFar 那一半；老客户端收全量（aoiEncode 的退路）。
+  c.proto = ws.__proto || 1;
   ws.__cid = c.cid; ws.__room = room; c.ws = ws;
   return c;
 }
@@ -1088,10 +1091,65 @@ function snapScratch(room) {
   if (!room.__snapScratch) room.__snapScratch = new DataView(new ArrayBuffer(HEADER_SIZE + 128 * ENTITY_SIZE));
   return room.__snapScratch;
 }
+
+// ── 距离 AOI（dom 大房规模化阶段 1，docs/dom-large-scale-plan.md）──────────────────
+// 全量快照是 O(N²) 下行：50v50 满房每人 418 kbps、出口 42 Mbps，挡门的不是 CPU 是带宽。
+// 裁法：只把"这一位看得见的世界"编进他那份快照 —— 距离外的敌人从快照里消失（不是看不见，
+// 是服务器不再为一段 200m 外的枪声给他发 26 字节）。队友**恒在**：小地图、名牌、计分
+// 都依赖全队名单，砍队友省不下多少字节却退化一堆体验。
+// 阈值（AOI_MIN_ENTITIES）以下保持一条共享缓冲：16 人房逐字节回到旧形状，一分 CPU 不多花。
+const AOI_MIN_ENTITIES = 24;   // 快照实体超过这个数才值得按人各编一份（30v30=60、50v50=100）
+const AOI_ENTER = 200;         // 进入半径：200m 外的敌人不进你的快照
+const AOI_EXIT = 220;          // 退出半径：进了"远"档的人要走近到这一档内才回来 —— 边界上
+                               // 反复进出 = 客户端反复"淡出/重建一个人"，比多发 26 字节贵得多
+// 按人各留一块持久编码缓冲。不能共用房间那块 snapScratch：同一次 broadcast 里 A 编完
+// send（异步落盘）之后 B 再编，会把 A 还没写进 socket 的字节盖掉 —— 与 snapScratch
+// 注释里"不能全进程共享"是同一条理由，只是尺度缩到了同一拍之内。挂连接上，断线即随
+// client 对象一起回收，没有清理路径要走。
+function aoiScratch(c) {
+  // 128 与 snapScratch 同容：proto<2 的老客户端在 50v50（100 实体）退回全量，也要装得下
+  if (!c.__snapBuf) c.__snapBuf = new DataView(new ArrayBuffer(HEADER_SIZE + 128 * ENTITY_SIZE));
+  return c.__snapBuf;
+}
+// 编出**这一位客户端**的快照： 自己恒在（ack 那一格是他自己的输入回执，缺席 = reconcile 断粮）；
+//  队友恒在（team 就是 teamIndex 后的那 1 字节，比房间里的 team 字符串好查）； 敌人按
+// 滞回距离裁。proto<2 的老客户端退回全量：它没有 grace/setFar 那一半（js/net/client.mjs
+// 的 onSnapshot），把 AOI 裁剪发给它的症状是"远处的人凭空消失"，比多发字节糟得多。
+function aoiEncode(room, snap, seq) {
+  const enter2 = AOI_ENTER * AOI_ENTER, exit2 = AOI_EXIT * AOI_EXIT;
+  return (c) => {
+    const me = room.clients.get(c.cid);
+    if (!me || !me.pl || (c.proto ?? 1) < 2) {
+      const { view, byteLength } = encodeSnapshot({ ...snap, seq }, aoiScratch(c));
+      return Buffer.from(view.buffer, 0, byteLength);
+    }
+    const far = c.__aoiFar || (c.__aoiFar = new Set());
+    const px = me.pl.pos.x, py = me.pl.pos.y, pz = me.pl.pos.z;
+    const myTeam = me.pl.team === 'B' ? 1 : 0;
+    const subset = [];
+    for (const e of snap.entities) {
+      if (e.id === c.cid || e.team === myTeam) { far.delete(e.id); subset.push(e); continue; }
+      const dx = e.x - px, dy = e.y - py, dz = e.z - pz;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      // 已在"远"档的按 220 判退出，否则按 200 判进入 —— 这两档之差就是滞回
+      if (far.has(e.id) ? d2 <= exit2 : d2 <= enter2) { far.delete(e.id); subset.push(e); }
+      else far.add(e.id);
+    }
+    const { view, byteLength } = encodeSnapshot({ ...snap, entities: subset, seq }, aoiScratch(c));
+    return Buffer.from(view.buffer, 0, byteLength);
+  };
+}
 function broadcast(room) {
-  const { view, byteLength } = encodeSnapshot({ ...room.snapshot(), seq: (room.seq = (room.seq || 0) + 1) }, snapScratch(room));
-  // 一份 Buffer 发给这个房间的所有人：ws.send 不会改写传入的 Buffer，没必要每人再拷一次。
-  const buf = Buffer.from(view.buffer, 0, byteLength);
+  const seq = (room.seq = (room.seq || 0) + 1);
+  // snapshot() 顺手盖章"这一拍已发给本房每个人"（lastSnapSent，延迟补偿的窗右端）。
+  // AOI 不改它的语义：缺席的实体在客户端本来就不在他的世界里，"已知世界已送达"仍成立。
+  const snap = room.snapshot();
+  // 小房：一条共享 Buffer 发所有人（与旧形状逐字节相同，test/net-audit 的判据全绿）。
+  let shared = null;
+  if (snap.entities.length <= AOI_MIN_ENTITIES) {
+    const { view, byteLength } = encodeSnapshot({ ...snap, seq }, snapScratch(room));
+    shared = Buffer.from(view.buffer, 0, byteLength);
+  }
   // 事件在这里一次排干（splice），再交给 fanout —— **顺序与去留的纪律在
   // server/fanout.mjs 里**（事件排在背压闸之前、次序上先事件后快照，以及为什么）。
   // 搬出去的理由只有一个：那份文件能被判据在进程内直接用假 ws 量，而这一份不能
@@ -1104,7 +1162,7 @@ function broadcast(room) {
   const layer = ev.length ? splitEvents(ev) : null;
   const evMsg = layer && layer.shared.length ? JSON.stringify({ t: 'ev', tick: room.tick, ev: layer.shared }) : null;
   const directed = layer ? (c) => directedFor(layer, c, room.tick) : null;
-  const { stalls } = fanout(room, evMsg, buf, CFG.wsBacklogBytes, directed);
+  const { stalls } = fanout(room, evMsg, shared || aoiEncode(room, snap, seq), CFG.wsBacklogBytes, directed);
   for (const s of stalls) console.log(`[room ${room.id}] cid ${s.cid} 下行积压 ${s.backlog} B，跳过快照（TCP 零窗？）`);
 }
 
@@ -1206,6 +1264,10 @@ wss.on('connection', (ws, req) => {
   const handleTextFrame = async (data) => {
     try {
       const msg = JSON.parse(String(data));
+      // 协议版本戳记（阶段 1）：join 帧带 proto ≥ 2 的客户端才收 AOI 裁剪快照。
+      // 戳在 ws 上（不是座位上）—— enterMatch 那一刻才转抄到座位；大厅帧不戳，
+      // 大厅没有快照可裁。
+      if (msg.t === 'join' && msg.proto != null) ws.__proto = Number(msg.proto) || 1;
       if (msg.t === 'join') {
         // 一条连接只许进一个房间：反复 join 会往房间里塞出一串没人退出的玩家
         //（removeClient 只认最后那一份 ws.__cid），表现是"幽灵玩家"占着出生点。

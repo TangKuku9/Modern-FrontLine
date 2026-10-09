@@ -54,8 +54,9 @@ export class MPMatch {
     this.scores = this.rules.scores;
     this.respawns = [];
     this.flags = null;
-    // 占领的"在已占点重生"：死了之后按 1/2/3 选旗（下标），部署那拍兑现；点丢了由
-    // flagSpawn 退回默认出生点。死亡时清零 —— 上一次命的选择不跟到下一次。
+    // 占领的"在已占点重生"：**三态** —— null = 还没选（不部署）、-1 = 亲手选了基地、
+    // 0..2 = 选了那面旗。部署那拍兑现并清零；点丢了回"未选择"，改选之后再走。
+    // 上一次命的选择不跟到下一次（死亡时清零）。
     this.spawnFlag = null;
     this.active = [];
     this.canChangeClass = true;
@@ -91,6 +92,9 @@ export class MPMatch {
     const enemyCount = this.ffa ? (this.cfg.enemies ?? 7) : this.cfg.enemies ?? 6;
     for (let i = 0; i < allyCount; i++) this.addBot('A', names[ni++ % names.length], def.styles[0]);
     for (let i = 0; i < enemyCount; i++) this.addBot(this.ffa ? 'F' + i : 'B', names[ni++ % names.length], this.ffa ? pick([def.styles[1], 'enemy', 'insurgent']) : def.styles[1]);
+    // dom 的每据点涨速与当场总人数正相关（match-rules.js:domScoreRate）：单机名单
+    // 开场即定 —— 队友 + 敌人 + 玩家自己。FFA 没有"队伍产出"，报了也无害。
+    this.rules.rosterSize = allyCount + enemyCount + 1;
     const mname = { tdm: '团队死斗', dom: '占领', ffa: '自由混战' }[this.type];
     if (this.type === 'dom') {
       this.flags = w.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null, mesh: flagMesh(game, p) }));
@@ -213,13 +217,14 @@ export class MPMatch {
       this.respawns.splice(i, 1);
     }
   }
-  // 基地波到点：把"没排据点"的死者（玩家 spawnFlag==null / Bot r.flag==null）整体放行。
+  // 基地波到点：把排在这趟车的死者放行。真人必须**亲手选了基地**（spawnFlag === -1）
+  // 才随基地波走 —— null 是"还没选"，不部署（等待画面里换装备/看战场不被波次拽走）；
+  // Bot 死时决策没有已占点（r.flag==null）的排基地波，照旧随批放行。
   deployBase(team) {
     for (let i = this.respawns.length - 1; i >= 0; i--) {
       const r = this.respawns[i];
       if (r.e.team !== team || r.e.alive) continue;
-      const want = r.e.isPlayer ? this.spawnFlag : r.flag;
-      if (want != null) continue;                 // 排了据点的走据点波
+      if (r.e.isPlayer ? this.spawnFlag !== -1 : r.flag != null) continue;   // 真人：null = 未选择
       const sp = this.spawnPoint(team);
       if (r.e.isPlayer) this.deployPlayer(sp);
       else {
@@ -239,31 +244,41 @@ export class MPMatch {
       if (el) el.textContent = r.t > 0 ? `${Math.ceil(r.t)} 秒后重新部署…` : '按 [空格] 重新部署';
       return;
     }
-    // dom：复活全程走波次（基地与据点同档 CD）。选点键的边沿自记 keys 的上一帧；
-    // 主文案给"当前等的那一趟"读数，卡片给全部复活点（含基地）。
+    // dom：复活全程走波次（基地与据点同档 CD），且**不选不部署** —— 死亡时不再被
+    // 预定到基地，等待画面里换装备/看战场不会被下一波拽走（用户实测的痛点）。
+    // 选点键的边沿自记 keys 的上一帧：1/2/3 选据点、4 选基地，键与卡片点击都收口到
+    // spawnSelectPick。主文案给"当前等的那一趟"读数，卡片给全部复活点（含基地）。
     const prev = this._spKeys || {};
-    for (let k = 0; k < this.flags.length; k++) {
+    const nF = this.flags.length;
+    for (let k = 0; k < nF; k++) {
       const down = !!game.input.keys['Digit' + (k + 1)];
       if (down && !prev[k] && this.flags[k].owner === pl.team) this.spawnSelectPick(k);
     }
-    this._spKeys = this.flags.map((f, k) => !!game.input.keys['Digit' + (k + 1)]);
-    if (this.spawnFlag != null && this.flags[this.spawnFlag].owner !== pl.team) this.spawnFlag = null;
+    const baseDown = !!game.input.keys['Digit' + (nF + 1)];
+    if (baseDown && !prev.base) this.spawnSelectPick(-1);
+    this._spKeys = {};
+    for (let k = 0; k < nF; k++) this._spKeys[k] = !!game.input.keys['Digit' + (k + 1)];
+    this._spKeys.base = baseDown;
+    if (this.spawnFlag != null && this.spawnFlag >= 0 && this.flags[this.spawnFlag].owner !== pl.team) this.spawnFlag = null;
     const cd = f => Math.max(0, Math.ceil(f.spawnCd == null ? 0 : f.spawnCd));
     const baseLeft = Math.max(0, Math.ceil(this.baseCd[pl.team] == null ? 0 : this.baseCd[pl.team]));
-    const sel = this.spawnFlag != null ? this.flags[this.spawnFlag] : null;
-    if (el) el.textContent = sel
-      ? `已选 ${sel.name} 点 · 下波 ${cd(sel)} 秒集体部署`
-      : `基地 · 下波 ${baseLeft} 秒`;
+    const sel = this.spawnFlag != null && this.spawnFlag >= 0 ? this.flags[this.spawnFlag] : null;
+    if (el) el.textContent = this.spawnFlag === -1
+      ? `已选 基地 · 下波 ${baseLeft} 秒集体部署`
+      : sel
+        ? `已选 ${sel.name} 点 · 下波 ${cd(sel)} 秒集体部署`
+        : `选择复活点 · 点击卡片或按 1/2/3（4 = 基地）`;
     game.hud.spawnSelect(this.flags.map(f => ({
       name: f.name, mine: f.owner === pl.team, cd: cd(f),
       label: f.owner == null ? '未占领' : '敌方',
     })), this.spawnFlag, baseLeft);
   }
-  // 单机选点的唯一入口（键与卡片点击都走它）：再选同一面旗 = 取消，回默认倒计时。
+  // 单机选点的唯一入口（键与卡片点击都走它）：再选同一面旗 = 取消，回"未选择"。
+  // i === -1 是基地：也是一种选择（再按一次取消）。不选不部署。
   // 联机那份在 main.js:spawnSelectPick —— 服务端把"再选同一面旗"当取消（requestSpawnSel）。
   spawnSelectPick(i) {
     if (!this.game.dead) return;
-    if (i === -1) { this.spawnFlag = null; return; }
+    if (i === -1) { this.spawnFlag = this.spawnFlag === -1 ? null : -1; return; }
     if (!this.flags || !this.flags[i] || this.flags[i].owner !== this.game.player.team) return;
     this.spawnFlag = this.spawnFlag === i ? null : i;
   }
@@ -495,6 +510,9 @@ export class MPMatch {
       // 跑的是同一份。这一段只剩表现：进度条、旗帜颜色、+200 弹窗与播报。
       const ft = flagsTick(this.flags, this.rules, game.entities, dt);
       for (const { f, teams, inRange, capped } of ft.flags) {
+        // 争夺态贴在旗上给水圈读数（hudScore 用）：两队同圈 = 僵持。teams 是 flagsTick
+        // 的复用数组，当场抄成布尔。
+        f.contested = teams.length > 1;
         // "我在圈里"的口径跟弱圈走（两层圈里都出力，都该看见进度条）；高度差由
         // flagsTick 那侧裁，这里只管水平距离。
         const pd = pl.alive && Math.hypot(pl.pos.x - f.pos.x, pl.pos.z - f.pos.z) < DOM_RADIUS_WEAK;
@@ -509,9 +527,16 @@ export class MPMatch {
           }
           game.hud.progress(null);
         } else if (teams.length === 1 && teams[0] !== f.owner) {
-          if (pd && teams[0] === pl.team) game.hud.progress(f.prog);
+          // 我方独占在占：蓝条往前走。
+          if (pd && teams[0] === pl.team) game.hud.progress(f.prog, 'ally');
         } else if (teams.length !== 1) {
-          if (pd && teams.length > 1) game.hud.progress(f.prog);
+          // 混战（两队都在圈）：进度冻在原地 —— 但**这是谁的动作**必须看得出来。
+          // capTeam 是敌是友染色：敌方正在夺我方点时，这条红bar读作"我们快丢了多少"，
+          // 而不是以前的固定强调色（分不清是谁在占 —— 用户报的"进度条好像有错"）。
+          if (pd && teams.length > 1) {
+            if (f.capTeam) game.hud.progress(f.prog, f.capTeam === pl.team ? 'ally' : 'enemy');
+            else game.hud.progress(null);        // 两队同时进圈、从没人独占过：没进度可显
+          }
         } else if (f.owner === teams[0] && pd) game.hud.progress(null);
         if (!pd && this.nearFlag === f) game.hud.progress(null);
         if (pd) this.nearFlag = f; else if (this.nearFlag === f) this.nearFlag = null;
@@ -582,11 +607,18 @@ export class MPMatch {
       // 同数（自己超自己时右格显第二名），看起来像比分出了问题（联机同款，client.mjs）。
       html = `<div class="sb-team a"><small style="font-size:10px;color:#9cf">我</small> ${pl.stats.kills}</div><div class="sb-time">${t}<br><small style="font-size:11px;color:#aaa">第 ${me + 1} 名</small></div><div class="sb-team b"><small style="font-size:10px;color:#f96">榜首</small> ${lead.e.isPlayer ? (r[1] ? r[1].k : 0) : lead.k}</div>`;
     } else {
-      let flags = '';
-      if (this.flags) flags = `<div class="sb-flags">${this.flags.map(f => `<div class="sb-flag ${f.owner === pl.team ? 'A' : f.owner ? 'B' : ''}">${f.name}</div>`).join('')}</div>`;
-      html = `<div class="sb-team a">${Math.floor(this.scores.A)}</div>${flags}<div class="sb-time">${t}</div><div class="sb-team b">${Math.floor(this.scores.B)}</div>`;
+      // 据点水圈不是普通 html：水位的 CSS 过渡需要元素**活着**，所以 scorebar 里只放
+      // 一个空容器，水圈由 hud.flagWaters 养（结构变了才重建，水位每拍直写 style）。
+      html = `<div class="sb-team a">${Math.floor(this.scores.A)}</div><div class="sb-flags" id="sbFlags"></div><div class="sb-time">${t}</div><div class="sb-team b">${Math.floor(this.scores.B)}</div>`;
     }
-    game.hud.scorebar(html);
+    // 签名门（60Hz 模拟拍上的 innerHTML 赋值必须加门 —— 铁律同款）：比分取整、时间
+    // 取秒，一秒内绝大多数拍这里一行 DOM 都不写。重建顺带重建水圈容器，水位下一拍
+    // 由 flagWaters 原样写回，肉眼看不出接缝。
+    if (html !== this._sbSig) { this._sbSig = html; game.hud.scorebar(html); }
+    // 水圈读数每拍直写（归属/争夺态走结构重建，水位与水色走 style）。
+    if (this.flags) game.hud.flagWaters(this.flags.map(f => ({
+      name: f.name, owner: f.owner, cap: f.capTeam, prog: f.prog, contested: !!f.contested, myT: pl.team,
+    })));
   }
   ranking() {
     const game = this.game, pl = game.player;

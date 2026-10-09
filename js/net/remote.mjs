@@ -161,6 +161,9 @@ export class NetPlayer {
   beginLeave() {
     if (this.leaving) return;
     this.leaving = true; this.leaveT = 0;
+    // AOI 藏着的人也要走淡出：先解除隐藏 —— 淡出要看得见，root.visible=false 的模型
+    // 淡完了也没人看见，症状是"他退出对局了，画面上那个残影直接瞬消"。
+    if (this.far) this.setFar(false);
     this.targetable = false;                   // 已经不在权威世界里了：不许再被打
     this.alive = false;
     const clones = new Map();                  // 原材质 → 私有 clone（同一次淡出内共享）
@@ -175,6 +178,18 @@ export class NetPlayer {
     for (const m of this._fadeMats) m.transparent = true;
   }
   get fadedOut() { return this.leaving && this.leaveT >= LEAVE_FADE; }
+
+  // ── AOI 的"远了"（dom 大房规模化阶段 1）──
+  // 服务端按距离裁快照（200m 进 / 220m 退出滞回），他缺席的这段时间里：
+  //   · 模型与名牌藏起 —— 但**不是** beginLeave：他没走，只是走出了 200m；
+  //   · 插值缓冲截短到 2 —— 回来时插值直接从最新两包起步，不重演 0.75s 的旧轨迹；
+  //   · update() 整个短路（见那里）—— 插值/骨骼/枪声/脚步对一个看不见的人全是白烧。
+  setFar(v) {
+    if (this.far === v) return;
+    this.far = v;
+    this.model.root.visible = !v;
+    if (v) { this.revealT = 0; if (this.buf.length > 2) this.buf.length = 2; }
+  }
 
   push(s, now) {
     this.buf.push({ t: now, s });
@@ -232,12 +247,18 @@ export class NetPlayer {
   // （144Hz 下移动依旧丝滑），只有两骨 IK + 落骨这一坨按 ≥1/60 的节拍跑，dt 用
   // 累进的真实帧时 —— 动画速度与 60Hz 驱动同速。按 60Hz 驱动（net-feel、锁 60 的
   // 渲染）时每拍必发，行为与旧代码一致。animRuns 给判据数（net-feel 的 C3 段）。
+  // 距离 LOD（阶段 1）：快照本来就是 20Hz，30m 外的人腿上那点 60Hz 细节根本看不出来
+  // —— 30m 内 60Hz（原值），80m 内 15Hz，更远 5Hz。100 人同屏的房间里骨骼 IK 是
+  // 按人头计费的，这一档把"远处的多数"从每帧最贵的那一项里摘出去。
   _anim(dt) {
     this._animT = (this._animT || 0) + dt;
-    if (this._animT < ANIM_MIN_DT) return;
+    const me = this.game.player;
+    const d = me ? Math.hypot(this.pos.x - me.pos.x, this.pos.z - me.pos.z) : 0;
+    const min = d < 30 ? ANIM_MIN_DT : d < 80 ? (1 / 15) : (1 / 5);
+    if (this._animT < min) return;
     this.animRuns = (this.animRuns || 0) + 1;
     animateSoldier(this.model, this.anim, this._animT);
-    this._animT %= ANIM_MIN_DT;
+    this._animT %= min;
   }
 
   update(dt, now = performance.now() / 1000) {
@@ -251,6 +272,10 @@ export class NetPlayer {
       if (this.tag) this.tag.visible = false;
       return;
     }
+    // AOI 藏着的人（setFar(true)，快照里暂时缺席）：模型已藏，插值/骨骼/枪声/脚步
+    // 对一个看不见的人全是白烧 —— 整个短路。他回到 200m 内时 onSnapshot 会先
+    // setFar(false) 再 push，下一帧从这里继续。
+    if (this.far) return;
     this.drives = (this.drives || 0) + 1;     // 插值有没有真的被驱动：没跑起来时 pos 会一直停在构造点
     const target = now - INTERP_DELAY;
     const buf = this.buf;

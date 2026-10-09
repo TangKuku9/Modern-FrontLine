@@ -63,7 +63,11 @@ export class LobbyClient {
       let done = false;
       const finish = (err) => { if (done) return; done = true; clearTimeout(timer); err ? rej(err) : res(this); };
       const timer = setTimeout(() => finish(new Error('连不上对局服务 ' + this.url)), TIMEOUT_MS);
-      ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'lobby' })); } catch { /* 立刻断了 */ } };
+      // proto 随 hello 报一遍（dom 大房规模化阶段 1）：它不参与大厅任何判定，服务端
+      // 也不回读 —— 这里带上的意义只有一条链：留一台"大厅探针/第三方工具"在协议里
+      // 亮明自己版本的位置，免得将来大厅帧要版本化时找不到先例。真正的快照版本
+      // 戳记在 join 帧上（js/net/client.mjs 的 PROTO）。
+      ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'lobby', proto: 2 })); } catch { /* 立刻断了 */ } };
       ws.onerror = () => finish(new Error('连接出错（服务是否在跑、地址对不对）'));
       ws.onclose = (ev) => {
         // 「连上之后断」与「压根没连上」是两件事，通知的面也不同（M9）：

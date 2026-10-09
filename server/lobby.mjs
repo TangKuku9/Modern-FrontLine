@@ -17,14 +17,17 @@
 // ── 权限在这里，不在界面上 ──
 // 谁能开局、开局要满足什么条件、聊天能发多快，全部在服务端判一遍。客户端把"开始"
 // 按钮置灰只是体验；改得动的东西不算权限（和 /api/rooms 的 401、WS 握手的 401 同源）。
-import { MP_MAPS, MP_MODES, MP_MINUTES, scoreOptions, mapAllowed, mapsForMode, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
+import { MP_MAPS, MP_MODES, MP_MINUTES, minutesOptions, DEFAULT_MINUTES, scoreOptions, mapAllowed, mapsForMode, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
 import { DEFAULT_SCORE_LIMIT } from '../js/match-rules.js';
 
-// 一间的上限。和 net-server:pickRoom 里那个"人最多且没满"的 16 是同一个数 ——
+// 一间的上限。和 net-server:pickRoom 里那个"人最多且没满"是同一个数 ——
 // 两处各写一份的话，改一处的症状是"列表说还能进、进去说满了"。
-export const MAX_SEATS = 16;
+// 64 = dom 30v30 的落点（docs/dom-large-scale-plan.md 阶段 0）：真正的护栏不是这个数，
+// 而是广播/记分板那几条 O(N²) 的路径（board Top-N 裁剪与快照 AOI 是同一批落地的配套）。
+// Bot 也占这一格：坐几个人、放几个 Bot 都从这里出（net-server:pickRoom import 同一常量）。
+export const MAX_SEATS = 64;
 export const MAX_PER_TEAM = MAX_SEATS / 2;
-// Bot 与真人**共用一个上限**：一间房里 16 个位置，坐几个人、放几个 Bot 都从这一格里出。
+// Bot 与真人**共用一个上限**：一间房里 64 个位置，坐几个人、放几个 Bot 都从这一格里出。
 // 给 Bot 另设一个上限的话，"列表说还能进、进去说满了"那种错位又回来了（这就是 seats
 // 那一条注释里已经数过的同一个形状）。
 // 难度三档的**名字表**在 js/data.js（房间屏也要画它）；这里只认下标。
@@ -79,8 +82,10 @@ const modeGate = (v) => (v == null || v === '' || MODE_IDS.has(v))
   ? null : `「${MODE_NAMES[v] || v}」的胜负判定还没接进服务器，这里只能开 ${MODE_LIST}`;
 // 时长那张表在 js/data.js（两端都要读它，抄两份的话界面会给出服务端不认的值）。
 export const MINUTES = MP_MINUTES;
-const MIN_SET = new Set(MINUTES);
-const cleanMinutes = (v) => { const n = Number(v); return MIN_SET.has(n) ? n : 10; };
+// 时长档位**按模式换表**（js/data.js:minutesOptions）：dom 是 15/25/35 那一档
+// （占点涨分慢，3/5 分钟的局刚进入状态就到点），一张 Set 打天下会把 dom 房里的
+// 3 分当合法时长收下 —— 与下面 cleanScore 的教训同一句。
+const cleanMinutes = (v, mode) => { const n = Number(v); return minutesOptions(mode).includes(n) ? n : DEFAULT_MINUTES(mode); };
 // 胜利目标那格与时长同一套规矩：不认的值**退回该模式的默认**（DEFAULT_SCORE_LIMIT），
 // 而不是退回一个写死的数 —— 三种模式的目标语义不同（击杀数 / 占领分数）。
 // 静默换值的症状与时长那条一样：房间标题上写的数从此是假的。
@@ -456,7 +461,7 @@ export class Lobby {
     const at = this.seat(ws);
     if (at) this.leaveRoom(ws);
     const room = this._mkRoom(id, flat(msg.title, 24), mapId,
-      mode, cleanMinutes(msg.minutes), cleanScore(msg.scoreLimit, mode));
+      mode, cleanMinutes(msg.minutes, mode), cleanScore(msg.scoreLimit, mode));
     room.hostKey = hostKey;
     const seat = this._seat(ws, msg.name, msg.loadout, msg.xp, msg.account, msg.streaks, msg.view);
     seat.ready = true;                      // 房主不用点准备：他按下开始就是他的准备
@@ -586,7 +591,10 @@ export class Lobby {
     if (msg.title != null) room.title = flat(msg.title, 24);
     if (MAP_IDS.has(msg.map)) room.mapId = msg.map;
     if (MODE_IDS.has(msg.mode)) room.mode = msg.mode;
-    if (MIN_SET.has(Number(msg.minutes))) room.minutes = Number(msg.minutes);
+    // 时长那格与目标同一套规矩：档位按**这一帧要落成的模式**验（js/data.js:minutesOptions
+    // —— dom 是 15/25/35，别把 tdm 房的 10 分当成 dom 的合法时长收下），不认的退回
+    // 该模式的默认。没带这格（老客户端 / 只改别的设置）就保持原值 —— 与地图/模式那两格同一句。
+    if (msg.minutes != null) room.minutes = cleanMinutes(msg.minutes, newMode);
     // 胜利目标。没带这格（老客户端 / 只改别的设置）就保持原值 —— 与地图/模式那两格同一句。
     // 档位按**这一帧要落成的模式**验：同帧同时改模式与目标的老客户端也要算对。
     if (msg.scoreLimit != null) room.scoreLimit = cleanScore(msg.scoreLimit, newMode);

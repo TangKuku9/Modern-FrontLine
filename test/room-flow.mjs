@@ -12,6 +12,10 @@
 import { WebSocket } from 'ws';
 import { withServer } from './with-server.mjs';
 import { HEADER_SIZE, ENTITY_SIZE } from '../server/codec.mjs';
+import { minutesOptions, DOM_MINUTES } from '../js/data.js';
+// 满员判据读**服务端的常量**，不抄字面 16：上限一改（dom 大房规模化 16→64，docs/dom-large-scale-plan.md），
+// 抄字面量的判据就整段假红 —— 这一节的上一版正是这么红的。
+import { MAX_SEATS } from '../server/lobby.mjs';
 
 let bad = 0, n = 0;
 const ok = (label, cond, info = '') => {
@@ -326,6 +330,21 @@ try {
   const dft200 = await h.until(j => j.t === 'room' && j.room && j.room.score === 200, 6000);
   ok('dom 里 50 不再是合法目标（退回 dom 的默认 200，不是收下也不是 tdm 的 50）',
     !!dft200, JSON.stringify(dft200 && dft200.room && dft200.room.score));
+
+  // ── 时长那格：与目标同一套规矩（档位按模式换表，不认的退回该模式默认）──
+  // 房间状态帧里时长那一格叫 time（server/lobby.mjs:brief 的 time: room.minutes）。
+  ok('两端共读一张表：minutesOptions 的 dom 档就是 15/25/35（界面画什么服务端认什么）',
+    JSON.stringify(minutesOptions('dom')) === JSON.stringify(DOM_MINUTES)
+    && JSON.stringify(DOM_MINUTES) === JSON.stringify([15, 25, 35])
+    && JSON.stringify(minutesOptions('tdm')) === JSON.stringify([3, 5, 10, 15]),
+    JSON.stringify([minutesOptions('dom'), minutesOptions('tdm')]));
+  h.send({ t: 'roomCfg', minutes: 35 });
+  const ok35 = await h.until(j => j.t === 'room' && j.room && j.room.time === 35, 6000);
+  ok('dom 的时长档位是 15/25/35：35 收得下', !!ok35, JSON.stringify(ok35 && ok35.room && ok35.room.time));
+  h.send({ t: 'roomCfg', minutes: 10 });
+  const dft25 = await h.until(j => j.t === 'room' && j.room && j.room.time === 25, 6000);
+  ok('dom 里 10 不再是合法时长（退回 dom 的默认 25，不是收下也不是 tdm 的 10）',
+    !!dft25, JSON.stringify(dft25 && dft25.room && dft25.room.time));
   h.send({ t: 'roomCfg', mode: 'tdm' });
   const errT = await h.until(j => j.t === 'err', 4000);
   ok('ridges 房里把模式改成 tdm 被拒（两格各自合法、拼在一起非法也要拦）',
@@ -350,6 +369,22 @@ try {
     !!rejR2 && /双丘战区/.test(rejR2.msg || '') && /占领/.test(rejR2.msg || ''), JSON.stringify(rejR2 && rejR2.msg));
   ok('【反证】被拒的建房没有留下开成一半的房',
     !(await apiRooms(srv3.base)).some(x => x.id === 'ridge2'), '');
+  // ── 时长那格的反证臂：tdm 不认 dom 的档位 —— "按模式换表"不是"两张表并成一张" ──
+  // 建房是重帧，与上面 ridge2 那次之间按 M7 歇 300ms（同一条理由）。
+  await sleep(300);
+  h3c.send({ t: 'createRoom', room: 'minroom', name: '壬3b', mode: 'tdm', minutes: 25 });
+  const okMin = await h3c.until(j => j.t === 'room' && j.room && j.room.id === 'minroom', 6000);
+  ok('tdm 建房带 dom 档的 25 分被退回 tdm 默认 10（两张档位表不合并）',
+    !!okMin && okMin.room.time === 10, JSON.stringify(okMin && okMin.room && okMin.room.time));
+  h3c.send({ t: 'roomCfg', minutes: 10 });
+  const ok10 = await h3c.until(j => j.t === 'room' && j.room && j.room.time === 10, 6000);
+  ok('tdm 的档位仍是 3/5/10/15：10 收得下（先决臂）', !!ok10, JSON.stringify(ok10 && ok10.room && ok10.room.time));
+  // dom 建房不填时长：兜到 dom 的默认 25（"没填"拿该模式的默认，与不填图兜 ridges 同一句）。
+  await sleep(300);
+  h3c.send({ t: 'createRoom', room: 'minroom2', name: '壬3c', mode: 'dom' });
+  const okDm = await h3c.until(j => j.t === 'room' && j.room && j.room.id === 'minroom2', 6000);
+  ok('dom 建房不填时长兜到 dom 的默认 25 分（不是 tdm 的 10）',
+    !!okDm && okDm.room.time === 25, JSON.stringify(okDm && okDm.room && okDm.room.time));
   h3c.close();
   h.close();
   srv3.kill();
@@ -385,7 +420,7 @@ try {
   await p.until(j => j.t === 'room' && j.botSkill === 1, 6000);
   ok('加了 Bot 之后一个人就能开局（这正是"加 Bot"这一项存在的理由）',
     !!i1 && i1.canStart === true, JSON.stringify(i1 && { canStart: i1.canStart, why: i1.why }));
-  ok('Bot 占位置：列表上那一格人数把它算进去了（不然"2/16"点进去只看见一个人）',
+  ok('Bot 占位置：列表上那一格人数把它算进去了（不然"2/16"这种读数点进去只看见一个人）',
     (await apiRooms(srv4.base)).find(x => x.id === 'botroom')?.players === 2,
     JSON.stringify((await apiRooms(srv4.base)).find(x => x.id === 'botroom')));
 
@@ -402,20 +437,29 @@ try {
     (await apiRooms(srv4.base)).find(x => x.id === 'botroom')?.bots === 1);
 
   // ── 满员 ──
+  // 63 连发会吃满 HEAVY_BURST=40/10s 的突发额度，被速率闸丢掉的帧**不算** botFull ——
+  // 所以分批走稳态额度（4/s），每轮轮询列表直到顶格。
   p.frames.length = 0;
-  for (let k = 0; k < 20; k++) p.send({ t: 'botAdd' });
-  await sleep(500);
+  for (let k = 0; k < 24; k++) p.send({ t: 'botAdd' });        // 第一批：突发额度内的安全数
+  for (let t0 = Date.now(); Date.now() - t0 < 30000;) {
+    if (((await apiRooms(srv4.base)).find(x => x.id === 'botroom') || {}).players >= MAX_SEATS) break;
+    for (let k = 0; k < 4; k++) p.send({ t: 'botAdd' });
+    await sleep(1000);
+  }
   const rowI = (await apiRooms(srv4.base)).find(x => x.id === 'botroom') || {};
-  ok('加满为止：Bot 与真人共用一个 16 的上限（不是给 Bot 另开一个池子）',
-    rowI.players === 16 && rowI.bots === 14, JSON.stringify({ players: rowI.players, bots: rowI.bots }));
+  ok(`加满为止：Bot 与真人共用一个 ${MAX_SEATS} 的上限（不是给 Bot 另开一个池子）`,
+    rowI.players === MAX_SEATS && rowI.bots === MAX_SEATS - 2, JSON.stringify({ players: rowI.players, bots: rowI.bots }));
+  // 顶格之后再补 8 发（稳态额度 2 秒正好放行）——撞上限的拒绝要数得出来
+  for (let k = 0; k < 8; k++) p.send({ t: 'botAdd' });
+  await sleep(2100);
   ok('加不进去的那几次在 /healthz 上数得出来（静默失效要显形）',
     (await health(srv4.base)).lobby.botFull >= 5, `botFull=${(await health(srv4.base)).lobby.botFull}`);
 
   // ── 减 Bot（只在等待态能改：开局那一刻名单就被读进 sim 了）──
   p.send({ t: 'botDel' });
-  const i3 = await p.until(j => j.t === 'room' && (j.bots || []).length === 13, 6000);
+  const i3 = await p.until(j => j.t === 'room' && (j.bots || []).length === MAX_SEATS - 3, 6000);
   ok('房主减一个：名单当场少一格（减的是最后加的那个）',
-    !!i3 && (i3.bots || []).length === 13 && (await health(srv4.base)).lobby.botDel === 1,
+    !!i3 && (i3.bots || []).length === MAX_SEATS - 3 && (await health(srv4.base)).lobby.botDel === 1,
     JSON.stringify(i3 && (i3.bots || []).length));
   q.send({ t: 'botDel' });
   const rejD = await q.until(j => j.t === 'err', 4000);
@@ -431,7 +475,7 @@ try {
   // 而权威端的 Bot 照样在开枪、照样裁决伤害 —— 那比不加 Bot 更糟。
   const botOthers = (wp2 && wp2.others || []).filter(o => o.bot);
   ok('Bot 随 welcome 一起下发（客户端按这一份建插值缓存与名牌）',
-    botOthers.length === 13, `others 里 ${botOthers.length} 个 Bot（共 ${(wp2 && wp2.others || []).length}）`);
+    botOthers.length === MAX_SEATS - 3, `others 里 ${botOthers.length} 个 Bot（共 ${(wp2 && wp2.others || []).length}）`);
   // 套件（差距 29）：others 每一格都要带 kits —— 远端模型按它建。两条分支各查一条：
   // 真人那支是 kitsOf(loadout)，Bot 那支是"手上那把枪"那一格（concat 出来的那半最容易漏，
   // 漏了的症状是"Bot 全是素枪"，而它不报错）。
@@ -447,11 +491,11 @@ try {
   // 包长反推实体数：HEADER_SIZE + n×ENTITY_SIZE。这条同时证明 Bot 编进了快照、
   // 且每实体的字节数没有漂（趴姿那轮把实体从 25 加宽到 26 时,就是这两条先红的）。
   const entN = p.lastBytes() ? (p.lastBytes() - HEADER_SIZE) / ENTITY_SIZE : -1;
-  ok('快照里确实是 15 个实体（2 人 + 13 Bot，包长反推，不是读服务端的对象）',
-    entN === 15, `${p.lastBytes()} 字节 → ${entN} 个实体`);
+  ok(`快照里确实是 ${MAX_SEATS - 1} 个实体（2 人 + ${MAX_SEATS - 3} Bot，包长反推，不是读服务端的对象）`,
+    entN === MAX_SEATS - 1, `${p.lastBytes()} 字节 → ${entN} 个实体`);
   // 反证臂：这条红了 = 快照里根本没有 Bot（或者每实体的字节数被改了）
-  ok('【反证】包长是整数个实体（HEADER_SIZE + 15×ENTITY_SIZE，不是被别的字段挤歪）',
-    p.lastBytes() === HEADER_SIZE + 15 * ENTITY_SIZE, `${p.lastBytes()} 字节`);
+  ok(`【反证】包长是整数个实体（HEADER_SIZE + ${MAX_SEATS - 1}×ENTITY_SIZE，不是被别的字段挤歪）`,
+    p.lastBytes() === HEADER_SIZE + (MAX_SEATS - 1) * ENTITY_SIZE, `${p.lastBytes()} 字节`);
   // 反证臂②：对局中不能再改名单 —— 那份名单在开局那一刻就被读进 sim 了，
   // 半路插人的症状是"场上凭空多一个人"，而客户端的名册是在 welcome 里一次性给的。
   p.send({ t: 'botAdd', team: 'A' });
@@ -463,13 +507,13 @@ try {
   p.close();
   const i2 = await q.until(j => j.t === 'room' && j.me && j.me.isHost === true, 8000);
   ok('房主离开后移交给另一个真人（Bot 不会变成房主 —— 它没有那条连接）',
-    !!i2 && i2.me.isHost === true && (i2.bots || []).length === 13, JSON.stringify(i2 && { host: i2.me.name, bots: (i2.bots || []).length }));
+    !!i2 && i2.me.isHost === true && (i2.bots || []).length === MAX_SEATS - 3, JSON.stringify(i2 && { host: i2.me.name, bots: (i2.bots || []).length }));
   q.close();
   srv4.kill();
 
   console.log('\n── L：自动补人（补满 / 真人优先 / 关掉的三种方式）──');
   // 缺口原文是"Bot 不自动补人"：人不够时只能房主一个个点，而且**真人来了没人让位** ——
-  // 一间被 Bot 填满的房在列表上写着 16/16，谁也进不来，那就成了一间死房。
+  // 一间被 Bot 填满的房在列表上写着满员，谁也进不来，那就成了一间死房。
   // 所以这一节量三件事：① 补满是真的（先决：开之前名单是空的）；② 真人优先（判別臂：
   // 人进来总数不变而 Bot 少一个、人走了 Bot 补回来）；③ 三种"不再补"（反证臂：
   // 对局中改不动、关掉之后不补、手动减一个自动关）。
@@ -487,22 +531,22 @@ try {
 
   // ── ① 打开：当场补满 ──
   fa.send({ t: 'roomCfg', fill: true });
-  const fl1 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
-  ok('打开自动补人：这一间当场补到 16（1 人 + 15 Bot），不用等下一个人才生效',
-    !!fl1 && fl1.fill === true && fl1.bots.length === 15,
+  const fl1 = await fa.until(j => j.t === 'room' && (j.bots || []).length === MAX_SEATS - 1, 6000);
+  ok(`打开自动补人：这一间当场补到 ${MAX_SEATS}（1 人 + ${MAX_SEATS - 1} Bot），不用等下一个人才生效`,
+    !!fl1 && fl1.fill === true && fl1.bots.length === MAX_SEATS - 1,
     JSON.stringify({ fill: fl1 && fl1.fill, bots: fl1 && fl1.bots.length }));
   ok('补满之后房主一个人就能开局（这正是"自动补人"这一项存在的理由）',
     !!fl1 && fl1.canStart === true, JSON.stringify(fl1 && { canStart: fl1.canStart, why: fl1.why }));
-  ok('补位置这件事在 /healthz 上数得出来（自动加了 15 个）',
-    ((await health(srvF.base)).lobby.botAuto | 0) - auto0 === 15,
+  ok(`补位置这件事在 /healthz 上数得出来（自动加了 ${MAX_SEATS - 1} 个）`,
+    ((await health(srvF.base)).lobby.botAuto | 0) - auto0 === MAX_SEATS - 1,
     `botAuto ${auto0} → ${(await health(srvF.base)).lobby.botAuto}`);
-  // 全塞进一个队的症状是"16 人房，一边 15 个 Bot、一边 1 个人"，而界面上只写着 16/16。
+  // 全塞进一个队的症状是"满员房，一边全 Bot、一边 1 个人"，而界面上只写着满员。
   const sides = fl1 ? fl1.bots.reduce((m, b) => (m[b.team] = (m[b.team] || 0) + 1, m), {}) : {};
   ok('补出来的 Bot 两队分摊（A/B 相差不超过 1，不是全塞一队）',
-    Math.abs((sides.A || 0) - (sides.B || 0)) <= 1 && (sides.A || 0) + (sides.B || 0) === 15, JSON.stringify(sides));
+    Math.abs((sides.A || 0) - (sides.B || 0)) <= 1 && (sides.A || 0) + (sides.B || 0) === MAX_SEATS - 1, JSON.stringify(sides));
   const rowF = (await apiRooms(srvF.base)).find(x => x.id === 'fill') || {};
-  ok('列表上这一格写着 16/16 且带 Bot 数（别人按它挑房，得看得见这是补出来的）',
-    rowF.players === 16 && rowF.bots === 15, JSON.stringify({ players: rowF.players, bots: rowF.bots }));
+  ok(`列表上这一格写着 ${MAX_SEATS}/${MAX_SEATS} 且带 Bot 数（别人按它挑房，得看得见这是补出来的）`,
+    rowF.players === MAX_SEATS && rowF.bots === MAX_SEATS - 1, JSON.stringify({ players: rowF.players, bots: rowF.bots }));
 
   // ── ② 真人优先：满的房里也进得来，且总数不变 ──
   const give0 = (await health(srvF.base)).lobby.botGive | 0;
@@ -511,58 +555,58 @@ try {
   const f2a = await fa.until(j => j.t === 'room' && j.seats && j.seats.length === 2, 6000);
   ok('补满的房里真人照样进得来（真人优先 —— 不然这间就是一间谁也进不去的死房）',
     !!fl2 && !!f2a, JSON.stringify({ 乙: fl2 && fl2.me && fl2.me.name, 甲看到座位: f2a && f2a.seats.length }));
-  ok('进来一个人、让位一个 Bot：总数仍是 16，Bot 少一个、真人多一个',
-    !!f2a && f2a.seats.length === 2 && f2a.bots.length === 14,
+  ok('进来一个人、让位一个 Bot：总数仍是满员，Bot 少一个、真人多一个',
+    !!f2a && f2a.seats.length === 2 && f2a.bots.length === MAX_SEATS - 2,
     JSON.stringify({ seats: f2a && f2a.seats.length, bots: f2a && f2a.bots.length }));
   ok('让位在 /healthz 上数得出来（不然"我的 Bot 怎么少了一个"只能靠猜）',
     ((await health(srvF.base)).lobby.botGive | 0) - give0 === 1,
     `botGive ${give0} → ${(await health(srvF.base)).lobby.botGive}`);
   // 反证臂：这条红了 = 让位是一次性的（每来一个人这间就少一格），而这间房在列表上
-  // 会慢慢从 16/16 掉下去 —— 与"补人"这个名字说的正好相反，且没有任何一处报错。
+  // 会慢慢从满员掉下去 —— 与"补人"这个名字说的正好相反，且没有任何一处报错。
   fb.close();
-  const fl3 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
+  const fl3 = await fa.until(j => j.t === 'room' && (j.bots || []).length === MAX_SEATS - 1, 6000);
   ok('【反证】那个人走了之后位置补回来（让位不是一次性的减法）',
-    !!fl3 && fl3.bots.length === 15 && fl3.seats.length === 1,
+    !!fl3 && fl3.bots.length === MAX_SEATS - 1 && fl3.seats.length === 1,
     JSON.stringify({ seats: fl3 && fl3.seats.length, bots: fl3 && fl3.bots.length }));
 
   // ── ③ 三种"不再补" ──
-  // ③a 关掉：场上的 Bot 留着，只是不再补。判別臂：减掉一个之后**停在 15**。
+  // ③a 关掉：场上的 Bot 留着，只是不再补。判別臂：减掉一个之后**停住**。
   fa.send({ t: 'roomCfg', fill: false });
   const fl4 = await fa.until(j => j.t === 'room' && j.fill === false, 6000);
   ok('关掉补人：场上的 Bot 留着不动（关 = 把补出来的全删了的话，房主手动摆的也没了）',
-    !!fl4 && fl4.bots.length === 15, JSON.stringify({ fill: fl4 && fl4.fill, bots: fl4 && fl4.bots.length }));
+    !!fl4 && fl4.bots.length === MAX_SEATS - 1, JSON.stringify({ fill: fl4 && fl4.fill, bots: fl4 && fl4.bots.length }));
   const del0 = (await health(srvF.base)).lobby.botDel | 0;
   fa.send({ t: 'botDel' });
-  await fa.until(j => j.t === 'room' && (j.bots || []).length === 14, 6000);
+  await fa.until(j => j.t === 'room' && (j.bots || []).length === MAX_SEATS - 2, 6000);
   await sleep(500);
-  ok('【判別臂】关掉之后不再补：减了一个就停在 14（补人还开着的话这里会自己涨回 15）',
-    ((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots === 14
+  ok('【判別臂】关掉之后不再补：减了一个就停住（补人还开着的话这里会自己涨回去）',
+    ((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots === MAX_SEATS - 2
     && ((await health(srvF.base)).lobby.botDel | 0) - del0 === 1,
     `bots=${((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots}`);
 
   // ③b 手动减一个 = 顺手关掉补人（减了立刻补回来的话，房主看到的是"点了减，名单纹丝不动"）。
   fa.send({ t: 'roomCfg', fill: true });
-  const fl5 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
+  const fl5 = await fa.until(j => j.t === 'room' && (j.bots || []).length === MAX_SEATS - 1, 6000);
   ok('【先决】重新打开补人又补满（不然下面"手动减一个"量的不是开着的那一档）',
-    !!fl5 && fl5.fill === true && fl5.bots.length === 15, JSON.stringify({ fill: fl5 && fl5.fill, bots: fl5 && fl5.bots.length }));
+    !!fl5 && fl5.fill === true && fl5.bots.length === MAX_SEATS - 1, JSON.stringify({ fill: fl5 && fl5.fill, bots: fl5 && fl5.bots.length }));
   fa.send({ t: 'botDel' });
-  const fl6 = await fa.until(j => j.t === 'room' && (j.bots || []).length === 14, 6000);
+  const fl6 = await fa.until(j => j.t === 'room' && (j.bots || []).length === MAX_SEATS - 2, 6000);
   ok('手动减一个 Bot：补人**自己关掉**（并说一声），不是把减掉的那个立刻补回来',
-    !!fl6 && fl6.fill === false && fl6.bots.length === 14, JSON.stringify({ fill: fl6 && fl6.fill, bots: fl6 && fl6.bots.length }));
+    !!fl6 && fl6.fill === false && fl6.bots.length === MAX_SEATS - 2, JSON.stringify({ fill: fl6 && fl6.fill, bots: fl6 && fl6.bots.length }));
   await sleep(500);
-  ok('【判別臂】关掉之后名单停在 14（没有"减了又补"那种死循环）',
-    ((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots === 14);
+  ok('【判別臂】关掉之后名单停在减一（没有"减了又补"那种死循环）',
+    ((await apiRooms(srvF.base)).find(x => x.id === 'fill') || {}).bots === MAX_SEATS - 2);
 
   // ③c 对局中改不动。这一格读的是**打完回房间那一帧**：中途那句 roomCfg 被丢掉的话，
   //     fill 到那时候仍然是 true（liveEnded 那条路照旧按补人把房间留着）。
   fa.send({ t: 'roomCfg', fill: true });
-  await fa.until(j => j.t === 'room' && (j.bots || []).length === 15, 6000);
+  await fa.until(j => j.t === 'room' && (j.bots || []).length === MAX_SEATS - 1, 6000);
   fa.frames.length = 0;
   fa.send({ t: 'start' });
   const flW = await fa.until(j => j.t === 'welcome', 15000);
   const flBots = ((flW && flW.others) || []).filter(o => o.bot).length;
-  ok('补出来的 15 个 Bot 随开局一起进对局（补人不是只补在名单上）',
-    !!flW && flBots === 15, `others 里 ${flBots} 个 Bot`);
+  ok(`补出来的 ${MAX_SEATS - 1} 个 Bot 随开局一起进对局（补人不是只补在名单上）`,
+    !!flW && flBots === MAX_SEATS - 1, `others 里 ${flBots} 个 Bot`);
   fa.send({ t: 'roomCfg', fill: false });
   fa.send({ t: 'roomCfg', mode: 'ffa' });
   const overF = await fa.until(j => j.t === 'ev' && (j.ev || []).some(e => e.e === 'matchOver'), 25000);
@@ -571,7 +615,7 @@ try {
     !!overF && !!backF && backF.fill === true && backF.room.mode === 'tdm',
     JSON.stringify(backF && { fill: backF.fill, mode: backF.room.mode }));
   ok('打完回房间照旧是满的（下一局还是随时能开，不用房主再点一遍）',
-    !!backF && backF.bots.length === 15, JSON.stringify(backF && backF.bots.length));
+    !!backF && backF.bots.length === MAX_SEATS - 1, JSON.stringify(backF && backF.bots.length));
   fa.close();
   srvF.kill();
 

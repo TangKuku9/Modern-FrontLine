@@ -527,7 +527,8 @@ class Game {
   // 能做的事：把那个数字画出来，以及把"时间到了"转成一条上行请求。
   // 倒计时走完之前**不发**：服务端那条闸门会把它丢掉（server/room.mjs:requestRespawn），
   // 而"发了却没生效"在客户端是完全看不见的 —— 那正是这个仓库最讨厌的一类失效。
-  // 死亡画面选点的唯一入口（卡片点击与 1/2/3 键都走它）：i = 旗下标，-1 = 回默认部署。
+  // 死亡画面选点的唯一入口（卡片点击与 1/2/3/4 键都走它）：i = 旗下标，-1 = 基地。
+  // **三态**：null = 未选择（不部署）、-1 = 亲手选了基地、0..2 = 选了那面旗。
   // 再选同一面旗 = 取消。联机改本地 _spawnSel 并把选择递给服务端 —— 服务端把"再选
   // 同一面旗"当取消（requestSpawnSel），两端各自重验归属，客户端不预判结果；单机直接
   // 改 game.mode.spawnFlag（MPMatch.spawnSelectPick），波次到点由 deployFlagWave 放行。
@@ -538,8 +539,9 @@ class Game {
     if (!netFlags && !mpFlags) return;
     if (!this.player) return;
     if (i === -1) {
-      if (netFlags) { if (this._spawnSel != null) { this.net.requestSpawnSel(this._spawnSel); this._spawnSel = null; } }
-      else if (this.mode) this.mode.spawnFlag = null;
+      // 基地也是一种**选择**（不再是"没选"的默认值）：再按一次取消，回"未选择"。
+      if (netFlags) { this.net.requestSpawnSel(-1); this._spawnSel = this._spawnSel === -1 ? null : -1; }
+      else if (this.mode) this.mode.spawnFlag = this.mode.spawnFlag === -1 ? null : -1;
       return;
     }
     const flags = netFlags || mpFlags;
@@ -549,10 +551,13 @@ class Game {
     if (netFlags) { this.net.requestSpawnSel(i); this._spawnSel = next; }
     else this.mode.spawnFlag = next;
   }
-  // 死亡画面的一帧（联机）：等待文案、选点键（1/2/3 的**边沿**）与复活点卡片。
-  // 边沿自记 keys 的上一帧状态 —— pressed 在 snapshotInput 末尾就被清了，这里读不到。
-  // dom 里**全程等波**（基地 5/10/20/30s 档，随阵营占有数走）：不发提前部署，
-  // 服务端同判（requestRespawn 在 dom 全拒）；tdm/ffa 照旧个人倒计时 + 空格提前部署。
+  // 死亡画面的一帧（联机）：等待文案、选点键（1/2/3 选据点、4 选基地的**边沿**）与
+  // 复活点卡片。边沿自记 keys 的上一帧状态 —— pressed 在 snapshotInput 末尾就被清了，
+  // 这里读不到。
+  // dom 里**全程等波**（基地 5/10/20/30s 档，随阵营占有数走）且**不选不部署** ——
+  // 服务端不再替人预定复活点（null = 未选择），换装备/看战场不会被下一波拽走；
+  // 不发提前部署，服务端同判（requestRespawn 在 dom 全拒）；tdm/ffa 照旧个人倒计时 +
+  // 空格提前部署。
   netRespawnTick() {
     const el = document.getElementById('respawnText');
     if (!el) return;
@@ -561,14 +566,18 @@ class Game {
     if (this.dead && !this.ending) {
       const flags = this.net && this.net.modeId === 'dom' && this.net.flags ? this.net.flags : null;
       if (flags && this.player) {
-        // 选点键的边沿（再按同一面旗 = 取消，由 spawnSelectPick 折成一次"重发同旗"）。
+        // 选点键的边沿（1/2/3 据点、4 基地；再按同一面 = 取消，由 spawnSelectPick 折成
+        // 一次"重发同旗/同基地"）。
         const prev = this._spKeys || (this._spKeys = {});
         for (let i = 0; i < flags.length; i++) {
           const down = !!this.input.keys['Digit' + (i + 1)];
           if (down && !prev[i]) this.spawnSelectPick(i);
           prev[i] = down;
         }
-        if (this._spawnSel != null && flags[this._spawnSel] && flags[this._spawnSel].owner !== this.player.team) this._spawnSel = null;
+        const bDown = !!this.input.keys['Digit' + (flags.length + 1)];
+        if (bDown && !prev.base) this.spawnSelectPick(-1);
+        prev.base = bDown;
+        if (this._spawnSel != null && this._spawnSel >= 0 && flags[this._spawnSel] && flags[this._spawnSel].owner !== this.player.team) this._spawnSel = null;
         // "下波几秒"：记分板 2 秒一班，直接读 cd 会一跳一跳 —— 用"上一次读数 + 本地流逝"
         // 插值（cdAt/baseCdAt 是 client.mjs 记下的到表时刻）。基地与据点同一口径。
         const now = performance.now() / 1000;
@@ -580,9 +589,11 @@ class Game {
           name: f.name, mine: f.owner === this.player.team, cd: cdOf(f),
           label: f.owner == null ? '未占领' : '敌方',
         })), this._spawnSel, baseLeft);
-        text = this._spawnSel != null
-          ? `已选 ${flags[this._spawnSel].name} 点 · 下波 ${cdOf(flags[this._spawnSel])} 秒集体部署`
-          : `基地 · 下波 ${baseLeft} 秒`;
+        text = this._spawnSel === -1
+          ? `已选 基地 · 下波 ${baseLeft} 秒集体部署`
+          : this._spawnSel != null
+            ? `已选 ${flags[this._spawnSel].name} 点 · 下波 ${cdOf(flags[this._spawnSel])} 秒集体部署`
+            : `选择复活点 · 点击卡片或按 1/2/3（4 = 基地）`;
       } else {
         this.hud.spawnSelect(null);
         const delay = (this.net && this.net.welcome && this.net.welcome.respawnDelay) || 3;

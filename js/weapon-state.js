@@ -37,6 +37,9 @@ export class WeaponState {
     this.sink = null;
     this.replay = false;              // 客户端回滚重放中：见 update() 的注释
     this.aimAccum = new THREE.Vector2();  // 攒给视图模型做摆动用的视线位移
+    // 高倍镜悬停漂移（见 update 的 sway 块）。swayX/Y 是"已经写进 pl.yaw/pitch 的那部分"，
+    // 出镜时按同一 delta 通道收回、净位移为零 —— 它们是裁决量，登记在 J_WS 里。
+    this.swayT = 0; this.swayX = 0; this.swayY = 0;
   }
   // 死亡清场。为什么非要有这么一个函数：**死了之后 ws.update 就不再被跑到**
   // （main.js 只给活人跑 update），于是 adsT / scopeState / 换弹动画会整组冻在死前那一帧 ——
@@ -52,6 +55,8 @@ export class WeaponState {
     // 高倍镜遮罩是 ws.update 每拍算出来挂在 game 上的（本文件末尾），这里一并摘掉，
     // 否则 HUD 的 #scope 会盖在死亡视角上（hud.js 就是照这个字段开关它的）
     if (this.game) this.game.scopeState = null;
+    // 漂移量一并清零：重生后第一次进镜从 swayX=0 起步，不会带着死前的偏移跳一下。
+    this.swayT = 0; this.swayX = 0; this.swayY = 0;
   }
   dispose() { this.sink = null; }
 
@@ -163,6 +168,30 @@ export class WeaponState {
     // 走路摆动：写进相机 y 与横滚（player.js:214/219），所以归玩法管
     const spd = Math.hypot(pl.vel.x, pl.vel.z);
     if (pl.onGround) this.bobPhase += dt * spd * (pl.sprinting ? 1.5 : 1.9);
+    // 高倍镜悬停漂移（sway，2026-10"收益与惩罚"轮）：zoom ≥ 2 的瞄具（热成像 2.5 /
+    // ACOG 4 / 狙击 7）满镜后视线缓慢漂移。修的是"全自动 + 高倍镜 = 激光枪"——过去
+    // 满镜的全部代价是一行恒定的 adsSpread，长点射毫无手感代价。漂移直接写进
+    // pl.yaw/pitch（弹道从同一位 yaw/pitch 取方向，所见即所打），由 game.time 的
+    // 双频正弦合成：不抽 pl.rng（私有流要省着用）、不读墙钟（重放要逐拍复现）。
+    // swayT 是进/出镜的渐变；出镜时漂移按同一 delta 通道收回，视线不留永久偏移。
+    // 姿态减档与后坐力同一套思想（趴 = 架在地上最稳），移动与腾空加重。
+    const wantSway = st.zoom >= 2 && this.adsT > 0.85;
+    this.swayT = damp(this.swayT, wantSway ? 1 : 0, 6, dt);
+    if (!wantSway && this.swayT < 0.001) this.swayT = 0;
+    if (this.swayT > 0 || this.swayX !== 0 || this.swayY !== 0) {
+      const steady = (pl.proneT > 0.5 ? 0.5 : pl.crouchT > 0.5 ? 0.85 : 1)
+        * (1 + spd / 6 * 0.9) * (pl.onGround ? 1 : 2.2);
+      // 基准幅 0.5°（ACOG），按 (zoom-1)/3 放大：热成像 0.25°、狙击 1.0°
+      const amp = 0.5 * DEG * (st.zoom - 1) / 3 * steady * this.swayT;
+      const t = game.time;
+      const tx = (Math.sin(t * 1.9 + 0.7) * 0.65 + Math.sin(t * 4.3 + 2.1) * 0.35) * amp;
+      const ty = (Math.sin(t * 1.5 + 3.9) * 0.7 + Math.sin(t * 3.7 + 1.1) * 0.3) * amp;
+      // pitch 不夹取：后坐 kick 同样不夹（fire() 直写 pl.pitch），姿态/弹道都读同一位
+      pl.yaw += tx - this.swayX;
+      pl.pitch += ty - this.swayY;
+      if (this.swayT === 0) { this.swayX = 0; this.swayY = 0; }
+      else { this.swayX = tx; this.swayY = ty; }
+    }
     // 射击
     const semi = st.fire !== 'auto';
     const fireInput = input.fire && (!semi || !this.triggerHeld);
@@ -198,7 +227,11 @@ export class WeaponState {
     let hip = st.hip * (1 + spd / 6 * 0.6) * (pl.onGround ? 1 : 2.2)
       * (pl.proneT > 0.5 ? 0.65 : pl.crouchT > 0.5 ? 0.8 : 1);
     hip *= 1 + Math.min(this.shotsInRow, 10) * 0.03;
-    const ads = st.adsSpread * (1 + spd / 6 * (st.type === 'sniper' ? 6 : 1.2));
+    const ads = st.adsSpread * (1 + spd / 6 * (st.type === 'sniper' ? 6 : 1.2))
+      // 高倍镜连射扩散：满镜全自动过去是恒定 adsSpread 的一根激光。按 (zoom-1) 给
+      // 连发 bloom（每发 +5%×(zoom-1)，10 发封顶）：ACOG 第 10 发 2.5 倍。栓动/半自动
+      // 因 0.12s 清零 shotsInRow 天然不吃这条 —— 惩罚的是"端着高倍镜泼水"。
+      * (st.zoom >= 2 ? 1 + Math.min(this.shotsInRow, 10) * 0.05 * (st.zoom - 1) : 1);
     return lerp(hip, ads, this.adsT) * (pl.proneT > 0.5 ? 0.9 : 1);
   }
 
@@ -270,9 +303,11 @@ export class WeaponState {
     game.makeNoise(pl.pos, st.suppressed ? 12 : 70, pl.team);
     if (!st.suppressed) pl.revealT = 1.5;
     // 后坐力：pitch/yaw/punch 进相机，属于裁决；vmKick/vmRot 只动枪模，属于视图模型
-    // 姿态减档与散布同一张表：蹲 0.85、趴 0.75 —— 趴下时枪几乎架死在地面上。
+    // 姿态档位（相对武器标称后坐，2026-10"收益与惩罚"改版）：站 ×1.15（惩罚最大）、
+    // 蹲 ×1.05（轻微增大 —— 蹲的收益在命中盒与脚步声那边，不再是免费的后坐折扣）、
+    // 趴 ×0.5（大幅降低，枪几乎架死在地面上）。旧表 0.85/0.75 已废弃。
     const adsMul = lerp(1, 0.75, this.adsT)
-      * (pl.proneT > 0.5 ? 0.75 : pl.crouchT > 0.5 ? 0.85 : 1);
+      * (pl.proneT > 0.5 ? 0.5 : pl.crouchT > 0.5 ? 1.05 : 1.15);
     const kick = st.recoilV * 0.55 * DEG * adsMul;
     // 横向抖动刻意偏向一侧（-0.4 而非 -0.5），且走玩法随机流：它直接写进 pl.yaw
     const side = (pl.rng.next() - 0.4) * st.recoilH * 0.5 * DEG * adsMul;

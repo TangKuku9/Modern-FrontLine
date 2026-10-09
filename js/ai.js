@@ -241,6 +241,8 @@ export class Bot {
     const A = this.anim;
     if (!this.alive) {
       A.deadT += dt;
+      // 服务端（game.headless）尸体姿态是纯视觉：快照那一行只带 alive 位与定格的坐标
+      if (game.headless) return;
       animateSoldier(this.model, A, dt);
       this.model.root.position.copy(this.pos);
       return;
@@ -248,8 +250,11 @@ export class Bot {
     this.perceiveT -= dt;
     if (this.perceiveT <= 0) { this.perceiveT = 0.15 + rng.next() * 0.08; this.perceive(); }
     this.stunT -= dt; this.flashT -= dt; this.revealT -= dt; this.grenadeCD -= dt; this.reloadT -= dt; this.slideCD -= dt;
-    this.model.flash.visible = this.flashT > 0;
-    A.recoil = damp(A.recoil, 0, 10, dt);
+    // 枪口火光与受击后仰是纯视觉；flashT 本身必须照走 —— 快照的 Firing 位读它
+    if (!game.headless) {
+      this.model.flash.visible = this.flashT > 0;
+      A.recoil = damp(A.recoil, 0, 10, dt);
+    }
 
     const desired = _d.set(0, 0, 0);
     let lookYaw = null, lookPitch = 0;
@@ -406,10 +411,12 @@ export class Bot {
     this.yaw += clamp(ad, -turn * dt, turn * dt);
     this.pitch = damp(this.pitch, lookPitch, 8, dt);
     this.crouchT = damp(this.crouchT, wantCrouch ? 1 : 0, 8, dt);
-    // 动画
+    // 动画。快照（room.mjs:botEntity）只消费 phase/speed/crouch/pitch 和 sprinting
+    // 这几个标量；骨骼、根变换、脚步声是纯视觉 —— 服务端（game.headless）喂饱标量就停。
     A.speed = spd; A.phase += dt * spd * 2.2; A.crouch = this.crouchT; A.pitch = this.pitch;
-    A.slide = damp(A.slide, this.slideT > 0 ? 1 : 0, 12, dt);     // 与 NetPlayer 的滑铲平滑同一档
     this.sprinting = sprinting;
+    if (game.headless) return;
+    A.slide = damp(A.slide, this.slideT > 0 ? 1 : 0, 12, dt);     // 与 NetPlayer 的滑铲平滑同一档
     A.sprint = damp(A.sprint, sprinting ? 1 : 0, 10, dt);         // 冲刺姿态:前倾+枪口上抬(soldier.js 通道)
     // RPG 弹头位（soldier.js 通道）：膛里有货才坐在筒口。目前 BOT_WEAPONS 不含
     // 发射器，这行是给契约留的座 —— 哪天 bot 拿上 RPG，第三人称不会回到
