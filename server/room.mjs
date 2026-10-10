@@ -13,7 +13,7 @@ import { rng } from '../js/rng.js';
 import { FLAG, weaponIndex, teamIndex, unpackInput, unpackStreak, uavBit, WORLD } from '../js/quant.js';
 import { sanitizeLoadout, kitsOf } from '../js/loadout.mjs';
 import { PoseRing, rewindTick } from './lagcomp.mjs';
-import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, domBotGoal, spawnWavesTick, SAY, ANNOUNCE, DOM_RADIUS_WEAK } from '../js/match-rules.js';
+import { MatchRules, StreakBook, UAV_SECONDS, WP_SECONDS, SENTRY_SECONDS, HELI_SECONDS, killScore, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, pickupsExpire, pickupAction, flagsTick, domBotGoal, spawnWavesTick, chooseSpawn, SAY, ANNOUNCE, DOM_RADIUS_WEAK } from '../js/match-rules.js';
 import { clusterStrike, phosphorusSweep } from '../js/combat.js';
 import { Sentry, Heli, BOT_WEAPONS, randomAtt } from '../js/mp.js';
 import { KILLSTREAKS, DEFAULT_STREAKS, BOT_NAMES } from '../js/data.js';
@@ -263,23 +263,20 @@ export class NetRoom {
 
   spawnPoint(team) {
     const w = this.game.world;
-    // 自由混战没有"自己人的出生点"：所有人都从两边的点里挑（与单机 mp.js:121 同句）。
+    // 自由混战没有"自己人的出生点"：所有人都从两边的点里挑，外加全图随机撒点 ——
+    // 那条随机是 ffa 的玩法（它没有老家概念）。dom/tdm 一律只从声明点里挑，与单机
+    // js/mp.js:spawnPoint 同一条口径，理由和实测数字都写在 js/match-rules.js:chooseSpawn。
     const solo = team === 'P' || this.rules.ffa;
     const cands = [...(w.spawns[team] || []), ...(solo ? [...w.spawns.A, ...w.spawns.B] : [])];
-    for (let i = 0; i < 6; i++) cands.push(w.randomWalkable());
+    if (solo) for (let i = 0; i < 6; i++) cands.push(w.randomWalkable());
     // Bot 也要算进"别贴着敌人出生"：房间里有 Bot 之后，只看 clients 的那份会把一堆 Bot
     // 摞在同一个出生点上（它们互相看不见对方，因为对方不在自己的敌情表里）。
-    const foes = [...this.clients.values()].map(c => c.pl)
-      .concat(this.game ? this.game.bots : [])
-      .filter(p => p && p.alive && p.team !== team && p.pos);
-    let best = cands[0], bs = -1;
-    for (const c of cands) {
-      let md = 1e9;
-      for (const f of foes) md = Math.min(md, f.pos.distanceTo(c));
-      const s = Math.min(md, 60) + rng.next() * 8;
-      if (s > bs) { bs = s; best = c; }
-    }
-    const pos = best.clone();
+    const all = [...this.clients.values()].map(c => c.pl)
+      .concat(this.game.bots || [])
+      .filter(p => p && p.alive && p.pos);
+    const foes = all.filter(p => p.team !== team);
+    const mates = all.filter(p => p.team === team);
+    const pos = chooseSpawn(cands, team, foes, mates, this.flags, () => rng.next()).clone();
     return { pos, yaw: Math.atan2(pos.x, pos.z) };
   }
 

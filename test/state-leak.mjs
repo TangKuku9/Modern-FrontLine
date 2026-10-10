@@ -208,6 +208,13 @@ const res = await page.evaluate(async () => {
     // （第一版沿用了文件顶部的旧 ws/pl，量的是上上局的死对象：adsT 恒 0、而 fov 的
     // 窄值来自新玩家在真开镜 —— 一半新一半旧，怎么都对不上）。
     const plN = g.player, wsN = plN.ws;
+    // 这一段量的是"onNetDeath 把瞄具状态清干净了没有"，前提是**玩家死前正开着镜** ——
+    // 所以他在这 200 帧里必须活着。tdm/yard 的模拟里 Bot 会自己找上门：2026-10-09 出生位
+    // 收口（dom/tdm 不再全图随机撒点，玩家固定从声明点生）之后，人被摸到 10m 内的敌人
+    // 在这段窗口里打死，L0/L0ᵃ 两条前提一起红，而红的都不是本段要量的东西。
+    // 于是这一段开 godMode —— 后面的死亡是手工摆的（onNetDeath + alive=false），
+    // 不吃 player.takeDamage 那条闸，判据形状不变。
+    g.godMode = true;
     wsN.replaceSlot(0, { id: 'l115', att: {}, camo: 'none' }, 5, 30);
     frames(20);
     wsN.switchTo(0);
@@ -258,6 +265,7 @@ const res = await page.evaluate(async () => {
     ok('L3ᵇ 反证：非重放的正常 update 仍写相机（开镜状态的窄 FOV 可见）', g.camera.fov < g.settings.fov - 5,
       `${g.camera.fov.toFixed(1)}° < ${g.settings.fov}°`);
     plN.alive = false;                         // 摆位结束，把人放回死亡态（本段到此为止）
+    g.godMode = false;                         // ⑥ 的无敌只覆盖 ⑥：后面的段照常吃伤害
   }
 
   // ---------- ⑦ 远端玩家的退出淡出：不许碰共享材质 ----------

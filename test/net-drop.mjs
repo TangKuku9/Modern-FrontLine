@@ -358,11 +358,25 @@ try {
       !!(await wait(a, () => (window.game.menu || {}).screen === 'onlineRoom'
         && document.querySelectorAll('#seatA .seat, #seatB .seat').length >= 2
         && !!document.querySelector('#rmChat') && !!document.querySelector('[data-a=start]') && !!document.querySelector('[data-a=leave]'))));
-    ok('房间设置那一格与服务端开放的玩法一字不差（房主点不到服务端判不了的）',
+    // 房间屏那一格滤的是**这间房的地图**允许的玩法（js/menu.js:renderRoom 那句
+    // "模式牵制地图、地图也牵制模式"，ridges 只在占领、占领只在 ridges）：房主在 frost
+    // 的房里点不到一开局就会被服务端 mapGate 拒掉的玩法。所以期望值按 room.map 算，
+    // 不是按"全部 net 玩法"算 —— 后者在地图过滤上线之后永远多出一格（2026-10-09 大房
+    // 那轮之后这条一直红着）。它不是"滤得越狠越对"：下面那条先决要求这一格**非空且含
+    // 团队死斗**，把候选滤成空会被它当场抓住；而"占领在别处可达、且只在双丘可达"由
+    // test/room-flow.mjs 的 dom 建房那两条（含两个拒绝方向）钉着，这里不重复。
+    ok('房间设置那一格与**这间房的地图**开放的玩法一字不差（房主点不到服务端判不了的）',
       await a.evaluate(async () => {
-        const { MP_MODES } = await import('/js/data.js');
+        const { MP_MODES, mapAllowed } = await import('/js/data.js');
         const s = document.querySelector('#rmMode');
-        return !!s && s.textContent.replace(/\s+/g, '') === MP_MODES.filter(m => m.net).map(m => m.name).join('');
+        const map = window.game.lobby.state.room.map;
+        return !!s && s.textContent.replace(/\s+/g, '') === MP_MODES.filter(m => m.net && mapAllowed(map, m.id)).map(m => m.name).join('');
+      }),
+      JSON.stringify(await a.evaluate(() => ({ shown: (document.querySelector('#rmMode') || {}).textContent, map: window.game.lobby.state.room.map }))));
+    ok('先决：这一格非空、含团队死斗、且不含这间房的地图打不了的占领',
+      await a.evaluate(() => {
+        const t = ((document.querySelector('#rmMode') || {}).textContent || '').replace(/\s+/g, '');
+        return t.length > 0 && t.includes('团队死斗') && !t.includes('占领');
       }),
       await a.evaluate(() => (document.querySelector('#rmMode') || {}).textContent));
     ok('一个人的时候不给开局，且把原因写在按钮旁边（不是把按钮藏起来）',
@@ -659,12 +673,17 @@ try {
       await a.evaluate(() => !document.querySelector('#rmBot')));
 
     await a.click('#rmFill div[data-v="1"]');
+    // 期望值读**服务端发来的那一格上限**（server/lobby.mjs:MAX_SEATS，随房间状态推给客户端
+    // 的 `room.max`），不写死 15/16：大房那轮把上限从 16 抬到 64，写死的两条就成了
+    // "补满只补到 16"的假要求（2026-10-09 起一直红，而功能是对的）。服务端那一侧同样
+    // 按 MAX_SEATS 判（test/room-flow.mjs 的 L 段），两条读的是同一个源。
     const filled = await wait(a, () => {
+      const max = window.game.lobby.state.room.max;
       const all = [...document.querySelectorAll('#seatA .seat[data-bid], #seatB .seat[data-bid]')];
-      return all.length === 15 ? { rows: all.length, bots: all.filter(el => (el.querySelector('.s-tag') || {}).textContent === 'Bot').length } : null;
+      return all.length === max - 1 ? { rows: all.length, max, bots: all.filter(el => (el.querySelector('.s-tag') || {}).textContent === 'Bot').length } : null;
     });
-    ok('点"补满"：座位栏当场补出 15 行 Bot（1 人 + 15 = 16，服务端那个上限）',
-      !!filled && filled.bots === 15, JSON.stringify(filled));
+    ok('点"补满"：座位栏当场补到服务端那个上限（除自己以外全是 Bot 行）',
+      !!filled && filled.bots === filled.max - 1, JSON.stringify(filled));
     ok('补满之后开始按钮就亮了（一个人也能开一局，这正是这一格存在的理由）',
       await a.evaluate(() => document.querySelector('[data-a=start]').disabled === false
         && (document.querySelector('#rmFill .sel') || {}).textContent === '补满'
@@ -674,10 +693,11 @@ try {
 
     await a.click('#rmFill div[data-v="0"]');
     const kept = await wait(a, () => {
+      const max = window.game.lobby.state.room.max;
       const all = [...document.querySelectorAll('#seatA .seat[data-bid], #seatB .seat[data-bid]')];
-      return (all.length === 15 && window.game.lobby.state.fill === false) ? { rows: all.length, sel: (document.querySelector('#rmFill .sel') || {}).textContent } : null;
+      return (all.length === max - 1 && window.game.lobby.state.fill === false) ? { rows: all.length, max, sel: (document.querySelector('#rmFill .sel') || {}).textContent } : null;
     });
-    ok('再点"手动"：这一格回到手动、服务端那格也变 false，场上的 15 行**留着**（关 = 不再补，不是把补出来的删掉）',
+    ok('再点"手动"：这一格回到手动、服务端那格也变 false，场上的 Bot 行**留着**（关 = 不再补，不是把补出来的删掉）',
       !!kept && kept.sel === '手动', JSON.stringify(kept));
     ok('页面没有真错误', realErrs(A.logs).length === 0, A.logs.slice(0, 2).join(' ⏐ '));
     srv.kill();

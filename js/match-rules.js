@@ -714,4 +714,52 @@ export function domBotGoal(flags, x, y, z, team, rand) {
   return { f: list[(rand() * list.length) | 0] || owned, hold: false };
 }
 
+// ---------- 出生位（dom/tdm 收口。单机 MPMatch 与联机 NetRoom 共用这一份选择） ----------
+//
+// 用户实测两条症状的根因都在这里：两端各自的 spawnPoint 往候选里掺全图随机可走点
+// （js/mp.js 25% 概率掺 6 个、server/room.mjs 每拍掺 6 个），而"离敌人远"那把尺带
+// 60m 饱和上限 —— 双丘 360m 的图上两队老家相距 ~314m，声明点与随机点**全部**夹成
+// 60 分，胜负只剩噪声，于是随机点按个数比例胜出（6/13）。实测落点：单机每次出生
+// 10.1% 落在既非基地也非据点的野地、0.9% 直接生在中立据点圈里；联机 40.9% / 3.1%
+// （量具 test/spawn-audit.mjs）。
+// 闸立在失效模式那一层，不立在语法那一层：
+//   ① 落在"不归本队所有"的据点弱圈内 ⇒ 不合格。中立那半边等于白送一个点（flagsTick
+//      弱圈占领力 1 × DOM_CAP_RATE 0.03 ⇒ 单人 33.3 秒占完，实测过），敌方那半边是把
+//      人直接投进对面的驻守圈里 —— 而死亡画面的选点卡片只给了"基地 + 三面旗"，
+//      这两种落点都不在该选项里。
+//   ② 候选集本身由调用方收口（dom/tdm 只交声明点，ffa 才允许全图随机）—— 这一条
+//      不在这里判，因为"有没有基地概念"是模式的事，不是几何的事。
+// 全部候选都被 ① 闸掉时（小图把基地修在点旁边，例如 yard 三旗间距才 18m）退回
+// 全体取最不坏的那一个 —— 宁可生在点旁边，也不许返回 undefined 把出生那一跳崩掉。
+// 散位项是补"删掉随机点之后 7 个声明点全同分"的：不分开的话全队挤在同一格，一条
+// 枪线/一发迫击炮带走一片，而旧写法正是靠那 6 个随机点歪打正着地把人摊开的。
+export const SPAWN_AVOID_R = 60;    // 离敌人多远算"够远"。再远不加，免得出生点被推到地图对角
+export const SPAWN_SPREAD_R = 20;   // 离同队最近的人多远算"散开"。超过不再加分
+export const SPAWN_JITTER = 2;      // 噪声必须盖不过散位项，否则又变成抽签
+export function spawnEligible(pos, team, flags) {
+  if (!flags) return true;
+  for (const f of flags) {
+    if (f.owner === team) continue;
+    if (Math.hypot(pos.x - f.pos.x, pos.z - f.pos.z) < DOM_RADIUS_WEAK) return false;
+  }
+  return true;
+}
+// foes/mates 由调用方筛好（活着的、有 pos 的、按队分开的），这里不再判形状。
+export function spawnScore(pos, foes, mates) {
+  let md = 1e9, ms = 1e9;
+  for (const e of foes) { const d = Math.hypot(pos.x - e.pos.x, pos.z - e.pos.z); if (d < md) md = d; }
+  for (const e of mates) { const d = Math.hypot(pos.x - e.pos.x, pos.z - e.pos.z); if (d < ms) ms = d; }
+  return Math.min(md, SPAWN_AVOID_R) + Math.min(ms, SPAWN_SPREAD_R);
+}
+export function chooseSpawn(cands, team, foes, mates, flags, rand) {
+  const passed = cands.filter(c => spawnEligible(c, team, flags));
+  const pool = passed.length ? passed : cands;
+  let best = pool[0], bs = -Infinity;
+  for (const c of pool) {
+    const s = spawnScore(c, foes, mates) + rand() * SPAWN_JITTER;
+    if (s > bs) { bs = s; best = c; }
+  }
+  return best;
+}
+
 export { WORLD };

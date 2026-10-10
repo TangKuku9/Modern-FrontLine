@@ -58,8 +58,16 @@ try {
   await A.waitForFunction(() => (window.game.__pathsViaWorker || 0) >= 1, null, { timeout: 30000 });
   ok('A3 离线 bot 的 A* 请求经 Worker 送达并回流', await A.evaluate(() => (window.game.__pathsViaWorker || 0) >= 1));
   ok('A4 bot 真的拿到了路径在走', await A.evaluate(() => window.game.bots.some(b => b.path && b.path.length >= 1)));
-  await A.waitForFunction(() => (window.game.__pathsViaWorker || 0) >= 3, null, { timeout: 30000 });
+  // 采样窗口必须由构造钉住，不能停在"第 3 条回流刚好落在那一拍"上：A5 的上限是
+  // `60 × t`，而 t 取的是**读数那一刻的模拟时钟** —— 只等 `got >= 3` 的话 t 落在
+  // 0.1~0.7s 之间（2026-10-10 实测：req 恒为 8，t 一抖这条就在 6/18/42 的上限两侧翻面），
+  // 于是它量的其实是"我什么时候去看的"，不是"有没有防洪门"。多等满 3 秒模拟时间，
+  // 上限变成 180，而无门的预测是 8 bot × 60/s × 3s = 1440 起 —— 门的有无才第一次
+  // 是这条判据的自变量。A5ᵃ 是它的先决：窗口不够长就当场红，不许静默变成"看着像过"。
+  await A.waitForFunction(() => (window.game.__pathsViaWorker || 0) >= 3 && window.game.time >= 3, null, { timeout: 30000 });
   const flood = await A.evaluate(() => ({ req: window.game.__pathRequests || 0, got: window.game.__pathsViaWorker || 0, t: window.game.time }));
+  ok('A5ᵃ 先决：采样窗口够长（t ≥ 3 秒模拟时间），否则下面那条的上限是抖出来的',
+    flood.t >= 3, `t=${flood.t.toFixed(1)}s`);
   // 防洪臂：pathPending 门在 —— 请求数必须是"bot 每几秒一寻路"的量级；门没了的话
   // steer 的 !path 分支会让 8 个 bot 每拍连发（60 拍/s × 8 ≈ 480/s 起）。
   ok('A5 pathPending 门防洪：请求数有界', flood.req < 60 * flood.t, `req=${flood.req} · got=${flood.got} · t=${flood.t.toFixed(1)}s（无门应为 ~${Math.round(60 * flood.t * 8)} 起）`);

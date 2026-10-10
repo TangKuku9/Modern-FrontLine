@@ -678,8 +678,29 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   const r3 = c.remotes.get(3);
   ok('N2 起手位置用**这一包**的坐标（留 (0,0,0) 会让第一帧把人摆在地图原点）',
     r3 && Math.abs(r3.pos.x - 1) < 1e-9, r3 ? `x=${r3.pos.x}` : 'null');
+  // ── 缺席的两种语义（PROTO=2：服务端按 AOI 裁剪快照，活着的人也会缺席）──
+  // js/net/client.mjs:onSnapshot 那一圈的分诊是：缺席第 1 份 ⇒ 只是**走出 200m 视野**，
+  // 藏起来（setFar）等他回来；连续缺席超过宽限 15 份（20Hz ≈ 0.75 秒）才按退房处理
+  // 进淡出队列。旧判据写的是"缺席一份就淡出"，那是 AOI 上线之前的语义（2026-10-09
+  // 起一直红着，而实现是对的）。这一族四种失效都得各自能红：
+  //   把 AOI 里暂时看不见的人直接删掉（最糟）→ N3a/N3b 拦；
+  //   永远不删（人走了模型留在场上）→ N3d 拦；
+  //   回来了不恢复 → N3c 拦；
+  //   瞬时 dispose 不淡出 → N4/N5 拦。
   frame([ent(4, 1, 2)], 103, 0.05);
-  ok('N3 人从快照里消失 ⇒ 进淡出队列（不是瞬时 dispose）',
+  ok('N3a 缺席第 1 份 ⇒ 只是藏起来（setFar），不进淡出队列',
+    c.leaving.length === 0 && c.remotes.has(3) && r3.far === true && r3.model.root.visible === false && g.entities.length === 2,
+    `leaving=${c.leaving.length} far=${r3.far} visible=${r3.model.root.visible}`);
+  for (let i = 0; i < 14; i++) frame([ent(4, 1, 2)], 104 + i, 0.10 + i * 0.05);
+  ok('N3b【反证】宽限之内（累计缺席 15 份）仍然不拆人 —— 走出视野是常态，不是退房',
+    c.leaving.length === 0 && c.remotes.has(3) && r3.__miss === 15,
+    `缺席 15 份：leaving=${c.leaving.length} miss=${r3.__miss}`);
+  frame([ent(3, 1, 1), ent(4, 1, 2)], 118, 0.80);
+  ok('N3c 走回视野 ⇒ 缺席计数归零、模型恢复可见（断断续续的缺席攒不出一次"退房"）',
+    r3.__miss === 0 && r3.far === false && r3.model.root.visible === true && c.leaving.length === 0,
+    `miss=${r3.__miss} far=${r3.far} visible=${r3.model.root.visible}`);
+  for (let i = 0; i < 16; i++) frame([ent(4, 1, 2)], 119 + i, 0.90 + i * 0.05);
+  ok('N3d 攒够宽限（连续第 16 份仍缺席）⇒ 进淡出队列，而不是瞬时 dispose',
     c.leaving.length === 1 && !c.remotes.has(3) && g.entities.length === 2,
     `leaving=${c.leaving.length} remotes=${c.remotes.size} entities=${g.entities.length}`);
   ok('N4 反证臂：他确实还在 entities 里（模型要在场上才谈得上"淡出"）', g.entities.indexOf(r3) >= 0);

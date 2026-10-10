@@ -11,7 +11,9 @@
 // 每一节都带反证臂。反证臂不是"再跑一遍看看还是绿的"——它是**同一个量具在被测对象
 // 坏掉时必须变红**的那一次。下面每条的措辞写的就是"这条红了说明什么坏了"。
 import { NetRoom, DT, STREAK_DEFS, resolveStreaks } from '../server/room.mjs';
-import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE, DOM_SCORE_PER_SEC, DOM_SCORE_ROSTER_NORM, DOM_CAP_RATE, DOM_POWER_STRONG, DOM_POWER_WEAK, DOM_RADIUS_WEAK, DOM_WAVE_BY_FLAGS, flagsTick } from '../js/match-rules.js';
+import { StreakBook, TickClock, MatchRules, killScore, killMedals, KILL_POINTS, UAV_SECONDS, uavFromFlags, onKillPerks, SAY, ANNOUNCE, DOM_SCORE_PER_SEC, DOM_SCORE_ROSTER_NORM, DOM_CAP_RATE, DOM_POWER_STRONG, DOM_POWER_WEAK, DOM_RADIUS_WEAK, DOM_WAVE_BY_FLAGS, flagsTick, chooseSpawn, spawnEligible } from '../js/match-rules.js';
+import { MPMatch } from '../js/mp.js';
+import { rng } from '../js/rng.js';
 import { encodeSnapshot, decodeSnapshot } from '../server/codec.mjs';
 import { STREAK_NONE, STREAK_MAX, packStreak, unpackStreak, WORLD, teamIndex, teamId } from '../js/quant.js';
 import { Bot } from '../js/ai.js';
@@ -1402,6 +1404,120 @@ sec('Q. FFA 的队键全链保真（独立队不许在快照/客户端/Bot 三�
   const qLead = qRows[0] && qRows[0].cid !== QA.cid ? qRows[0] : qRows[1];
   ok('Q16 右格守卫：榜首是我 → 显第二名（旧代码左右两格同数，看上去像红蓝比分相同）',
     qLead && qLead.k === 3, JSON.stringify(qRows.map(r => r.k)));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sec('R. 出生位收口：dom/tdm 只从声明点生，ffa 保留全图随机');
+// ═══════════════════════════════════════════════════════════════════════════
+// 用户实测两条：① 开局就有敌方 Bot 站在 B 点里占点；② 有时重生落在既不是基地也
+// 不是据点的位置。改之前的数（量具 test/spawn-audit.mjs，各 4000 次抽样）：单机每次
+// 出生 10.1% 野地 / 0.9% 生在中立据点圈内；联机 40.9% / 3.1%。复刻 800 局的开局名单
+// ⇒ 4.75% 的对局至少有一名敌方 Bot 一出生就站在无人点里，而单人独站弱圈 33.3 秒就把
+// 那点占下来（真跑 flagsTick 量出来的）。根因是候选集掺了全图随机点 + "离敌人远"带
+// 60m 饱和（两队老家相距 314m ⇒ 声明点与随机点全部同分，胜负只剩噪声）。
+// 这一节每条都带 A/B 两方向的拦网：一把只会绿的尺在这类静默失效里等于没有。
+{
+  const roomS = new NetRoom({ id: 'spawn-dom', mapId: 'ridges', seed: 20261009, mode: 'dom' });
+  await roomS.start();
+  const wS = roomS.game.world;
+  const decDist = (p, list) => Math.min(...list.map(s => Math.hypot(p.x - s.x, p.z - s.z)));
+  // "不归本队所有"= 中立与敌占都算：中立那半边是白送点，敌占那半边是把人投进驻守圈。
+  const inFoeCircle = (p, team) => roomS.flags.some(f => f.owner !== team
+    && Math.hypot(p.x - f.pos.x, p.z - f.pos.z) < DOM_RADIUS_WEAK);
+  const SAMPLES = 200;
+
+  for (const team of ['A', 'B']) {
+    let offBase = 0, inCircle = 0;
+    for (let i = 0; i < SAMPLES; i++) {
+      const p = roomS.spawnPoint(team).pos;
+      if (decDist(p, wS.spawns[team]) > 2) offBase++;
+      if (inFoeCircle(p, team)) inCircle++;
+    }
+    ok(`R1 dom 联机 spawnPoint('${team}') ${SAMPLES} 次落点全是本队声明点（症状②=0 野地）`, offBase === 0, `野地 ${offBase}`);
+    ok(`R2 dom 联机 spawnPoint('${team}') ${SAMPLES} 次无一次落在不归本队的据点圈内（症状①=0）`, inCircle === 0, `圈内 ${inCircle}`);
+  }
+
+  {
+    // 单机那条路：跑**真的** MPMatch.prototype.spawnPoint。这只 game 交两格就够 ——
+    // 该函数实际读的只有 game.world 与 game.entities（加 this.flags / this.ffa），
+    // 多挂的都是它不碰的字段，抄本才会骗人，本体不会。
+    const m = Object.create(MPMatch.prototype);
+    m.ffa = false; m.type = 'dom'; m.flags = roomS.flags;
+    m.game = { world: wS, entities: [{ alive: true, team: 'B', pos: wS.spawns.B[0].clone() }] };
+    let offBase = 0, inCircle = 0;
+    for (let i = 0; i < SAMPLES; i++) {
+      const p = m.spawnPoint('A').pos;
+      if (decDist(p, wS.spawns.A) > 2) offBase++;
+      if (inFoeCircle(p, 'A')) inCircle++;
+    }
+    ok(`R3 dom 单机 MPMatch.spawnPoint 同一条口径（${SAMPLES} 次：野地 ${offBase} / 敌圈 ${inCircle}）`, offBase === 0 && inCircle === 0);
+  }
+
+  {
+    // tdm 也收口（没有旗子 ⇒ 合格闸自然不判，但候选集不许再掺全图随机点）
+    const roomTd = new NetRoom({ id: 'spawn-tdm', mapId: 'yard', seed: 3, mode: 'tdm' });
+    await roomTd.start();
+    let offBase = 0;
+    for (let i = 0; i < SAMPLES; i++) if (decDist(roomTd.spawnPoint('A').pos, roomTd.game.world.spawns.A) > 2) offBase++;
+    ok(`R4 tdm 联机 spawnPoint 也只从声明点生（${SAMPLES} 次野地 ${offBase}）`, offBase === 0);
+  }
+
+  {
+    // 反证臂（方向那一侧）：ffa 没有"老家"概念，全图撒点是它的玩法。这条红了 = 有人
+    // 把收口一刀切到了 ffa 上。
+    const roomF = new NetRoom({ id: 'spawn-ffa', mapId: 'yard', seed: 4, mode: 'ffa' });
+    await roomF.start();
+    const all = [...roomF.game.world.spawns.A, ...roomF.game.world.spawns.B];
+    let field = 0;
+    for (let i = 0; i < SAMPLES; i++) if (decDist(roomF.spawnPoint('P7').pos, all) > 2) field++;
+    ok('R5【反证】ffa 仍保留全图随机撒点（这条红了 = 把 ffa 的玩法一并删了）', field > 0, `野地 ${field}/${SAMPLES}`);
+  }
+
+  {
+    // 合格闸本体的 A/B 两方向。构造一个"落在无人 B 点圈内 5m"的候选混进声明点里 ——
+    // 同一个种子跑两遍：带着 flags ⇒ 圈内点一次都选不中；摘掉 flags（= 闸被拆）⇒
+    // 它按同分抽签的比例中选。后半是"这把尺在被测对象坏掉时会红"的证据，缺了它
+    // R1/R2 那两条可能只是在量空气（ridges 的声明点本来就离旗 120m+）。
+    const foeFlag = roomS.flags[1];
+    const inside = { x: foeFlag.pos.x + 5, y: foeFlag.pos.y, z: foeFlag.pos.z };
+    ok('R6a spawnEligible：圈内点被拒、声明点放行（两个方向都判）',
+      spawnEligible(inside, 'A', roomS.flags) === false && spawnEligible(wS.spawns.A[0], 'A', roomS.flags) === true);
+    const poison = [inside, ...wS.spawns.A];
+    let withGate = 0, noGate = 0;
+    for (let i = 0; i < 200; i++) {
+      rng.seed(5000 + i);
+      if (chooseSpawn(poison, 'A', [], [], roomS.flags, () => rng.next()) === inside) withGate++;
+      rng.seed(5000 + i);
+      if (chooseSpawn(poison, 'A', [], [], null, () => rng.next()) === inside) noGate++;
+    }
+    ok(`R6b【反证】同一把尺拆掉闸就会红：带闸选中圈内点 ${withGate} 次，摘闸 ${noGate} 次`,
+      withGate === 0 && noGate > 0, `带闸=${withGate} 摘闸=${noGate}`);
+    rng.seed(11);
+    const twoBad = [{ x: foeFlag.pos.x + 3, y: 0, z: foeFlag.pos.z }, { x: foeFlag.pos.x - 4, y: 0, z: foeFlag.pos.z }];
+    const fb = chooseSpawn(twoBad, 'A', [], [], roomS.flags, () => rng.next());
+    ok('R6c 全部候选都不合格时退回全体（yard 那种三旗间距 18m 的小图不许返回 undefined）',
+      twoBad.includes(fb), String(fb && fb.x));
+  }
+
+  {
+    // 散位项：删掉随机点之后 7 个声明点全同分，不推开的话全队叠在一格。
+    // 反证臂是同一批种子屏蔽散位项 —— 出现叠格才算这条判据认得出那件事。
+    const trial = (useMates) => {
+      const seen = [];
+      for (let i = 0; i < 6; i++) {
+        const mates = useMates ? seen.map(p => ({ pos: p })) : [];
+        seen.push(chooseSpawn(wS.spawns.A, 'A', [], mates, roomS.flags, () => rng.next()).clone());
+      }
+      return new Set(seen.map(p => `${Math.round(p.x)},${Math.round(p.z)}`)).size;
+    };
+    const SEEDS = 60;
+    let allDistinct = 0, dupNoMates = 0;
+    for (let i = 0; i < SEEDS; i++) { rng.seed(9000 + i); if (trial(true) === 6) allDistinct++; }
+    for (let i = 0; i < SEEDS; i++) { rng.seed(9000 + i); if (trial(false) < 6) dupNoMates++; }
+    ok(`R7a 同队散位：连生 6 人把 7 个声明点摊开（${SEEDS} 个种子全部 6 人不同格）`, allDistinct === SEEDS, `${allDistinct}/${SEEDS}`);
+    ok(`R7b【反证】屏蔽散位项后同一批种子出现叠格 ⇒ 这条认得出散位没了（旧写法是靠那 6 个随机点歪打正着摊开的）`,
+      dupNoMates > SEEDS / 2, `叠格种子 ${dupNoMates}/${SEEDS}`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

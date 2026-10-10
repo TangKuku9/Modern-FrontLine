@@ -7,7 +7,7 @@ import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, comput
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
-import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, spawnWavesTick, SAY, SAY_START, ANNOUNCE, DOM_RADIUS_WEAK } from './match-rules.js';
+import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, spawnWavesTick, chooseSpawn, SAY, SAY_START, ANNOUNCE, DOM_RADIUS_WEAK } from './match-rules.js';
 import { addLocalXp } from './progress.mjs';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
@@ -71,6 +71,15 @@ export class MPMatch {
   start() {
     const game = this.game, w = game.world, def = MAPS[this.cfg.map];
     const pteam = this.ffa ? 'P' : 'A';
+    // 占领点建在**招人之前**。这不是整理风格：出生位的合格闸（match-rules.js:chooseSpawn
+    // 那一条"不许生在不归本队所有的据点圈里"）吃的就是 this.flags，而开局那 12 个人的
+    // 落点正是最需要在场判定的时刻 —— 旗子建晚了，闸在整局里最关键的那一跳上是瞎的。
+    if (this.type === 'dom') {
+      this.flags = w.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null, mesh: flagMesh(game, p) }));
+      // 每队基地的波次倒计时（spawnWavesTick 独占、懒初始化）。dom 里基地也是复活点：
+      // 档位跟该队占有的据点个数走（0 点只有基地 ⇒ 5s/波…）。
+      this.baseCd = { A: null, B: null };
+    }
     // 玩家
     const lo = this.buildLoadout(game.profile.classes[game.profile.selClass]);
     game.playerSleeve = def.styles[0] === 'snowA' ? 'fab_snowA' : 'fab_ally';
@@ -96,12 +105,6 @@ export class MPMatch {
     // 开场即定 —— 队友 + 敌人 + 玩家自己。FFA 没有"队伍产出"，报了也无害。
     this.rules.rosterSize = allyCount + enemyCount + 1;
     const mname = { tdm: '团队死斗', dom: '占领', ffa: '自由混战' }[this.type];
-    if (this.type === 'dom') {
-      this.flags = w.flagPos.map((p, i) => ({ name: 'ABC'[i], pos: p.clone(), owner: null, prog: 0, capTeam: null, mesh: flagMesh(game, p) }));
-      // 每队基地的波次倒计时（spawnWavesTick 独占、懒初始化）。dom 里基地也是复活点：
-      // 档位跟该队占有的据点个数走（0 点只有基地 ⇒ 5s/波…）。
-      this.baseCd = { A: null, B: null };
-    }
     game.hud.reset();
     game.hud.announce(mname, `${def.name} · ${this.ffa ? '率先达到 ' + this.scoreLimit + ' 次击杀' : '目标分数 ' + this.scoreLimit}`, 4);
     game.audio.say(SAY_START(mname));
@@ -134,21 +137,24 @@ export class MPMatch {
   spawnPoint(team) {
     const w = this.game.world;
     let cands;
-    if (this.ffa) cands = [...w.spawns.A, ...w.spawns.B];
-    else cands = team === 'A' ? w.spawns.A : w.spawns.B;
+    if (this.ffa) {
+      // 自由混战没有"老家"这件事，全图撒点就是它的玩法 —— 随机候选只留在这里。
+      cands = [...w.spawns.A, ...w.spawns.B];
+      for (let i = 0; i < 6; i++) cands.push(w.randomWalkable());
+    } else {
+      // 占领/团队死斗：合法出生点只有本队声明的那几格。"在己方已占据点重生"是另一条
+      // 路（flagSpawn，落在弱圈内），不许和全图随机点混在一个候选集里 —— 混了之后
+      // "离敌人远"那把尺（60m 饱和）会让随机点和基地点同分，实测 10% 的落点既不是
+      // 基地也不是据点，还有 0.9% 一出生就站在无人据点圈里白送一个点（内核见
+      // js/match-rules.js:chooseSpawn，量具 test/spawn-audit.mjs）。
+      cands = team === 'A' ? w.spawns.A : w.spawns.B;
+    }
     // 出生点只躲地面的敌人：直升机每 45 秒绕场一圈，把它算进"离敌人多远"会让出生点
     // 躲一条它在天上留下的轨迹。
-    const enemies = this.game.entities.filter(e => e.alive && e.team !== team && e.pos && !e.isHeli);
-    // 加入随机点提升多样性（占领/自由模式）
-    if (this.ffa || rng.next() < 0.25) for (let i = 0; i < 6; i++) cands = cands.concat([w.randomWalkable()]);
-    let best = cands[0], bs = -1;
-    for (const c of cands) {
-      let md = 1e9;
-      for (const e of enemies) md = Math.min(md, e.pos.distanceTo(c));
-      const s = Math.min(md, 60) + rng.next() * 8;
-      if (s > bs) { bs = s; best = c; }
-    }
-    const pos = best.clone();
+    const onfield = this.game.entities.filter(e => e.alive && e.pos && !e.isHeli);
+    const foes = onfield.filter(e => e.team !== team);
+    const mates = onfield.filter(e => e.team === team);
+    const pos = chooseSpawn(cands, team, foes, mates, this.flags || null, () => rng.next()).clone();
     const yaw = Math.atan2(pos.x, pos.z); // 面向中心
     return { pos, yaw };
   }

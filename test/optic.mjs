@@ -483,7 +483,27 @@ const px = await page.evaluate(async () => {
   // drawImage 拷到旧帧，三种症状长得跟"分划没画"一模一样（swiftshader 重载下偶发）。
   const ctxLost = g.renderer.getContext().isContextLost();
   mark('采样时');
+  // ── 采这两帧的参照面必须是**已知的中性场**，不是"准星后面那块地图" ──
+  // 判据的措辞是"差分像素确实是变红"。开关分划的两帧之间世界不推进（snap 只 render
+  // 不 frame），所以差分量的是"加上分划之后这一像素变成了什么"：
+  //   · 背景 = 地图（旧写法）⇒ 差分的颜色由**背景**决定。玩家站在土色掩体前面时
+  //     G/B 被抬起来，站在天空前面时 G/B 直接变负 —— 两种都能过或都能挂，而分划
+  //     一个像素没变。2026-10-09 出生位收口（dom/tdm 不再全图随机撒点，玩家固定从
+  //     声明点生、朝图心看）之后背景换了一块，这条从 ΔR=370/ΔG=141/ΔB=11 翻成
+  //     ΔR=540/ΔG=304/ΔB=177 而变红 —— 红的不是分划，是量具读的是哪个量。
+  //   · 背景 = 中性灰 ⇒ 差分是 (dot − gray)，"比原来更红"这句话才真的被量到。
+  // 所以把世界整层藏掉 + 清屏色设成 18/128 的灰，采完立刻原样交还（阶段 C 与反证臂
+  // 用的还是真实背景）。这条现在仍然会说"不红"：分划画成青色的话 dG ≥ dR 当场红。
+  const T3 = await import('three');
+  const clearWas = new T3.Color();
+  g.renderer.getClearColor(clearWas);
+  const alphaWas = g.renderer.getClearAlpha();
+  const sceneWas = g.scene.visible;
+  g.scene.visible = false;
+  g.renderer.setClearColor(new T3.Color(0x808080), 1);
   const on = snap(true), offf = snap(false);
+  g.renderer.setClearColor(clearWas, alphaWas);
+  g.scene.visible = sceneWas;
   const c = diffPx(on.center, offf.center);
   const k = diffPx(on.corner, offf.corner);
   const fullD = diffPx(on.full, offf.full);
