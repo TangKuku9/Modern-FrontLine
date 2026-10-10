@@ -1,7 +1,7 @@
 // 菜单系统：主菜单、战役简报、多人大厅、配装、枪匠、设置、暂停、结算
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, DOM_SCORES, DOM_MINUTES, MP_TEAM_SIZES, scoreOptions, minutesOptions, DEFAULT_MINUTES, mapAllowed, mapsForMode, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
+import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, STREAK_KEY_LABELS, MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, DOM_SCORES, DOM_MINUTES, MP_TEAM_SIZES, scoreOptions, minutesOptions, DEFAULT_MINUTES, mapAllowed, mapsForMode, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
 // DEFAULT_SCORE_LIMIT：切模式时旧的目标偏好不在新模式的档位表里，就落回那个模式的默认。
 // 默认只此一份（规则内核的家），界面不要自己再写一个 200/50。
 import { DEFAULT_SCORE_LIMIT } from './match-rules.js';
@@ -17,6 +17,10 @@ import { levelOf, totalXp, xpText, applyAccountXp } from './progress.mjs';
 
 const DIFF_NAMES = ['新兵', '正规军', '老兵'];
 const MAX_ATT = 5;
+// 菜单层里"长得就能点"的那一批（HU-06）。它同时是**委托点击的音效名单**与**键盘可达名单** ——
+// 这两件事必须是同一批元素，否则键盘名单会落后于鼠标名单，而"用鼠标点得到、按 Tab 走不到"
+// 正是这一层原来的样子。新增一类可点元素时改这里一行。
+const KEYPICK = '.mbtn,.btn,.pick,.cls,.slotc,.gs-att,.gs-slot,.mode,.mapc,.diff,.seg div,.camo';
 // 目标档位两张表（tdm/ffa 的 MP_SCORES 与 dom 独有的 DOM_SCORES）的**并集**。渲染一次的
 // 选择器用它把全部候选先画出来，再按 js/data.js:scoreOptions 藏掉当前模式不收的值 ——
 // 监听器直接挂在 div 上，重建 innerHTML 会把它们一起丢掉，所以"画全集 + 藏"而不是"重画"。
@@ -127,7 +131,19 @@ export class Menu {
     this.buildScene();
     this.el.addEventListener('pointerdown', () => game.audio.init());
     this.el.addEventListener('mouseover', e => { const t = e.target.closest('.mbtn,.btn,.pick,.cls,.slotc,.gs-att,.gs-slot,.mode,.mapc,.diff'); if (t && t !== this._hov) { this._hov = t; game.audio.ui('hover'); } });
-    this.el.addEventListener('click', e => { if (e.target.closest('.mbtn,.btn,.pick,.cls,.slotc,.gs-att,.gs-slot,.mode,.mapc,.diff,.seg div,.camo')) game.audio.ui('click'); });
+    this.el.addEventListener('click', e => { if (e.target.closest(KEYPICK)) game.audio.ui('click'); });
+    // Enter / 空格 = 一次 click（键盘可达的另一半，见 keyify 那段注释）。原生可激活的元素
+    // 一律跳过：BUTTON 自己就会把 Enter/空格 派成 click，这里再点一次就是**双击** ——
+    // 而这一层好几个动作是幂等不起来的（建房、开始游戏、下一局）。
+    this.el.addEventListener('keydown', e => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      // 正在表单字段里打字：回车是"提交这一格"（建房名、登录密码那几格都自己绑了 Enter），
+      // 不许顺带把包着它的可点元素也激活一次。
+      if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+      const t = e.target.closest && e.target.closest(KEYPICK);
+      if (!t || /^(BUTTON|INPUT|SELECT|TEXTAREA|A)$/.test(t.tagName)) return;
+      e.preventDefault(); t.click();
+    });
     window.addEventListener('keydown', e => {
       if (e.code === 'Escape' && game.paused && this.screen === 'pause' && performance.now() - this.pauseAt > 300) this.resume();
       else if (e.code === 'Escape' && this.screen === 'classSelect') this.hideClassSelect();
@@ -266,8 +282,16 @@ export class Menu {
   render(html, cls = 'dim', screen = '') {
     this.screen = screen;
     this.el.innerHTML = `<div class="screen ${cls}">${html}</div>`;
-    return this.el.firstChild;
+    const root = this.el.firstChild;
+    this.keyify(root);
+    return root;
   }
+  // 键盘可达（HU-06）：这一层的"按钮"绝大多数是 <div> + 委托点击，浏览器既不会把它们放进
+  // Tab 序列，Enter/空格 也不产生 click —— 于是键盘用户在满屏都是按钮的界面里寸步难行。
+  // 补在**唯一的渲染点**上（每屏都过 render()，所以不会有哪一屏漏掉）：可点的都进 Tab 序列，
+  // 而"激活之后干什么"仍然走既有的那套委托 —— constructor 里那条委托 keydown 只把 Enter/空格
+  // 变成一次 click，不新增第二套语义。
+  keyify(root) { root.querySelectorAll(KEYPICK).forEach(el => { el.tabIndex = 0; }); }
   on(root, sel, fn) { root.querySelectorAll(sel).forEach((el, i) => el.addEventListener('click', e => fn(el, e, i))); }
   hide() { this.el.innerHTML = ''; this.screen = ''; this.overlayOpen = false; }
   level() {
@@ -314,7 +338,7 @@ export class Menu {
       ${this.playerCard()}
       <div style="position:absolute;right:40px;bottom:30px;text-align:right;font-size:12px;color:#777;line-height:1.9">
         <div><span class="kbd">WASD</span>移动 <span class="kbd">Shift</span>冲刺 <span class="kbd">C</span>蹲/滑铲 <span class="kbd">Z</span>趴 <span class="kbd">Q/E</span>探头 <span class="kbd">空格</span>跳跃 <span class="kbd">R</span>换弹 <span class="kbd">V</span>近战</div>
-        <div><span class="kbd">4</span>投掷物（左键烹饪/投出） <span class="kbd">F</span>互动 <span class="kbd">N</span>夜视仪 <span class="kbd">5/6/7</span>连杀奖励 <span class="kbd">Tab</span>记分板</div>
+        <div><span class="kbd">4</span>投掷物（左键烹饪/投出） <span class="kbd">F</span>互动 <span class="kbd">N</span>夜视仪 <span class="kbd">${STREAK_KEY_LABELS.join('/')}</span>连杀奖励 <span class="kbd">Tab</span>记分板</div>
         <div style="color:#555;margin-top:6px">v1.0</div>
       </div>`, 'dim', 'main');
     this.on(r, '[data-a]', el => {
@@ -1269,6 +1293,9 @@ export class Menu {
     d.className = 'picker';
     d.innerHTML = `<div class="hdr">${title}<small>${sub}</small></div>${inner}<button class="btn ghost back" data-a="pback">返回</button>`;
     scr.appendChild(d);
+    // 覆盖层不走 render()，所以 Tab 序列得在这里补上同一刀（keyify 是同一个名单，
+    // 漏掉的话选枪/选连杀那几屏又是"鼠标点得到、键盘走不到"）。
+    this.keyify(d);
     d.querySelector('[data-a=pback]').addEventListener('click', () => { d.remove(); onBack && onBack(); });
     return d;
   }
@@ -1421,7 +1448,7 @@ export class Menu {
           <div><b>1 / 2 / 滚轮</b>切换武器</div>
           <div><b>V / 鼠标侧键</b>近战</div><div><b>4</b>切出投掷物（再按 4 换种）</div>
           <div><b>左键</b>按住烹饪 / 松手投出</div><div><b>F</b>互动 / 拾取武器</div>
-          <div><b>N</b>夜视仪（战役）</div><div><b>5 / 6 / 7</b>连杀奖励</div>
+          <div><b>N</b>夜视仪（战役）</div><div><b>${STREAK_KEY_LABELS.join(' / ')}</b>连杀奖励</div>
           <div><b>Tab</b>记分板</div>
         </div>
         <div style="margin-top:24px;display:flex;gap:12px"><button class="btn" data-a="back">返回</button><button class="btn ghost small" data-a="resetp">重置存档</button></div>

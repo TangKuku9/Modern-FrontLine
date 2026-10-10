@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { Player } from './player.js';
 import { Bot } from './ai.js';
 import { MAPS } from './maps.js';
-import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats } from './data.js';
+import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats, streakKeyLabel } from './data.js';
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
@@ -342,7 +342,7 @@ export class MPMatch {
       this.respawns.push({ e: victim, t: 4.5 });
       const el = document.getElementById('deathScreen');
       el.classList.remove('hidden');
-      document.getElementById('killerInfo').innerHTML = killer && killer !== victim ? `被 <b>${killer.name}</b> 使用 ${weapon || ''} ${head ? '爆头' : ''}击杀` : '自我击杀';
+      game.hud.killerInfo(killer && killer !== victim ? killer.name : null, weapon, head);   // HU-38：拼接与转义见 js/hud.js
       pl.stats.streak = 0;
       this.streakKills = 0;
       this.streakBook.onDeath();
@@ -399,7 +399,7 @@ export class MPMatch {
     this.streakKills = this.streakBook.progress;
     for (const i of this.streakBook.charge(v)) {
       const def = KILLSTREAKS.find(k => k.id === this.streakState[i].id);
-      this.game.hud.announce(def.name + ' 就绪', `按 [${i + 3}] 呼叫`, 2.5);
+      this.game.hud.announce(def.name + ' 就绪', `按 [${streakKeyLabel(i)}] 呼叫`, 2.5);
       this.game.audio.say(SAY.ready(def.name));
       this.game.audio.beep(3);
     }

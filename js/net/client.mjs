@@ -10,6 +10,7 @@ import { NetPlayer, INTERP_DELAY, setInterpDelay } from './remote.mjs';
 import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
 import { uavFromFlags, SAY, streakOwn, SAY_START, medalSay, DOM_RADIUS_WEAK } from '../match-rules.js';
+import { streakKeyLabel } from '../data.js';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { foldJudge } from './idle-ruler.mjs';
@@ -1014,7 +1015,7 @@ export class NetClient {
         if (ev.cid === this.cid) {
           this.setStreakSlot(ev.id, { ready: true });
           const i = this.streakState.findIndex(s => s.id === ev.id);
-          this.game.hud.announce(`${ev.name} 就绪`, `按 [${i + 3}] 呼叫`, 2.5);
+          this.game.hud.announce(`${ev.name} 就绪`, `按 [${streakKeyLabel(i)}] 呼叫`, 2.5);
           this.game.audio.say(SAY.ready(ev.name)); this.game.audio.beep(3);
         }
       } else if (ev.e === 'streak') {

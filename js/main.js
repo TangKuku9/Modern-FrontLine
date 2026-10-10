@@ -23,7 +23,7 @@ import { NetClient } from './net/client.mjs';
 import { killfeedIdent, killerRemote } from './net/identity.mjs';
 import { LobbyClient } from './net/lobby.mjs';
 import { buildGun } from './gunmodel.js';
-import { DEFAULT_CLASSES, DEFAULT_STREAKS, MP_MODES } from './data.js';
+import { DEFAULT_CLASSES, DEFAULT_STREAKS, MP_MODES, streakSlotOf } from './data.js';
 import { repairClass } from './loadout.mjs';
 import { applyAccountXp } from './progress.mjs';
 import { damp } from './util.js';
@@ -490,9 +490,8 @@ class Game {
     this._spKeys = null;               // 选点键的边沿表一并作废
     const el = document.getElementById('deathScreen');
     el.classList.remove('hidden');
-    document.getElementById('killerInfo').innerHTML = ev.killer && ev.killer !== ev.victim
-      ? `被 <b>${escHtml(ev.killer)}</b> 使用 ${escHtml(ev.weapon || '')} ${ev.head ? '爆头' : ''}击杀`
-      : '自我击杀';
+    // 那一行的拼接（含转义）收成一处：js/hud.js 的 killerInfo（HU-38）
+    this.hud.killerInfo(ev.killer && ev.killer !== ev.victim ? ev.killer : null, ev.weapon, ev.head);
     if (document.pointerLockElement) document.exitPointerLock();
   }
   // 挨打的三件套。本地玩家在联机里的血量是**快照直接覆盖**的（js/net/predict.mjs 写 pl.hp），
@@ -556,8 +555,8 @@ class Game {
   // 这里读不到。
   // dom 里**全程等波**（基地 5/10/20/30s 档，随阵营占有数走）且**不选不部署** ——
   // 服务端不再替人预定复活点（null = 未选择），换装备/看战场不会被下一波拽走；
-  // 不发提前部署，服务端同判（requestRespawn 在 dom 全拒）；tdm/ffa 照旧个人倒计时 +
-  // 空格提前部署。
+  // 不发提前部署，服务端同判（requestRespawn 在 dom 全拒）；tdm/ffa 照旧个人倒计时，
+  // **到点自动部署** —— 那一句 requestRespawn 是去抖确认而不是玩家的按键（见下面那段注释）。
   netRespawnTick() {
     const el = document.getElementById('respawnText');
     if (!el) return;
@@ -600,7 +599,13 @@ class Game {
         const left = delay - (performance.now() / 1000 - (this.deathAt || 0));
         if (left > 0) { text = `${Math.ceil(left)} 秒后重新部署…`; this._respawnAsked = false; }
         else {
-          text = '按 [空格] 重新部署';
+          // 这句以前写的是「按 [空格] 重新部署」，而这一条路从不读空格 —— 假的不只是文案：
+          // 服务端把"提前部署"挡在了一道闸后面（server/room.mjs:requestRespawn 只在
+          // respawnT ≤ 0.12s 时认，dom 更是全拒），所以下面那句 requestRespawn 是
+          // "我这边的倒计时走完了"的去抖确认，不是玩家能按的按钮。到点就走，照实写。
+          // 单机那份真读空格（js/mp.js 的 respawns 队列给到 4 秒宽限）—— 两端这一段的
+          // 差是行为差，记在 docs/hud-ux-audit.md 的 HU-02，要抹平得动服务端那道闸。
+          text = '正在部署…';
           if (!this._respawnAsked) { this._respawnAsked = true; if (this.net && this.net.requestRespawn) this.net.requestRespawn(); }
         }
       }
@@ -653,7 +658,10 @@ class Game {
     const I = this.input;
     const cv = this.canvas;
     window.addEventListener('keydown', e => {
-      if (e.code === 'Tab') e.preventDefault();
+      // Tab：对局里它是"记分板"，不许顺带把页面焦点切走；而菜单里它是键盘用户唯一的导航键，
+      // 拦不得（HU-06 —— 以前是无条件 preventDefault，于是连输入框之间都跳不动）。
+      // 暂停也算菜单：那会儿没有对局可打断，Tab 得能走到"继续 / 设置 / 退出"那几行。
+      if (e.code === 'Tab' && this.state === 'play' && !this.paused) e.preventDefault();
       if (!I.keys[e.code]) I.pressed[e.code] = true;
       I.keys[e.code] = true;
       if (this.state === 'play') {
@@ -788,7 +796,7 @@ class Game {
       reloadPressed: P.KeyR, swapPressed: I.wheel !== 0, slot1: P.Digit1, slot2: P.Digit2,
       meleePressed: P.KeyV || P.Mouse3, grenadePressed: P.Digit4,   // CS 制投掷：4 切雷，左键（fire/firePressed）烹饪/出手
       interact: K.KeyF, interactPressed: P.KeyF, nvgPressed: P.KeyN,
-      streak: P.Digit5 ? 0 : P.Digit6 ? 1 : P.Digit7 ? 2 : -1,      // 4 让给了投掷物，连杀顺延到 5/6/7
+      streak: streakSlotOf(P),      // 键位与 HUD 文案同源：js/data.js 的 STREAK_KEYS
       firePressed: P.Mouse0, adsPressed: P.Mouse2,
       mdx: I.mdx, mdy: I.mdy,
     };

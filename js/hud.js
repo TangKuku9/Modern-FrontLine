@@ -1,6 +1,6 @@
 // HUD 显示
 import * as THREE from 'three';
-import { KILLSTREAKS } from './data.js';
+import { KILLSTREAKS, streakKeyLabel } from './data.js';
 import { fmtTime, clamp } from './util.js';
 import { parseChatCommand, toggleMute, chatRowHtml, isImeKey } from './net/chat.mjs';
 import { escHtml } from './escape.js';
@@ -56,9 +56,17 @@ export class HUD {
     $('fade').style.opacity = 0; $('flashOverlay').style.opacity = 0; this.flashT = 0;
     $('announce').style.opacity = 0; $('scorebar').innerHTML = ''; $('streaks').innerHTML = '';
     this.markerEls = {};
-    // 节流状态一并归位（C1）：_eqSig 不清的话，重开局装备串恰好与上局相同会跳写、
-    // 装备行空白；累加器给满让第一拍立刻重画。
-    this._eqSig = undefined; this.sweepT = 1; this.mmT = 1;
+    // 节流状态一并归位（C1）：**每一条签名门都得出现在下面这一行里**，少一条的症状都是
+    // "那一格整局空白"——上面刚把它写的 DOM 清空，而签名门比对旧签名认为"没变"，于是永不
+    // 重写。_eqSig 先踩过这一脚（注释留在下面），_stkSig 是同一个坑（HU-04）。
+    // 对账由 test/hud-ux.mjs C 段拿源码做：全文出现过的 this._*Sig，reset() 里必须逐个归位。
+    // 累加器给满，让进对局第一拍就把小地图/敌名画出来。
+    this._eqSig = undefined; this._stkSig = undefined; this.sweepT = 1; this.mmT = 1;
+    // 水圈的两个缓存指向的是**刚被清掉的那批 DOM**（上面清了 #scorebar）：留着既吊着
+    // detached 节点，又让 flagWaters 里"元素换了人"那条重建判据失真。
+    this._fwEl = null; this._fwNodes = null; this._fwSig = '';
+    // 上一局的复活点卡片不许跟到新局（HU-21：过去靠 deathUiTick 每拍覆盖兜住，是侥幸）
+    this.spawnSelect(null);
     $('enemyName').textContent = '';
     // 聊天条也是上一局的残留：不清的话上一局的话会跟着新局一起开（与 deathScreen 同一类事）
     this.chatRows = []; this.chatActive = false; this.chatChannel = 'match'; clearTimeout(this.chatT);
@@ -246,7 +254,7 @@ export class HUD {
     if (!list) { el.innerHTML = ''; return; }
     el.innerHTML = list.map((s, i) => {
       const def = KILLSTREAKS.find(k => k.id === s.id);
-      return `<div class="stk ${s.ready ? 'ready' : ''}"><span>${s.ready ? `[${i + 5}] ` : ''}${def.name}</span><span class="k">${s.ready ? '就绪' : s.cost}</span><span class="ic">${def.icon}</span></div>`;
+      return `<div class="stk ${s.ready ? 'ready' : ''}"><span>${s.ready ? `[${streakKeyLabel(i)}] ` : ''}${def.name}</span><span class="k">${s.ready ? '就绪' : s.cost}</span><span class="ic">${def.icon}</span></div>`;
     }).join('') + `<div class="stk"><span>连杀</span><span class="k">${kills}</span></div>`;
   }
 
@@ -410,6 +418,19 @@ export class HUD {
       el.style.left = x + 'px'; el.style.top = y + 'px';
     }
     for (const id in this.markerEls) if (!seen.has(id)) { this.markerEls[id].remove(); delete this.markerEls[id]; }
+  }
+
+  // 「被 X 使用 Y 击杀」那一行（死亡画面）。三处调用点 —— 联机死亡事件（js/main.js）、
+  // 单机被杀（js/mp.js）、战役被杀（js/campaign.js）—— 过去各拼一份 innerHTML，而只有
+  // 联机那份过了 escHtml（HU-38）。转义的责任放在**拼 innerHTML 的这一处**：与 killfeed
+  // 同一条纪律（见上面 M10 那段），多一个调用点不该多一次"会不会忘了转义"。
+  // killerName 传空 = 这条命是自己了断的（文案由调用方定：战役那边不说"自我击杀"）。
+  killerInfo(killerName, weapon, head, selfText = '自我击杀') {
+    const el = $('killerInfo');
+    if (!el) return;
+    el.innerHTML = killerName
+      ? `被 <b>${escHtml(killerName)}</b> 使用 ${escHtml(weapon || '')} ${head ? '爆头' : ''}击杀`
+      : selfText;
   }
 
   // 死亡画面·复活点卡片（占领）。单一渲染点：签名没变就不写 DOM（respawnText 同一招）。

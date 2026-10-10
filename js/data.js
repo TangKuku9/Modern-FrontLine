@@ -257,6 +257,21 @@ export const KILLSTREAKS = [
   { id: 'wp', name: '白磷弹', kills: 10, desc: '白磷覆盖整个战场，灼烧所有敌人', icon: '🔥' },
 ];
 
+// 连杀槽位的键位：**实际绑定与屏幕上写的键码共用这一份**（HU-01）。
+// 以前是三处各写各的字面量 —— 播报拼 `i + 3`（js/mp.js、js/net/client.mjs）、槽位自绘拼
+// `i + 5`（js/hud.js）、真键是 Digit5/6/7（js/main.js 的 snapshotInput）。漂移不报错也不崩，
+// 症状是玩家照提示按键、叫出来的是别的连杀（按 4 还会切出投掷物）。
+// 4 让给了 CS 制投掷物，所以连杀从 5 起 —— 这条理由只在这里记一次。
+export const STREAK_KEYS = ['Digit5', 'Digit6', 'Digit7'];
+export const STREAK_KEY_LABELS = STREAK_KEYS.map(k => k.replace(/^Digit/, ''));
+export const streakKeyLabel = i => STREAK_KEY_LABELS[i] || '';
+// 按下的是哪个连杀槽（-1 = 没按）。绑定做成函数是为了让判据能直接喂一份按键表进来量，
+// 而不必去 grep 某个调用点的写法。
+export const streakSlotOf = pressed => {
+  for (let i = 0; i < STREAK_KEYS.length; i++) if (pressed && pressed[STREAK_KEYS[i]]) return i;
+  return -1;
+};
+
 export const DEFAULT_CLASSES = [
   { name: '突击兵', primary: 'm4', patt: { optic: 'holo', under: 'vgrip', muzzle: 'comp' }, pcamo: 'none', secondary: 'm1911', satt: {}, scamo: 'none', lethal: 'frag', tactical: 'flash', perks: ['doubletime', 'ghost', 'sleight'] },
   { name: '近战突破', primary: 'mp5', patt: { optic: 'reddot', laser: 'tac', stock: 'none' }, pcamo: 'digital', secondary: 'm1911', satt: {}, scamo: 'none', lethal: 'semtex', tactical: 'flash', perks: ['doubletime', 'quickfix', 'ninja'] },

@@ -7,6 +7,15 @@ html, body { position: fixed; inset: 0; }
 .hidden { display: none !important; }
 :root { --acc: #d4f24a; --acc2: #ffb400; --ally: #4fb4ff; --enemy: #ff4a3d; --panel: rgba(12, 14, 16, 0.78); }
 
+/* 键盘可见焦点（HU-06）：这套深色底上浏览器默认的焦点环几乎看不见，而 Tab 刚在菜单里放开 ——
+   能导航却没有落点等于没有。用描边而不是改背景：.mbtn / .seg div 的 :hover 已经占了背景与左边框，
+   焦点态跟它叠在一起时得看得出是两件事。 */
+.mbtn:focus-visible, .btn:focus-visible, .pick:focus-visible, .cls:focus-visible, .slotc:focus-visible,
+.gs-att:focus-visible, .gs-slot:focus-visible, .mode:focus-visible, .mapc:focus-visible, .diff:focus-visible,
+.seg div:focus-visible, .camo:focus-visible, input:focus-visible, button:focus-visible {
+  outline: 2px solid var(--acc); outline-offset: 2px;
+}
+
 /* 加载 */
 #loading { position: fixed; inset: 0; background: radial-gradient(ellipse at center, #1b1f22 0%, #050606 70%); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .load-inner { width: 520px; text-align: center; }
@@ -391,7 +400,9 @@ html, body { position: fixed; inset: 0; }
 #progressFill.enemy { background: var(--enemy); }
 #subtitles { position: absolute; left: 50%; bottom: 110px; transform: translateX(-50%); text-align: center; max-width: 70%; font-size: 19px; text-shadow: 0 0 4px #000, 0 0 8px #000; }
 #subtitles .sp { color: var(--acc2); font-weight: 800; margin-right: 8px; }
-#announce { position: absolute; left: 50%; top: 22%; transform: translateX(-50%); text-align: center; font-size: 30px; font-weight: 900; letter-spacing: 6px; text-shadow: 0 0 8px #000; opacity: 0; transition: opacity .3s; white-space: nowrap; }
+#announce { position: absolute; left: 50%; top: 22%; transform: translateX(-50%); text-align: center; font-size: 30px; font-weight: 900; letter-spacing: 6px; text-shadow: 0 0 8px #000; opacity: 0; transition: opacity .3s; max-width: min(80vw, 900px); }
+/* 不写 nowrap（HU-03）：#hud 是 overflow:hidden，而掉线那一句要把"原因 + 服务器备注 +
+   按 Enter 重新连接"整段塞进 small 那一行 —— nowrap 之下两端一起被裁掉，被裁的正好是唯一的出路。 */
 #announce small { display: block; font-size: 14px; letter-spacing: 3px; color: #ccc; font-weight: 400; margin-top: 4px; }
 #enemyName { position: absolute; left: 50%; top: calc(50% - 50px); transform: translateX(-50%); font-size: 14px; font-weight: 700; color: var(--enemy); text-shadow: 0 0 3px #000; }
 #alertEdge { position: absolute; inset: 0; opacity: 0; box-shadow: inset 0 0 80px 10px rgba(255,180,0,.7); transition: opacity .2s; }

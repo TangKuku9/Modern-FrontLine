@@ -311,7 +311,8 @@ export class Campaign {
       this.deaths = (this.deaths || 0) + 1;
       this.deadT = 2;
       document.getElementById('deathScreen').classList.remove('hidden');
-      document.getElementById('killerInfo').innerHTML = killer && killer !== victim ? `被 <b>${killer.name}</b> 使用 ${weapon || ''} 击杀` : '你阵亡了';
+      // 战役不说"自我击杀"（那一栏是"你阵亡了"），也不报爆头 —— 传进同一处拼接（HU-38）
+      game.hud.killerInfo(killer && killer !== victim ? killer.name : null, weapon, false, '你阵亡了');
       document.querySelector('#deathScreen .death-btns').style.display = 'none';
       if (document.pointerLockElement) document.exitPointerLock();
       return;
