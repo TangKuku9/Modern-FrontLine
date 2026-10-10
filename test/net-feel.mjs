@@ -83,6 +83,9 @@ function makeGame() {
     makeNoise: () => {},
     hud: {
       announce: () => {}, popup: () => {}, killfeed: () => {}, damageFrom: () => {}, flash: () => {}, scorebar: () => {},
+      // HU-41：玩家离开对局那条从 announce 改走左下角聊天条，桩里没有这一格就会 TypeError，
+      // 而"抛异常"不是判决（同一句纪律）。顺手把话记下来，X 段之外谁要用都有得查。
+      chatLocal: (t) => { log.chats = (log.chats || []).concat(t); },
       streaks: (list, kills) => { log.streaks = { list, kills }; }, showScoreboard: () => {}, hitmarker: () => {},
       setMarkers: (l) => { log.markers = l; }, prompt: () => {}, progress: () => {}, highAlert: () => {},
     },
@@ -409,15 +412,19 @@ const mkRemote = (g, o = {}) => new NetPlayer(g, { id: 2, name: '敌', team: 'B'
   ok('J13b′ 反证臂：自己叫的集束空袭**照常**建副本（本地没预测过它，这是呼叫者唯一的一双眼）',
     g.projectiles.length === 2 && c.projs.get(7) === g.projectiles[1], `场上 ${g.projectiles.length} 颗`);
 
-  // leave：既要开始淡出、又要有一句提示
-  const said = [];
+  // leave：既要开始淡出、又要说一句。而那一句现在走**左下角聊天条**（docs/hud-ux-audit.md 的
+  // HU-41）：16 人房里连着走人，过去是连着几条 30px 居中大字盖住战场。
+  // 两条都要钉住 —— 换了通道不等于可以不说话，说了也不许再占屏幕中心。
+  const said = [], chats = [];
   g.hud.announce = (...a) => said.push(a[0]);
+  g.hud.chatLocal = (...a) => chats.push(a[0]);
   const r = mkRemote(g, { id: 3, name: '老王', team: 'B' });
   c.remotes.set(3, r); c.roster.set(3, { name: '老王', team: 'B' });
   feed([{ e: 'leave', cid: 3 }]);
-  ok('J14 leave ⇒ 进入淡出队列并说一句（不再是瞬时消失、无声无息）',
-    c.leaving.indexOf(r) >= 0 && !c.remotes.has(3) && said.length === 1 && /老王/.test(said[0]),
-    `leaving=${c.leaving.length} 提示=${JSON.stringify(said)}`);
+  ok('J14 leave ⇒ 进入淡出队列并说一句（HU-41：那句现在在聊天条里，不是瞬时消失、无声无息）',
+    c.leaving.indexOf(r) >= 0 && !c.remotes.has(3) && chats.length === 1 && /老王/.test(chats[0]),
+    `leaving=${c.leaving.length} 聊天条=${JSON.stringify(chats)}`);
+  ok('J14b 反证臂：那一句没走 announce（换了通道 ≠ 随便占屏幕中心）', said.length === 0, JSON.stringify(said));
   ok('J15 反证臂：淡出队列里的那个确实在淡（不是只挪了个表）', r.targetable === false && r.beginLeaveCalled !== false);
 }
 

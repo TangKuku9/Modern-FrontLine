@@ -1284,6 +1284,10 @@ export class NetRoom {
     if (want && want.id === 'cluster' && dist > CLUSTER_MAX) {
       S.rejected++;
       if (S.why.length < 6) S.why.push({ cid: c.cid, slot: i, reason: 'cluster-needs-target', dist: dist === Infinity ? null : +dist.toFixed(1) });
+      // 拒收要当着呼叫者的面说（HU-12）：过去这里只加读数，屏幕上一点反应都没有，
+      // 玩家以为"按了没反应"，于是连着按。只发**语义码**，成品文案在两端共查的
+      // js/data.js:STREAK_REJECT_TEXT 里（与上面那句"语义下发，不成品文案"同一条约定）。
+      this.events.push({ e: 'streakNope', cid: c.cid, why: 'target' });
       return null;
     }
     const s = c.book.take(i);
@@ -1295,6 +1299,7 @@ export class NetRoom {
         cid: c.cid, slot: i, progress: +c.book.progress.toFixed(2),
         costs: c.book.slots.map(x => x.cost), ready: c.book.slots.map(x => x.ready),
       });
+      this.events.push({ e: 'streakNope', cid: c.cid, why: 'slot' });   // 同上：本人回执，语义码
       return null;
     }
     S.accepted++;

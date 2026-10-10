@@ -271,6 +271,17 @@ export const streakSlotOf = pressed => {
   for (let i = 0; i < STREAK_KEYS.length; i++) if (pressed && pressed[STREAK_KEYS[i]]) return i;
   return -1;
 };
+// 连杀呼叫失败的回执（HU-12）。四条失败路都从这里取话：单机按了没就绪的槽、联机按了没就绪的槽、
+// 权威端拒收集束落点、权威端拿不到槽。各写一份的症状是"同一种失败在两种模式下有两种说法"
+// （与 HU-38 同族）。以前这四条**一句都不说**，玩家只会反复按同一个键。
+export const streakNotReadyText = (name, need) => (need > 0 ? `${name} 还差 ${need} 杀` : `${name} 还没就绪`);
+// 服务端只下发**语义码**（'slot' / 'target'），成品文案在两端共查的这张表里 ——
+// 与 server/room.mjs 那句"语义下发，不成品文案"同一条约定。
+export const STREAK_REJECT_TEXT = {
+  target: '空袭落点太远 · 请重新选点',
+  slot: '槽位状态已变 · 再按一次',
+};
+export const streakRejectText = why => STREAK_REJECT_TEXT[why] || '呼叫未被接受';
 
 export const DEFAULT_CLASSES = [
   { name: '突击兵', primary: 'm4', patt: { optic: 'holo', under: 'vgrip', muzzle: 'comp' }, pcamo: 'none', secondary: 'm1911', satt: {}, scamo: 'none', lethal: 'frag', tactical: 'flash', perks: ['doubletime', 'ghost', 'sleight'] },

@@ -319,6 +319,10 @@ html, body { position: fixed; inset: 0; }
 #minimapWrap { position: absolute; left: 24px; top: 24px; width: 220px; height: 220px; border: 1px solid rgba(255,255,255,.2); background: rgba(0,0,0,.4); }
 #minimap { width: 220px; height: 220px; display: block; }
 #mmLabel { position: absolute; left: 0; bottom: -20px; font-size: 11px; color: #ccc; letter-spacing: 2px; }
+/* 我方存活读数（HU-15）：以前"我方还剩几个人"只能在小地图上数点。放在地图右下角，
+   与地图同一块视线落点；ffa（每人一队）与战役（没有比分条）由 hud.js 那侧留空。 */
+#teamAlive { position: absolute; right: 0; bottom: -20px; font-size: 11px; color: var(--ally); letter-spacing: 2px; text-shadow: 0 0 3px #000; }
+#teamAlive:empty { display: none; }
 #scorebar { position: absolute; top: 52px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; font-weight: 800; }
 .sb-team { min-width: 90px; padding: 5px 12px; font-size: 20px; text-align: center; }
 .sb-team.a { background: rgba(79,180,255,.25); border-bottom: 3px solid var(--ally); }
@@ -376,11 +380,17 @@ html, body { position: fixed; inset: 0; }
 #ammoMag { font-size: 44px; }
 #ammoMag.low { color: var(--enemy); }
 #ammoRes { font-size: 18px; color: #aaa; margin-left: 6px; }
+/* 打光与"还有很多"必须一眼分得开（HU-11）：'/ 0' 与 '/ 240' 过去同色同字号。 */
+#ammoRes.dry { color: var(--enemy); font-weight: 800; }
 #equipRow { display: flex; gap: 14px; justify-content: flex-end; font-size: 13px; margin-top: 4px; color: #ddd; }
 #equipRow span b { color: var(--acc); margin-left: 3px; }
 #healthBox { position: absolute; left: 50%; bottom: 30px; width: 240px; margin-left: -120px; height: 5px; background: rgba(0,0,0,.5); }
 #healthFill { height: 100%; width: 100%; background: #eee; transition: width .1s; }
 #healthFill.low { background: var(--enemy); }
+/* 血量数字（HU-07）：5px 的条在剩 30 与剩 90 之间只差一点点长度，而"还剩多少"是玩家
+   决定撤不撤的那个数。数字与条同由 hud.setHealth 一处写、同一个 low 口径点亮。 */
+#hpNum { position: absolute; left: 50%; bottom: 9px; transform: translateX(-50%); font-size: 13px; font-weight: 800; color: #ddd; text-shadow: 0 0 3px #000; letter-spacing: 1px; }
+#hpNum.low { color: var(--enemy); }
 #streaks { position: absolute; right: 40px; bottom: 150px; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
 .stk { display: flex; align-items: center; gap: 8px; font-size: 12px; background: rgba(0,0,0,.45); padding: 4px 10px; color: #aaa; }
 .stk .ic { font-size: 18px; filter: grayscale(1); opacity: .5; }
@@ -407,6 +417,13 @@ html, body { position: fixed; inset: 0; }
 #enemyName { position: absolute; left: 50%; top: calc(50% - 50px); transform: translateX(-50%); font-size: 14px; font-weight: 700; color: var(--enemy); text-shadow: 0 0 3px #000; }
 #alertEdge { position: absolute; inset: 0; opacity: 0; box-shadow: inset 0 0 80px 10px rgba(255,180,0,.7); transition: opacity .2s; }
 #fps { position: absolute; right: 8px; bottom: 6px; font-size: 11px; color: #8f8; }
+/* 常驻网络读数（HU-08）：以前 ping 只在按住 Tab 的记分板脚注里，被拽回时屏幕上没有解释。
+   放在右下角 FPS 之上，与它同一档不打扰战场；warn 态（收不到快照 / RTT 异常）换成红色。 */
+/* bottom:21 不是随手写的：实测 #ammoBox 里最下面那行（#equipRow）占 [667,684)，而 #fps 占 [699,714)
+   —— 22 会让这一格的第一行像素压上装备行，21 正好两头都不碰（真浏览器量出来的）。 */
+#netStat { position: absolute; right: 8px; bottom: 21px; font-size: 11px; letter-spacing: 1px; color: #8f8; text-shadow: 0 0 3px #000; }
+#netStat:empty { display: none; }
+#netStat.warn { color: var(--enemy); }
 #deathScreen { position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 14vh; background: radial-gradient(ellipse at center, transparent 30%, rgba(60,0,0,.6)); }
 .death-inner { text-align: center; }
 .death-title { font-size: 44px; font-weight: 900; letter-spacing: 10px; color: var(--enemy); }

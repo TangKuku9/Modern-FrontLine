@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { Player } from './player.js';
 import { Bot } from './ai.js';
 import { MAPS } from './maps.js';
-import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats, streakKeyLabel } from './data.js';
+import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats, streakKeyLabel, streakNotReadyText } from './data.js';
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
@@ -431,7 +431,15 @@ export class MPMatch {
   // ---------- 连杀奖励 ----------
   useStreak(i) {
     const s = this.streakState[i];
-    if (!s || !s.ready) return;
+    // 没就绪也要说话（HU-12）：过去这里静默 return，而 5/6/7 是全平台通用的槽位键，
+    // 按下没反应玩家只会再按一次。差几个杀是本地就算得出的数，不必问权威端。
+    if (!s || !s.ready) {
+      if (s) {
+        const def = KILLSTREAKS.find(k => k.id === s.id);
+        this.game.hud.popup(streakNotReadyText(def ? def.name : '该连杀奖励', s.cost - Math.floor(this.streakBook.progress)), '#f66');
+      }
+      return;
+    }
     const game = this.game, pl = game.player;
     // 两种"不能呼叫即消耗"的：
     //  · 集束空袭要先选目标，改主意（右键）就不该扣掉；
@@ -785,7 +793,11 @@ export class Sentry {
         if (this.dumb) return;
         const r = fireHitscan(game, this.owner.alive !== undefined ? this.owner : this, eye, dir, this.stats, '哨戒机枪');
         game.effects.tracer(m, r.point, [2, 1.4, 0.6]);
-        if (r.ent && this.owner.isPlayer) { game.hud.hitmarker(r.killed); }
+        if (r.ent && this.owner.isPlayer) {
+          // 命中音与准星上那个叉是一对（HU-13）：步枪那条路两处都调（js/weapon-state.js:291），
+          // 连杀这两处只画叉不出声 —— 打死了人一声不响，玩家以为自己没打中。
+          game.hud.hitmarker(r.killed); game.audio.hit(r.killed, r.part === 'head');
+        }
       }
     } else this.yaw += dt * 0.6;
     this.head.rotation.y = this.yaw;
@@ -967,7 +979,10 @@ export class Heli {
         const shooter = { team: this.team, isPlayer: false, name: '武装直升机', kills: undefined, alive: true };
         const res = fireHitscan(game, this.owner && this.owner.isPlayer ? this.owner : shooter, muzzle, dir, this.stats, '武装直升机');
         game.effects.tracer(muzzle, res.point, [2, 1.3, 0.5]);
-        if (res.ent && this.owner && this.owner.isPlayer) game.hud.hitmarker(res.killed);
+        if (res.ent && this.owner && this.owner.isPlayer) {
+          // 与哨戒机枪同一对（HU-13）：命中音补上，理由见那里。
+          game.hud.hitmarker(res.killed); game.audio.hit(res.killed, res.part === 'head');
+        }
       }
     } else look = this.ang + Math.PI;
     if (this.mesh) {           // 权威端无模型（性能审查 N2）；yaw 那一行在门外面，永不被跳过

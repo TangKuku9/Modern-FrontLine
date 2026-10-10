@@ -710,7 +710,10 @@ sec('I. M10 转义：全仓只留一份，以及三处命门');
 
   // ── I9 记分板：审计点名的第一处（r.name）──
   const fake = {
-    cid: 7, team: 'A', ffa: false, rtt: 12, snaps: 30, scores: { A: 1, B: 2 },
+    cid: 7, team: 'A', ffa: false, rtt: 12, snaps: 30, pulls: 0, scores: { A: 1, B: 2 },
+    // HU-08 之后脚注那一句取自 netStatusText()（与常驻 HUD 同一处措辞）。桩缺这一格会
+    // TypeError —— 缺口在桩里补齐，不动被测对象（与 test/net-feel.mjs 同一条纪律）。
+    netStatusText() { return NetClient.prototype.netStatusText.call(this); },
     board: { rows: [{ cid: 1, team: 'B', name: XSS, s: 0, k: 0, d: 0, a: 0, rank: 1 },
       { cid: 7, team: 'A', name: '我', s: 1, k: 2, d: 3, a: 4, rank: 2 }] },
   };

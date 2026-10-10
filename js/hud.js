@@ -9,6 +9,24 @@ import { DOM_RADIUS_WEAK } from './match-rules.js';
 
 const $ = id => document.getElementById(id);
 const _v = new THREE.Vector3();
+const _d = new THREE.Vector3();
+const _r = new THREE.Vector3();
+const _u = new THREE.Vector3();
+
+// ── HUD 读数的几把尺子，全在本文件顶部（HU-07/09/10/14）──
+// 每一条都是"屏幕上写出来的数"与"代码实际用的数"必须同源的那种：抄第二份迟早会分叉，
+// 而分叉的症状是界面在说谎（见 docs/hud-ux-audit.md 的 HU-01 / HU-38 两节）。
+// MM_SIZE 与 index.html 里 <canvas id="minimap" width="220" height="220"> 是同一个数，
+// 由 test/hud-ux.mjs 的 K6 拿 index.html 对账；改一边就得同时改另一边。
+const MM_SIZE = 220;
+const MM_RADIUS = 45;                 // 小地图显示半径（米）—— #mmLabel 上写的就是它
+const HP_LOW = 0.35;                  // 血量告警口径：条与数字共用同一个阈值
+const DMG_DIR_MAX = 4;                // 伤害方向指示同时最多几条（点射不许弧叠弧）
+const DMG_DIR_MERGE = 20 * Math.PI / 180;   // 同方向判据：来向夹角小于这个数就合成一条
+// 来袭警告（HU-10）：哪些弹种算"落在你附近会要你命"，以及那一行说什么。
+// 非致命弹（flash / smoke）不在表里 —— 把致盲雷报成"快跑"是狼来了。
+const NADE_WARN = { frag: '手雷！', semtex: '粘性炸弹！', molotov: '燃烧瓶！', rocket: 'RPG 来袭！', bomb: '空袭弹幕！' };
+const NADE_NEAR = 14;                 // 米：破片杀伤 7m，留一倍余量才来得及跑出杀伤半径
 
 export class HUD {
   constructor(game) {
@@ -20,6 +38,14 @@ export class HUD {
     this.subQueue = []; this.subT = 0;
     this.announceT = 0;
     this.buildCompass();
+    // 小地图那一格写的半径 = 绘制用的那个数（HU-09）：#mmLabel 过去是死 DOM，
+    // 建 HTML 的人留了格子，JS 从不写，于是地图上永远没有比例尺读数。
+    const ml = $('mmLabel'); if (ml) ml.textContent = '半径 ' + MM_RADIUS + 'm';
+    // 已经喊过"手雷！"的那几颗（HU-10）：按弹记账，一颗只喊一次。
+    this._nadeWarned = new Set();
+    // 出生就是满弹匣，所以"没打光"是这块的初值；写 false 而不是 undefined，
+    // 是因为 false→true 那个边沿就是要能被第一次打光触发。
+    this._drySig = false;
     this.fpsAcc = 0; this.fpsN = 0;
     // 节流累加器（客户端性能审查 C1）：初值给满 —— 进对局第一拍就把小地图/敌名画出来，
     // 不等第一个周期。
@@ -62,12 +88,16 @@ export class HUD {
     // 对账由 test/hud-ux.mjs C 段拿源码做：全文出现过的 this._*Sig，reset() 里必须逐个归位。
     // 累加器给满，让进对局第一拍就把小地图/敌名画出来。
     this._eqSig = undefined; this._stkSig = undefined; this.sweepT = 1; this.mmT = 1;
+    this._hpSig = undefined; this._drySig = false; this._netSig = undefined; this._taSig = undefined;
     // 水圈的两个缓存指向的是**刚被清掉的那批 DOM**（上面清了 #scorebar）：留着既吊着
     // detached 节点，又让 flagWaters 里"元素换了人"那条重建判据失真。
     this._fwEl = null; this._fwNodes = null; this._fwSig = '';
     // 上一局的复活点卡片不许跟到新局（HU-21：过去靠 deathUiTick 每拍覆盖兜住，是侥幸）
     this.spawnSelect(null);
     $('enemyName').textContent = '';
+    // 新局还没打过一发，读数格子不该带着上一局的数字进场（与上面那堆清空同一件事）
+    $('hpNum').textContent = ''; $('teamAlive').textContent = ''; $('netStat').textContent = '';
+    this._nadeWarned = new Set();
     // 聊天条也是上一局的残留：不清的话上一局的话会跟着新局一起开（与 deathScreen 同一类事）
     this.chatRows = []; this.chatActive = false; this.chatChannel = 'match'; clearTimeout(this.chatT);
     const cb = $('chatBox');
@@ -81,10 +111,23 @@ export class HUD {
     h.style.transform = `scale(${kill ? 1.3 : 1})`;
   }
   flash(t) { this.flashT = t; this.flashMax = t; }
+  // 受击方向指示。两条纪律（HU-14）：
+  //   ① 同方向去重 —— 全自动被扫一梭子时过去每跳血新增一条弧，1.6 秒里叠六七条，
+  //      "那边有人打我"这个读数糊成一团白雾；来向夹角小于 DMG_DIR_MERGE 的续命不新画。
+  //   ② 条数上限 —— 就算全来自不同方向，也不许把屏幕画满。
   damageFrom(pos) {
+    const pl = this.game.player;
+    const ref = Math.atan2(pos.x - pl.pos.x, -(pos.z - pl.pos.z));   // 世界来向（与看向哪儿无关）
+    for (const d of this.dmgDirs) {
+      let da = d.ref - ref;
+      while (da > Math.PI) da -= Math.PI * 2;
+      while (da < -Math.PI) da += Math.PI * 2;
+      if (Math.abs(da) < DMG_DIR_MERGE) { d.pos.copy(pos); d.ref = ref; d.t = 1.6; return; }
+    }
     const el = document.createElement('div'); el.className = 'dmgdir';
     $('dmgDirs').appendChild(el);
-    this.dmgDirs.push({ el, pos: pos.clone(), t: 1.6 });
+    this.dmgDirs.push({ el, pos: pos.clone(), ref, t: 1.6 });
+    while (this.dmgDirs.length > DMG_DIR_MAX) this.dmgDirs.shift().el.remove();
   }
   highAlert(pos) {
     const pl = this.game.player; if (!pl) return;
@@ -264,6 +307,76 @@ export class HUD {
   // dt 取的是那一帧的**墙钟差**,所以锁 60 时读数就是 60,而不是被 raw 的截断带偏。
   meterFrame(dt) { this.fpsAcc += dt; this.fpsN++; }
 
+  // 血量读数（HU-07）：条与数字**同一处写、同一个 HP_LOW 判**。分两处的话会出现
+  // "红条配白字"，而这一格是玩家决定撤不撤的唯一依据 —— 以前只有那根 5px 的条，
+  // 剩 30 与剩 90 只差一点点长度。
+  setHealth(hp, maxHp) {
+    const k = clamp(hp / maxHp, 0, 1);
+    const low = k < HP_LOW;
+    const hf = $('healthFill');
+    hf.style.width = (k * 100) + '%';
+    hf.classList.toggle('low', low);
+    const txt = String(Math.max(0, Math.round(hp)));
+    // 签名带上有不红：34.9 与 35.4 取整后是同一个"35"，而一个该红一个不该红 ——
+    // 只按数字设门的话，跨过阈值那一拍会被门跳过，于是"白字配红条"（判据 H3 钉的就是这个）。
+    const sig = txt + (low ? '!' : '');
+    if (this._hpSig !== sig) {
+      this._hpSig = sig;
+      const el = $('hpNum');
+      el.textContent = txt;
+      el.classList.toggle('low', low);
+    }
+  }
+
+  // 我方存活读数（HU-15）：以前"我方还剩几个人"只能在小地图上数点。
+  // 名单来自 game.entities（单机 Bot、联机远端、玩家本体都在这一张表里），
+  // 排除非战斗人员用的就是规则内核那三条既有判据（哨戒机枪/直升机不算人）。
+  // ffa 每人一支队伍，"我方还剩几个"这个问题本身不成立 ⇒ 留空而不是写一个骗人的数。
+  teamReadout() {
+    const game = this.game, pl = game.player, mode = game.mode;
+    let txt = '';
+    if (pl && mode && !mode.ffa) {
+      let alive = 0, total = 0;
+      for (const e of game.entities) {
+        if (e.targetable === false || e.isTurret || e.isHeli || e.team !== pl.team || !e.pos) continue;
+        total++; if (e.alive) alive++;
+      }
+      if (total > 1) txt = `我方 ${alive}/${total}`;      // 一个人的队不配叫"存活名单"
+    }
+    if (this._taSig !== txt) { this._taSig = txt; $('teamAlive').textContent = txt; }
+  }
+
+  // 常驻网络读数（HU-08）：文案由 NetClient 那一处出（HUD 不自己拼第二份 ping 格式 ——
+  // 与记分板脚注同一句文案，两处各写就是两个真相）。单机/战役没有 net，留空。
+  netReadout() {
+    const net = this.game.net;
+    const txt = net && net.netStatusText ? net.netStatusText() : '';
+    if (this._netSig !== txt) {
+      this._netSig = txt;
+      const el = $('netStat');
+      el.textContent = txt;
+      el.classList.toggle('warn', !!(net && net.netStatusWarn));
+    }
+  }
+
+  // 手雷来袭（HU-10）：敌方/队友扔出来的致命弹在自己屏幕上从来没有过任何预告 ——
+  // 只有炸的那一刻的镜头冲击。这里补两件事：小地图上那颗有独立标记，进杀伤距离时喊一次。
+  // 记账按"颗"不按"拍"：一颗只喊一次（每拍喊的话 2.2 秒的 popup 会常亮成噪音）。
+  nadeWatch() {
+    const game = this.game, pl = game.player;
+    const list = game.projectiles;
+    if (!pl || !list || !list.length) return;
+    for (const p of list) {
+      if (!p.alive || p.owner === pl || !NADE_WARN[p.type]) continue;
+      const warned = this._nadeWarned.has(p);
+      if (!warned && p.pos.distanceTo(pl.pos) <= NADE_NEAR) {
+        this._nadeWarned.add(p);
+        this.popup(NADE_WARN[p.type], '#f66');
+        game.audio.beep(2);
+      }
+    }
+  }
+
   update(dt) {
     const game = this.game, pl = game.player;
     if (!pl) return;
@@ -301,16 +414,22 @@ export class HUD {
     // 受伤
     const hpk = pl.hp / pl.maxHp;
     $('vignette').style.opacity = clamp((1 - hpk) * 1.3, 0, 1);
-    const hf = $('healthFill'); hf.style.width = (hpk * 100) + '%'; hf.classList.toggle('low', hpk < 0.35);
+    this.setHealth(pl.hp, pl.maxHp);
     // 伤害方向
-    for (let i = this.dmgDirs.length - 1; i >= 0; i--) {
-      const d = this.dmgDirs[i];
-      d.t -= dt;
-      if (d.t <= 0) { d.el.remove(); this.dmgDirs.splice(i, 1); continue; }
-      const dx = d.pos.x - pl.pos.x, dz = d.pos.z - pl.pos.z;
-      const ang = Math.atan2(dx, -dz) + pl.yaw; // 屏幕角
-      d.el.style.transform = `rotate(${ang}rad)`;
-      d.el.style.opacity = Math.min(1, d.t);
+    if (this.dmgDirs.length) {
+      const q = game.camera.quaternion;
+      const right = _r.set(1, 0, 0).applyQuaternion(q);
+      const up = _u.set(0, 1, 0).applyQuaternion(q);
+      for (let i = this.dmgDirs.length - 1; i >= 0; i--) {
+        const d = this.dmgDirs[i];
+        d.t -= dt;
+        if (d.t <= 0) { d.el.remove(); this.dmgDirs.splice(i, 1); continue; }
+        // 屏幕角由**相机基向量**投影得到（HU-14）：旧写法 atan2(dx,-dz)+yaw 只有平面角 ——
+        // 抬头瞄天时来自脚下的枪声被画到正上方，探头侧倾一点都不参与。
+        _d.copy(d.pos).sub(pl.pos);
+        d.el.style.transform = `rotate(${Math.atan2(_d.dot(right), _d.dot(up))}rad)`;
+        d.el.style.opacity = Math.min(1, d.t);
+      }
     }
     // 警觉
     this.alertT -= dt;
@@ -325,14 +444,29 @@ export class HUD {
       if (wnEl.textContent !== wnTxt) wnEl.textContent = wnTxt;
       const magTxt = inv ? String(inv.count) : '0';
       if (magEl.textContent !== magTxt) { magEl.textContent = magTxt; magEl.classList.toggle('low', !inv || inv.count <= 1); }
-      if (resEl.textContent !== '') resEl.textContent = '';
+      // 切出雷时把"打光"那个颜色一起摘掉（HU-11）：这一格留空了却还挂着 dry，读起来就是
+      // "雷的备弹打光了"。签名门只盯 textContent，颜色是它的另一个自由度，得自己归位。
+      if (resEl.textContent !== '' || resEl.classList.contains('dry')) { resEl.textContent = ''; resEl.classList.remove('dry'); }
     } else if (w) {
       const wnTxt = w.stats.name + (w.stats.suppressed ? ' · 消音' : '');
       if (wnEl.textContent !== wnTxt) wnEl.textContent = wnTxt;
       const magTxt = String(w.mag);
       if (magEl.textContent !== magTxt) { magEl.textContent = magTxt; magEl.classList.toggle('low', w.mag <= Math.ceil(w.stats.mag * 0.25)); }
       const resTxt = '/ ' + w.reserve;
-      if (resEl.textContent !== resTxt) resEl.textContent = resTxt;
+      const dry = w.reserve <= 0;
+      if (resEl.textContent !== resTxt) {
+        resEl.textContent = resTxt;
+        // 打光与"还有很多"必须一眼分得开（HU-11）：'/ 0' 过去与 '/ 240' 同色同字号，
+        // 而它是全场唯一会永久停住的那个读数。
+        resEl.classList.toggle('dry', dry);
+      }
+      // 进入"打光"那一拍喊一次（HU-11）。存上一拍的布尔 ⇒ 只在 false→true 响；
+      // 每拍弹的话 2.2 秒的 popup 会连成常亮，而扣着扳机不放的干响应本来就一声不出。
+      const prevDry = this._drySig;
+      if (prevDry !== dry) {
+        this._drySig = dry;
+        if (dry && prevDry === false) this.popup(ws.slots.length > 1 ? '弹药用尽 · 按 [2] 换副武器' : '弹药用尽', '#f66');
+      }
     }
     // 装备行：两种雷都挂在 4 上（按 4 在其间循环），切出中的那种点亮。
     {
@@ -384,6 +518,7 @@ export class HUD {
     // 30Hz —— 2.4px/m 的比例下跑动者每拍挪不到半像素，转身时 12°/拍的旋转也无顿挫感。
     this.mmT += dt;
     if (this.mmT >= 1 / 30) { this.mmT %= 1 / 30; this.drawMinimap(); }
+    this.teamReadout(); this.netReadout(); this.nadeWatch();
     this.updateMarkers();
   }
 
@@ -498,7 +633,7 @@ export class HUD {
 
   drawMinimap() {
     const game = this.game, pl = game.player, world = game.world;
-    const ctx = this.mm, S = 220, R = 45; // 显示半径（米）
+    const ctx = this.mm, S = MM_SIZE, R = MM_RADIUS; // 显示半径（米），与 #mmLabel 那行同源
     const scale = S / (R * 2);
     ctx.save();
     ctx.clearRect(0, 0, S, S);
@@ -510,14 +645,34 @@ export class HUD {
     ctx.globalAlpha = 0.9;
     ctx.drawImage(world.topDown, (-pl.pos.x - world.half) * scale, (-pl.pos.z - world.half) * scale, sz, sz);
     ctx.globalAlpha = 1;
+    const EDGE = S / 2 - 7;
+    // 圈外的点收成圈沿上的箭头（HU-09）：旧 dot() 不 clamp，45m 之外的队友与敌人被 canvas
+    // 直接裁掉 —— "地图上没人"与"人在北边 80 米"在屏幕上长得一样。旗子有 3D 标记兜底，
+    // 人没有。箭头方向就是真实来向（这个上下文已经按 pl.yaw 旋过，所以"朝外"自带朝向）。
     const dot = (x, z, color, r = 4, tri = false, yaw = 0) => {
-      const px = (x - pl.pos.x) * scale, pz = (z - pl.pos.z) * scale;
+      let px = (x - pl.pos.x) * scale, pz = (z - pl.pos.z) * scale;
+      const dd = Math.hypot(px, pz);
+      const off = dd > EDGE;
+      if (off) { const k = EDGE / dd; px *= k; pz *= k; }
       ctx.save(); ctx.translate(px, pz);
       ctx.fillStyle = color;
-      if (tri) { ctx.rotate(-yaw); ctx.beginPath(); ctx.moveTo(0, -r * 1.4); ctx.lineTo(r, r); ctx.lineTo(-r, r); ctx.closePath(); ctx.fill(); }
+      if (off) {
+        ctx.rotate(Math.atan2(pz, px) + Math.PI / 2);
+        ctx.globalAlpha = 0.8;
+        ctx.beginPath(); ctx.moveTo(0, -r * 1.2); ctx.lineTo(r, r * 0.9); ctx.lineTo(-r, r * 0.9); ctx.closePath(); ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      else if (tri) { ctx.rotate(-yaw); ctx.beginPath(); ctx.moveTo(0, -r * 1.4); ctx.lineTo(r, r); ctx.lineTo(-r, r); ctx.closePath(); ctx.fill(); }
       else { ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill(); }
       ctx.restore();
     };
+    // 来袭爆炸物（HU-10）：这张图此前只有人 —— 手雷落在脚边，小地图上也看不见那颗飞进来的东西。
+    // 自己扔的那一颗不画（你知道自己往哪儿扔的），非致命弹（闪光/烟雾）也不画（那是狼来了）。
+    const projs = game.projectiles;
+    if (projs) for (const p of projs) {
+      if (!p.alive || p.owner === pl || !NADE_WARN[p.type]) continue;
+      dot(p.pos.x, p.pos.z, '#ff9a2a', 4.5);
+    }
     // 目标点
     const mode = game.mode;
     if (mode && mode.flags) for (const f of mode.flags) {

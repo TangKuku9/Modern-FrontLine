@@ -10,7 +10,7 @@ import { NetPlayer, INTERP_DELAY, setInterpDelay } from './remote.mjs';
 import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs';
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
 import { uavFromFlags, SAY, streakOwn, SAY_START, medalSay, DOM_RADIUS_WEAK } from '../match-rules.js';
-import { streakKeyLabel } from '../data.js';
+import { streakKeyLabel, streakNotReadyText, streakRejectText } from '../data.js';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { foldJudge } from './idle-ruler.mjs';
@@ -43,6 +43,9 @@ const withFoePrefix = (voice, text) => {
   const t = String(text || '');
   return (t.startsWith('敌方') || voice.startsWith('敌方')) ? voice : '敌方' + voice;
 };
+// 被拽回"看得见"的那一档（HU-08）：一次对账纠正超过半个身位才计入读数。
+// 亚分米的抖动每包都有，报出来只会让右下角常亮成噪音。
+const PULL_METRES = 0.5;
 
 export class NetClient {
   constructor(game, opts = {}) {
@@ -683,6 +686,9 @@ export class NetClient {
     this.lastOwnLead = ownLead;                        // 留给下一包：它的基态就缺这一撮
     this.replayed = r.replayed;
     this.corrected = r.corrected;
+    // 拽回次数（HU-08）：那"位置瞬移一下"以前在屏幕上没有任何解释，玩家只会以为自己卡了
+    // 或者手柄失灵。超过 PULL_METRES 的纠正才计数 —— 小的每包都有，计进去读数就常亮。
+    if (r.corrected > PULL_METRES) this.pulls = (this.pulls || 0) + 1;
     this.correctedMax = Math.max(this.correctedMax || 0, r.corrected);
     this.recIdx = (this.recIdx || 0) + 1;
     // 输入饥饿的**准确**签名：服务端从上一包到这包跑了 dTick 拍，而我的 ack 只前进 dAck 拍。
@@ -1027,6 +1033,11 @@ export class NetClient {
           this.setStreakSlot(ev.id, { ready: false, used: true });
           this.game.audio.say(streakOwn(ev.id) || SAY.ready(ev.name));
         }
+      } else if (ev.e === 'streakNope') {
+        // 权威端拒收了这一次呼叫（HU-12）。槽位表是每人一份的，所以只报给呼叫者本人 ——
+        // 别人屏幕上不该冒出"落点太远"。走 popup 不走 announce：拒收是战场上的事，
+        // 而 announce 会把屏幕中心让给一条只有一个人需要读的消息。
+        if (ev.cid === this.cid) this.game.hud.popup(streakRejectText(ev.why), '#f66');
       } else if (ev.e === 'turret') {
         this.spawnTurret(ev);
       } else if (ev.e === 'gone') {
@@ -1104,7 +1115,13 @@ export class NetClient {
         const who = this.roster.get(ev.cid);
         const r = this.remotes.get(ev.cid) || this.leaving.find(x => x.id === ev.cid);
         if (r) this.beginLeave(r);                  // 事件先到：淡出不必等下一包快照缺人
-        if (who && ev.cid !== this.cid) this.game.hud.announce((who.name || '一名玩家') + ' 离开了对局', '', 2);
+        if (who && ev.cid !== this.cid) {
+          // 走左下角的聊天条，不走 30px 居中大字（HU-41）：16 人房里连着走人，过去就是连着
+          // 几条大字盖住战场 —— 而"某人退了"既不值得打断瞄准，也不值得占住屏幕中心。
+          // join 那侧**不要**跟着加：它只在名单成型那批到，加了就是开局刷屏
+          // （见 docs/hud-ux-audit.md 的 HU-05 更正）。
+          this.game.hud.chatLocal((who.name || '一名玩家') + ' 离开了对局');
+        }
       } else if (ev.e === 'board') {
         this.board = ev;
         this.scores.A = ev.scores.A; this.scores.B = ev.scores.B;
@@ -1264,7 +1281,17 @@ export class NetClient {
   // 没就绪的槽不进选点：照旧上报，让服务端的 rejected 读数保持诚实。
   useStreak(i) {
     const s = this.streakState[i];
-    if (!s || !s.ready || s.id !== 'cluster') return false;
+    // 没就绪也要说话（HU-12，与单机 js/mp.js:useStreak 同一份文案表）：过去静默 return，
+    // 玩家只会把同一个键再按一遍。回执只是表现 —— 上行照旧带这一位，
+    // 服务端的 rejected 读数仍诚实（那是"两端账对不上"的探针，不能被 HUD 的嘴吃掉）。
+    if (!s || !s.ready) {
+      if (s) {
+        const def = this.streakDefs[i];
+        this.game.hud.popup(streakNotReadyText(def ? def.name : '该连杀奖励', s.cost - Math.floor(this.streakProgress)), '#f66');
+      }
+      return false;
+    }
+    if (s.id !== 'cluster') return false;
     this.targeting = { slot: i };
     this.confirmShot = false;           // 新一轮选点不许继承上一轮的残留点击
     this.game.hud.announce('选择空袭目标', '左键确认 · 右键取消', 2.5);
@@ -1541,6 +1568,20 @@ export class NetClient {
     }, 2500);
   }
 
+  // 网络读数的**唯一**措辞处（HU-08）：常驻 HUD 右下角那一格与记分板脚注都调这一句。
+  // 两处各拼一遍的话，同一屏会出现两种说法、而两个数本来来自同一份 rtt/snaps（HU-38 同族）。
+  // rtt 是 pong 实测的往返（每秒一次，所以这个数一格一格跳，不是假的"实时"）；
+  // snaps 停住 = 下行断了；pulls 是本地被权威端拽回的次数（判据见 PULL_METRES）。
+  netStatusText() {
+    // _jitEma 的单位是**秒**（onSnapshot 那条时间轴是 performance.now()/1000），这里换成 ms。
+    // 头几包它还是 undefined —— 直接 Math.round(undefined*1000) 会把 "抖动 NaN ms" 印上屏幕，
+    // 那一族病在 test/net-feel.mjs 的 AB 段有判据（坏的一枚 pong 不许污染读数），这里同形。
+    const jit = Number.isFinite(this._jitEma) ? Math.round(this._jitEma * 1000) : 0;
+    return `ping ${Math.round(this.rtt)} ms · 抖动 ${jit} ms · 快照 ${this.snaps} 份 · 拽回 ${this.pulls || 0} 次`;
+  }
+  // warn 态只说一件确定无疑的事：下行断了。看门狗 2.5 秒才判死，这里 1 秒就先把颜色换掉。
+  get netStatusWarn() { return !!this.lost || this.snapGap > 1; }
+
   scoreboardHTML() {
     // `r.name` 是**别的玩家**的呼号，而这里拼的是 innerHTML —— 于是它必须过 escHtml（M10）。
     // 另外几格都是服务端算出来的数字，插进模板里本来就到不了"当标签解析"那一步。
@@ -1560,10 +1601,9 @@ export class NetClient {
     const A = rows.filter(r => r.team === this.team), B = rows.filter(r => r.team !== this.team);
     const mine = this.team === 'A' ? this.scores.A : this.scores.B;
     const theirs = this.team === 'A' ? this.scores.B : this.scores.A;
-    // 网络状态：同一屏里回答"是我卡了还是服务器卡了"。rtt 是 pong 实测的往返（每秒一次），
-    // snaps 是收到的快照份数 —— 后者停住就说明下行断了（和 2.5 秒那条看门狗是同一个事实）。
-    const net = `ping ${Math.round(this.rtt)} ms · 快照 ${this.snaps} 份`;
-    return `<div class="sbnet">${net}</div>`
+    // 网络状态：同一屏里回答"是我卡了还是服务器卡了"。文案与右下角那格常驻读数是同一句
+    // （netStatusText，HU-08）—— 这里不再自己拼第二份。
+    return `<div class="sbnet">${this.netStatusText()}</div>`
       + head(`我方 · ${Math.floor(mine)}`, 'A') + A.map(row).join('') + '</table>'
       + head(`敌方 · ${Math.floor(theirs)}`, 'B') + B.map(row).join('') + '</table>' + cut;
   }

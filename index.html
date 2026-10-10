@@ -95,7 +95,7 @@
   <div id="dmgDirs"></div>
   <div id="markers"></div>
   <div id="compass"><div id="compassStrip"></div><div class="compass-tick"></div></div>
-  <div id="minimapWrap"><canvas id="minimap" width="220" height="220"></canvas><div id="mmLabel"></div></div>
+  <div id="minimapWrap"><canvas id="minimap" width="220" height="220"></canvas><div id="mmLabel"></div><div id="teamAlive"></div></div>
   <div id="scorebar"></div>
   <div id="killfeed"></div>
   <!-- 对局内聊天（差距 43）：行在 .ct-log，输入行只在 chatOpen 时出现（Enter 全体 / Y 队伍） -->
@@ -109,7 +109,7 @@
     <div class="ammo-row"><span id="ammoMag">30</span><span id="ammoRes">/ 120</span></div>
     <div id="equipRow"></div>
   </div>
-  <div id="healthBox"><div id="healthFill"></div></div>
+  <div id="healthBox"><div id="healthFill"></div><div id="hpNum"></div></div>
   <div id="streaks"></div>
   <div id="popups"></div>
   <div id="prompt"></div>
@@ -118,6 +118,9 @@
   <div id="announce"></div>
   <div id="enemyName"></div>
   <div id="alertEdge"></div>
+  <!-- 常驻网络读数（HU-08）：ping/回正/掉线状态以前只在按住 Tab 的记分板脚注里，
+       被拽回时屏幕上一点解释都没有。文案由 NetClient.netStatus() 一处出，两端不各拼一遍。 -->
+  <div id="netStat"></div>
   <div id="fps"></div>
   <div id="flashOverlay"></div>
   <div id="fade"></div>
