@@ -23,7 +23,7 @@
 ```bash
 npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / world-equiv / terrain / props / worker-core / preload-graph / net-journal / stance-recoil / codec / lagcomp / mp-rules / accounts / progress / hardening / service-guards / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / net-audit / heli-armor / optic / state-leak / hud-ux
                   # 其中要一个真浏览器的那几份，名单见 README《验收》（从源码推的，别在这儿抄第二份）
-npm run test:all  # 再加四个真浏览器测试（net-play 对打、net-drop 掉线、tab-session 同源双标签页、worker-live 离线实跑 Worker 双路）
+npm run test:all  # 再加五个真浏览器测试（net-play 对打、net-drop 掉线、tab-session 同源双标签页、worker-live 离线实跑 Worker 双路、hud-keys 菜单层键盘可达）
 ```
 
 期望：两条都 `EXIT=0`，末行是 `GREEN n/n`。

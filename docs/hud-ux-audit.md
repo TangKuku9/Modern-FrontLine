@@ -9,7 +9,7 @@
   `js/audio.js`、`js/effects.js`、`js/combat.js`、`js/weapon-state.js`、`docs/net-vs-local-gaps.md`
 - **grep 快照**（当日事实，代码一动就可能变味，用前先重跑）：
   - `grep -c "@media" style.css` → **0**
-  - `grep -rn "tabindex\|aria-\|role=\|autofocus\|:focus" js/ style.css index.html` → **0 命中**（仅 `hud.js:115` 的 `inp.focus()`）
+  - `grep -rn "tabindex\|aria-\|role=\|autofocus\|:focus" js/ style.css index.html` → 审计当时 **0 命中**（仅 `hud.js:115` 的 `inp.focus()`）。第一批之后：`:focus-visible` 有了一条、`tabindex` 由 `keyify()` 在运行时设（源码里查不到），`aria-/role=` 仍是 0 → 拆成 HU-40
   - `grep -rn "mmLabel" js/` → **0**（DOM 里有，JS 从不写）
 
 ## 编号约定
@@ -23,15 +23,17 @@ P3 = 对局外流程，P4 = 适配性）。状态只有三种写法：`待修` /
 ## 进度（这三个数由 grep 数出来，改条目就改标题那行的状态，别动这里的散文）
 
 ```bash
-grep -c '^### HU-.*· 已修' docs/hud-ux-audit.md     # 6
-grep -c '^### HU-.*· 部分已修' docs/hud-ux-audit.md  # 1
-grep -c '^### HU-.*· 待修' docs/hud-ux-audit.md     # 32
-grep -c '^### HU-' docs/hud-ux-audit.md             # 39   ← 上面三个相加必须等于它
+grep -c '^### HU-.*· 已修' docs/hud-ux-audit.md     # 7
+grep -c '^### HU-.*· 部分已修' docs/hud-ux-audit.md  # 0
+grep -c '^### HU-.*· 待修' docs/hud-ux-audit.md     # 33
+grep -c '^### HU-' docs/hud-ux-audit.md             # 40   ← 上面三个相加必须等于它
 ```
 
-**第一批已收口**（2026-10-10）：HU-01 · HU-02 · HU-03 · HU-04 · HU-21 · HU-38，外加 HU-06 的可达性那一半。
-判据 `test/hud-ux.mjs`（47 条，每条都带反证臂；F 段自己写明它只到源码形状），已进 `npm test` 主体档 ——
-README《验收》与 `docs/deploy-checklist.md` §0 都点了名，由 `test/docs-guard.mjs` 对账。
+**第一批已收口**（2026-10-10）：P0 六条整 —— HU-01 · HU-02 · HU-03 · HU-04 · HU-06 · HU-21，
+另捎带收了 HU-38（原本挂在 P4）。判据两份：`test/hud-ux.mjs`（47 条，进程内）与
+`test/hud-keys.mjs`（24 条，真浏览器），都已进脚本档位 —— README《验收》与
+`docs/deploy-checklist.md` §0 都点了名，由 `test/docs-guard.mjs` 对账。
+ARIA 那半从 HU-06 拆出去单立了 **HU-40**（与键盘可达是两件事，混一条会两条都收不干净）。
 
 ---
 
@@ -103,7 +105,7 @@ README《验收》与 `docs/deploy-checklist.md` §0 都点了名，由 `test/do
 - **收法**：两条都改成同一类轻量提示（killfeed 位的小字，不打断战场阅读），或都不播。
 - **判据**：跨窗口真浏览器 —— 乙进甲的局，甲侧必须出现**一条**进人提示；leave 与 join 的呈现强度必须同级。
 
-### HU-06 菜单层不可键盘操作，且 Tab 被全局禁掉 · 部分已修（F 段：可达性那一半）
+### HU-06 菜单层不可键盘操作，且 Tab 被全局禁掉 · 已修（F 段形状 + `test/hud-keys.mjs` 真判据）
 
 - **症状**：
   - `main.js:656` 的 `Tab preventDefault` 是无条件的，菜单屏里也被拦 ⇒ 焦点在输入框之间都跳不动。
@@ -125,9 +127,17 @@ README《验收》与 `docs/deploy-checklist.md` §0 都点了名，由 `test/do
     不新增第二套语义；原生 `BUTTON/INPUT/SELECT/TEXTAREA/A` 与**正在打字的表单字段**一律跳过
     （否则回车提交建房名那种格会顺带激活包着它的可点元素，F5）；
   - `style.css` 加 `:focus-visible` 描边环（深色底上浏览器默认焦点环几乎看不见，能导航却没落点等于没放，F2）。
-- **仍欠**：Esc 在菜单各屏的统一语义；`aria-*` / 屏幕阅读器那套；以及 F 段自己都写明的——
-  这一段的判据全是**源码形状**，证明的是接线在不在，不是"键盘真的走得到每一项"。
-  后者要一条浏览器判据（数 Tab 序列 + Enter 激活 + 焦点环可见），还没写。
+- **补上的第二半（同一天）**：统一的 Esc 走 `js/menu.js` 的 `ESC_EXIT` 表 —— **每屏指向它本来就有的那个出口**
+  （房间屏那一个叫"离开房间"、枪匠那一个叫"完成"，各屏的去处早就在它自己的按钮里按 `loadoutFrom`/`inGame`
+  分好了，Esc 再算一遍就是第二个真相）。`main`/`loading`/`results` 刻意不进表：宁可 Esc 没反应，
+  也不能一按把人从结算或对话里踢出去。开着 picker 时先合覆盖层，退一层是一层。
+- **`test/hud-keys.mjs`（真浏览器 24 条）**把 F 段证不了的那半证了：Tab 走遍主菜单五个入口 · 焦点环取
+  `getComputedStyle` 算出来的 outline（不读我们自己写的标记）· Enter 换屏且**一次 Enter 只激活一次**
+  （数 `audio.ui('click')`，委托若没跳过原生 `BUTTON` 这里就变 2）· 选枪覆盖层里 Tab 走到的那张卡
+  就是落进 `profile` 的那一把 · **反方向臂** E1/E1b：打得正热时按 Tab 焦点一步都不许动，
+  而按住出记分板、松开就收 —— 只量"菜单能用"的话，把对局里的 Tab 一起放开照样全绿。
+- **仍欠**：ARIA / 语义标签（屏幕阅读器读到的仍是一堆 div）另立 **HU-40**；联网大厅与房间屏的键盘路径
+  **没进** `hud-keys`（那两屏要真服务端状态，随 HU-22~HU-26 一起做；这份的文件头写明了边界）。
 
 ---
 
@@ -335,6 +345,18 @@ README《验收》与 `docs/deploy-checklist.md` §0 都点了名，由 `test/do
   `solid` 背景是 `rgba(6,8,9,.9)`+blur（`style.css:25`）⇒ 联机暂停时服务端照跑，比分条、水圈、击杀条全被盖住，
   只剩一行小字「对局不会因此停下」（`js/menu.js:108`）。
 
+### HU-40 界面没有 ARIA / 语义标签，屏幕阅读器读到的是一堆 div · 待修
+
+- **来源**：从 HU-06 拆出来的。键盘可达与"辅助技术读不读得到"是两件事，混在一条里只会让两条都收不干净。
+- **证据**（2026-10-10 第二批之后的 grep 快照，用前先重跑）：`aria-` / `role=` 命中仍是 **0**；
+  交互元素仍多为 `<div>`（`.mbtn/.pick/.mode/.mapc/.seg div`）。`tabindex` 不在源码里 —— 它由
+  `js/menu.js` 的 `keyify()` 在运行时设；`:focus-visible` 已经有一条（`style.css`）。
+- **症状**：屏幕阅读器念不出"这是设置按钮"；记分板、`#announce`、killfeed、占领进度那种**动态区**
+  没有 `aria-live`，变了也不会被播报 —— 对局里那些"只写在屏幕上"的事（谁进了、哪点掉了）对他们是静默的。
+- **收法方向**：先给动态区补 `aria-live`（便宜、收益直接），再把 `<div>` 换成真 `<button>`
+  （语义顺带就有）；**别**用 `role="button"` 糊在 div 上 —— 那样键盘事件还得自己接一遍。
+- **判据**：用 Playwright 的 accessibility snapshot 量"读得到名字"，不是量源码里有几个 `aria-`。
+
 ---
 
 ## 需要真浏览器复验才能定性的（别先写代码）
@@ -347,11 +369,12 @@ README《验收》与 `docs/deploy-checklist.md` §0 都点了名，由 `test/do
 
 ## 落地顺序建议
 
-- **第一批（纯文案/纯映射，风险最低）· 已收口 2026-10-10**：HU-01、HU-02、HU-04、HU-38、HU-21 —— 都只动表现层，权威状态一律不碰。
+- **第一批（纯文案/纯映射，风险最低）· 已收口 2026-10-10**：HU-01、HU-02、HU-03、HU-04、HU-06、HU-21、HU-38 —— 都只动表现层，权威状态一律不碰。
 - **第二批（HUD 读数补齐）**：HU-07、HU-09、HU-11、HU-12、HU-13、HU-05、HU-08。
 - **第三批（记分板/结算形状统一）**：HU-16、HU-18、HU-19、HU-20。
 - **第四批（对局外流程反馈）**：HU-22 ~ HU-27、HU-29 ~ HU-31。
-- **立项级（单独 PR，别混进手感改动）**：HU-06（键盘可达性）、HU-32~HU-37（响应式 + 设置面板扩容）。
+- **立项级（单独 PR，别混进手感改动）**：HU-32~HU-37（响应式 + 设置面板扩容）、HU-40（ARIA / 语义标签，用 accessibility snapshot 量）。
+  HU-06（键盘可达）已在这一批里收掉，不再挂这一档。
 
 ## 本分支的边界
 

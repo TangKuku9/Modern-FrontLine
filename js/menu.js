@@ -21,6 +21,18 @@ const MAX_ATT = 5;
 // 这两件事必须是同一批元素，否则键盘名单会落后于鼠标名单，而"用鼠标点得到、按 Tab 走不到"
 // 正是这一层原来的样子。新增一类可点元素时改这里一行。
 const KEYPICK = '.mbtn,.btn,.pick,.cls,.slotc,.gs-att,.gs-slot,.mode,.mapc,.diff,.seg div,.camo';
+// Esc 的出路（HU-06）：**每屏指向它本来就有的那个出口**，而不是新写一套回退逻辑。
+// 各屏的去处早就在它自己的按钮里分好了（loadout 认 loadoutFrom、settings 认 inGame），
+// 而且名字本来就不一样：房间屏那一个叫"离开房间"、枪匠那一个叫"完成"。Esc 再算一遍
+// 就是第二个真相，而两个真相迟早分叉。
+// 表是**刻意收窄**的：pause 保留原有的 resume、classSelect 保留原有的收起，而
+// main（无处可回）/ loading（正在加载）/ results（它的出口就是离开结算）不进表 ——
+// 宁可 Esc 没反应，也不能一按把人从对局里踢出去。要加一屏就在这里加一行。
+const ESC_EXIT = {
+  campaign: '[data-a=back]', lobby: '[data-a=back]', onlineGate: '[data-a=back]',
+  online: '[data-a=back]', onlineRoom: '[data-a=leave]', loadout: '[data-a=back]',
+  gunsmith: '[data-a=done]', settings: '[data-a=back]',
+};
 // 目标档位两张表（tdm/ffa 的 MP_SCORES 与 dom 独有的 DOM_SCORES）的**并集**。渲染一次的
 // 选择器用它把全部候选先画出来，再按 js/data.js:scoreOptions 藏掉当前模式不收的值 ——
 // 监听器直接挂在 div 上，重建 innerHTML 会把它们一起丢掉，所以"画全集 + 藏"而不是"重画"。
@@ -147,6 +159,7 @@ export class Menu {
     window.addEventListener('keydown', e => {
       if (e.code === 'Escape' && game.paused && this.screen === 'pause' && performance.now() - this.pauseAt > 300) this.resume();
       else if (e.code === 'Escape' && this.screen === 'classSelect') this.hideClassSelect();
+      else if (e.code === 'Escape') this.escBack(e);
     });
     // 枪匠拖拽旋转
     let drag = null;
@@ -292,6 +305,17 @@ export class Menu {
   // 而"激活之后干什么"仍然走既有的那套委托 —— constructor 里那条委托 keydown 只把 Enter/空格
   // 变成一次 click，不新增第二套语义。
   keyify(root) { root.querySelectorAll(KEYPICK).forEach(el => { el.tabIndex = 0; }); }
+  // Esc 走的是 ESC_EXIT 那张表（为什么是"点本屏本来就有的出口"而不是另写一套，表旁边写着）。
+  // 覆盖层优先：开着选枪/选连杀那种 picker 时，Esc 先把它合上，退一层是一层。
+  escBack(e) {
+    if (e && e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;   // 正在打字：Esc 是这一格的，不是这一屏的
+    const sel = this.el.querySelector('.picker [data-a=pback]') ? '[data-a=pback]' : ESC_EXIT[this.screen];
+    if (!sel) return;
+    const b = this.el.querySelector(sel);
+    if (!b) return;
+    if (e) e.preventDefault();
+    b.click();
+  }
   on(root, sel, fn) { root.querySelectorAll(sel).forEach((el, i) => el.addEventListener('click', e => fn(el, e, i))); }
   hide() { this.el.innerHTML = ''; this.screen = ''; this.overlayOpen = false; }
   level() {
@@ -339,6 +363,7 @@ export class Menu {
       <div style="position:absolute;right:40px;bottom:30px;text-align:right;font-size:12px;color:#777;line-height:1.9">
         <div><span class="kbd">WASD</span>移动 <span class="kbd">Shift</span>冲刺 <span class="kbd">C</span>蹲/滑铲 <span class="kbd">Z</span>趴 <span class="kbd">Q/E</span>探头 <span class="kbd">空格</span>跳跃 <span class="kbd">R</span>换弹 <span class="kbd">V</span>近战</div>
         <div><span class="kbd">4</span>投掷物（左键烹饪/投出） <span class="kbd">F</span>互动 <span class="kbd">N</span>夜视仪 <span class="kbd">${STREAK_KEY_LABELS.join('/')}</span>连杀奖励 <span class="kbd">Tab</span>记分板</div>
+        <div><span class="kbd">Enter / Y</span>全体 / 队伍聊天（联网对局） <span class="kbd">C</span>阵亡换配装（多人对局） <span class="kbd">Esc</span>暂停 / 返回</div>
         <div style="color:#555;margin-top:6px">v1.0</div>
       </div>`, 'dim', 'main');
     this.on(r, '[data-a]', el => {
@@ -1449,7 +1474,8 @@ export class Menu {
           <div><b>V / 鼠标侧键</b>近战</div><div><b>4</b>切出投掷物（再按 4 换种）</div>
           <div><b>左键</b>按住烹饪 / 松手投出</div><div><b>F</b>互动 / 拾取武器</div>
           <div><b>N</b>夜视仪（战役）</div><div><b>${STREAK_KEY_LABELS.join(' / ')}</b>连杀奖励</div>
-          <div><b>Tab</b>记分板</div>
+          <div><b>Tab</b>记分板</div><div><b>Esc</b>暂停 / 返回上一层</div>
+          <div><b>Enter / Y</b>全体 / 队伍聊天（联网对局里）</div><div><b>C</b>阵亡时换配装（多人对局，战役里不换）</div>
         </div>
         <div style="margin-top:24px;display:flex;gap:12px"><button class="btn" data-a="back">返回</button><button class="btn ghost small" data-a="resetp">重置存档</button></div>
       </div>`, inGame ? 'solid' : 'dim', 'settings');

@@ -300,14 +300,15 @@ npm run test:all      # 上面两档全跑
 **表现层与手感**
 
 - `test/fps.mjs` 真实客户端那条 RAF 循环的帧率无关性（对照组 `fixedStep=false` 必须漂，否则这把尺子永远绿）· `test/viewmodel.mjs` 视图模型拆分的接缝回归 · `test/gunvisual.mjs` 枪械视觉六条，每条问的都是**被画出来的那个量** · `test/optic.mjs` 开放式瞄具通透性与分划**角直径** · `test/state-leak.mjs` 死亡 / 换局 / 热成像三处的状态残留
-- `test/hud-ux.mjs` HUD 与界面「不许说谎」（`docs/hud-ux-audit.md` 第一批）：连杀槽的键码与**实际生效的那把键**做闭环对账（照屏幕提示按键，叫出来的必须是同一个连杀）· `hud.reset()` 里每一条签名门都得归位（漏一条的症状是那一格整局空白，量具不点名 `_stkSig` 而是把"全文用过的"与"reset 归位的"两个集合对账）· 死亡画面的文案不许承诺一个从不被读的键 —— E 段直接量服务端那道 `respawnT ≤ 0.12s` 的闸，因为"到点自动部署"这句话的正确性靠它 · F 段钉菜单键盘可达（Tab 只在打得正热时拦、键盘名单与鼠标委托名单同一份 `KEYPICK`、Enter 不给原生按钮和正在打字的字段重复派 click）—— F 段自己写明它只到**源码形状**，"键盘真的走得到每一项"那条浏览器判据还欠着
+- `test/hud-ux.mjs` HUD 与界面「不许说谎」（`docs/hud-ux-audit.md` 第一批）：连杀槽的键码与**实际生效的那把键**做闭环对账（照屏幕提示按键，叫出来的必须是同一个连杀）· `hud.reset()` 里每一条签名门都得归位（漏一条的症状是那一格整局空白，量具不点名 `_stkSig` 而是把"全文用过的"与"reset 归位的"两个集合对账）· 死亡画面的文案不许承诺一个从不被读的键 —— E 段直接量服务端那道 `respawnT ≤ 0.12s` 的闸，因为"到点自动部署"这句话的正确性靠它 · F 段钉菜单键盘可达（Tab 只在打得正热时拦、键盘名单与鼠标委托名单同一份 `KEYPICK`、Enter 不给原生按钮和正在打字的字段重复派 click）—— F 段自己写明它只到**源码形状**，"真的走得到"那一半在下面的 `hud-keys`
+- `test/hud-keys.mjs` 菜单层键盘可达的**真**判据（真按键、真焦点，全程不碰鼠标）：Tab 走遍主菜单五个入口 · 焦点环取 `getComputedStyle` 算出来的 outline（不读我们自己写的标记）· Enter 换屏且**一次 Enter 只激活一次**（委托给原生 `BUTTON` 重复派 click 会在这里变 2）· Esc 一层是一层（选枪覆盖层先合上，再按才离开配装屏；枪匠走它自己那个"完成"）· 主菜单上 Esc 什么都不做（宁可没反应，不许一按把人踢出界面）· **反方向臂** E1：打得正热时按 Tab 焦点一步都不许动，而记分板照样叫得出来 —— 只量"菜单能用"的话，把对局里的 Tab 一起放开照样全绿
 - `test/net-feel.mjs` 联机手感层：远端表现 + 本地反馈闭环，共同点是**全都不影响权威状态** —— 少了它不崩不报错，只是"看不见、听不见、没反应"。AA 段是空跑窗尺子自己的判据，V 段是语音播报
 - `test/net-play.mjs` / `test/net-drop.mjs`：两个真浏览器对打（延迟补偿与客户端帧时序唯一一起参与的地方）、掉线四种情形分开验收；另外量奖章弹窗、房间屏"补人"那一格、账号闸上的"忘了密码？"
 - `test/tab-session.mjs` 同源双标签页（cookie 按"源"共享，两个 page 放进同一个 context）· `test/worker-live.mjs` Worker 双路真浏览器离线实跑，B 臂把 `window.Worker` 封锁死
 
-**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` / `tab-session` / `worker-live` —— 名单**从源码推**（谁 `import { chromium } from 'playwright'` 就是谁），漏写和多写都红。其余判据都在进程内跑完，不碰浏览器。
+**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` / `tab-session` / `worker-live` / `hud-keys` —— 名单**从源码推**（谁 `import { chromium } from 'playwright'` 就是谁），漏写和多写都红。其余判据都在进程内跑完，不碰浏览器。
 
-这 10 份的 `launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本机绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据，由 G 段逐份核（少一档就红）。
+这 11 份的 `launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本机绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据，由 G 段逐份核（少一档就红）。
 
 ## 已知缺口
 
