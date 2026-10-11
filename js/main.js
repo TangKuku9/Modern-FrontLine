@@ -26,7 +26,9 @@ import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS, MP_MODES, streakSlotOf } from './data.js';
 import { repairClass } from './loadout.mjs';
 import { applyAccountXp } from './progress.mjs';
-import { damp } from './util.js';
+// damp 之外还要加载条那张台阶表（HUD 审计 HU-31）：文字与百分比同取 js/util.js 那一份，
+// 两处各写各的就会出现"写着正在建菜单场景、条子却停在 90% 不动"那种只有玩家看出来的谎。
+import { damp, BOOT_STEPS, bootPct } from './util.js';
 import { escHtml } from './escape.js';
 
 function spawnGameWorker() {
@@ -175,15 +177,15 @@ class Game {
       };
       this.pathWorker.onerror = () => { this.pathWorker = null; };   // 半路死掉就整体回退同步路
     }
-    txt.textContent = '正在初始化渲染管线…';
+    txt.textContent = BOOT_STEPS[0];
     await new Promise(r => setTimeout(r, 10));
     this.effects = new Effects(this);
     setFlashTexture(this.effects.texFlash);
     this.hud = new HUD(this);
     this.setupComposer();
     this.setupInput();
-    fill.style.width = '90%';
-    txt.textContent = '正在构建菜单场景…';
+    fill.style.width = bootPct(0) + '%';
+    txt.textContent = BOOT_STEPS[1];
     await new Promise(r => setTimeout(r, 10));
     this.menu = new Menu(this);
     // ── 账号状态**不在启动时问**。这一条是量出来的，不是审美 ──
@@ -207,8 +209,10 @@ class Game {
     // 决定先过闸还是进大厅，主菜单的档案卡要显示服务端那份经验值 —— 都发生在菜单上。
     // 所以改成**按需拉**（showMain / showOnlineEntry）。顺带两个好处：
     // ?online=1 直接进对局那条路上一次 /api/* 都不发；单机玩家不来问这件事。
-    // 预编译着色器
-    fill.style.width = '100%';
+    // 最后一步做完 = 100%，而这个数是 BOOT_STEPS 那张表算出来的，不是写死的台阶（HU-31）。
+    // 原来这一档标着"预编译着色器"，可这里根本没有 compile() —— 真编译在 startGame 与
+    // beginNetMatch 里那一句 renderer.compile，为每一局的那张图跑一次。
+    fill.style.width = bootPct(1) + '%';
     window.addEventListener('resize', () => this.onResize());
     document.getElementById('loading').style.display = 'none';
     this.state = 'menu';
@@ -373,7 +377,11 @@ class Game {
     // ② 菜单这一侧：onlineError 里那段守卫会把"正在进房…"的加载层收掉并退回大厅 ——
     //    它本来就是为这一格写的（拒绝恰恰是最需要让人看见的一种结果）。
     this.menu.onlineError(why);
-    if (this.menu.screen === 'online') this.menu.renderRooms();   // 房表那一格停止撒谎
+    // 房表那一格停止撒谎（它只随推送重画，而连接断了就再也没有推送）。房间屏同理（HU-26）：
+    // 那一屏的「重新连接」与"连上之后回大厅"那行说明，只有重画才会亮起来 —— 而断线的时候
+    // 服务端那一班状态推送永远到不了，不主动补这一下，玩家站的就是一屏"看起来还在房间里"。
+    if (this.menu.screen === 'online') this.menu.renderRooms();
+    else if (this.menu.screen === 'onlineRoom') this.menu.renderRoom();
   }
   // 建房 / 加入之后先占住这一屏：座位应答到达之前不画房间（画了会是一屏空座位）。
   // 应答失败时 onlineError 会清掉这个标记并退回大厅，人不会被卡在"正在进房…"上。
@@ -1136,4 +1144,14 @@ function buildName(id) { return WEAPONS[id] ? WEAPONS[id].name : id; }
 
 const game = new Game();
 window.game = game;
-game.init().catch(e => { console.error(e); document.getElementById('loadText').textContent = '初始化失败：' + e.message; });
+// 「重试」常驻在这一格之后：#loadRetry 平时是 display:none，只有 init 抛了才亮（HU-31）。
+// 它不重新走一遍流程、只 reload —— 加载失败的原因大半在环境里（Worker 起不来、着色器编译被
+// 驱动拒绝、贴图池分配失败），页面内"再试一次"能恢复的那些，reload 一样能；恢复不了的那些，
+// 页内重试只会把人按在同一处第二次异常上，而那一屏连刚才错在哪都重写不出来。
+const loadRetry = document.getElementById('loadRetry');
+if (loadRetry) loadRetry.addEventListener('click', () => location.reload());
+game.init().catch(e => {
+  console.error(e);
+  document.getElementById('loadText').textContent = '初始化失败：' + e.message;
+  if (loadRetry) loadRetry.style.display = '';
+});

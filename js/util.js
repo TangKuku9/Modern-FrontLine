@@ -69,6 +69,14 @@ export function fmtTime(s) {
   return m + ':' + (r < 10 ? '0' : '') + r;
 }
 
+// 启动那根进度条的台阶表（HUD 审计 HU-31）。贴图生成占 0~80% —— 那一段是**量出来的**
+// （js/textures.js 的 initTextures 回调给的是真实完成比例，它也是加载期 CPU 的大头），
+// 剩下的 20% 按这两步均分、每步**做完**才挪一格。原来那是两个硬写的 90% / 100%：后面
+// 没有任何测量，屏幕上的数与还剩多少活没关系，而"卡住了"和"正在建菜单场景"在那一格上
+// 长得一模一样。文字与宽度现在同取这一张表（HU-38 那条纪律：同一格只有一份）。
+export const BOOT_STEPS = ['正在初始化渲染管线…', '正在构建菜单场景…'];
+export const bootPct = (step, frac = 1) => 80 + Math.min(20, Math.max(0, ((step + frac) / BOOT_STEPS.length) * 20));
+
 // BinaryHeap 迁去 pathfind.js（性能审查 C5 抽核）：寻路 Worker 里没有 import map，
 // util.js 顶层 import 'three' 进不去 —— 本体在那边，此处转出保持既有 import 不变。
 export { BinaryHeap } from './pathfind.js';

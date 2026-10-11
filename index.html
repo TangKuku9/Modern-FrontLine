@@ -82,6 +82,9 @@
     <div class="logo"><span class="l1">现代战线</span><span class="l2">MODERN FRONTLINE</span></div>
     <div class="load-bar"><div id="loadFill"></div></div>
     <div id="loadText">正在载入…</div>
+    <!-- 加载失败时才亮（HUD 审计 HU-31）：那一屏原来只留下一行"初始化失败：xxx"，
+         没有任何可点的东西 —— 能做的只有 F5，而屏幕上没告诉人可以这么干。 -->
+    <button id="loadRetry" class="btn small" style="display:none">重试</button>
     <div class="load-tip">冲刺中按 C 滑铲</div>
   </div>
 </div>

@@ -96,6 +96,10 @@ html, body { position: fixed; inset: 0; }
    那个按钮不是点不动，是根本看不见（Playwright 的报错原文：element is outside of the viewport）。
    所以在 .opts 里写自由文字时，要么给它这个类，要么自己写 grid-column:1/-1。 */
 .note-wide { grid-column: 1 / -1; font-size: 12px; color: #888; line-height: 1.7; min-height: 16px; }
+/* #lbErr / #rmErr 那一格（HU-25）：它写的是"刚才那一下失败了 + 服务端原话"，现在还不带定时器、
+   会一直留在屏上。它必须与旁边的说明文字一眼能分开，否则要人读完一整段才知道哪句是错误。 */
+.note-wide.err { color: #ff9a8a; font-size: 13px; }
+.note-wide.err .btn { margin-left: 10px; vertical-align: middle; }
 #acctMsg { color: #e6a8c8; }
 .seg { display: flex; }
 .seg div { padding: 7px 14px; background: rgba(255,255,255,.06); cursor: pointer; font-size: 13px; border: 1px solid rgba(255,255,255,.08); white-space: nowrap; }
@@ -174,7 +178,9 @@ html, body { position: fixed; inset: 0; }
 .team-btns { display: flex; gap: 6px; margin-top: 8px; }
 .team-btns .btn { flex: 1; }
 .rm-foot { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
-.rm-foot #rmWhy { margin-left: auto; font-size: 12px; color: #999; }
+/* 房间屏底部那一行"现在该干什么"（HU-25）：原来是 12px 的 #999 一行灰字 —— 那一格是整个房间屏
+   上唯一说"接下来该按哪个"的地方，小到要凑近屏幕才读得见，等于没有。 */
+.rm-foot #rmWhy { margin-left: auto; font-size: 13px; color: #cfcfcf; }
 .btn.go { letter-spacing: 4px; }
 .btn[disabled] { cursor: default; filter: none; }
 .btn.small[disabled] { opacity: .45; }

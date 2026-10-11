@@ -75,6 +75,7 @@ function makeDom() {
   const get = id => { if (!els.has(id)) els.set(id, mk(id)); return els.get(id); };
   return {
     rec: id => get(id).__rec,
+    mk,
     doc: {
       getElementById: get, createElement: t => mk('dyn:' + t),
       querySelector: () => null, querySelectorAll: () => [], addEventListener() { },
@@ -82,7 +83,7 @@ function makeDom() {
     },
   };
 }
-const { doc: DOM, rec } = makeDom();
+const { doc: DOM, rec, mk } = makeDom();
 globalThis.document = DOM;
 // js/mp.js 这一族在模块加载期就要 window/localStorage（第二批要直接驱动 MPMatch.useStreak
 // 与 Sentry.update，不能只 grep 源码形状）。桩给最小的一份，与 test/net-feel.mjs 同一套做法。
@@ -945,6 +946,489 @@ const SB_SRC = src('js/scoreboard.mjs');
   } finally {
     Object.assign(globalThis, { setInterval: REAL.si, clearInterval: REAL.ci, setTimeout: REAL.st, clearTimeout: REAL.ct });
   }
+}
+
+// ═════════════════════════ 第四批：P3 对局外流程（HU-22 … HU-31）═════════════════════════
+// 这一批的病全在"点了没反应"与"屏幕上写的那条出路并不存在"这两族：不崩、不报错、权威状态
+// 一切正常，只有玩家看得出来。所以判据一律**驱动 js/menu.js 的本体** —— onlineCreate / onlineJoin /
+// onlineJoinById / roomStart / renderRoom / roomWhyText / botSeatRow / roomRowJoin / onlineError /
+// paintErr / carryAtt / miniBars / playerCard 都是原方法 .call 在夹具上，不是这里替它算一遍。
+// 量不到的那几条（要真光标、真滚轮、真焦点序列的那些）退回形状闸并在标签里写明；
+// 那半边的真判据在 test/hud-keys.mjs 的 H~K 段（那两屏要真服务端状态，所以只能在那边量）。
+const { Menu, cleanClassName } = await import('../js/menu.js');
+const { BOOT_STEPS, bootPct } = await import('../js/util.js');
+const LOBBY_SRC = src('server/lobby.mjs');
+
+// 按**选择器**记账的一份小 DOM。第一批的 makeDom 只按 id 找（那时不需要"某一格里写了什么字"），
+// 这一批量的正是"那一格亮不亮、那一格写的是什么"，所以给一层选择器 → 假元素的映射。
+// 元素本体是同一个 makeDom 里的 mk —— 记账口径与 A 段自证过的那份是同一把尺子，不另起一台。
+// `slots` 给成数组时就是"这一屏到底有哪些格子"的名单：不在名单里的选择器返回 null，
+// 与浏览器在别的屏上 querySelector 找不到那个 id 是同一件事。**没有这一层的话**，
+// "这一屏根本没有画错误的格子"那种现场就造不出来（夹具会什么都答一个元素，判据恒绿）。
+function elMap(slots) {
+  const map = new Map();
+  const have = Array.isArray(slots) ? slots : null;
+  const q = sel => { if (have && !have.includes(sel)) return null; if (!map.has(sel)) map.set(sel, mk('q:' + sel)); return map.get(sel); };
+  return {
+    map, q, slots: have,
+    el: { querySelector: q, querySelectorAll: () => [] },
+    txt: sel => (map.get(sel) || { textContent: '' }).textContent,
+    html: sel => (map.get(sel) || { innerHTML: '' }).innerHTML,
+    disp: sel => { const e = map.get(sel); return e ? String(e.style.display) : '(没这一格)'; },
+  };
+}
+// "这一帧发出去了吗"记在本子上的一份 LobbyClient 替身。**不替换任何判断**：菜单那一路的闸、
+// 路由、文案全是本体，这里只把 socket 那一层换成计数器（send 的返回值语义与本体一致）。
+function lbStub(rooms = [], opts = {}) {
+  const sent = [];
+  return {
+    sent, connected: opts.connected !== false, lost: opts.lost || null, rooms, online: 1, chat: [],
+    state: opts.state || null, name: '士兵',
+    createRoom: o => { sent.push(['create', o.room]); return !opts.dropSend; },
+    joinRoom: r => { sent.push(['join', r]); return !opts.dropSend; },
+    quickRoom: () => { sent.push(['quick']); return !opts.dropSend; },
+    start: () => { sent.push(['start']); return !opts.dropSend; },
+    ready: () => true, setTeam: () => true, addBot: () => true, removeBot: () => true, setCfg: () => true,
+    close() { this.connected = false; },
+  };
+}
+// 菜单屏的夹具：整屏渲染器（render / showOnlineLobby / showOnlineRoom / showLoadingOverlay）换成
+// 计数器 —— 它们要真 DOM 才能跑，而"换了哪一屏"从来不是这一段的被测对象；
+// **闸门、路由判据、那一格写什么**全都留的是本体。renderRoom 也留本体（它只碰按选择器给的格子）。
+function menuStub(opts = {}) {
+  const lb = opts.lb || null;
+  const game = {
+    lobby: lb, _wantRoom: false, roomSoon: 0, showRoomSoon() { this._wantRoom = true; this.roomSoon++; },
+    profile: opts.profile || { classes: [], streaks: [], muted: [], xp: 0, xpLocal: 0 },
+    account: opts.account || { statusKnown: true, requireAccount: false, loggedIn: false, user: null },
+    saveProfile() { }, saveSettings() { }, audio: { ui() { }, init() { }, say() { } },
+    onlineLobby: () => Promise.resolve(lb),
+  };
+  const m = Object.create(Menu.prototype);
+  m.game = game; m._lobby = 0; m._room = 0; m._overlay = 0;
+  m.el = opts.el || { querySelector: () => null, querySelectorAll: () => [] };
+  m.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, minutes: 10, score: 50, name: '士兵', team: 'A', room: '', title: '' };
+  m._lastErr = ''; m._enterRoom = null; m._enterT = null; m._startSent = false;
+  m.screen = opts.screen || 'online';
+  m.showOnlineLobby = () => { m._lobby++; };
+  m.showOnlineRoom = () => { m._room++; };
+  m.showLoadingOverlay = () => { m._overlay++; };
+  m.renderRooms = () => { m._rooms++; };
+  if (opts.remote) m.remoteJoin = row => { m._remote = (m._remote || []).concat(row.id); return Promise.resolve(); };
+  return { m, game, lb };
+}
+const ROOM_ST = ({ host = true, ready = true, canStart = true, why = '', playing = false, bots = [], seats = null } = {}) => ({
+  room: { id: 'r-7', title: '深夜', state: playing ? 'playing' : 'waiting', map: 'dune', mode: 'tdm', time: 10, score: 50, players: 1, max: 16, host: '房主甲' },
+  me: { sid: 1, name: '我', isHost: host, ready, team: 'A' },
+  seats: seats || [{ sid: 1, name: '房主甲', team: 'A', ready: true, isHost: host }],
+  bots, canStart, why, botSkill: 1, fill: 0, chat: [],
+});
+
+// ───────────────────────── W 段：HU-22 进房那一路的本地闸门 ─────────────────────────
+{
+  const timers = new Map(); let nid = 1;
+  const REAL = { st: globalThis.setTimeout, ct: globalThis.clearTimeout };
+  const fireAll = () => { for (const t of [...timers.values()]) t.f(); };
+  try {
+    globalThis.setTimeout = (f) => { const k = nid++; timers.set(k, { f }); return k; };
+    globalThis.clearTimeout = k => timers.delete(k);
+
+    const lb = lbStub();
+    const { m, game } = menuStub({ lb });
+    m.onlineCreate(); m.onlineCreate(); m.onlineCreate();
+    ok('W1【驱动 onlineCreate】连点三下「创建房间」只发一帧：第二帧服务端回的是「这个房间号已经有人在了」，而那句拒绝会把刚建好的那间房从屏幕上抹掉（HU-22）',
+      lb.sent.filter(x => x[0] === 'create').length === 1 && game.roomSoon === 1, JSON.stringify(lb.sent));
+    ok('W1b【命门·闸门会松】一句拒绝之后必须再发得出去：挡成永久锁就是把"点了没反应"换成更难查的那一种',
+      (() => { const n = lb.sent.length; m.onlineError('那间房已经不在了'); m.onlineCreate(); return lb.sent.length === n + 1; })(),
+      JSON.stringify(lb.sent));
+
+    const s2 = menuStub({ lb: lbStub([], { connected: false }) });
+    s2.m.onlineCreate();
+    ok('W2 没连上时点创建：一帧都不发、**也不盖那层"正在进房…"**（盖了就没人在收它），并且留下一句读得到的原因',
+      s2.lb.sent.length === 0 && s2.game._wantRoom === false && s2.m._lastErr.length > 0, JSON.stringify({ sent: s2.lb.sent, err: s2.m._lastErr }));
+
+    const s3 = menuStub({ lb: lbStub() });
+    s3.m.onlineCreate();
+    const midErr = s3.m._lastErr, midLobby = s3.m._lobby;
+    fireAll();
+    ok('W3【驱动超时·HU-31】发出去之后服务端一直不回话：到点要收回那层全屏加载、说清是哪一步没回、并把闸门松开（原来这一屏唯一出路是 F5）',
+      midErr === '' && /没回这一句/.test(s3.m._lastErr) && s3.m._enterRoom === null && s3.game._wantRoom === false && s3.m._lobby === midLobby + 1,
+      JSON.stringify({ mid: midErr, after: s3.m._lastErr, want: s3.game._wantRoom }));
+    ok('W3b 超时之后人还能再点一次（这一句是出路，不是一句悼词）',
+      (() => { const n = s3.lb.sent.length; s3.m.onlineCreate(); return s3.lb.sent.length === n + 1; })());
+
+    // 「开始游戏」那一格：它是房间屏上唯一一个"发了帧却不换屏"的动作，所以它是"点了没反应"
+    // 最常被撞到的那一个。这里驱动的是 renderRoom 本体，量的是落到 DOM 的那一句。
+    const fx = elMap();
+    const s4 = menuStub({ lb: lbStub([], { state: ROOM_ST() }), el: fx.el, screen: 'onlineRoom' });
+    s4.m.renderRoom();
+    ok('W4 没按之前那一格写的是「开始游戏」且可按（W5 的"变成正在开局"必须是**变出来的**，不是一开始就写着）',
+      fx.txt('[data-a=start]') === '开始游戏' && fx.map.get('[data-a=start]').disabled === false, fx.txt('[data-a=start]'));
+    s4.m.roomStart();
+    ok('W5【驱动 roomStart + renderRoom】按下之后：一帧发出、那一格改成「正在开局…」并灰掉（这是本地唯一的"我这一下收到了"）',
+      s4.lb.sent.filter(x => x[0] === 'start').length === 1 && fx.txt('[data-a=start]') === '正在开局…'
+      && fx.map.get('[data-a=start]').disabled === true, JSON.stringify({ sent: s4.lb.sent, label: fx.txt('[data-a=start]') }));
+    s4.m.roomStart();
+    ok('W5b 再按一次不发第二帧（第二帧换来的是「这间已经在对局中了。」糊在一个正要进对局的屏幕上）',
+      s4.lb.sent.filter(x => x[0] === 'start').length === 1, JSON.stringify(s4.lb.sent));
+    s4.m.onlineError('这间已经在对局中了。');
+    ok('W5c【命门·不许哑】被拒之后那一格**自己**回到「开始游戏」并可再按（这里一次重画都没补 —— 停在原地的"正在开局…"就是换了个形式的"点了没反应"）',
+      fx.txt('[data-a=start]') === '开始游戏' && fx.map.get('[data-a=start]').disabled === false, fx.txt('[data-a=start]'));
+    ok('W5c2【形状·同文件代回】onlineError 里那一次"顺手重画房间屏"是这条链的唯一环节：删掉它，W5c 那种自动就没了',
+      /if \(this\.screen === 'onlineRoom'\) this\.renderRoom\(\);/.test(MENU_SRC)
+      && !/if \(this\.screen === 'onlineRoom'\) this\.renderRoom\(\);/.test(MENU_SRC.replace("if (this.screen === 'onlineRoom') this.renderRoom();", '')));
+    ok('W5d 那一格的文案与"能不能按"是同一次算出来的（roomStartState 一处，不是两处各写一遍）',
+      (() => {
+        const st = ROOM_ST();
+        const a = s4.m.roomStartState(st.me, { canStart: true }, false);
+        s4.m._startSent = true;
+        const b = s4.m.roomStartState(st.me, { canStart: true }, false);
+        s4.m._startSent = false;
+        return a.disabled === false && a.label === '开始游戏' && b.disabled === true && b.label === '正在开局…';
+      })());
+    ok('W5e【反证臂·合成夹具】旧那条 `!canStart || playing` 在"已发出"这一格上会说还能按 —— 同一把尺子当场认出来',
+      (() => {
+        const st = ROOM_ST(); s4.m._startSent = true;
+        const old = { disabled: !st.canStart || false, label: '开始游戏' };
+        const now = s4.m.roomStartState(st.me, { canStart: true }, false);
+        s4.m._startSent = false;
+        return old.disabled === false && now.disabled === true;
+      })());
+    ok('W6【跨屏·驱动 onlineJoinById】按房号加入也要过同一道闸：连点两下只发一帧 joinRoom',
+      (() => {
+        const f = elMap(); f.q('#joinRoomId').value = 'hall-2';
+        const s = menuStub({ lb: lbStub(), el: f.el });
+        s.m.onlineJoinById(); s.m.onlineJoinById();
+        return s.lb.sent.filter(x => x[0] === 'join').length === 1 && s.lb.sent[0][1] === 'hall-2';
+      })(), JSON.stringify(menuStub({ lb: lbStub() }).lb.sent));
+
+    // ── HU-31 的另外半：进房那层 overlay 之外，启动那一根条不许再写死台阶 ──
+    ok('W7【HU-31·驱动 bootPct】剩下的那一段按**数得清的台阶**分：两步各自一格，最后一步做完才是 100%',
+      BOOT_STEPS.length === 2 && bootPct(0) === 90 && bootPct(1) === 100 && bootPct(1) > bootPct(0),
+      JSON.stringify({ n: BOOT_STEPS.length, a: bootPct(0), b: bootPct(1) }));
+    ok('W7b bootPct 不许跑出 80~100 那一段（frac 给 0、给 5 都不许把条子推出边框）',
+      bootPct(0, 0) === 80 && bootPct(1, 5) === 100 && bootPct(-1) <= 100);
+    ok('W8 贴图那一段仍然是**量出来的**真实比例（占 0~80%，那是加载期 CPU 的大头，不能被台阶表冒充掉）',
+      /initTextures\(p => \{ fill\.style\.width = \(p \* 80\)/.test(MAIN_SRC));
+    ok('W8b【反证臂·同文件代回】把那两个写死的 90% / 100% 代回 js/main.js，同一把尺子当场认出来',
+      !/fill\.style\.width = '\d+%';/.test(MAIN_SRC)
+      && /fill\.style\.width = '90%';/.test(MAIN_SRC.replace("bootPct(0) + '%'", "'90%'")));
+    ok('W9 启动失败那一屏有一个可点的「重试」，而且**只在失败时亮**（原来只留一行字，屏幕上没告诉人还能 F5）',
+      /<button id="loadRetry"[^>]*style="display:none"/.test(HTML_SRC)
+      && /if \(loadRetry\) loadRetry\.style\.display = '';/.test(MAIN_SRC)
+      && MAIN_SRC.includes("getElementById('loadRetry')"));
+    ok('W9b【反证臂·同文件代回】把失败时亮起来那一句删掉，尺子当场认出来（按钮从此永远藏着的假修法是量不出来的）',
+      !/if \(loadRetry\) loadRetry\.style\.display = '';/.test(MAIN_SRC.replace("if (loadRetry) loadRetry.style.display = '';", '')));
+  } finally {
+    Object.assign(globalThis, { setTimeout: REAL.st, clearTimeout: REAL.ct });
+  }
+}
+
+// ───────────────────────── X 段：HU-23 远端死按钮 · HU-24 按房号加入 ─────────────────────────
+{
+  const { m } = menuStub();
+  ok('X0【先决】roomRowJoin 是本体（不是这里替它判一遍）', typeof Menu.prototype.roomRowJoin === 'function');
+  ok('X1 等待中、没满 ⇒ 可加入', (() => { const j = m.roomRowJoin({ state: 'waiting', players: 3, max: 16, ready: 1 }); return j.can === true && j.label === '加入'; })());
+  ok('X2 对局中 ⇒ 不画成能点（这一仓库没有观战，那一格说的是"观战不了"而不是"加入"）',
+    (() => { const j = m.roomRowJoin({ state: 'playing', players: 3, max: 16 }); return j.can === false && j.label === '观战不了'; })());
+  ok('X3【命门·HU-23】另一台的行**没有 url** ⇒ 不画成一枚亮着的「加入」（旧写法只算 !playing && !full，点下去发的是**本台**的 joinRoom）',
+    (() => { const j = m.roomRowJoin({ state: 'waiting', players: 1, max: 16, remote: true, url: '' }); return j.can === false; })(),
+    JSON.stringify(m.roomRowJoin({ state: 'waiting', players: 1, max: 16, remote: true, url: '' })));
+  ok('X3b 有 url 的远端行照旧可进（"别画死按钮"不等于"把跨台这一条整个禁掉"）',
+    m.roomRowJoin({ state: 'waiting', players: 1, max: 16, remote: true, url: 'http://b:8080' }).can === true);
+  ok('X3c 满员 ⇒ 不可点，但那一格仍写「加入」（灰着的一枚比一句"满了"更省地方，人数那一列已经说了原因）',
+    (() => { const j = m.roomRowJoin({ state: 'waiting', players: 16, max: 16 }); return j.can === false && j.state === '已满'; })());
+  const evil = m.roomRowJoin({ state: 'waiting', players: 1, max: 16, title: '<img src=x>', id: 'a<b' });
+  ok('X3d 列表那一格仍然转义（这一条与 roomRowJoin 无关，钉的是"重画那一段时别顺手把 esc 丢了"）',
+    !evil.label.includes('<') && evil.state !== undefined);
+
+  const s = menuStub({ lb: lbStub([{ id: 'far', remote: true, url: '' }]), remote: true });
+  s.m.onlineJoin('far');
+  ok('X4【驱动 onlineJoin】远端且没有地址 ⇒ **本台 joinRoom 一帧都不发**（一间存在过的房被服务端查成"那间房已经不在了"是一句谎；更糟的是本台恰好有同号房时他会安安静静进错房）',
+    s.lb.sent.length === 0 && s.m._lastErr.includes('地址'), JSON.stringify({ sent: s.lb.sent, err: s.m._lastErr }));
+  const s2 = menuStub({ lb: lbStub([{ id: 'far2', remote: true, url: 'http://b:1/ws' }]), remote: true });
+  s2.m.onlineJoin('far2');
+  ok('X4b 远端有地址 ⇒ 走换台那条路（而**不是**发一帧本地 joinRoom）',
+    s2.lb.sent.length === 0 && JSON.stringify(s2.m._remote) === '["far2"]', JSON.stringify({ r: s2.m._remote, sent: s2.lb.sent }));
+  ok('X4c 列表那一格与点下去那一路用的是同一个判据（remote 要有 url 才算进得去 —— 两处不一致就会画出一枚点得动的死按钮）',
+    /x\.remote && x\.url/.test(MENU_SRC));
+
+  const box = v => { const f = elMap(); f.q('#joinRoomId').value = v; const s = menuStub({ lb: lbStub(), el: f.el }); return { f, s }; };
+  const a1 = box('   ');
+  a1.s.m.onlineJoinById();
+  ok('X5 空房号 ⇒ 不发帧，并说出"要先填房号"（静默不处理就是 HU-22 那一族）',
+    a1.s.lb.sent.length === 0 && /房号/.test(a1.s.m._lastErr), a1.s.m._lastErr);
+  const a2 = box('深夜大院');
+  a2.s.m.onlineJoinById();
+  ok('X6 中文房名当房号 ⇒ **当场**说白名单，不许发出去让服务端洗成空串再回一句「那间房已经不在了」（那会把"你打错了"说成"它不存在"）',
+    a2.s.lb.sent.length === 0 && /A-Z/.test(a2.s.m._lastErr), a2.s.m._lastErr);
+  const a3 = box('hall-2_x.9');
+  a3.s.m.onlineJoinById();
+  ok('X6b 合法房号 ⇒ 一帧 joinRoom、用的就是填进去那个串，并且记回偏好（下一次进大厅还看得见）',
+    a3.s.lb.sent.length === 1 && a3.s.lb.sent[0][0] === 'join' && a3.s.lb.sent[0][1] === 'hall-2_x.9' && a3.s.m.lobby.room === 'hall-2_x.9',
+    JSON.stringify(a3.s.lb.sent));
+  const a4 = box('x'.repeat(40));
+  a4.s.m.onlineJoinById();
+  ok('X6c 超过上限 ⇒ 不发（服务端会截，截完查到的可能是**另一间**房）',
+    a4.s.lb.sent.length === 0 && /最长/.test(a4.s.m._lastErr), a4.s.m._lastErr);
+
+  // 跨文件对账：房号白名单的正本在 server/lobby.mjs，客户端这一份只校验不清洗。
+  const srvBad = /export const ROOM_ID_BAD = (\/[^/]+\/[a-z]*);/.exec(LOBBY_SRC);
+  const cliBad = /const ROOM_ID_BAD = (\/[^/]+\/[a-z]*);/.exec(MENU_SRC);
+  const srvMax = /export const ROOM_ID_MAX = (\d+)/.exec(LOBBY_SRC);
+  const cliMax = /const ROOM_ID_MAX = (\d+)/.exec(MENU_SRC);
+  ok('X7【先决】两份房号规则都认得出（切不到就别装"查过了"）',
+    !!srvBad && !!cliBad && !!srvMax && !!cliMax, JSON.stringify({ srvBad: srvBad && srvBad[1], cliBad: cliBad && cliBad[1] }));
+  ok('X7a【跨文件对账】客户端那份与 server/lobby.mjs 那份逐字相同（字符类与长度上限）',
+    cliBad[1] === srvBad[1] && cliMax[1] === srvMax[1], `菜单 ${cliBad[1]}/${cliMax[1]} vs 服务端 ${srvBad[1]}/${srvMax[1]}`);
+  ok('X7b【反证臂·同文件代回】把菜单那份的字符类改宽（放行中文）、或把上限改成 48，同一把对账尺子当场认出来',
+    (() => {
+      const rb = /const ROOM_ID_BAD = (\/[^/]+\/[a-z]*);/, rm = /const ROOM_ID_MAX = (\d+)/;
+      const wide = MENU_SRC.replace('const ROOM_ID_BAD = /[^A-Za-z0-9_.-]/g;', 'const ROOM_ID_BAD = /[^A-Za-z0-9_.-\\u4e00-\\u9fa5]/g;');
+      const long = MENU_SRC.replace('const ROOM_ID_MAX = 32;', 'const ROOM_ID_MAX = 48;');
+      return wide !== MENU_SRC && long !== MENU_SRC && rb.exec(wide)[1] !== srvBad[1] && rm.exec(long)[1] !== srvMax[1];
+    })());
+  ok('X7c 输入框那个 maxlength 抄的是同一份上限（写死一个别的数 = 界面放行、服务端截断）',
+    MENU_SRC.includes('id="joinRoomId" maxlength="${ROOM_ID_MAX}"'), (MENU_SRC.match(/id="joinRoomId"[^>]*/) || [''])[0]);
+  const metaLine = (MENU_SRC.match(/ · 房主[^\n]*/) || [''])[0];
+  ok('X8 房间屏把**房号**写在标题那一行（按房号加入要有号可抄：起了中文房名的房，房号原来从屏幕上消失）',
+    /房号 \$\{room\.id\}/.test(MENU_SRC), metaLine.slice(0, 60));
+  ok('X8b【反证臂·同文件代回】把那一格抄回旧的"只写房主"，尺子当场认出来',
+    !/房号 \$\{room\.id\}/.test(MENU_SRC.replace(' · 房主 ${room.host || \'—\'} · 房号 ${room.id}', " · 房主 ${room.host || '—'}")));
+}
+
+// ───────────────────────── Y 段：HU-25 错误不蒸发 · 那两格说实话 ─────────────────────────
+{
+  const timers = new Map(); let nid = 1;
+  const REAL = { st: globalThis.setTimeout, ct: globalThis.clearTimeout };
+  const fireAll = () => { for (const t of [...timers.values()]) t.f(); };
+  try {
+    globalThis.setTimeout = (f) => { const k = nid++; timers.set(k, { f }); return k; };
+    globalThis.clearTimeout = k => timers.delete(k);
+    const f = elMap();
+    const s = menuStub({ lb: lbStub(), el: f.el, screen: 'online' });
+    s.m.onlineError('那间房正在对局中，等它打完或在列表里另找一间');
+    ok('Y1【驱动 onlineError·命门】错误**不会被时间擦掉**：把所有待触发定时器都跑一遍，那一格还写着原话（旧写法是 6 秒后 textContent 清空）',
+      f.html('#lbErr').includes('那间房正在对局中') && (fireAll(), f.html('#lbErr').includes('那间房正在对局中')),
+      JSON.stringify({ timers: timers.size, now: f.html('#lbErr').slice(0, 30) }));
+    ok('Y1b 但它也不是永久的：按「知道了」之后那一格必须清空（改成永远挂着是另一种噪音）',
+      (() => { s.m._lastErr = ''; s.m.paintErr(); return f.html('#lbErr') === ''; })(), f.html('#lbErr'));
+    const ERR_BODY = bodyOf(MENU_SRC, /\n {2}onlineError\(/) || '';
+    ok('Y1c【先决】onlineError 的体切得到（切不到下面那条就是遍历空集合的恒绿）', ERR_BODY.includes('paintErr'), `${ERR_BODY.length} 字符`);
+    ok('Y1d【反证臂·同文件代回】把那个 6 秒定时器代回 onlineError 体内，同一把尺子（"这一格里不许有定时器"）当场认出来',
+      !/setTimeout/.test(ERR_BODY)
+      && /setTimeout/.test(ERR_BODY.replace("this._lastErr = msg || '';", "setTimeout(() => { el.textContent = ''; }, 6000); this._lastErr = msg || '';")));
+    const f2 = elMap();
+    const s2 = menuStub({ lb: lbStub(), el: f2.el, screen: 'onlineRoom' });
+    s2.m.onlineError('那间房已经满了');
+    ok('Y2 落在哪一屏就画在哪一屏的格子里（在大厅画 #lbErr、在房间屏画 #rmErr，两处不是同一格）',
+      f2.html('#rmErr').includes('那间房已经满了') && f2.html('#lbErr') === '', JSON.stringify({ rm: f2.html('#rmErr'), lb: f2.html('#lbErr') }));
+    ok('Y2b 挂着的那一句自带一个「知道了」的落点（不蒸发 = 得有一条看得见的路把它收掉）',
+      f2.html('#rmErr').includes('data-a="errack"'), f2.html('#rmErr').slice(-60));
+    const f3 = elMap();
+    const s3 = menuStub({ lb: lbStub(), el: f3.el, screen: 'online' });
+    s3.m.onlineError('服务端说：<img src=x onerror=alert(1)>');
+    ok('Y3 服务端原话照说，但**转义点在拼 innerHTML 的这一处**（这一格是 innerHTML，不是 textContent）',
+      !f3.html('#lbErr').includes('<img') && f3.html('#lbErr').includes('&lt;img'), f3.html('#lbErr').slice(0, 60));
+    const f4 = elMap([]);                     // 配装屏上两块错误格子（#lbErr / #rmErr）都不存在
+    const s4 = menuStub({ lb: lbStub(), el: f4.el, screen: 'loadout' });
+    s4.m.onlineError('这句这一屏没地方画');
+    ok('Y4 这一屏没有画它的格子时**不丢**：留在 _lastErr 里，下一屏渲染时补画（在大厅之外失败原本等于没说过）',
+      s4.m._lastErr === '这句这一屏没地方画' && f4.map.size === 0, JSON.stringify({ kept: s4.m._lastErr, wrote: f4.map.size }));
+    f4.slots.push('#lbErr'); s4.screen = 'online'; s4.m.paintErr();
+    ok('Y4b 回到有格子的那一屏时补画得出来（"留着"不是"永远看不见"）',
+      f4.html('#lbErr').includes('这句这一屏没地方画'), f4.html('#lbErr').slice(0, 40));
+    ok('Y4c 大厅那一屏渲染结尾会补画一次（形状闸：跨屏那一条路的另一半）',
+      /this\.paintErr\(\);/.test(bodyOf(MENU_SRC, /\n {2}showOnlineLobby\(/) || ''));
+    ok('Y4d【反证臂·同文件代回】把补画那一句从 showOnlineLobby 里删掉，尺子当场认出来',
+      !/this\.paintErr\(\);/.test((bodyOf(MENU_SRC, /\n {2}showOnlineLobby\(/) || '').replace('this.paintErr();', '')));
+
+    // #rmWhy 那一行：房主念服务端那句 why，非房主**不许**听到"只有房主能开始游戏"。
+    ok('Y5【驱动 roomWhyText】房主 + 可以开始 ⇒ 说"可以开始"',
+      /可以开始/.test(s.m.roomWhyText({ canStart: true, why: '' }, { isHost: true, ready: true }, false)));
+    ok('Y5b 房主 + 不能开 ⇒ 念服务端那句原因（那是他的问题，那句正是答他的）',
+      s.m.roomWhyText({ canStart: false, why: '至少还要再来一个人或一个 Bot。' }, { isHost: true, ready: true }, false) === '至少还要再来一个人或一个 Bot。');
+    ok('Y5c【命门】非房主、还没准备 ⇒ 屏幕上**不许**出现那句"只有房主"（旧写法把 st.why 直接念给他，而他没打算开局，只是还没点准备）',
+      (() => {
+        const t = s.m.roomWhyText({ canStart: false, why: '只有房主能开始游戏。' }, { isHost: false, ready: false }, false);
+        return !/只有房主/.test(t) && /准备/.test(t);
+      })(), s.m.roomWhyText({ canStart: false, why: '只有房主能开始游戏。' }, { isHost: false, ready: false }, false));
+    ok('Y5d 非房主、已准备 ⇒ 等房主（这一句原来是对的，改判序不许把它改丢）',
+      /等房主/.test(s.m.roomWhyText({ canStart: false, why: '还在等：张三' }, { isHost: false, ready: true }, false)));
+    ok('Y5e【反证臂·合成夹具】把旧的三元式代回来（非房主念 st.why），同一把尺子当场认出来',
+      (() => {
+        const me = { isHost: false, ready: false }, st = { canStart: false, why: '只有房主能开始游戏。' };
+        const old = st.why || '还没准备。';
+        return /只有房主/.test(old) && !/只有房主/.test(s.m.roomWhyText(st, me, false));
+      })());
+    ok('Y5f 对局中那一句照旧（这一条钉的是"补哪一格都不许把别的格子改黄"）',
+      s.m.roomWhyText({ canStart: false, why: '' }, { isHost: true, ready: true }, true) === '所有人已进入对局。');
+
+    // Bot 那一行：能不能点由 data-bid 说，而 CSS 的 hover/cursor 也按它设门。
+    ok('Y6【驱动 botSeatRow】房主 + 等待态 ⇒ 带 data-bid，且那一格写明"点击移除"',
+      (() => { const h = s.m.botSeatRow({ bid: 3, name: '哨戒', skill: 1 }, true); return h.includes('data-bid="3"') && /点击移除/.test(h); })());
+    ok('Y6b【命门】非房主 ⇒ **不发** data-bid（旧写法照发，然后在 roomDelBot 开头静默 return：那一行一样亮、一样 hover，点了什么也不发生）',
+      (() => { const h = s.m.botSeatRow({ bid: 3, name: '哨戒', skill: 1 }, false); return !h.includes('data-bid') && !/点击移除/.test(h); })(),
+      s.m.botSeatRow({ bid: 3, name: '哨戒', skill: 1 }, false).replace(/\s+/g, ' '));
+    ok('Y6c【跨文件对账】CSS 的 cursor 与 hover 确实都按 [data-bid] 设门（否则"不发这个属性"根本不等于"不高亮"）',
+      /\.seat\.bot\[data-bid\] \{ cursor: pointer; \}/.test(CSS_SRC) && /\.seat\.bot\[data-bid\]:hover/.test(CSS_SRC));
+    ok('Y6d 名字那一格转义（Bot 名是服务端起的，但这一屏所有行都走同一条拼接）',
+      !s.m.botSeatRow({ bid: 1, name: '<b>x</b>', skill: 0 }, true).includes('<b>x</b>'));
+    ok('Y7【HU-25·形状】底部那一行不再是 12px 的 #999（整个房间屏唯一说"接下来按哪个"的地方，小到要凑近才读得见）',
+      /\.rm-foot #rmWhy \{ margin-left: auto; font-size: 13px; color: #cfcfcf; \}/.test(CSS_SRC),
+      (CSS_SRC.match(/\.rm-foot #rmWhy[^\n]*\n?/) || [''])[0].trim());
+    ok('Y7b【反证臂·同文件代回】把它抄回 12px #999，尺子当场认出来',
+      !/\.rm-foot #rmWhy \{ margin-left: auto; font-size: 13px; color: #cfcfcf; \}/.test(CSS_SRC.replace('font-size: 13px; color: #cfcfcf', 'font-size: 12px; color: #999')));
+  } finally {
+    Object.assign(globalThis, { setTimeout: REAL.st, clearTimeout: REAL.ct });
+  }
+}
+
+// ───────────────────────── Z 段：HU-26 房间屏的那条出路 ─────────────────────────
+{
+  const askCount = (MENU_SRC.match(/还没连上大厅，稍等一下（或点「重新连接」）/g) || []).length;
+  ok('Z0【先决】"还没连上大厅"那一句在原处出现两次（大厅与房间屏共用一份文案），而且都指向「重新连接」',
+    askCount === 2, String(askCount));
+  ok('Z1【跨文件对账·命门】文案指的那条出路在**两张屏上都真有一个入口**：大厅 data-a=relobby、房间屏 data-a=reconnect（HU-26 的病就是房间屏只有一句"点重新连接"，而那一屏根本没有那一格）',
+    MENU_SRC.includes('data-a="relobby"') && MENU_SRC.includes('data-a="reconnect"')
+    && MENU_SRC.includes("this.on(r, '[data-a=relobby]'") && MENU_SRC.includes("this.on(r, '[data-a=reconnect]'"));
+  const f = elMap();
+  const up = menuStub({ lb: lbStub([], { state: ROOM_ST({ host: false }) }), el: f.el, screen: 'onlineRoom' });
+  up.m.renderRoom();
+  ok('Z2【驱动 renderRoom】连接在手上时那一格是**收着的**（常亮的重连按钮是在宣称"连接是断的"，与大厅那一格同一条判据）',
+      f.disp('#rmRe') === 'none' && f.disp('#rmReNote') === 'none', f.disp('#rmRe'));
+  up.game.lobby.connected = false;
+  up.m.renderRoom();
+  ok('Z2b 断了之后它亮出来（两个方向都要，只量"断时亮"的那一版可以是恒亮）',
+    f.disp('#rmRe') === '' && f.disp('#rmReNote') === '', f.disp('#rmRe'));
+  ok('Z2c 重连那一格上写着"连上之后回大厅"（座位是那条连接身上的，连接一断服务端就收了它 —— 说"回到房间"是另一句谎）',
+    /连上之后回大厅/.test(MENU_SRC));
+  ok('Z3 断线通知会**主动重画房间屏**（服务端那一班推送再也到不了，不补这一下玩家站的就是一屏"看起来还在房间里"）',
+    /else if \(this\.menu\.screen === 'onlineRoom'\) this\.menu\.renderRoom\(\);/.test(MAIN_SRC));
+  ok('Z3b【反证臂·同文件代回】把这一句删掉，尺子当场认出来',
+    !/else if \(this\.menu\.screen === 'onlineRoom'\) this\.menu\.renderRoom\(\);/.test(MAIN_SRC.replace("else if (this.menu.screen === 'onlineRoom') this.menu.renderRoom();", '')));
+  ok('Z4【驱动 onlineRelobby】重连第一步是**关掉断了的那条**再重建（不换的话旧连接上的座位/房间状态还挂在 game.lobby 上）',
+    (() => {
+      let closed = 0;
+      const lb = lbStub(); lb.close = () => { closed++; };
+      const s = menuStub({ lb });
+      s.m.onlineRelobby();
+      return closed === 1 && s.m._overlay === 1;
+    })());
+  ok('Z5 房间屏与大厅屏的错误格各自带「知道了」的落点（同一份 paintErr，两屏共用一个口径）',
+    (MENU_SRC.match(/id="lbErr"|id="rmErr"/g) || []).length === 2 && /class="note-wide err"/.test(MENU_SRC));
+}
+
+// ───────────────────────── AA 段：HU-27 数值条 · HU-28 滚轮 ─────────────────────────
+{
+  const { computeStats, statBars, WEAPONS, ATTACHMENTS, attachmentAllowed, findAttachment } = await import('../js/data.js');
+  const { m } = menuStub();
+  ok('AA0【先决】carryAtt 是本体、且配件表不是空的', typeof Menu.prototype.carryAtt === 'function' && Object.keys(ATTACHMENTS).length > 3);
+  // 夹具里的配件不是抄的：每把枪都按 data.js 那两张表**装满**（每个槽位取第一个该枪收的配件）。
+  // 抄一份 { muzzle:'supp' } 的话，哪天表里改了 id，这条判据会静默变成"什么都滤不掉"的恒绿。
+  const fullPatt = id => { const p = {}; for (const s of (WEAPONS[id].slots || [])) { const a = (ATTACHMENTS[s] || []).find(x => attachmentAllowed(id, s, x)); if (a) p[s] = a.id; } return p; };
+  const clsFor = id => ({ primary: id, patt: fullPatt(id), secondary: 'm1911', satt: {} });
+  const cls = clsFor('m4');
+  ok('AA0b【先决】m4 那份配件不是空的（空了的话 AA1~AA3 全是空断言）', Object.keys(cls.patt).length >= 2, JSON.stringify(cls.patt));
+  const keptM4 = m.carryAtt(cls, 'primary', 'm4');
+  ok('AA1b 同一把枪上兼容的那些**一个都不掉**（这条钉的是"滤完不是清空"）',
+    Object.keys(keptM4).length === Object.keys(cls.patt).length, JSON.stringify(keptM4));
+  const poor = Object.keys(WEAPONS).find(id => id !== 'm4' && Object.keys(m.carryAtt(cls, 'primary', id)).length < Object.keys(cls.patt).length);
+  ok('AA1【驱动 carryAtt】换到一支不兼容的枪时，留下的只有那些在这把枪上还存在的配件（这份筛选原来只在 pickWeapon 的点击分支里，而数值条拿的是另一份 = 一把空枪）',
+    !!poor && Object.keys(m.carryAtt(cls, 'primary', poor)).length < Object.keys(cls.patt).length, String(poor));
+  ok('AA1c 留下的每一个都必须真的被那把枪收（不兼容的那几个不许留在条子上冒充"我这把"）',
+    !!poor && Object.entries(m.carryAtt(cls, 'primary', poor)).every(([s, a]) => attachmentAllowed(poor, s, findAttachment(s, a))),
+    poor ? JSON.stringify(m.carryAtt(cls, 'primary', poor)) : '没有一支不兼容的枪');
+  const BAR = ['伤害', '射速', '射程', '精准度', '机动性'];
+  const barsId = Object.keys(WEAPONS).find(id => {
+    const k = m.carryAtt(clsFor(id), 'primary', id);
+    const a = statBars(computeStats(id, k)), b0 = statBars(computeStats(id, {}));
+    return BAR.some(x => Math.round(a[x]) !== Math.round(b0[x]));
+  });
+  ok('AA2【先决】存在一把枪，它的"带配件"与"空配件"那五根条**确实不同**（都没有的话 AA3 就是空断言，得退回形状闸）', !!barsId, String(barsId));
+  const k2 = m.carryAtt(clsFor(barsId), 'primary', barsId);
+  const withA = statBars(computeStats(barsId, k2)), bare = statBars(computeStats(barsId, {}));
+  const widths = h => [...h.matchAll(/width:([\d.]+)%/g)].map(x => Math.round(+x[1]));
+  ok('AA3【驱动 miniBars】选枪屏那几根条画的就是"我这把带配件的"那些数（HU-27：原来画的是空配件基准条，与实际带进对局的枪无关）',
+    JSON.stringify(widths(m.miniBars(barsId, k2))) === JSON.stringify(BAR.map(x => Math.round(withA[x])))
+    && m.miniBars(barsId, k2) !== m.miniBars(barsId), JSON.stringify({ att: widths(m.miniBars(barsId, k2)), bare: widths(m.miniBars(barsId)) }));
+  ok('AA3b 不给第二参时照旧可用，且那就是空枪那一组数（旧调用点不许炸、也不许悄悄变成"猜一份配件"）',
+    JSON.stringify(widths(m.miniBars(barsId))) === JSON.stringify(BAR.map(x => Math.round(bare[x]))));
+  ok('AA3c【反证臂·同文件代回】把 miniBars 抄回 computeStats(id, {})，AA3 那把尺子当场认出来',
+    (() => {
+      const back = MENU_SRC.replace('statBars(computeStats(id, att || {}))', 'statBars(computeStats(id, {}))');
+      const g = /computeStats\(id, att \|\| \{\}\)/;
+      return g.test(MENU_SRC) && !g.test(back);
+    })());
+  ok('AA4 选枪屏与"装上"那一路共用同一份 carryAtt（两处各写一遍筛选，条子就会说谎而没人报错）',
+    (MENU_SRC.match(/this\.carryAtt\(/g) || []).length >= 2 && !/const old = c\[k\] \|\| \{\}; const nw = \{\};/.test(MENU_SRC));
+  ok('AA5 枪匠的 delta 预览同时挂在 focus 上（键盘用户 Tab 到那一行时原来只能盲按回车**直接装上**）',
+    /el\.addEventListener\('mouseenter', preview\);\s*\n\s*el\.addEventListener\('focus', preview\);/.test(MENU_SRC),
+    (MENU_SRC.match(/addEventListener\('mouseenter'[^\n]*/) || [''])[0].slice(0, 50));
+  ok('A5b【反证臂·同文件代回】把 focus 那一刀删掉（回到只有鼠标能预览），尺子当场认出来',
+    !/addEventListener\('focus', preview\)/.test(MENU_SRC.replace("el.addEventListener('focus', preview);", '')));
+  const WHEEL = bodyOf(MENU_SRC, /this\.el\.addEventListener\('wheel'/) || '';
+  const wheelGate = /e\.target\.closest\('\.gs-left,\.gs-right,\.gs-stats,\.gs-foot,\.picker'\)/;
+  ok('AA6【HU-28·形状】滚轮缩放只归"看枪"那块区域：指针落到会滚的面板上时不许抢那个手势（真判据在 hud-keys 的 K 段）',
+    !!WHEEL && WHEEL.includes("this.screen !== 'gunsmith'") && wheelGate.test(WHEEL), WHEEL.replace(/\s+/g, ' ').slice(0, 70));
+  ok('AA6b【反证臂·同文件代回】把 .gs-right 从那份排除名单里拿掉（就是 HU-28 那个现场：列表在滚、镜头也在缩放），同一把尺子当场认出来',
+    (() => { const back = WHEEL.replace('.gs-left,.gs-right,', '.gs-left,'); return back !== WHEEL && !wheelGate.test(back); })());
+  ok('AA6c 排除名单里那两个"会滚"的容器确实是 CSS 里带 overflow-y 的那两个（名单不是抄来的，是对账出来的）',
+    /\.gs-right \{[^}]*overflow-y: auto/.test(CSS_SRC) && /\.pick-grid \{[^}]*overflow-y: auto/.test(CSS_SRC));
+}
+
+// ───────────────────────── AB 段：HU-29 原生弹窗 · HU-30 战绩 ─────────────────────────
+{
+  const { m } = menuStub();
+  // 原生弹窗那道全仓闸：把**行注释**与**方法定义行**摘掉之后再找裸 prompt/confirm/alert。
+  // 两处都要摘：这一层的注释里会引用旧写法（`confirm('…')` 那种历史说明），而 js/hud.js 自己
+  // 就有一个方法叫 prompt(text) —— 它长得不像调用，但它就是会被"裸 prompt(" 那个形状认进去。
+  const codeOnly = t => t.split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).map(l => l.replace(/\s+\/\/.*$/, '')).join('\n');
+  const nativeHits = t => {
+    // `window.confirm(` 也算：先把这个前缀摘掉，让"裸调用"那一条形状去认它（前缀那个点会被
+    // [^\w.$] 挡在门外 —— 而 hud.prompt()/this.prompt() 靠的正是同一个点被排除，两类要分开）。
+    const c = codeOnly(t).replace(/\bwindow\.(prompt|confirm|alert)\b/g, ' $1')
+      .replace(/^\s*(prompt|confirm|alert)\s*\([^)]*\)\s*\{/gm, '    DEF_HEAD');
+    return [...c.matchAll(/(?:^|[^\w.$])\b(prompt|confirm|alert)\s*\(/g)].map(x => x[1]);
+  };
+  const UI_FILES = ['js/menu.js', 'js/main.js', 'js/hud.js', 'js/mp.js', 'js/campaign.js', 'js/net/client.mjs', 'js/account.js'];
+  const natives = UI_FILES.flatMap(p => nativeHits(src(p)).map(k => p + ':' + k));
+  ok('AB0【自证·量具先活着】这道闸认得出裸调用、藏得住方法定义与行注释（摘掉这两类之后还找得到，才是真在数调用点）',
+    nativeHits("  const n = prompt('x');\n").join() === 'prompt'
+    && nativeHits("  prompt(text) {\n    el.textContent = t;\n  }\n").length === 0
+    && nativeHits("  // 原来：confirm('确定要重置吗？') 一版\n").length === 0
+    && nativeHits("  hud.prompt('a'); this.prompt('b');\n").length === 0, JSON.stringify(natives));
+  ok('AB1【全仓闸·HU-29】表现层里一处原生弹窗都不剩（那几条灰框与这一层的排版断层，而且读不出"会丢什么"）',
+    natives.length === 0, natives.join(' | '));
+  ok('AB1b【反证臂·同文件代回】把改名那一句抄回 window.prompt，同一把尺子当场认出来',
+    nativeHits(MENU_SRC.replace('this.renameClass(ci)', "window.prompt('配装名称', c.name)")).join() === 'prompt'
+    && nativeHits(MENU_SRC).length === 0);
+  ok('AB2【驱动 cleanClassName】12 字上限 / 两端空白 / 控制字符都在这一处清洗（页内那一格与判据用的是同一份规矩）',
+    cleanClassName('  侦察兵  ') === '侦察兵' && cleanClassName('一二三四五六七八九十甲乙丙') === '一二三四五六七八九十甲乙' && cleanClassName('a\u0007b') === 'a b',
+    JSON.stringify([cleanClassName('  侦察兵  '), cleanClassName('一二三四五六七八九十甲乙丙'), cleanClassName('a\u0007b')]));
+  ok('AB2b 全空白 ⇒ 空串（调用方据此**不改名**，而不是把配装改成一个空格）', cleanClassName('   ') === '');
+  const cardFor = (account, profile) => Object.assign(Object.create(Menu.prototype), {
+    game: { account, profile: Object.assign({ xp: 0, xpLocal: 0, muted: [] }, profile) },
+    level: () => ({ lv: 1, frac: 0 }),
+  }).playerCard();
+  const ON = cardFor({ loggedIn: true, user: { name: '甲', xp: 900, matches: 12, wins: 7 } }, { xp: 900 });
+  const OFF = cardFor({ loggedIn: false, user: null }, { xpLocal: 40 });
+  ok('AB3【驱动 playerCard·命门】主菜单那张卡上从此有一行战绩：登录态取服务端那本账（场次/胜），单机与访客走的是"没这本账"那一支（HU-30 的症状是这些只写在联网大厅那块面板里）',
+    /场次 12 · 胜 7/.test(ON) && /场次 — · 胜 —/.test(OFF), OFF.replace(/<[^>]+>/g, ' ').trim().slice(-40));
+  ok('AB3b 没账本的那两格写 —、**不写 0**（0 是一句陈述，而"从来没打过"与"打过但本地没有这本账"是两回事 —— 照 HU-16 那条纪律）',
+    !/场次 0/.test(OFF) && !/胜 0/.test(OFF), OFF.replace(/<[^>]+>/g, ' ').trim().slice(-30));
+  ok('AB4【HU-29·形状】重置那一层把会丢的几样列出来了，并且「先导出为文件」排在「确认重置」前面（不可逆的操作先给一次退路）',
+    /会在你这台机器上清掉的/.test(MENU_SRC) && MENU_SRC.indexOf('data-a="dump"') < MENU_SRC.indexOf('data-a="doprofile"'));
+  ok('AB4b 导出的是**会被这次重置清掉的那一份**（mf_profile），不是"全部"：设置那一格根本不在清除范围内（settings 是另一个键）',
+    /localStorage\.getItem\('mf_profile'\)/.test(MENU_SRC) && /removeItem\('mf_profile'\)/.test(MENU_SRC)
+    && !/removeItem\('mf_settings'\)/.test(MENU_SRC));
+  const SET_BODY = bodyOf(MENU_SRC, /\n {2}showSettings\(/) || '';
+  const nativeShape = /(?:^|[^\w.$])\bconfirm\s*\(/;
+  ok('AB4c【反证臂·同文件代回】把旧的 confirm 那一条代回 showSettings，同一把尺子当场认出来（正向不脏、代回必脏）',
+    SET_BODY.includes('resetSaveDialog') && !nativeShape.test(SET_BODY)
+    && nativeShape.test(SET_BODY.replace('this.resetSaveDialog()', " confirm('确定要重置所有配装与经验值吗？')")));
+  ok('AB4d 改名那一格自带焦点（原生 prompt 本来就有这件事，换成层内那一格就得自己补 —— 不然点开之后还得先点一下才能打字）',
+    /f\.focus\(\)/.test(bodyOf(MENU_SRC, /\n {2}renameClass\(/) || ''));
 }
 
 // ───────────────────────── 收口 ─────────────────────────

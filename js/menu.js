@@ -46,6 +46,17 @@ const MINUTES_ALL = [...MP_MINUTES, ...DOM_MINUTES.filter(v => !MP_MINUTES.inclu
 // 与 server/lobby.mjs:MODE_IDS 同源，两侧各筛各的话症状就是"界面上给了一格，点下去被拒"
 // —— 而房间列表上那一格模式正是别人挑房的依据。
 const ONLINE_MODES = MP_MODES.filter(m => m.net);
+// 进房那一条上行的"没回话"兜底（HU-31）。这一层原来只有两种结局：座位应答到了（换屏），
+// 或服务端明说拒绝（onlineError 把人退回大厅）。**两种都不是**的那一种是真会发生的：帧发进
+// 了一条看着还活着、对端却不再回话的连接（进程被杀、代理半开），人就被扣在"正在进房…"
+// 那一层全屏加载上，而那一屏上没有任何一个可点的东西 —— 唯一出路是 F5。
+const ROOM_ANSWER_MS = 8000;
+// 房号的白名单与长度上限（HU-24：按房号加入）。**这一份是抄本，正本在 server/lobby.mjs:134**
+// （`roomId = String(raw).slice(0, ROOM_ID_MAX).replace(ROOM_ID_BAD, '')`）。客户端这一份
+// 只**校验**、不清洗 —— 清洗是服务端的事，两处各洗各的就会出现"界面上放行那个串"与
+// "真正拿去查房的那串"不是同一个东西。判据跨文件对账这两个数（字符类与长度必须逐字相同）。
+const ROOM_ID_BAD = /[^A-Za-z0-9_.-]/g;
+const ROOM_ID_MAX = 32;
 
 // 地图缩略插画（内联SVG）
 const MAP_ART = {
@@ -105,6 +116,14 @@ const esc = escHtml;
 import { isImeKey, parseChatCommand, toggleMute, chatRowHtml } from './net/chat.mjs';
 export { isImeKey };
 
+// 配装改名（HU-29：那一格原来用原生 prompt）。抽成纯函数与 pauseActions 同一个理由：
+// 它住在 DOM 事件回调里，进程内够不到，而它的**清洗口径**是玩家看得见的规则
+// （12 字上限、空白不算名字）—— 让它在页内那一层里各写一遍，就是"两个入口两套规矩"。
+// 这一格只存在本机存档里，不上服务端（呼号那一份才有服务端的 flat/白名单）。
+export function cleanClassName(raw) {
+  return String(raw == null ? '' : raw).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim().slice(0, 12);
+}
+
 // 暂停屏上"这一屏该说什么、该给哪些动作"。抽成纯函数有两个理由：
 //   ① 联机这条路上"暂停"这个词是**假**的（本地 sim 停了、服务端照跑，你的人还在场上挨打）——
 //      §附三 说得很清楚，服务端不暂停不是缺陷，缺的是**客户端的提示与降级**；
@@ -139,11 +158,28 @@ export class Menu {
     this.lobby = { mode: 'tdm', map: 'dune', diff: 1, allies: 5, enemies: 6, time: 10, minutes: 10, score: 50, name: '士兵', team: 'A', room: '', title: '' };
     this.campDiff = 1;
     this.gateRecover = false;      // 闸的形态：false = 登录/注册，true = 用恢复码重设密码
+    // ── 对局外流程的三条状态（HU-22 / HU-25，都在 P3）──
+    // _lastErr  ：当前挂着的那句错误。**没有定时器**（HU-25 的病就是"6 秒自动蒸发"），
+    //             只有三种东西能收掉它：新的一条错误、玩家按「知道了」、他离开这一层。
+    // _enterRoom：已经发出一条"落地就换屏"的上行、还没等到落地。闸门归这一层自己管，
+    //             不归服务端 —— 远端那一路（remoteJoin）要 await 两次，期间大厅屏还活着。
+    // _startSent：房主的「开始游戏」发出去了。发出去之后那一格必须说"正在开局…"，
+    //             否则连点第二下发出的是第二帧，而服务端的回话是「这间已经在对局中了。」
+    this._lastErr = '';
+    this._enterRoom = null;
+    this._enterT = null;
+    this._startSent = false;
     this.selClass = game.profile.selClass || 0;
     this.buildScene();
     this.el.addEventListener('pointerdown', () => game.audio.init());
     this.el.addEventListener('mouseover', e => { const t = e.target.closest('.mbtn,.btn,.pick,.cls,.slotc,.gs-att,.gs-slot,.mode,.mapc,.diff'); if (t && t !== this._hov) { this._hov = t; game.audio.ui('hover'); } });
-    this.el.addEventListener('click', e => { if (e.target.closest(KEYPICK)) game.audio.ui('click'); });
+    this.el.addEventListener('click', e => {
+      if (e.target.closest(KEYPICK)) game.audio.ui('click');
+      // 那条错误的「知道了」（HU-25）。走委托而不是 on()：它是 onlineError **事后**塞进 DOM 的，
+      // 绑定时那一格还不存在 —— 与房间屏 Bot 行同一根线，同一个"点了没反应"的坑。
+      const ack = e.target.closest('[data-a=errack]');
+      if (ack) { this._lastErr = ''; this.paintErr(); }
+    });
     // Enter / 空格 = 一次 click（键盘可达的另一半，见 keyify 那段注释）。原生可激活的元素
     // 一律跳过：BUTTON 自己就会把 Enter/空格 派成 click，这里再点一次就是**双击** ——
     // 而这一层好几个动作是幂等不起来的（建房、开始游戏、下一局）。
@@ -166,7 +202,16 @@ export class Menu {
     this.el.addEventListener('pointerdown', e => { if (this.screen === 'gunsmith' && !e.target.closest('.gs-left,.gs-right,.gs-stats,.gs-foot')) { drag = { x: e.clientX, y: e.clientY }; this.gunSpin = false; } });
     window.addEventListener('pointermove', e => { if (drag) { this.gunRotY += (e.clientX - drag.x) * 0.01; this.gunRotX = Math.max(-0.6, Math.min(0.6, this.gunRotX + (e.clientY - drag.y) * 0.006)); drag.x = e.clientX; drag.y = e.clientY; } });
     window.addEventListener('pointerup', () => { drag = null; });
-    this.el.addEventListener('wheel', e => { if (this.screen === 'gunsmith') { this.gsZoom = Math.max(0.8, Math.min(2.2, (this.gsZoom || 1.45) + Math.sign(e.deltaY) * 0.1)); this.camTarget.pos.z = this.gsZoom; } }, { passive: true });
+    // 枪匠的滚轮缩放只归"看枪"那块区域（HU-28）。原来这里只判"当前是枪匠屏"，于是鼠标
+    // 停在右边那一列配件上滚轮时**列表在滚、镜头也在缩放** —— 一个手势被两件事同时抢走，
+    // 而那一列恰恰是这一屏唯一会滚的（style.css 的 .gs-right 带 overflow-y:auto）。
+    // 覆盖层 .picker 也在排除名单里：选枪那一屏同样有会滚的 .pick-grid，不该顺手缩放背景。
+    this.el.addEventListener('wheel', e => {
+      if (this.screen !== 'gunsmith') return;
+      if (e.target && e.target.closest && e.target.closest('.gs-left,.gs-right,.gs-stats,.gs-foot,.picker')) return;
+      this.gsZoom = Math.max(0.8, Math.min(2.2, (this.gsZoom || 1.45) + Math.sign(e.deltaY) * 0.1));
+      this.camTarget.pos.z = this.gsZoom;
+    }, { passive: true });
   }
 
   // ---------------- 3D 场景 ----------------
@@ -330,7 +375,14 @@ export class Menu {
     const L = this.level();
     // 两半分开写在卡上：玩家看得见"本地这些没进账号"，而不是只看见一个总数。
     const line = xpText(this.game.profile, !!(this.game.account && this.game.account.user));
-    return `<div class="player-card"><div class="lvl">${L.lv}</div><div><div style="font-weight:700;letter-spacing:2px">指挥官</div><div style="font-size:11px;color:#999">${line}</div><div class="xpbar"><div style="width:${Math.round(L.frac * 100)}%"></div></div></div></div>`;
+    // 战绩那一行（HU-30）：场次/胜 原来只在联网大厅那块"身份"面板里有，主菜单上这个人
+    // 只看得见自己的等级。服务端那份账（A.user.matches/wins）登了录就在；**本地这一份
+    // 没有场次账本**，那一格写 —（照 HU-16 那条纪律：没有账本的那一格由它自己说"我没这个数"，
+    // 不写 0 —— 0 是一句陈述，而"从来没打过"与"打过但没记"是两件事；也不整行消失，
+    // 消失就又回到"主菜单看不到战绩"那一格）。
+    const A = this.game.account, u = (A && A.loggedIn && A.user) || null;
+    const rec = u ? `场次 ${u.matches | 0} · 胜 ${u.wins | 0}` : '场次 — · 胜 —';
+    return `<div class="player-card"><div class="lvl">${L.lv}</div><div><div style="font-weight:700;letter-spacing:2px">指挥官</div><div style="font-size:11px;color:#999">${line}</div><div style="font-size:11px;color:#999">${rec}</div><div class="xpbar"><div style="width:${Math.round(L.frac * 100)}%"></div></div></div></div>`;
   }
   showLoadingOverlay(text) {
     this.render(`<div style="margin:auto;text-align:center"><div class="logo"><div class="l1">现代战线</div><div class="l2">MODERN FRONTLINE</div></div><div class="load-bar" style="width:420px;margin:0 auto"><div style="height:100%;width:100%;background:var(--acc);animation:ldpulse 1s infinite"></div></div><div style="margin-top:14px;color:#999;letter-spacing:3px;font-size:13px">${esc(text)}</div></div><style>@keyframes ldpulse{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}</style>`, 'solid', 'loading');
@@ -659,11 +711,15 @@ export class Menu {
             <div class="panel"><div class="opts">
               <div>建房 / 加入</div>
               <div style="display:flex;gap:8px"><input id="roomTitle" maxlength="24" placeholder="房间名（可留空）" value="${esc(L.title || '')}" style="${inp};flex:1;min-width:0"><button class="btn small" data-a="create">创建房间</button><button class="btn small ghost" data-a="quick">快速加入</button></div>
+              <!-- 按房号加入（HU-24）。房名是给人看的、房号才是寻址用的那一格，服务端把它们
+                   洗成两样东西（中文房名当房号会被洗成空串），所以这里**另开一格**而不是
+                   复用上面那个房名框。 maxlength 抄的是服务端那个长度上限，跨文件对账钉住。 -->
+              <div style="display:flex;gap:8px"><input id="joinRoomId" maxlength="${ROOM_ID_MAX}" placeholder="已有房号（A-Z a-z 0-9 . - _）" autocomplete="off" value="${esc(L.room || '')}" style="${inp};flex:1;min-width:0"><button class="btn small ghost" data-a="joinId">按房号加入</button></div>
               <div>地图</div>${seg('segMap', MP_MAPS.map(m => m.id), MP_MAPS.map(m => m.name), L.map)}
               <div>模式</div>${seg('segMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), this.onlineMode())}
               <div>时长</div>${seg('segMin', MINUTES_ALL, MINUTES_ALL.map(v => v + ' 分'), L.minutes)}
               <div>目标</div>${seg('segScore', SCORES_ALL, SCORES_ALL.map(v => this.scoreLabel(v, this.onlineMode())), L.score)}
-              <div class="note-wide" id="lbErr"></div>
+              <div class="note-wide err" id="lbErr"></div>
             </div></div>
           </div>
           <div class="lobby-col lb-right">
@@ -713,7 +769,11 @@ export class Menu {
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('online'));
     this.on(r, '[data-a=quick]', () => this.onlineQuick());
     this.on(r, '[data-a=create]', () => this.onlineCreate());
+    this.on(r, '[data-a=joinId]', () => this.onlineJoinById());
     this.on(r, '[data-a=relobby]', () => this.onlineRelobby());
+    // 房号那一格吃回车（与建房名、聊天框同一套规矩：输入法选词的回车是**上屏**，不是"加入"）。
+    const jInp = r.querySelector('#joinRoomId');
+    if (jInp) jInp.addEventListener('keydown', e => { e.stopPropagation(); if (isImeKey(e)) return; if (e.key === 'Enter') { e.preventDefault(); this.onlineJoinById(); } });
     this.bindChat(r, 'lobby');
     this.renderIdentity(r, L);
     this.renderRooms();
@@ -725,6 +785,7 @@ export class Menu {
       this.lobbyNote(r, LB ? '大厅连接已断开' : '还没连上大厅');
     }
     this.mountRecoveryPanel();   // 刚注册/刚重设的人：那一叠码补挂在这一屏顶端
+    this.paintErr();             // 上一次失败的那一句还认得这条路（HU-25：不蒸发）
     // 连接是这条路的入口：进不来就把原因写在这一屏上（而不是把人踢回主菜单 ——
     // 他什么都不知道，只会以为"这按钮点了没用"）。
     this.game.onlineLobby().then(() => { this.syncLobbyName(); }).catch(e => this.lobbyNote(r, '连不上大厅：' + (e && e.message || e)));
@@ -738,25 +799,55 @@ export class Menu {
   // 换回一条玩家在联机界面上无从解释的拒绝。这里刻意不改 L.mode —— 那是别人的偏好，
   // 玩家回到单人对战时理应当看见他上次选的那个。
   onlineMode() { const m = this.lobby.mode; return ONLINE_MODES.some(x => x.id === m) ? m : ONLINE_MODES[0].id; }
-  // 进房三件套共用的一道闸（M9）。三处各写一遍 `if (!lb.connected) return;` 的话，
-  // 漏一处就是一条静默的"点了没反应"（更糟：那条路上还会盖上"正在进房…"的加载层，
-  // 而它的唯一出路是 F5）—— 所以收成一个函数，并且**返回值**就是"这一帧发出去了吗"。
+  // 进房那一路的**本地闸门**（HU-22）。"发出去就该换屏"的上行在落地之前不许受理第二下，
+  // 因为这条路上连点两次不是"多做一遍"那种无害重复：
+  //   · 创建房间 —— 服务端对第二帧回「这个房间号已经有人在了」，那句拒绝经 onlineError 会
+  //     清掉 _wantRoom 并把人退回大厅：他站在列表前看着一句自己制造的拒绝，而刚建好的那间
+  //     房他进不去（座位应答落到了一屏已经被换掉的房间屏上）。
+  //   · 快速加入 / 加入某一间落在**远端行**上时（remoteJoin）要 await 一次 HTTP 加一次换台
+  //     连接 —— 那几百毫秒里大厅屏还活着、按钮还亮着，第二下会把刚建起来的第一条连接半路关掉。
+  // 闸门松开有三个出口，每个都真走得到：服务端拒绝（onlineError）、人进了房（showOnlineRoom）、
+  // 或者压根没回话（下面那个超时）。**刻意不做成"一次性的永久锁"**：那会把这一条换成更难查的
+  // 那一种症状 —— 点了没反应，而且再也没有第二下。
+  enterRoomGuard() {
+    if (this._enterRoom) return false;
+    this._enterRoom = 'room';
+    clearTimeout(this._enterT);
+    this._enterT = setTimeout(() => this.enterRoomTimeout(), ROOM_ANSWER_MS);
+    return true;
+  }
+  // 没回话（HU-31 的"无失败重试"那一半）：那层全屏加载原来没有任何可点的东西，玩家唯一的
+  // 出路是 F5 —— 而 F5 会把他这台机器上还没存的东西（房名、地图与模式的选择、聊天框里打到
+  // 一半的字）一起扔掉。这里把他送回大厅并说清楚刚才是哪一步没回话，按钮就在原地。
+  enterRoomTimeout() {
+    if (!this._enterRoom) return;
+    this.onlineError(`服务端 ${Math.round(ROOM_ANSWER_MS / 1000)} 秒没回这一句 · 可以再点一次（这期间连点被本地挡着，不会造出第二间房）`);
+  }
+  // 进房三件套 + 按房号加入共用的两道闸（M9 / HU-22）。四处各写一遍 `if (!lb.connected) return;`
+  // 的话，漏一处就是一条静默的"点了没反应"（更糟：那条路上还会盖上"正在进房…"的加载层，
+  // 而它的唯一出路是 F5）—— 所以收成函数，并且**返回值**就是"可以继续往下发吗"。
   lobbyAsk(fn) {
     const lb = this.game.lobby;
     if (!lb || !lb.connected) { this.onlineError('还没连上大厅，稍等一下（或点「重新连接」）'); return false; }
     if (fn && !fn(lb)) { this.onlineError('大厅连接刚刚断了，这一句没发出去'); return false; }
     return true;
   }
-  // 房间屏上行的闸（与进房三件套的 lobbyAsk 同一族）：连接不在手上时，加 / 减 Bot、
+  // 房间屏上行的闸（与进房那一路的 lobbyAsk 同一族）：连接不在手上时，加 / 减 Bot、
   // 换队、准备、改设置、开始这些按钮原来全是静默丢帧 —— "点了没反应"那一族里最后
   // 几个没设闸的入口。LobbyClient 那几条上行现在都把"真的发出去了吗"交回来，这里统一问。
+  // 那句"或点「重新连接」"在**两张屏上都说得出**：房间屏也有那一格了（HU-26），
+  // 判据把"文案指的那个入口在这两屏都存在"钉成一条跨文件对账。
   roomAsk(fn) {
     const lb = this.game.lobby;
-    if (!lb || !lb.connected) { this.onlineError('还没连上大厅，稍等一下（或点「重新连接」）'); return; }
-    if (!fn(lb)) this.onlineError('大厅连接刚刚断了，这一下没发出去');
+    if (!lb || !lb.connected) { this.onlineError('还没连上大厅，稍等一下（或点「重新连接」）'); return false; }
+    if (!fn(lb)) { this.onlineError('大厅连接刚刚断了，这一下没发出去'); return false; }
+    return true;
   }
   // 重连大厅：扔掉断了的那条连接，重新走一遍 onlineLobby()。**不刷新页面** ——
   // 这一页上还有房名、地图、装备选择与聊天框里没发完的字，F5 会把它们全丢掉。
+  // 从房间屏点它也一样落回大厅：座位是**那条连接**身上的，连接一断服务端就把座位收了，
+  // 没有哪一条路能"重连"回原来那一间 —— 所以这里不说"回到房间"，把人放回列表并写明房号
+  // 那一格在哪（他可以按房号再进一次，见 onlineJoinById）。
   onlineRelobby() {
     const g = this.game;
     if (g.lobby) { g.lobby.close(); g.lobby = null; }   // close() 会立 _closing ⇒ 不再报一次"断开"
@@ -766,6 +857,7 @@ export class Menu {
       .catch(e => { this.showOnlineLobby(); this.onlineError('还是连不上：' + ((e && e.message) || e)); });
   }
   onlineCreate() {
+    if (!this.enterRoomGuard()) return;
     const L = this.lobby;
     const title = String((this.el.querySelector('#roomTitle') || {}).value || '').trim().slice(0, 24);
     L.title = title;
@@ -778,6 +870,7 @@ export class Menu {
   }
   onlineQuick() {
     const lb = this.game.lobby; if (!lb) return;
+    if (!this.enterRoomGuard()) return;
     this.syncLobbyName();
     // 没连上时**先拦在这里**：`lb.rooms` 这时候是空的，下面那段"本台有没有可进的房"
     // 会一路判到 quickRoom —— 而那一帧发不出去，症状与点「创建房间」一模一样。
@@ -785,6 +878,8 @@ export class Menu {
     // 快速加入的偏好顺序：本台有可进的等待房 → 交给服务端的 quick（它挑本台的）；
     // 本台没有而目录里登记了别台的房 → 跨台加入；都没有 → 本台新建（原行为）。
     // 让服务端先挑本台是刻意的：少一次换台的连接抖动，玩家对"我在哪台"也少一次困惑。
+    // 远端行还要**有 url** 才算可进（与列表那一格同一个判据，见 roomRowJoin）：
+    // 没有地址的那一行点下去只能落到本台的 joinRoom，而那不是一间能在本台查到的房。
     const localJoinable = (lb.rooms || []).some(x => !x.remote && x.state === 'waiting' && x.players < x.max);
     if (!localJoinable) {
       const row = (lb.rooms || []).find(x => x.remote && x.url && x.state === 'waiting' && x.players < x.max);
@@ -793,14 +888,35 @@ export class Menu {
     if (!this.lobbyAsk(x => x.quickRoom({ title: '', map: this.lobby.map, mode: this.onlineMode(), minutes: this.lobby.minutes, scoreLimit: this.lobby.score }))) return;
     this.game.showRoomSoon();
   }
-  onlineJoin(room, title) {
+  onlineJoin(room) {
     const lb = this.game.lobby; if (!lb) return;
+    if (!this.enterRoomGuard()) return;
     this.syncLobbyName();
-    // 远端行（房间目录里别台的房）：走跨台那条路 —— row.url 告诉我们该连哪台。
+    // 远端行（房间目录里别台的房）只有一条路：换台连过去。缺 url 的那些**绝不退回**
+    // "先拿本台的 joinRoom 试一把"（HU-23）—— 本台查不到它，服务端只会回一句
+    // 「那间房已经不在了」，那是句谎；而本台恰好有一间同号的房时更糟：他安安静静进错房。
+    // 这一格在今天的部署下起不来（理由写在 roomRowJoin 上面那段），留的是**不变量**，不是现场修复。
     const row = (lb.rooms || []).find(x => x.id === room);
-    if (row && row.remote && row.url) { this.remoteJoin(row); return; }
+    if (row && row.remote) {
+      if (row.url) { this.remoteJoin(row); return; }
+      this.onlineError('那间房在另一台服务器上，可它没登记连得过去的地址 · 换一间，或等它下一班心跳');
+      return;
+    }
     if (!this.lobbyAsk(x => x.joinRoom(room))) return;
     this.game.showRoomSoon();
+  }
+  // 按房号加入（HU-24）。房号是房主**念给你或截图给你**的那一串（房间屏标题那行写着），
+  // 所以这一格要收任意合法房号，而不只能从列表里点。它**不清洗**输入：清洗是
+  // server/lobby.mjs:roomId 那一份的事，这里只判"这一串算不算一个房号"——不是就当场上报，
+  // 别让它变成一句查过之后的「那间房已经不在了」（那会把"你打错了"说成"它不存在"）。
+  onlineJoinById() {
+    const raw = String((this.el.querySelector('#joinRoomId') || {}).value || '').trim();
+    const L = this.lobby;
+    if (!raw) { this.onlineError('要先填房号 · 房主那一侧的房间屏标题那行就写着'); return; }
+    if (raw.replace(ROOM_ID_BAD, '') !== raw) { this.onlineError('房号只能用 A-Z a-z 0-9 和 . - _（房名可以写中文，房号不行）'); return; }
+    if (raw.length > ROOM_ID_MAX) { this.onlineError(`房号最长 ${ROOM_ID_MAX} 个字符`); return; }
+    L.room = raw;
+    this.onlineJoin(raw);
   }
   // 跨台加入：换台 = 换一条连接（大厅 → 房间 → 对局 都在同一条 ws 上，这是
   // js/net/lobby.mjs 写定的前提，换台就必须换连接，旧连接上的座位/房间状态随之作废）。
@@ -823,7 +939,9 @@ export class Menu {
     const wsUrl = String(row.url).replace(/^http/, 'ws') + '/ws' + q;
     try { await this.game.onlineLobby(wsUrl); }
     catch (e) { this.onlineError('连不上另一台：' + (e && e.message || e)); return; }
-    this.game.lobby.joinRoom(row.id);
+    // 换台成功了，还要这一帧真发出去（send 的返回值就是"发出去了吗"）。原来这里不核返回值：
+    // 连接刚建好又当场断的话，症状仍然是那句"点了没反应"（HU-22 那一族的最后一条）。
+    if (!this.game.lobby.joinRoom(row.id)) { this.onlineError('连上了另一台，可那一帧没发出去 · 再点一次'); return; }
     this.game.showRoomSoon();
   }
   // 呼号：要账号的服上它是服务端给的（renderIdentity 那一格只显示、不填），
@@ -867,18 +985,32 @@ export class Menu {
     rows.innerHTML = list.map(x => {
       const map = MP_MAPS.find(m => m.id === x.map) || { name: x.map };
       const mode = MP_MODES.find(m => m.id === x.mode) || { name: x.mode };
-      const playing = x.state === 'playing';
-      const full = x.players >= x.max;
-      const can = !playing && !full;
-      return `<div class="room-row ${can ? '' : 'off'}">
+      const j = this.roomRowJoin(x);
+      return `<div class="room-row ${j.can ? '' : 'off'}">
         <div class="rr-name">${esc(x.title)}</div>
         <div class="rr-meta">${esc(map.name)} · ${esc(mode.name)} · ${x.time || 10} 分${x.remote ? ' · 另一台' : ''}</div>
         <div class="rr-n">${x.players | 0}/${x.max | 0}</div>
-        <div class="rr-state">${playing ? '对局中' : (full ? '已满' : (x.ready | 0) + ' 已准备')}</div>
-        <button class="btn small ${can ? '' : 'ghost'}" data-a="joinRow" data-room="${esc(x.id)}" ${can ? '' : 'disabled'}>${playing ? '观战不了' : '加入'}</button>
+        <div class="rr-state">${j.state}</div>
+        <button class="btn small ${j.can ? '' : 'ghost'}" data-a="joinRow" data-room="${esc(x.id)}" ${j.can ? '' : 'disabled'}>${j.label}</button>
       </div>`;
     }).join('');
     this.on(rows, '[data-a=joinRow]', el => { if (!el.disabled) this.onlineJoin(el.dataset.room); });
+  }
+  // 列表上一行"进得去吗、那一格该写什么"（HU-23）。收成一处是为了让**列表、快速加入、点下去**
+  // 三条路问同一个问题 —— 两处各判各的写法就是那条症状的形状：列表说"进不去"，快速加入却撞上去。
+  // 三种拒绝各说一句：观战这一仓库做不了（没有那条通道，不是"人满了"那种能说清的原因）、
+  // 地址不明、满员（灰着的一枚 + 人数那一列已经说了原因）。
+  // 【可达性更正 2026-10-11】"另一台上、却没登记可达地址"那一格在**今天的服务上起不来**：远端行只
+  // 来自 RoomDirectory，那一列是 `url text not null`（server/room-dir.mjs:40），写它用的是
+  // `CFG.publicUrl || http://<host>:<port>`（server/net-server.mjs:609）—— 两条里必有一条非空。
+  // 所以这一格留的是**不变量**：目录哪天被别的写入方填了空 url，界面也不许画出一枚点得动的死按钮。
+  // 完整过程写在 docs/hud-ux-audit.md 的 HU-23 那一节（同 HU-05 那条教训：先问输入可达吗）。
+  roomRowJoin(x) {
+    const full = (x.players | 0) >= (x.max | 0);
+    const state = x.state === 'playing' ? '对局中' : (full ? '已满' : `${x.ready | 0} 已准备`);
+    if (x.state === 'playing') return { can: false, label: '观战不了', state };
+    if (x.remote && !x.url) return { can: false, label: '进不了', state: '地址不明' };
+    return { can: !full, label: '加入', state };
   }
   // 离开联机这一层：连接是这一层唯一的真相来源，回主菜单就把它拆掉。
   // 不拆的症状是"人已经在主菜单了，聊天还在往里灌、房间里还占着一个座位"。
@@ -886,6 +1018,9 @@ export class Menu {
     const lb = this.game.lobby;
     if (lb) { lb.close(); this.game.lobby = null; }
     this._recovPending = null;   // 离开这一层就丢弃：留着的话下次进大厅会摆出一叠早就作废的码
+    // 同一条纪律：本地那些等落地的闸门与挂着的那句错误都属于这一层，出去就得清零 ——
+    // 留着的话下一次进大厅会凭空多出一句"上一世的失败"和一个点不动的按钮（HU-22 / HU-25）。
+    this._enterRoom = null; clearTimeout(this._enterT); this._startSent = false; this._lastErr = '';
     this.showMain();
   }
 
@@ -986,11 +1121,35 @@ export class Menu {
   // 服务端那句拒绝画在**当前那一屏**上。它不翻译、不复述（和注册闸同一个规矩）：
   // "邀请码不对"和"服务器忙"如果被揉成同一句"失败了"，服主永远收不到真问题。
   onlineError(msg) {
+    // 任何一条走到这里的回话都意味着"那一下没成"，两道本地闸门必须同时松开 —— 否则第二次
+    // 点击是被**我自己**挡下来的，那会把 HU-22 换成更难查的那一种"点了没反应"。
+    this._enterRoom = null; clearTimeout(this._enterT); this._startSent = false;
     // 正在进房的那一层是"加载"屏，它没有地方画这句话 —— 不先退回大厅，人就会被
     // 永久卡在"正在进房…"上（拒绝恰恰是最需要让人看见的一种结果）。
     if (this.game._wantRoom) { this.game._wantRoom = false; this.showOnlineLobby(); }
+    // HU-25：这一句原来是 6 秒后定时器擦掉的。擦掉的症状不是"提示不好看"，是**那句话再也没有
+    // 人看见过** —— 他在读房间列表、在打字，或者那句拒绝来得比他低头看键盘那一下晚一点，屏幕
+    // 上就没有任何地方还写着"刚才失败过、以及为什么"。现在它留在屏上，直到新的一条错误顶掉它、
+    // 他按「知道了」、他离开这一层，或者他**成功进了某一间房**（那一句就是旧错误的收条）。
+    // 转义点在拼 innerHTML 的这一处（与 killfeed、killerInfo 同一条 M10 纪律）：msg 是服务端
+    // 原话，这个模块不翻译也不复述。
+    this._lastErr = msg || '';
+    this.paintErr();
+    // 松了闸还得让**已经画在屏上的那一格**跟着改口：房间屏不随推送重画的话，「正在开局…」
+    // 会一直停在那里、按钮按不动 —— 那正是这一条要修的"点了没反应"，只是换了个形式回来。
+    // （这一句是给 test/hud-keys.mjs 的 I2 逼出来的：进程内那一版是手动补一次 renderRoom 量的，
+    // 量不到"现实中没人补这一下"。）
+    if (this.screen === 'onlineRoom') this.renderRoom();
+  }
+  // 把挂着的那句错误画在当前那一屏的格子里。它单独成一个方法是为了两条都能被驱动：
+  // onlineError 事后塞进来的（绑定时那一格还不存在，所以「知道了」走委托而不是 on()），
+  // 以及**换屏之后补画**的那条路（在大厅屏之外失败时，那一屏根本没有 #lbErr）。
+  paintErr() {
     const el = this.el.querySelector(this.screen === 'onlineRoom' ? '#rmErr' : '#lbErr');
-    if (el) { el.textContent = msg || ''; clearTimeout(this._errT); this._errT = setTimeout(() => { el.textContent = ''; }, 6000); }
+    if (!el) return;                       // 这一屏没地方画：留在 _lastErr 里，下一屏渲染时补
+    el.innerHTML = this._lastErr
+      ? `${esc(this._lastErr)} <button class="btn ghost small" data-a="errack">知道了</button>`
+      : '';
   }
   // ── 联机第四层：房间 ──
   // 这一屏只干一件事：凑人、准备、由房主按下开始。
@@ -1000,6 +1159,9 @@ export class Menu {
   showOnlineRoom() {
     const lb = this.game.lobby, st = lb && lb.state;
     if (!st || !st.me) { this.showOnlineLobby(); return; }      // 不在任何房里就别画房间
+    // 落到这一屏 = 前面那些"发出去等落地"的上行都落地了（HU-22 的闸门收条），而"人已经进来了"
+    // 就是上一次那句失败的收条（HU-25：错误不许在成功之后还挂在屏上）。
+    this._enterRoom = null; clearTimeout(this._enterT); this._startSent = false; this._lastErr = '';
     this.setCam('lobby');
     const r = this.render(`
       <div class="lobby rm">
@@ -1016,7 +1178,12 @@ export class Menu {
           <div class="lobby-col rm-mid">
             <div class="panel" id="rmCfg"></div>
             ${this.chatPanel('room', '房间频道')}
-            <div class="note-wide" id="rmErr"></div>
+            <div class="note-wide err" id="rmErr"></div>
+            <!-- 房间屏原来**没有**重连入口（HU-26）：这一屏上行的闸说的话是"还没连上大厅，
+                 稍等一下（或点「重新连接」）"，而这一屏上根本没有那一格 —— 屏幕上写的那条出路
+                 是一个不存在的东西（HU-01 同族）。它只在连接不在手上时才亮：常亮的那一格的语义
+                 是"连接是断的"，与大厅那一格同一条判据。 -->
+            <div class="lobby-foot"><button class="btn small" data-a="reconnect" id="rmRe" style="display:none">重新连接</button><span class="note-wide" id="rmReNote" style="display:none">连上之后回大厅 · 那一间要是还在，按房号再进一次</span></div>
           </div>
           <div class="lobby-col team-col">
             <div class="team-hd b">B 队<span id="nB" class="th-n"></span></div>
@@ -1038,7 +1205,8 @@ export class Menu {
     this.on(r, '[data-a=leave]', () => this.roomLeave());
     this.on(r, '[data-a=loadout]', () => this.showLoadouts('onlineRoom'));
     this.on(r, '[data-a=ready]', () => this.roomReady());
-    this.on(r, '[data-a=start]', () => this.roomAsk(l => l.start()));
+    this.on(r, '[data-a=start]', () => this.roomStart());
+    this.on(r, '[data-a=reconnect]', () => this.onlineRelobby());
     this.on(r, '[data-a=toA]', () => this.roomTeam('A'));
     this.on(r, '[data-a=toB]', () => this.roomTeam('B'));
     this.on(r, '[data-a=addA]', () => this.roomAddBot('A'));
@@ -1072,9 +1240,15 @@ export class Menu {
     const mt = this.el.querySelector('#rmMeta');
     // Bot 占位置，所以人数那一格要把它们算进去；另写一个"N Bot"，否则一间 1 人 + 7 Bot
     // 的房在标题上写着 8 人，点进去只看见一个人 —— 那看起来像列表算错了。
+    // 房号也写在同一行（HU-24）：大厅里那一格"按房号加入"要有号可填，而房主的屏幕上原来
+    // **只有房名** —— 房名是他自己起的、可以写中文，而中文当房号会被服务端洗成空串（两格
+    // 本来就不是一个东西）。没起房名时标题那格显示的就是房号，起了名它就从屏幕上消失了，
+    // 朋友就没有地方抄它。
     if (mt) mt.textContent = `${map.name} · ${mode.name} · ${room.score || 50}${room.mode === 'dom' ? ' 分' : ' 杀'} · ${room.time || 10} 分 · ${room.players || seats.length}/${room.max || 16} 人`
-      + (bots.length ? `（${bots.length} Bot）` : '') + ` · 房主 ${room.host || '—'}`;
+      + (bots.length ? `（${bots.length} Bot）` : '') + ` · 房主 ${room.host || '—'} · 房号 ${room.id}`;
     const per = Math.max(2, Math.floor((room.max || 16) / 2));
+    // Bot 那一行 → botSeatRow()：它对不对点得动是一格**独立的事实**，值得被单独量（下面有理由）。
+    const canDelBot = !!(me.isHost && !playing);
     // 座位栏上的等级读的是**服务端发来**的 `s.xp`（账号那一半），不混本地那份：
     // 这一屏看的是别人，别人机器上的战役经验我这儿不可能有，同一张表里两个来源就乱了。
     // 所以这里的等级与档案卡（两半之和）在"本地也挣过"的人身上会差一级，这是有意的。
@@ -1084,19 +1258,12 @@ export class Menu {
       <span class="s-lv">${s.xp ? 'Lv ' + (levelOf(s.xp)) : ''}</span>
       <span class="s-st">${s.isHost ? '随时可开' : (s.ready ? '已准备' : '等待中')}</span>
     </div>`;
-    // Bot 那一行：房主点一下移除，所以它是可点的（data-bid），并且写明"点击移除" ——
-    // 一行看着和真人一模一样的名单，玩家没有任何办法知道哪个能点。
-    const botRow = (b) => `<div class="seat bot" data-bid="${b.bid}">
-      <span class="s-tag">Bot</span>
-      <span class="s-name">${esc(b.name)}</span>
-      <span class="s-lv">${BOT_SKILL_NAMES[b.skill | 0] || ''}</span>
-      <span class="s-st">${me.isHost && !playing ? '点击移除' : ''}</span>
-    </div>`;
+    // Bot 那一行的画法收在 botSeatRow() 里（HU-25），理由写在那儿。
     const blank = () => '<div class="seat empty"><span class="s-tag">·</span><span class="s-name">空位</span><span class="s-st"></span></div>';
     for (const team of ['A', 'B']) {
       const box = this.el.querySelector(team === 'A' ? '#seatA' : '#seatB');
       const list = seats.filter(s => s.team === team).map(row);
-      const bl = bots.filter(b => b.team === team).map(botRow);
+      const bl = bots.filter(b => b.team === team).map(b => this.botSeatRow(b, canDelBot));
       const all = list.concat(bl);
       const n = this.el.querySelector(team === 'A' ? '#nA' : '#nB');
       if (n) n.textContent = `${all.length}/${per}`;
@@ -1114,13 +1281,20 @@ export class Menu {
     }
     const sb = this.el.querySelector('[data-a=start]');
     if (sb) {
+      const s = this.roomStartState(me, st, playing);
       sb.style.display = me.isHost ? '' : 'none';
-      sb.disabled = !st.canStart || playing;
-      sb.style.opacity = sb.disabled ? .45 : 1;
-      sb.textContent = playing ? '对局进行中…' : '开始游戏';
+      sb.disabled = s.disabled;
+      sb.style.opacity = s.disabled ? .45 : 1;
+      sb.textContent = s.label;
     }
     const why = this.el.querySelector('#rmWhy');
-    if (why) why.textContent = playing ? '所有人已进入对局。' : (me.isHost ? (st.canStart ? '人都准备好了，可以开始。' : st.why || '') : (me.ready ? '已准备，等房主开始。' : st.why || '还没准备。'));
+    if (why) why.textContent = this.roomWhyText(st, me, playing);
+    // 重连那一格跟着连接的**真相**走（HU-26），与大厅那一格同一条规矩：断着才亮、连上就收 ——
+    // 常亮的重连按钮是在宣称"连接是断的"。断线的时候这一屏是画不出新状态的（服务端那一班
+    // 推送再也到不了），所以 main.js 的 onLobbyLost 会**主动**再走一遍 renderRoom 把这一格亮出来。
+    const lost = !lb.connected || !!lb.lost;
+    const re = this.el.querySelector('#rmRe'); if (re) re.style.display = lost ? '' : 'none';
+    const rn = this.el.querySelector('#rmReNote'); if (rn) rn.style.display = lost ? '' : 'none';
     // 房主改设置那一格：非房主只读（改了也不会生效，摆成能编辑的样子就是骗人）。
     const cfg = this.el.querySelector('#rmCfg');
     if (cfg) {
@@ -1162,6 +1336,49 @@ export class Menu {
       }));
     }
   }
+  // Bot 那一行（HU-25）。`data-bid` 是"这一行点得掉"的**唯一**标记 —— style.css 里
+  // `cursor:pointer` 与 hover 高亮两条都按 `[data-bid]` 设门，所以"不给非房主点"必须靠
+  // **不发这个属性**，而不是在点击处理里悄悄 return：旧写法正是后者（roomDelBot 开头那句
+  // `if (!st.me.isHost) return;`），症状是 Bot 行对所有人一样亮、一样 hover，非房主点下去
+  // 什么也不发生 —— 而那一行右边的"点击移除"是空的，等于一句不说原因的沉默。
+  botSeatRow(b, canDel) {
+    return `<div class="seat bot"${canDel ? ` data-bid="${b.bid}"` : ''}>
+      <span class="s-tag">Bot</span>
+      <span class="s-name">${esc(b.name)}</span>
+      <span class="s-lv">${BOT_SKILL_NAMES[b.skill | 0] || ''}</span>
+      <span class="s-st">${canDel ? '点击移除' : ''}</span>
+    </div>`;
+  }
+  // 房主按下「开始游戏」（HU-22）。这一格在服务端回话之前必须**既不再受理第二下、又说出
+  // "这一下已经发出去了"**：房间屏是唯一一个"发了帧却不换屏"的动作（建房/进房那一族换的是
+  // 整屏，加载层本身就是反馈），所以它是"点了没反应"最常被撞到的那一个。连点的第二帧换来的是
+  // 服务端一句「这间已经在对局中了。」—— 那句话会糊在一个正要进对局的屏幕上，而且描述的是
+  // 他自己造成的重复帧，不是任何他需要做点什么的状态。
+  roomStart() {
+    if (this._startSent) return;
+    if (!this.roomAsk(l => l.start())) return;
+    this._startSent = true;
+    this.renderRoom();
+  }
+  // 那一格该写什么、能不能按。判序照服务端 canStartGame，但**多一条本地闸门**（_startSent）：
+  // 帧已经发出去之后，它不该再长得像还能按。松开的出口是 onlineError（拒绝）与换屏/离房。
+  roomStartState(me, st, playing) {
+    if (playing) return { disabled: true, label: '对局进行中…' };
+    if (this._startSent) return { disabled: true, label: '正在开局…' };
+    if (!me.isHost) return { disabled: true, label: '开始游戏' };
+    return { disabled: !st.canStart, label: '开始游戏' };
+  }
+  // 底部那一行"现在该干什么"（HU-25）。抽成函数是为了它能被逐种状态驱动。旧的写法把服务端的
+  // `st.why` 直接念给**没点准备的人**听 —— 而 canStartGame 的判序是"先问是不是房主"，所以他
+  // 看到的是一句「只有房主能开始游戏。」：他没打算开始游戏，他只是还没准备。屏幕上写的话必须
+  // 是对说话人说的（HU-01 那一族）。服务端那句 why 归位成只有房主才念 —— 那一句回答的正是
+  // "为什么我不能开局"。
+  roomWhyText(st, me, playing) {
+    if (playing) return '所有人已进入对局。';
+    if (me.isHost) return st.canStart ? '人都准备好了，可以开始。' : (st.why || '');
+    if (me.ready) return '已准备，等房主开始。';
+    return '还没准备 · 点下面那一格的「准备」';
+  }
   roomReady() {
     const lb = this.game.lobby, st = lb && lb.state; if (!st || !st.me) return;
     this.roomAsk(l => l.ready(!st.me.ready));
@@ -1181,6 +1398,8 @@ export class Menu {
   roomLeave() {
     const lb = this.game.lobby; if (lb) lb.leaveRoom();
     this.game._wantRoom = false;
+    // 离开这一间就是把本地那些"发出去等落地"的状态收干净（HU-22 的闸门、HU-25 挂着的那句）。
+    this._enterRoom = null; clearTimeout(this._enterT); this._startSent = false; this._lastErr = '';
     this.showOnlineLobby();
   }
 
@@ -1298,7 +1517,7 @@ export class Menu {
       </div>`, 'dim', 'loadout');
     this.on(r, '.cls', el => { this.selClass = +el.dataset.i; this.showLoadouts(); });
     this.on(r, '[data-a=equip]', () => { P.selClass = ci; this.game.saveProfile(); this.showLoadouts(); });
-    this.on(r, '[data-a=rename]', () => { const n = prompt('配装名称', c.name); if (n && n.trim()) { c.name = n.trim().slice(0, 12); this.game.saveProfile(); this.showLoadouts(); } });
+    this.on(r, '[data-a=rename]', () => this.renameClass(ci));
     this.on(r, '[data-g]', (el, e) => { e.stopPropagation(); this.showGunsmith(ci, el.dataset.g); });
     this.on(r, '[data-w]', (el, e) => { e.stopPropagation(); this.pickWeapon(ci, el.dataset.w); });
     this.on(r, '.slotc[data-s]', el => this.pickWeapon(ci, el.dataset.s));
@@ -1324,8 +1543,37 @@ export class Menu {
     d.querySelector('[data-a=pback]').addEventListener('click', () => { d.remove(); onBack && onBack(); });
     return d;
   }
-  miniBars(id) {
-    const b = statBars(computeStats(id, {}));
+  // 配装改名（HU-29）。原来是一句 window.prompt：浏览器自己那条灰框与这一层的排版断层，
+  // 而且在"全屏 + 指针锁"的上下文里它长得像系统报错。换成层内那一格之后，规矩得自己写全 ——
+  // 焦点、回车提交、以及输入法选词那一记回车（同一个 isImeKey，与注册闸和聊天框一把尺子）。
+  // 清洗口径收在 cleanClassName()（判据直接走它）。这一格只存在本机存档里，不上服务端。
+  renameClass(ci) {
+    const c = this.game.profile.classes[ci];
+    const box = 'flex:1;min-width:0;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);color:#eee;padding:7px 10px;font:inherit;letter-spacing:1px';
+    const d = this.picker('重命名配装', '最多 12 个字 · 只存在你这台机器上',
+      `<div style="display:flex;gap:8px;max-width:520px"><input id="clsName" maxlength="12" value="${esc(c.name)}" placeholder="配装名称" autocomplete="off" style="${box}"><button class="btn small" data-a="ok">保存</button></div><div class="note-wide" id="cnMsg"></div>`);
+    const f = d.querySelector('#clsName'), msg = d.querySelector('#cnMsg');
+    const fire = () => {
+      const n = cleanClassName(f && f.value);
+      if (!n) { msg.textContent = '名字不能是空的（那就别改）'; return; }
+      c.name = n; this.game.saveProfile(); this.showLoadouts();
+    };
+    d.querySelector('[data-a=ok]').addEventListener('click', fire);
+    f.addEventListener('keydown', e => { e.stopPropagation(); if (isImeKey(e)) return; if (e.key === 'Enter') { e.preventDefault(); fire(); } });
+    f.focus(); f.select && f.select();      // 原生 prompt 自带这件事，换成层内那一格就得自己补
+  }
+  // 这一支枪**实际会带进对局**的那几个配件（HU-27）。换武器时"保留兼容配件"这条筛选本来就存在
+  // （pickWeapon 的点击分支里），把它抽成一处、让选枪屏那几根数值条也走同一份 —— 否则条子画的
+  // 是"一把空枪"，而玩家挑的是"我这把带着配件的"：同一屏上两个数说的是两把不同的枪，
+  // 而那一格的用处正是"我在几把枪之间比较"。
+  carryAtt(cls, slot, weaponId) {
+    const k = slot === 'primary' ? 'patt' : 'satt';
+    const old = (cls && cls[k]) || {}, nw = {};
+    for (const s in old) { const a = findAttachment(s, old[s]); if (a && attachmentAllowed(weaponId, s, a)) nw[s] = old[s]; }
+    return nw;
+  }
+  miniBars(id, att) {
+    const b = statBars(computeStats(id, att || {}));
     return ['伤害', '射速', '射程', '精准度', '机动性'].map(k => `<div class="stat" style="margin-top:6px">${k}<div class="bar"><div class="b0" style="width:${b[k]}%"></div></div></div>`).join('');
   }
   pickWeapon(ci, slot) {
@@ -1333,15 +1581,19 @@ export class Menu {
     const overkill = c.perks.includes('overkill');
     const list = slot === 'primary' ? PRIMARY_ORDER : overkill ? [...SECONDARY_ORDER, ...PRIMARY_ORDER.filter(x => x !== c.primary)] : SECONDARY_ORDER;
     const cur = slot === 'primary' ? c.primary : c.secondary;
-    const d = this.picker(slot === 'primary' ? '选择主武器' : '选择副武器', overkill && slot === 'secondary' ? '火力过载：可携带第二把主武器' : '选择后可进入枪匠改装', `<div class="pick-grid">${list.map(id => { const w = WEAPONS[id]; return `<div class="pick ${id === cur ? 'sel' : ''}" data-id="${id}"><div class="cat">${w.cls}</div><b>${w.name}</b><span>伤害 ${w.dmg[0]} · 射速 ${w.rpm} · 弹匣 ${w.mag}</span>${this.miniBars(id)}</div>`; }).join('')}</div>`);
+    // 数值条拿的是 carryAtt(...)：换到那把枪之后**真的会带上**的那几个配件（HU-27）。
+    // 那句 sub 把这件事写在屏上 —— 一格里两个来源的数（空枪 vs 我这把）只差在注释里，
+    // 玩家读不出来，而"这条比那条短"正是他挑枪时唯一的依据。
+    const d = this.picker(slot === 'primary' ? '选择主武器' : '选择副武器',
+      (overkill && slot === 'secondary' ? '火力过载：可携带第二把主武器' : '选择后可进入枪匠改装') + ' · 数值条按你当前配件带进那一把的部分算（不兼容的会自动摘掉）',
+      `<div class="pick-grid">${list.map(id => { const w = WEAPONS[id]; return `<div class="pick ${id === cur ? 'sel' : ''}" data-id="${id}"><div class="cat">${w.cls}</div><b>${w.name}</b><span>伤害 ${w.dmg[0]} · 射速 ${w.rpm} · 弹匣 ${w.mag}</span>${this.miniBars(id, this.carryAtt(c, slot, id))}</div>`; }).join('')}</div>`);
     this.on(d, '.pick', el => {
       const id = el.dataset.id;
       const k = slot === 'primary' ? 'patt' : 'satt';
       if (slot === 'primary') c.primary = id; else c.secondary = id;
-      // 保留兼容配件
-      const old = c[k] || {}; const nw = {};
-      for (const s in old) { const a = findAttachment(s, old[s]); if (a && attachmentAllowed(id, s, a)) nw[s] = old[s]; }
-      c[k] = nw;
+      // 保留兼容配件 —— 与上面那几根条**同一份**筛选（carryAtt），两处各写一遍的话，
+      // 条子会说谎而没人报错。
+      c[k] = this.carryAtt(c, slot, id);
       this.game.saveProfile();
       this.showLoadouts();
     });
@@ -1425,8 +1677,15 @@ export class Menu {
     drawStats(null);
     this.on(r, '.gs-slot', el => { this.gsSlot = el.dataset.s; this.showGunsmith(ci, which); });
     r.querySelectorAll('.gs-att[data-id]').forEach(el => {
-      el.addEventListener('mouseenter', () => { const p = Object.assign({}, att); if (el.dataset.id) p[this.gsSlot] = el.dataset.id; else delete p[this.gsSlot]; drawStats(p); });
+      // delta 预览原来只挂在 mouseenter 上（HU-27）：键盘用户 Tab 到这一行、按回车是**直接装上**，
+      // 全程看不到它会改什么 —— 那一格明明画着六根条，却只对鼠标说话。focus 给同一个预览，
+      // "看着它改"这件事就不再需要一根会悬停的指针。（触屏那半还欠着：那一类设备上没有
+      // 一种"不产生副作用的悬停"，点下去就是装上 —— 收口写在审计里。）
+      const preview = () => { const p = Object.assign({}, att); if (el.dataset.id) p[this.gsSlot] = el.dataset.id; else delete p[this.gsSlot]; drawStats(p); };
+      el.addEventListener('mouseenter', preview);
+      el.addEventListener('focus', preview);
       el.addEventListener('mouseleave', () => drawStats(null));
+      el.addEventListener('blur', () => drawStats(null));
       el.addEventListener('click', () => {
         const aid = el.dataset.id;
         if (!aid) delete att[this.gsSlot];
@@ -1503,7 +1762,40 @@ export class Menu {
       this.game.saveSettings();
     }));
     this.on(r, '[data-a=back]', () => { if (inGame) this.showPause(); else this.showMain(); });
-    this.on(r, '[data-a=resetp]', () => { if (confirm('确定要重置所有配装与经验值吗？')) { localStorage.removeItem('mf_profile'); location.reload(); } });
+    this.on(r, '[data-a=resetp]', () => this.resetSaveDialog());
+  }
+
+  // 重置存档（HU-29）。原来：`confirm('确定要重置所有配装与经验值吗？')` → removeItem → reload。
+  // 三处不对：① 那一句没说出会丢的**具体是哪几样**（配装、本地经验、屏蔽名单、战役最佳用时），
+  // 「经验值」三个字还会让人以为服务器上的战绩也没了；② 丢之后没有任何退路，而这份数据本来就
+  // 躺在本机 localStorage 里，先给一次导出的成本是一行；③ 原生 confirm 与这一层的排版断层。
+  // 「先导出为文件」导的正是**会被这次重置清掉的那一份**（mf_profile）—— 说"导出全部"是另一句谎，
+  // 而设置那一格根本不在清除范围内（localStorage 里是另一个键，见 js/main.js 的 saveSettings）。
+  resetSaveDialog() {
+    const P = this.game.profile;
+    const loss = [`配装 ${P.classes.length} 套（含枪匠配件与迷彩）`, `本地经验 ${P.xpLocal | 0}`,
+      `屏蔽名单 ${(P.muted || []).length} 人`, `战役最佳用时 ${P.campaignBest ? fmtTime(P.campaignBest) : '—'}`];
+    const d = this.picker('重置存档', '这一步不可恢复', `
+      <div style="max-width:560px">
+        <div class="note-wide">会在你这台机器上清掉的：</div>
+        <ul style="margin:0 0 10px 18px;padding:0;line-height:1.9">${loss.map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+        <div class="note-wide">不受影响：服务器上的账号与战绩，以及画面 / 灵敏度那些设置。</div>
+        <div style="display:flex;gap:10px;margin-top:14px"><button class="btn small ghost" data-a="dump">先导出为文件</button><button class="btn small" data-a="doprofile">确认重置</button></div>
+      </div>`);
+    d.querySelector('[data-a=dump]').addEventListener('click', () => this.exportProfile());
+    d.querySelector('[data-a=doprofile]').addEventListener('click', () => { localStorage.removeItem('mf_profile'); location.reload(); });
+  }
+  // 把本机那份存档导成一个文件（HU-29：不可逆的操作先给一次退路）。纯前端 —— 那份数据本来就
+  // 只在这台机器上，往服务端传反而是新增一条不该有的上行。
+  exportProfile() {
+    const raw = localStorage.getItem('mf_profile') || '{}';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([raw], { type: 'application/json' }));
+    a.download = 'mf-profile-' + new Date().toISOString().slice(0, 10) + '.json';
+    document.body.appendChild(a); a.click();
+    // 收掉那个临时链接要延一拍：点下去的同一拍就 remove() 的话，某些浏览器会把刚开始的
+    // 下载一起掐掉（症状是"按了导出，什么都没下来"）。URL 也在这里释放。
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(a.href); }, 0);
   }
 
   // ---------------- 暂停 ----------------
