@@ -2,9 +2,10 @@
 //   第一批（P0）HU-01（连杀键位三处口径）· HU-02（联机死亡画面写着不存在的键）·
 //     HU-04 + HU-21（reset 漏归位签名门与选点卡片）· HU-38（同一格文案三处各拼一遍）·
 //     HU-03（掉线文案被 nowrap 裁掉）· HU-06 第一半（菜单键盘可达）。
-//   第二批（P1）H=HU-07 血量数字 · I=HU-11 空仓 · J=HU-14 受击方向 · K=HU-09 越界指示 + HU-10 地图记号 ·
+//   第二批（P1）H=HU-07 血量数字 · I=HU-11 空仓 · J=HU-14 受击方向 · K=HU-09 越界指示 ·
 //     L=HU-15 我方存活 · M=HU-08 常驻网络读数 · N=HU-12 连杀拒收回执 · O=HU-41 走人提示进聊天框 ·
-//     P=HU-10 来袭记账 · Q=HU-13 连杀命中音。
+//     Q=HU-13 连杀命中音。（**HU-10 曾在 K/P 两段有判据，2026-10-11 整条回退** —— 弹窗预警与
+//     小地图记号实测效果不好，判据随之删除；P 段那个字母空着是有意的，别再往里塞别的东西。）
 //   第三批（P2）S=HU-16 记分板两端同形 · T=HU-17 按住 Tab 的活刷 · U=HU-18 大房点名 ·
 //     V=HU-19 冻结期间的读数 + HU-20 结算屏按钮说实话。
 //     HU-17 那一半里"浏览器到底保不保活"不在这里 —— 进程内量不到，见 test/hud-keys.mjs 的 G 段。
@@ -427,7 +428,7 @@ const el = id => DOM.getElementById(id);       // rec() 给的是账本，style 
     Math.abs(Math.atan2(below.x - 0, -(below.z - 0)) + 0) < 0.01);
 }
 
-// ───────────────────────── K 段：HU-09 越界指示 / HU-10 地图上的雷 ─────────────────────────
+// ───────────────────────── K 段：HU-09 越界指示 ─────────────────────────
 {
   const tr = [], sets = [];
   const ctx = new Proxy({}, {
@@ -452,17 +453,6 @@ const el = id => DOM.getElementById(id);       // rec() 给的是账本，style 
     Math.abs(Math.hypot(p2[0], p2[1]) - EDGE) < 0.01, `r=${Math.hypot(p2[0], p2[1]).toFixed(2)}·圈沿=${EDGE}`);
   ok('K2b 收拢不改方向：仍在正北（px≈0、pz<0）', Math.abs(p2[0]) < 0.01 && p2[1] < 0, JSON.stringify(p2));
   ally.pos.z = -20;
-  g.projectiles = [{ alive: true, type: 'frag', owner: { team: 'B' }, pos: { x: 5, y: 1, z: -5 } }];
-  tr.length = 0; sets.length = 0; h.drawMinimap();
-  ok('K3 来袭爆炸物在地图上有自己的记号（HU-10：这张图以前只有人）', tr.length === 3, `记号数=${tr.length - 1}`);
-  ok('K3b 记号的颜色与敌我两点都不同款（同色就读不出"那是颗雷"）',
-    sets.includes('#ff9a2a'), JSON.stringify(sets.slice(0, 6)));
-  g.projectiles = [{ alive: true, type: 'frag', owner: pl, pos: { x: 5, y: 1, z: -5 } }];
-  tr.length = 0; h.drawMinimap();
-  ok('K4 自己扔的那一颗不画（你知道自己往哪儿扔的，多一个记号只是噪音）', tr.length === 2);
-  g.projectiles = [{ alive: true, type: 'smoke', owner: { team: 'B' }, pos: { x: 5, y: 1, z: -5 } }];
-  tr.length = 0; h.drawMinimap();
-  ok('K4b 非致命弹（烟雾）不算来袭记号（把致盲弹报成"快跑"是狼来了）', tr.length === 2);
   ok('K5 #mmLabel 有读数了（过去是死 DOM：HTML 里留了格子，JS 从不写）',
     rec('mmLabel').text === '半径 45m', rec('mmLabel').text);
   const mmSize = +(HUD_SRC.match(/const MM_SIZE = (\d+)/) || [])[1];
@@ -552,10 +542,10 @@ const el = id => DOM.getElementById(id);       // rec() 给的是账本，style 
   const [h6] = mkHud();
   h6.netReadout();
   ok('M6 单机与战役那一格留空（那边没有 net，写 "ping 0 ms" 是新的一种谎）', rec('netStat').text === '');
-  ok('M7 三格都挂在 update() 上（每拍驱动的是它们自己，不是只在记分板里才刷）',
-    /this\.teamReadout\(\); this\.netReadout\(\); this\.nadeWatch\(\);/.test(HUD_SRC));
-  ok('M7b【反证臂】把这一行删掉 ⇒ 三个方法都成了死代码，尺子认得出',
-    !/this\.teamReadout\(\); this\.netReadout\(\); this\.nadeWatch\(\);/.test(HUD_SRC.replace('this.teamReadout(); this.netReadout(); this.nadeWatch();', '')));
+  ok('M7 两格都挂在 update() 上（每拍驱动的是它们自己，不是只在记分板里才刷）',
+    /this\.teamReadout\(\); this\.netReadout\(\);/.test(HUD_SRC));
+  ok('M7b【反证臂】把这一行删掉 ⇒ 两个方法都成了死代码，尺子认得出',
+    !/this\.teamReadout\(\); this\.netReadout\(\);/.test(HUD_SRC.replace('this.teamReadout(); this.netReadout();', '')));
   ok('M8 拽回次数只在纠正超过半个身位时才计（每包都涨的话这一格常亮成噪音）',
     /if \(r\.corrected > PULL_METRES\) this\.pulls = \(this\.pulls \|\| 0\) \+ 1;/.test(NET_SRC));
 }
@@ -655,49 +645,6 @@ const el = id => DOM.getElementById(id);       // rec() 给的是账本，style 
   NetClient.prototype.onEvents.call(cliJ, { ev: [{ e: 'join', cid: 8, name: '张三', team: 'B', perks: [] }] });
   ok('O5 join 那侧仍然什么都不说（HU-05 的更正：join 只在名单成型那批到，加了就是开局刷屏）',
     cj.length === 0, JSON.stringify(cj));
-}
-
-// ───────────────────────── P 段：HU-10 来袭警告的记账 ─────────────────────────
-{
-  const nade = (owner, dist = 5, type = 'frag') => ({
-    alive: true, type, owner,
-    pos: { x: dist, y: 1, z: dist, distanceTo(p) { return Math.hypot(this.x - p.x, this.y - p.y, this.z - p.z); } },
-  });
-  const [h1, g1, p1] = mkHud();
-  g1.projectiles = [nade({ team: 'B' })];
-  h1.nadeWatch();
-  ok('P1 别人扔的雷进了杀伤距离 ⇒ 屏幕上有一次警告（HU-10：过去只有炸的那一刻才知道）',
-    p1.length === 1 && p1[0] === '手雷！', JSON.stringify(p1));
-  h1.nadeWatch(); h1.nadeWatch();
-  ok('P2 一颗只喊一次（每拍喊的话 popup 连成常亮，读数和噪音一个样）', p1.length === 1);
-  const [h2, g2, p2] = mkHud();
-  g2.projectiles = [nade({ team: 'B' }, 60)];
-  h2.nadeWatch();
-  ok('P2b NADE_NEAR 之外不喊：远处那颗与我无关', p2.length === 0);
-  const [h3, g3, p3] = mkHud();
-  g3.projectiles = [nade(g3.player)];
-  h3.nadeWatch();
-  ok('P3 自己扔的那一颗不喊', p3.length === 0);
-  const [h4, g4, p4] = mkHud();
-  g4.projectiles = [nade({ team: 'B' }, 5, 'semtex'), nade({ team: 'B' }, 4, 'rocket')];
-  h4.nadeWatch();
-  ok('P4 弹种各有各的话（粘性炸弹与 RPG 不该都叫"手雷"）',
-    p4.length === 2 && p4[0] === '粘性炸弹！' && p4[1] === 'RPG 来袭！', JSON.stringify(p4));
-  const [h5, g5, p5] = mkHud();
-  g5.projectiles = [nade({ team: 'B' }, 5, 'smoke'), nade({ team: 'B' }, 5, 'flash')];
-  h5.nadeWatch();
-  ok('P4b 非致命弹不报警（闪光/烟雾喊"快跑"喊两次就没人信了）', p5.length === 0);
-  const [h6, g6, p6] = mkHud();
-  const same = nade({ team: 'B' }, 5);
-  g6.projectiles = [same];
-  h6.nadeWatch();
-  h6.reset();
-  g6.projectiles = [same];
-  h6.nadeWatch();
-  ok('P5 新局开局后同一颗还在飞的雷要重新喊（reset 漏归位那本账 = 症状与 HU-04 同族）',
-    p6.length === 2, `喊过 ${p6.length} 次`);
-  ok('P5b【复发闸】reset 里确实归位了"已喊过哪几颗"那本账（C4 那条泛化闸只盯 *Sig，这本要单独钉）',
-    /_nadeWarned = new Set\(\)/.test(RESET_BODY));
 }
 
 // ───────────────────────── Q 段：HU-13 连杀击杀的命中音 ─────────────────────────

@@ -23,10 +23,6 @@ const MM_RADIUS = 45;                 // 小地图显示半径（米）—— #m
 const HP_LOW = 0.35;                  // 血量告警口径：条与数字共用同一个阈值
 const DMG_DIR_MAX = 4;                // 伤害方向指示同时最多几条（点射不许弧叠弧）
 const DMG_DIR_MERGE = 20 * Math.PI / 180;   // 同方向判据：来向夹角小于这个数就合成一条
-// 来袭警告（HU-10）：哪些弹种算"落在你附近会要你命"，以及那一行说什么。
-// 非致命弹（flash / smoke）不在表里 —— 把致盲雷报成"快跑"是狼来了。
-const NADE_WARN = { frag: '手雷！', semtex: '粘性炸弹！', molotov: '燃烧瓶！', rocket: 'RPG 来袭！', bomb: '空袭弹幕！' };
-const NADE_NEAR = 14;                 // 米：破片杀伤 7m，留一倍余量才来得及跑出杀伤半径
 
 export class HUD {
   constructor(game) {
@@ -41,8 +37,6 @@ export class HUD {
     // 小地图那一格写的半径 = 绘制用的那个数（HU-09）：#mmLabel 过去是死 DOM，
     // 建 HTML 的人留了格子，JS 从不写，于是地图上永远没有比例尺读数。
     const ml = $('mmLabel'); if (ml) ml.textContent = '半径 ' + MM_RADIUS + 'm';
-    // 已经喊过"手雷！"的那几颗（HU-10）：按弹记账，一颗只喊一次。
-    this._nadeWarned = new Set();
     // 出生就是满弹匣，所以"没打光"是这块的初值；写 false 而不是 undefined，
     // 是因为 false→true 那个边沿就是要能被第一次打光触发。
     this._drySig = false;
@@ -100,7 +94,6 @@ export class HUD {
     $('enemyName').textContent = '';
     // 新局还没打过一发，读数格子不该带着上一局的数字进场（与上面那堆清空同一件事）
     $('hpNum').textContent = ''; $('teamAlive').textContent = ''; $('netStat').textContent = '';
-    this._nadeWarned = new Set();
     // 聊天条也是上一局的残留：不清的话上一局的话会跟着新局一起开（与 deathScreen 同一类事）
     this.chatRows = []; this.chatActive = false; this.chatChannel = 'match'; clearTimeout(this.chatT);
     const cb = $('chatBox');
@@ -362,24 +355,6 @@ export class HUD {
     }
   }
 
-  // 手雷来袭（HU-10）：敌方/队友扔出来的致命弹在自己屏幕上从来没有过任何预告 ——
-  // 只有炸的那一刻的镜头冲击。这里补两件事：小地图上那颗有独立标记，进杀伤距离时喊一次。
-  // 记账按"颗"不按"拍"：一颗只喊一次（每拍喊的话 2.2 秒的 popup 会常亮成噪音）。
-  nadeWatch() {
-    const game = this.game, pl = game.player;
-    const list = game.projectiles;
-    if (!pl || !list || !list.length) return;
-    for (const p of list) {
-      if (!p.alive || p.owner === pl || !NADE_WARN[p.type]) continue;
-      const warned = this._nadeWarned.has(p);
-      if (!warned && p.pos.distanceTo(pl.pos) <= NADE_NEAR) {
-        this._nadeWarned.add(p);
-        this.popup(NADE_WARN[p.type], '#f66');
-        game.audio.beep(2);
-      }
-    }
-  }
-
   update(dt) {
     const game = this.game, pl = game.player;
     if (!pl) return;
@@ -521,7 +496,7 @@ export class HUD {
     // 30Hz —— 2.4px/m 的比例下跑动者每拍挪不到半像素，转身时 12°/拍的旋转也无顿挫感。
     this.mmT += dt;
     if (this.mmT >= 1 / 30) { this.mmT %= 1 / 30; this.drawMinimap(); }
-    this.teamReadout(); this.netReadout(); this.nadeWatch();
+    this.teamReadout(); this.netReadout();
     this.updateMarkers();
   }
 
@@ -669,13 +644,6 @@ export class HUD {
       else { ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill(); }
       ctx.restore();
     };
-    // 来袭爆炸物（HU-10）：这张图此前只有人 —— 手雷落在脚边，小地图上也看不见那颗飞进来的东西。
-    // 自己扔的那一颗不画（你知道自己往哪儿扔的），非致命弹（闪光/烟雾）也不画（那是狼来了）。
-    const projs = game.projectiles;
-    if (projs) for (const p of projs) {
-      if (!p.alive || p.owner === pl || !NADE_WARN[p.type]) continue;
-      dot(p.pos.x, p.pos.z, '#ff9a2a', 4.5);
-    }
     // 目标点
     const mode = game.mode;
     if (mode && mode.flags) for (const f of mode.flags) {
