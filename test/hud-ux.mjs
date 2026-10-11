@@ -1,10 +1,13 @@
-// HUD / UI「界面不许说谎」判据。对应 docs/hud-ux-audit.md 两批：
+// HUD / UI「界面不许说谎」判据。对应 docs/hud-ux-audit.md 三批：
 //   第一批（P0）HU-01（连杀键位三处口径）· HU-02（联机死亡画面写着不存在的键）·
 //     HU-04 + HU-21（reset 漏归位签名门与选点卡片）· HU-38（同一格文案三处各拼一遍）·
 //     HU-03（掉线文案被 nowrap 裁掉）· HU-06 第一半（菜单键盘可达）。
 //   第二批（P1）H=HU-07 血量数字 · I=HU-11 空仓 · J=HU-14 受击方向 · K=HU-09 越界指示 + HU-10 地图记号 ·
 //     L=HU-15 我方存活 · M=HU-08 常驻网络读数 · N=HU-12 连杀拒收回执 · O=HU-41 走人提示进聊天框 ·
 //     P=HU-10 来袭记账 · Q=HU-13 连杀命中音。
+//   第三批（P2）S=HU-16 记分板两端同形 · T=HU-17 按住 Tab 的活刷 · U=HU-18 大房点名 ·
+//     V=HU-19 冻结期间的读数 + HU-20 结算屏按钮说实话。
+//     HU-17 那一半里"浏览器到底保不保活"不在这里 —— 进程内量不到，见 test/hud-keys.mjs 的 G 段。
 //
 // 这一层和 js/net/remote.mjs 那一族是同一个病：**全都不影响权威状态**，不崩不报错，
 // 症状只有玩家看得出来 —— 照屏幕提示按键、叫出来的是别的连杀；某一格整局空白；
@@ -510,6 +513,9 @@ const el = id => DOM.getElementById(id);       // rec() 给的是账本，style 
     scores: { A: 10, B: 5 }, board: { total: 1, rows: [{ cid: 1, name: '我', s: 10, k: 2, d: 1, a: 0, rank: 1 }] },
     // 脚注与常驻那一格必须调**同一个方法**，所以夹具里也给它同一个真函数（不是抄一份返回值）
     netStatusText() { return NetClient.prototype.netStatusText.call(this); },
+    // 大房那一句（HU-18）同样是本体：夹具里抄一份文案的话 M2 量的就不是那张真表了。
+    bigRoomCutText(rows) { return NetClient.prototype.bigRoomCutText.call(this, rows); },
+    roster: new Map(), _sbNames: new Map(),
   };
   const line = NetClient.prototype.netStatusText.call(cli);
   ok('M1 常驻读数四件都有：ping / 抖动 / 快照份数 / 被拽回次数（HU-08 的病是"只有按住 Tab 才看得见"）',
@@ -735,6 +741,263 @@ const el = id => DOM.getElementById(id);       // rec() 给的是账本，style 
       const back = MP_SRC.replace("game.hud.hitmarker(res.killed); game.audio.hit(res.killed, res.part === 'head');", 'game.hud.hitmarker(res.killed);');
       return [...back.matchAll(/game\.hud\.hitmarker\([^)]*\);/g)].some(m => !/game\.audio\.hit\(/.test(back.slice(m.index, m.index + 120)));
     })());
+}
+
+// ───────────────────────── S 段：HU-16 记分板两端同形 ─────────────────────────
+// 两端各自的**真** scoreboardHTML 喂两套夹具：单机的行对象形状来自 MPMatch.ranking()
+// （player 走 stats.*、Bot 走扁字段），联机的来自服务端 pushBoard 的行。判据量的是
+// "同一份表形状"，不是"两份代码看起来差不多"。
+const SB_SRC = src('js/scoreboard.mjs');
+{
+  const ths = t => [...t.matchAll(/<th[^>]*>([^<]*)<\/th>/g)].map(m => m[1]);
+  // 按表拆：队名写在"名字"那一格的表头里，那是**各端各自的文案**（联合特遣队 / 我方），
+  // 同形要量的是列，不是队名。
+  const tablesOf = t => t.split('</table>').filter(x => x.includes('<table'));
+  const shapeOf = t => JSON.stringify(tablesOf(t).map(x => ths(x).map((c, i) => (i === 1 ? '' : c))));
+  const plain = s => s.replace(/<[^>]*>/g, '');
+  const cells = t => [...t.matchAll(/<tr class="[^"]*">([\s\S]*?)<\/tr>/g)]
+    .map(m => [...m[1].matchAll(/<td>([\s\S]*?)<\/td>/g)].map(x => x[1]));
+  const pl = { name: '我', team: 'A', isPlayer: true, alive: true, stats: { kills: 7, deaths: 2, score: 900, assists: 3, captures: 2 } };
+  const b1 = { name: '甲', team: 'A', alive: false, kills: 5, deaths: 4, score: 600, captures: 1 };
+  const b2 = { name: '乙', team: 'B', alive: true, kills: 3, deaths: 6, score: 400, captures: 0 };
+  const b3 = { name: '丙', team: 'B', alive: true, kills: 1, deaths: 0, score: 100, captures: 0 };
+  const mkMp = (who) => {
+    const m = Object.create(MPMatch.prototype);
+    m.game = { player: pl, bots: who || [b1, b2, b3] }; m.ffa = false; m.scores = { A: 900, B: 400 };
+    return m.scoreboardHTML();
+  };
+  const mkNet = (rows, total) => {
+    const c = Object.create(NetClient.prototype);
+    Object.assign(c, {
+      cid: 1, team: 'A', ffa: false, scores: { A: 900, B: 400 }, roster: new Map(), _sbNames: new Map(),
+      netStatusText: () => 'ping 40 ms', board: { total: total == null ? rows.length : total, rows },
+    });
+    return c.scoreboardHTML();
+  };
+  const NET_ROWS = [
+    { cid: 1, name: '我', team: 'A', s: 900, k: 7, d: 2, a: 3, rank: 1, alive: true },
+    { cid: 2, name: '甲', team: 'A', s: 600, k: 5, d: 4, a: 1, rank: 2, alive: false },
+    { cid: 3, name: '乙', team: 'B', s: 400, k: 3, d: 6, a: 0, rank: 3, alive: true },
+  ];
+  const mpHtml = mkMp([b1, b2]);
+  const netHtml = mkNet(NET_ROWS);
+  const COLS = ['#', '名字', '得分', '击杀', '死亡', 'K/D', '助攻', '占领'];
+  const SHAPE = JSON.stringify([COLS.map((c, i) => (i === 1 ? '' : c)), COLS.map((c, i) => (i === 1 ? '' : c))]);
+  ok('S1 两端的表形状逐格相等：两张表、八列、列名同序（HU-16 的病根就是两份拼接代码）',
+    shapeOf(mpHtml) === SHAPE && shapeOf(netHtml) === SHAPE,
+    `单机=${shapeOf(mpHtml)}·联机=${shapeOf(netHtml)}`);
+  ok('S2 名次是独立的一列：单机过去把它塞在名字格里（`1. 张三`），现在第一格只有数、名字格里没有编号前缀',
+    cells(mpHtml)[0][0] === '1' && cells(mpHtml)[0][1].startsWith('我') && !/^\s*\d+[.、]/.test(cells(mpHtml)[0][1]),
+    JSON.stringify(cells(mpHtml)[0]));
+  ok('S2c 分队那两张表的名次是**全榜**位次（联机那侧的 rank 由服务端按全房排；旧写法每张表各从 1 数起）',
+    (() => {
+      const r = cells(mkMp([b1, b2, { ...b2, name: '丁', team: 'B', kills: 6 }])).map(x => x[0]);
+      return JSON.stringify([...r].sort()) === JSON.stringify(['1', '2', '3', '4']);
+    })(), JSON.stringify(cells(mkMp([b1, b2, { ...b2, name: '丁', team: 'B', kills: 6 }])).map(x => x[0])));
+  ok('S2b 每一行的格数与表头一样多（少一格 = 整行读错位，而它不会报错）',
+    [...cells(mpHtml), ...cells(netHtml)].every(r => r.length === COLS.length),
+    `行=${JSON.stringify(cells(mpHtml).map(r => r.length))}/${JSON.stringify(cells(netHtml).map(r => r.length))}`);
+  // 助攻=6、占领=7：这两列在两端各缺一本账，缺的那一格必须是 '-'。
+  ok('S3 单机 Bot 的助攻**没有账本** ⇒ 落 \'-\' 而不是 0（ai.js 只建了 captures；补那本账要动伤害记账=规则侧）',
+    cells(mpHtml)[1][6] === '-' && cells(mpHtml)[0][6] === '3', JSON.stringify(cells(mpHtml)[1]));
+  ok('S3b 联机的占领**没有账本** ⇒ 同一列落 \'-\'（服务端占点只加 200 分、不计数，补它=账本+协议字段，越界）',
+    cells(netHtml)[0][7] === '-' && cells(mpHtml)[0][7] === '2', JSON.stringify(cells(netHtml)[0]));
+  ok('S3c【自证】0 与"量不出来"确实长得不一样：有账且为零 ⇒ 写 0',
+    cells(mpHtml)[2][7] === '0' && cells(mpHtml)[1][7] === '1', JSON.stringify(cells(mpHtml)[2]));
+  ok('S4 K/D 与结算面板同一把尺（`k / Math.max(1, d)`），同一屏不许两处各算一份',
+    cells(mpHtml)[0][5] === (7 / Math.max(1, 2)).toFixed(2) && cells(netHtml)[0][5] === cells(mpHtml)[0][5],
+    `${cells(mpHtml)[0][5]} vs ${cells(netHtml)[0][5]}`);
+  const zeroDeath = mkMp([b1, b2, { ...b3 }]);
+  ok('S4b 一场没死 ⇒ K/D 是 1.00 那种数，不是 Infinity/NaN（结算面板那条式子的行为，界面上不许漏出除零）',
+    cells(zeroDeath).some(r => r[5] === '1.00') && !/Infinity|NaN/.test(zeroDeath),
+    JSON.stringify(cells(zeroDeath).map(r => r[5])));
+  const EVIL = '<img src=x onerror=alert(1)>';
+  const evilMp = mkMp([{ ...b1, name: EVIL }]);
+  const evilNet = mkNet([{ ...NET_ROWS[1], name: EVIL }]);
+  ok('S5 呼号进 DOM 之前转义，而且两端过的是**同一处** escHtml（联机那条 M10 判据现在由共用处兜住）',
+    !evilMp.includes('<img') && evilMp.includes('&lt;img') && !evilNet.includes('<img') && evilNet.includes('&lt;img'),
+    evilMp.slice(0, 60));
+  ok('S6 榜首那一枚只落在名次第一那一行：单机取 ranking() 的第一、联机取服务端排好的 rank',
+    cells(mpHtml).filter(r => r[1].includes('sb-mvp')).length === 1 && cells(mpHtml)[0][1].includes('sb-mvp')
+    && cells(netHtml)[0][1].includes('sb-mvp') && !cells(netHtml)[1][1].includes('sb-mvp'),
+    JSON.stringify(cells(netHtml).map(r => r[1])));
+  ok('S6b 那一枚写的是"榜首"，渲染出来的串里不许出现 MVP：这一仓库里没有发奖的裁决（HU-01 同族）',
+    mpHtml.includes('榜首') && !/MVP/.test(mpHtml + netHtml), mpHtml.match(/<i[^>]*>[^<]*<\/i>/)?.[0]);
+  const thBuilder = t => /<th/.test(t);
+  const dup = ['js/mp.js', 'js/net/client.mjs'].filter(f => thBuilder(src(f)));
+  ok('S7 玩家榜单的表头只有一处在拼：js/mp.js 与 js/net/client.mjs 里再出现 `<th` 就是 HU-16 复发',
+    dup.length === 0, JSON.stringify(dup));
+  ok('S7b【先决·合成夹具】把单机旧那份表头拼法塞回尺子，同一个判据当场命中（正则失灵=上面那条恒绿）',
+    thBuilder('<table class="sbt A"><tr><th>联合特遣队</th><th>得分</th></tr></table>') && SB_SRC.includes('<th'),
+    '合成串里有 <th ⇒ 必须判成"有人在拼第二份"');
+}
+
+// ───────────────────────── T 段：HU-17 按住 Tab 期间榜单自己活着 ─────────────────────────
+// 手动排程的假定时器：这一份量的是"过了 500 ms 之后重画没重画"，等真时间会把整套判据
+// 变成秒级抖动。被测对象仍是 HUD 本体的 showScoreboard（不是抄的一份判断）。
+{
+  const timers = new Map(); const alarms = new Map(); let nid = 1;
+  const REAL = { si: globalThis.setInterval, ci: globalThis.clearInterval, st: globalThis.setTimeout, ct: globalThis.clearTimeout };
+  const fire = (n = 1) => { for (let i = 0; i < n; i++) for (const t of [...timers.values()]) t.f(); };
+  try {
+    globalThis.setInterval = (f) => { const k = nid++; timers.set(k, { f }); return k; };
+    globalThis.clearInterval = k => timers.delete(k);
+    globalThis.setTimeout = (f, ms) => { const k = nid++; alarms.set(k, { f, ms }); return k; };
+    globalThis.clearTimeout = k => alarms.delete(k);
+    const [h, g] = mkHud();
+    let v = 0;
+    g.mode = { scoreboardHTML: () => `<table class="sbt A"><tr class="me"><td>${++v}</td></tr></table>` };
+    const w0 = rec('scoreboard').writes;
+    h.showScoreboard(true);
+    ok('T1【先决】按下那一下画了一次，并且**留下了一条重画路径**（旧写法画完就不管了）',
+      rec('scoreboard').writes === w0 + 1 && timers.size === 1, `writes=${rec('scoreboard').writes}·timers=${timers.size}`);
+    fire(2);
+    ok('T2 数据变了、时间到了 ⇒ 不必重新按键，榜自己跟上（HU-17 的症状是"冻在按下那一刻的数据上"）',
+      rec('scoreboard').writes === w0 + 3 && rec('scoreboard').html.includes('<td>3</td>'),
+      `writes=${rec('scoreboard').writes}·html=${rec('scoreboard').html}`);
+    h.showScoreboard(false);
+    ok('T3 松开就拆表：定时器清零，之后数据再怎么变都不写（漏掉这句就是隐藏面板每 0.5 s 白烧一次）',
+      timers.size === 0, `残留 timers=${timers.size}`);
+    const wOff = rec('scoreboard').writes;
+    fire(3);
+    ok('T3b 松开之后那一屏真的停了（writes 一条不涨）', rec('scoreboard').writes === wOff, `+${rec('scoreboard').writes - wOff}`);
+    const [h2, g2] = mkHud();
+    g2.mode = { scoreboardHTML: () => '<table class="sbt A"><tr class="me"><td>固定</td></tr></table>' };
+    h2.showScoreboard(true);
+    const wFix = rec('scoreboard').writes;
+    fire(5);
+    ok('T4 签名门在：内容没变 ⇒ 一行 DOM 都不写（这条重画路径挂在按住不放上，没门就是每 0.5 s 白拆一次表）',
+      rec('scoreboard').writes === wFix, `写次=${rec('scoreboard').writes - wFix}`);
+    h2.showScoreboard(false);
+    const [h3, g3] = mkHud();
+    g3.mode = { scoreboardHTML: () => '<table class="sbt A"><tr class="me"><td>x</td></tr></table>' };
+    h3.showScoreboard(true); h3.showScoreboard(true); h3.showScoreboard(true);
+    ok('T5 反复按下不许叠出多条重画路径（keydown 沿抖三抖就是三个定时器同时往同一格写）',
+      timers.size === 1, `timers=${timers.size}`);
+    h3.reset();
+    ok('T5b reset() 把这条定时器一并归位（上一局的榜单不许在新局里继续刷 —— 与 HU-21 同一族）',
+      timers.size === 0, `残留 timers=${timers.size}`);
+    const SB_BODY = bodyOf(HUD_SRC, /\n {2}showScoreboard\(/);
+    ok('T6 装定时器之前先拆旧的（形状闸：漏了 clearInterval 的话 T5 只在"新建实例"上才绿）',
+      /clearInterval\(this\._sbT\)/.test(SB_BODY || '') && SB_BODY.indexOf('clearInterval') < SB_BODY.indexOf('setInterval'),
+    SB_BODY ? SB_BODY.slice(0, 60).replace(/\n/g, ' ') : '找不到 showScoreboard 的函数体');
+    ok('T6b【反证臂·同文件代回】把那句 clearInterval 摘掉，同一把尺子当场认出来',
+      !/clearInterval\(this\._sbT\)/.test(SB_BODY.replace('clearInterval(this._sbT); this._sbT = 0;', '')));
+  } finally {
+    Object.assign(globalThis, { setInterval: REAL.si, clearInterval: REAL.ci, setTimeout: REAL.st, clearTimeout: REAL.ct });
+  }
+}
+
+// ───────────────────────── U 段：HU-18 大房点名 ─────────────────────────
+// 驱动的是 NetClient.prototype.bigRoomCutText 本体：分母、点名的次序、上限、静默条件
+// 都是它自己的判断，不是这里替它算一遍。
+{
+  const mk = ({ total, inFrame, roster = [], seen = [] }) => {
+    const c = Object.create(NetClient.prototype);
+    c.cid = 1; c.team = 'A';
+    c.board = { total, rows: inFrame };
+    c.roster = new Map(roster);
+    c._sbNames = new Map(seen);
+    return c.bigRoomCutText(inFrame);
+  };
+  const rows16 = Array.from({ length: 16 }, (_, i) => ({ cid: i + 1, name: 'R' + (i + 1), team: i % 2 ? 'A' : 'B', rank: i + 1, s: 100 - i, k: 9, d: 3, a: 1, alive: true }));
+  const t = mk({
+    total: 40, inFrame: rows16,
+    roster: [[30, { name: '张三', team: 'A' }], [31, { name: '李四', team: 'A' }], [32, { name: '王五', team: 'B' }]],
+    seen: [[77, { name: '哨戒Bot', team: 'A' }]],
+  });
+  ok('U1 分母是全房人数、不是裁剪后的行数（旧那句"榜上 N 人"读起来像房就这么点人）',
+    t.includes('全房 40 人') && t.includes('榜上 16 行'), t);
+  ok('U2 看不见的到底是谁：本队那两个点得出名，而且排在敌队前面（HU-18 的症状是"队友死活看不见又不知道是谁"）',
+    t.indexOf('张三') < t.indexOf('王五') && t.includes('李四'), t);
+  ok('U2b 只在前一班出现过的那一行（Bot 的名字本地只能从行表里认）也点得到',
+    t.includes('哨戒Bot'), t);
+  ok('U3 名字有上限：超过五个收成"等 N 人"，不许把整间房的小字铺满一屏',
+    (() => {
+      const many = mk({ total: 60, inFrame: rows16, roster: Array.from({ length: 20 }, (_, i) => [200 + i, { name: 'N' + i, team: 'A' }]) });
+      return /等 20 人/.test(many) && (many.match(/N\d+/g) || []).length <= 5;
+    })(), mk({ total: 60, inFrame: rows16, roster: Array.from({ length: 20 }, (_, i) => [200 + i, { name: 'N' + i, team: 'A' }]) }).slice(-46));
+  ok('U4 榜上齐了 ⇒ 这一句整个不给（凭空多一行"没上榜的："是噪音，不是读数）',
+    mk({ total: 16, inFrame: rows16, roster: [[30, { name: '张三', team: 'A' }]] }) === '', JSON.stringify(mk({ total: 16, inFrame: rows16 })));
+  ok('U5 那一行只点名、不编数：死活/ping/毫秒一个都不许出现（服务端这一班根本没推那些人）',
+    !/ping|毫秒|ms\b|延迟|掉了/.test(t), t);
+  ok('U5b 自己那一行不许被点成"没上榜"（定向事件里总带着自己，漏掉这一条就是把自己写没了）',
+    !t.includes('R1、') && !t.includes('我'), t.slice(0, 90));
+  const BODY = bodyOf(NET_SRC, /\n {2}bigRoomCutText\(/);
+  ok('U6【反证臂·同文件代回】把分母抄回裁剪后的行数，同一把尺子当场认出来（那就是 HU-18 原来那条症状）',
+    /this\.board && this\.board\.total/.test(BODY || '') && !/this\.board && this\.board\.total/.test(BODY.replace('this.board.total', 'rows.length')));
+  const evilNet = mk({ total: 40, inFrame: rows16, roster: [[30, { name: '<img src=x onerror=alert(1)>', team: 'A' }]] });
+  ok('U6b 点名的时候也转义：别的玩家的呼号是字符串，不是标记',
+    !evilNet.includes('<img') && evilNet.includes('&lt;img'), evilNet.slice(0, 80));
+}
+
+// ───────────────────────── V 段：HU-19 冻结期间的读数 + HU-20 按钮说实话 ─────────────────────────
+{
+  const timers = new Map(); let nid = 1;
+  const REAL = { si: globalThis.setInterval, ci: globalThis.clearInterval, st: globalThis.setTimeout, ct: globalThis.clearTimeout };
+  const fireTimeouts = () => { for (const t of [...timers.values()]) t.f(); };
+  try {
+    globalThis.setInterval = (f) => { const k = nid++; timers.set(k, { f }); return k; };
+    globalThis.clearInterval = k => timers.delete(k);
+    globalThis.setTimeout = (f) => { const k = nid++; timers.set(k, { f }); return k; };
+    globalThis.clearTimeout = k => timers.delete(k);
+    const pl = { name: '我', team: 'A', isPlayer: true, alive: true, stats: { kills: 9, deaths: 2, score: 1200, assists: 1, captures: 0, shots: 40, hits: 20, headshots: 3 } };
+    const bot = { name: '甲', team: 'B', alive: true, kills: 4, deaths: 5, score: 400, captures: 0 };
+    const log = []; let shown = null;
+    const game = {
+      player: pl, bots: [bot], ending: false, profile: { xp: 0, xpLocal: 0 }, saveProfile() { },
+      audio: { say() { }, beep() { } }, cfg: { map: 'yard', mode: 'tdm' },
+      hud: { announce: (...a) => log.push(['announce', a]), showScoreboard: v => log.push(['sb', v]), popup() { }, scorebar() { }, progress() { } },
+      menu: { showResults: r => { shown = r; } },
+    };
+    const m = Object.create(MPMatch.prototype);
+    Object.assign(m, { game, ffa: false, over: false, type: 'tdm', cfg: game.cfg, scores: { A: 1200, B: 400 }, rules: { forceEnd() { } } });
+    m.end('A');
+    ok('V1 单机终局那一下就立刻把榜拉起来（HU-19 的症状是"这 2.5 秒只剩一行大字"）',
+      log.some(x => x[0] === 'sb' && x[1] === true), JSON.stringify(log.map(x => x[0])));
+    ok('V1b 而且是**同步**给的，不在那 2.5 s 的定时里（放里面就等于没改）',
+      shown === null && timers.size === 1, `面板=${shown ? '已画' : '未画'}·待触发定时器=${timers.size}`);
+    fireTimeouts();
+    ok('V2 结算面板上那张榜带榜首那一枚（HU-19 欠的是"这局谁打得好"那一格）',
+      !!shown && shown.board.includes('sb-mvp') && shown.board.includes('榜首'), shown ? shown.board.slice(0, 40) : '面板没画');
+    ok('V2b 单机那一格的文案照旧是"再来一局"：按下真的会重开（startGame 在 again 里）',
+      !!shown && shown.againLabel === undefined && typeof shown.again === 'function');
+    // HU-20：联机那一路。按钮写的必须就是按下它发生的事。
+    const mkNet = (lobby) => {
+      const cli = Object.create(NetClient.prototype);
+      let cap = null;
+      const g = {
+        player: pl, profile: { xp: 0, xpLocal: 0 }, account: null, saveProfile() { },
+        menu: { showResults: r => { cap = r; } }, net: null, lobby,
+      };
+      cli.game = g; g.net = cli;
+      cli.cid = 1; cli.team = 'A'; cli.ffa = false; cli.scores = { A: 12, B: 5 };
+      cli.myStats = { k: 9, d: 2, a: 1, s: 1200 };
+      cli.board = { total: 2, rows: [{ cid: 1, name: '我', team: 'A', s: 1200, k: 9, d: 2, a: 1, rank: 1, alive: true }] };
+      cli.roster = new Map(); cli._sbNames = new Map();
+      timers.clear();
+      cli.showResults('win', '胜利');
+      fireTimeouts();
+      return cap;
+    };
+    const host = mkNet({ connected: true, state: { me: { isHost: true } } });
+    const guest = mkNet({ connected: true, state: { me: { isHost: false } } });
+    const direct = mkNet(null);
+    ok('V3 有房间的联机结算屏：那一格写「回房间」，不写「再来一局」（按下去等的是房主，不是下一局）',
+      !!host && host.againLabel === '回房间' && guest.againLabel === '回房间', `host=${host && host.againLabel}·guest=${guest && guest.againLabel}`);
+    ok('V3b 房主看到的是下一步在哪（房间屏那份表单：改地图/模式、再按开始游戏）',
+      !!host && /开始游戏/.test(host.againNote || ''), host && host.againNote);
+    ok('V3c 访客看到的是"等房主"，而不是一句做不到的承诺',
+      !!guest && /等房主/.test(guest.againNote || ''), guest && guest.againNote);
+    ok('V3d 直连对局没有房间可回 ⇒ 那一格就是「返回主菜单」，而且不再画第二格同名按钮',
+      !!direct && direct.againLabel === '返回主菜单' && direct.againMenu === true, JSON.stringify(direct && { l: direct.againLabel, m: direct.againMenu }));
+    ok('V4 面板上那行字取的是调用方给的 label，"再来一局"只当缺省（写死就是 HU-01 那一族病）',
+      /esc\(res\.againLabel \|\| '再来一局'\)/.test(MENU_SRC), (MENU_SRC.match(/data-a="again"[^>]*/) || [''])[0]);
+    ok('V4b【反证臂·同文件代回】把按钮写死成"再来一局"，同一把尺子当场认出来',
+      !/esc\(res\.againLabel \|\| '再来一局'\)/.test(MENU_SRC.replace("esc(res.againLabel || '再来一局')", '再来一局')));
+  } finally {
+    Object.assign(globalThis, { setInterval: REAL.si, clearInterval: REAL.ci, setTimeout: REAL.st, clearTimeout: REAL.ct });
+  }
 }
 
 // ───────────────────────── 收口 ─────────────────────────

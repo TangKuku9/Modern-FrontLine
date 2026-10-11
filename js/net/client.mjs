@@ -18,6 +18,7 @@ import { clamp } from '../util.js';
 import { viewSettingsOf } from '../player.js';
 import { escHtml } from '../escape.js';
 import { addAccountXp, addLocalXp } from '../progress.mjs';
+import { scoreboardTables } from '../scoreboard.mjs';
 import { Sentry, Heli, flagMesh } from '../mp.js';
 import { Projectile } from '../combat.js';
 import { openSocket, tabNonce } from '../account.js';
@@ -94,6 +95,9 @@ export class NetClient {
     this.streakProgress = 0;
     this.worldFlags = 0;
     this.board = null;                                // 最近一份记分板（每 2 秒一条事件）
+    // 大房点名用的名字表（HU-18）：Bot 的名字只能从某一行里认出来，所以每班都往这里攒一份。
+    // 一局一个 NetClient 实例（js/main.js 进对局时 new），所以它不需要跨局归位。
+    this._sbNames = new Map();
     this.turrets = new Map();                         // netId -> 本地表现副本（哨戒机枪 / 直升机）
     // 别人扔出来的那些东西，在这边各有一个**表现副本**（js/combat.js:Projectile 的 dumb 模式）。
     // 起手状态（位置/速度/引信）来自权威事件，之后客户端自己按同一套物理飞 —— 只看得见，
@@ -1555,15 +1559,23 @@ export class NetClient {
       //（症状是"打完卡在结算上，回不了房"，test/net-drop 的局末那条就是这么红的）。
       if (this.game.net !== this) return;
       if (document.pointerLockElement) document.exitPointerLock();
+      // HU-20：这一格写的必须就是按下它真的发生的事。联机没有"本地重开"这条路 ——
+      // 那条连接是房间的座位，不能关，按下只是**回房间**；下一局打什么由房主在房间屏
+      // 那份表单上定（地图/模式/开始游戏都在那里，服务端 startGate 只放行房主）。
+      // 直连对局（?online=1 与所有探针）连房间都没有，那一格就写成"返回主菜单"，
+      // 与暂停菜单"退出本局"同一句 —— 别画一个不会兑现的"再来一局"。
+      const inRoom = !!(g.lobby && g.lobby.connected);
+      const isHost = !!(inRoom && g.lobby.state && g.lobby.state.me && g.lobby.state.me.isHost);
       g.menu.showResults({
         win, title,
         sub: this.ffa ? `第 ${meRow ? meRow.rank : '-'} 名` : `${Math.floor(this.scores.A)} : ${Math.floor(this.scores.B)}`,
         stats: [['得分', s], ['击杀', k], ['死亡', d], ['K/D', (k / Math.max(1, d)).toFixed(2)],
           ['命中率', Math.round(hits / Math.max(1, shots) * 100) + '%'], ['经验值', '+' + xp]],
         board: this.scoreboardHTML(),
-        // "再来一局"在联机里的语义是**回房间**（等房主再开下一局）—— 那条连接是房间的
-        // 座位，不能关；直连对局没有房间可回，退回主菜单（与暂停菜单"退出本局"同一句）。
-        again: () => { (g.lobby && g.lobby.connected) ? g.returnToRoom() : g.exitToMenu(); },
+        againLabel: inRoom ? '回房间' : '返回主菜单',
+        againNote: inRoom ? (isHost ? '回到房间后可改地图与模式，再按「开始游戏」' : '回到房间等房主开下一局（只有房主能按开始）') : '',
+        againMenu: !inRoom,
+        again: () => { inRoom ? g.returnToRoom() : g.exitToMenu(); },
       });
     }, 2500);
   }
@@ -1583,29 +1595,66 @@ export class NetClient {
   get netStatusWarn() { return !!this.lost || this.snapGap > 1; }
 
   scoreboardHTML() {
-    // `r.name` 是**别的玩家**的呼号，而这里拼的是 innerHTML —— 于是它必须过 escHtml（M10）。
-    // 另外几格都是服务端算出来的数字，插进模板里本来就到不了"当标签解析"那一步。
-    // 眼下服务端的呼号白名单（NAME_RE）把 `<` 压死了，所以这条路够不到：属纵深防御 ——
-    // 白名单一放宽、换个服、或者以后接上跨服房间目录，它就是存储型 XSS。
-    const row = (r) => `<tr class="${r.cid === this.cid ? 'me ' : ''}${r.alive === false ? 'dead' : ''}">`
-      + `<td>${r.rank || ''}</td><td>${escHtml(r.name)}</td><td>${r.s}</td><td>${r.k}</td><td>${r.d}</td><td>${r.a || 0}</td></tr>`;
-    const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>#</th><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
+    // 表形状在 js/scoreboard.mjs（HU-16）：这一处只交**数据源**与联机独有的两行脚注
+    //（网络状态行 + 大房点名）。`r.name` 的转义也一起搬进去了 —— 它是别的玩家的呼号，
+    // 而这里拼的是 innerHTML（M10 那条判据现在由共用处兜着，两端都过 escHtml）。
     const rows = (this.board && this.board.rows) || [];
-    // 大房裁剪的可见性：服务端只推前 16 行 + 自己一行（total 是全房人数）。不给这一句，
-    // "榜单怎么只有这么几个人"就是一条必然出现的客服工单。
-    const total = (this.board && this.board.total) || 0;
-    const cut = total > rows.length ? `<div class="sbnet">榜上 ${rows.length} 人 / 全房 ${total} 人（只列前 16 名与你自己）</div>` : '';
-    // 自由混战：一张表按名次排（与单机 MPMatch.scoreboardHTML 同形）—— 分两队的表
-    // 在 ffa 里是假的（"我方/敌方"根本不存在）。
-    if (this.ffa) return cut + head('自由混战', 'A') + rows.map(row).join('') + '</table>';
+    const entry = (r) => ({
+      rank: r.rank, name: r.name, s: r.s, k: r.k, d: r.d, a: r.a,
+      // 占领次数这一端**没有账本**：`server/room.mjs:662` 占点只给 `score += 200`、不计数，
+      // 补计数要动权威端的账本与记分板协议字段 —— 越出本分支"只动表现层"的前提。
+      // 所以那一格交 undefined ⇒ 落 `'-'`（"这一端没这本账"），而不是 0（"他一次都没占"）。
+      // 列本身两端都在：按端增减列就是 HU-16 的病根本身，判据 S1 钉住表头逐格相等。
+      alive: r.alive !== false, me: r.cid === this.cid,
+      // 名次第一打"榜首"（与单机 scoreboardHTML 同一枚标记、同一把尺：服务端排好的 rank）。
+      // 不写 MVP —— 服务端没有发奖的裁决，rank 只是 pushBoard 的排序结果（HU-01 同族）。
+      mvp: r.rank === 1,
+    });
+    // 网络状态：同一屏里回答"是我卡了还是服务器卡了"。文案与右下角那格常驻读数是同一句
+    // （netStatusText，HU-08）—— 这里不再自己拼第二份。它画在表头之前，所以先算。
+    const pre = `<div class="sbnet">${this.netStatusText()}</div>`;
+    // 大房裁剪的可见性：服务端只推前 16 行 + 自己那一行（`board.total` 是裁剪**前**的全房
+    // 行数，由 server/room.mjs 在排好名次的那份完整 rows 上算）。这一句自己判该不该说
+    // （榜上齐了就沉默），这里只负责给它套一层壳。不给这一句，"榜单怎么就这么几个人"
+    // 是一条必然出现的客服工单。
+    const note = this.bigRoomCutText(rows);
+    const cut = note ? `<div class="sbnet">${note}</div>` : '';
+    // 自由混战：一张表按名次排（列与单机 MPMatch.scoreboardHTML 同一份表形状）—— 分两队
+    // 的表在 ffa 里是假的（"我方/敌方"根本不存在）。
+    if (this.ffa) return scoreboardTables([{ label: '自由混战', cls: 'A', entries: rows.map(entry) }], { pre, post: cut });
     const A = rows.filter(r => r.team === this.team), B = rows.filter(r => r.team !== this.team);
     const mine = this.team === 'A' ? this.scores.A : this.scores.B;
     const theirs = this.team === 'A' ? this.scores.B : this.scores.A;
-    // 网络状态：同一屏里回答"是我卡了还是服务器卡了"。文案与右下角那格常驻读数是同一句
-    // （netStatusText，HU-08）—— 这里不再自己拼第二份。
-    return `<div class="sbnet">${this.netStatusText()}</div>`
-      + head(`我方 · ${Math.floor(mine)}`, 'A') + A.map(row).join('') + '</table>'
-      + head(`敌方 · ${Math.floor(theirs)}`, 'B') + B.map(row).join('') + '</table>' + cut;
+    return scoreboardTables([
+      { label: `我方 · ${Math.floor(mine)}`, cls: 'A', entries: A.map(entry) },
+      { label: `敌方 · ${Math.floor(theirs)}`, cls: 'B', entries: B.map(entry) },
+    ], { pre, post: cut });
+  }
+
+  // 看不见的到底是谁（HU-18）。裁剪之后"榜上 N 行 / 全房 M 人"只说了有个差值，
+  // 而玩家要问的是**我队那几个人去哪了** —— 名单本地就有：`this.roster` 是 welcome 与
+  // join 事件攒下的同局玩家（中途进人服务端根本不放行，见 HU-05，所以它是全的），
+  // Bot 的名字只可能从某一份行表里见过（`this._sbNames` 累计每一班带回来的名字）。
+  // 那一行只点名、不编数字：死活与 ping 这一端确实收不到（服务端就没推那一行），
+  // 补读数要在协议里加行 = 带宽/协议侧，不在本分支。
+  bigRoomCutText(rows) {
+    const total = (this.board && this.board.total) || 0;
+    // 榜上齐了 ⇒ 一个字都不说。留着那句"没上榜的："后面跟空串，读起来像表出错了。
+    if (total <= rows.length) return '';
+    const seen = this._sbNames || (this._sbNames = new Map());
+    for (const r of rows) if (r.name) seen.set(r.cid, { name: r.name, team: r.team });
+    const inFrame = new Set(rows.map(r => r.cid));
+    const known = [];
+    if (this.roster) for (const [id, o] of this.roster) if (!inFrame.has(id)) known.push({ id, name: o.name, team: o.team });
+    for (const [id, o] of seen) if (!inFrame.has(id) && !known.some(x => x.id === id)) known.push({ id, name: o.name, team: o.team });
+    const gap = total - rows.length;
+    // 本队的排前面：这一屏上"看不见的队友"才是玩家要找的人，对面的榜首落榜没人关心。
+    known.sort((a, b) => ((b.team === this.team ? 1 : 0) - (a.team === this.team ? 1 : 0)));
+    const names = known.slice(0, 5).map(x => escHtml(x.name));
+    // 点得出名字就说名字，点不出（全是不认识的 Bot）就退回只报个数 —— 那句"没上榜的："
+    // 后面跟空串比不说更糟。
+    const who = names.length ? `没上榜的：${names.join('、')}${known.length > names.length ? ` 等 ${known.length} 人` : ''}` : '';
+    return `榜上 ${rows.length} 行 / 全房 ${total} 人（只列前 16 名与你自己）${gap > 0 && who ? ` · ${who}` : ''}`;
   }
 
   dispose(keepSocket = false) {

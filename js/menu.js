@@ -1583,7 +1583,8 @@ export class Menu {
         <div class="res-stats">${res.stats.map(([k, v]) => `<div><b>${v}</b>${k}</div>`).join('')}</div>
         ${res.board ? `<div id="sbCopy" style="max-height:38vh;overflow-y:auto;text-align:left;margin-bottom:20px">${res.board}</div>` : ''}
         <div style="font-size:13px;color:#999;margin-bottom:20px">等级 ${L.lv} · <div style="display:inline-block;width:200px;height:4px;background:#333;vertical-align:middle"><div style="height:100%;width:${Math.round(L.frac * 100)}%;background:var(--acc)"></div></div></div>
-        <div style="display:flex;gap:12px;justify-content:center"><button class="btn" data-a="again">再来一局</button><button class="btn ghost" data-a="menu">返回主菜单</button></div>
+        <div style="display:flex;gap:12px;justify-content:center"><button class="btn" data-a="again">${esc(res.againLabel || '再来一局')}</button>${res.againMenu ? '' : '<button class="btn ghost" data-a="menu">返回主菜单</button>'}</div>
+        ${res.againNote ? `<div class="res-note">${esc(res.againNote)}</div>` : ''}
       </div>`, 'solid', 'results');
     this.on(r, '[data-a=again]', () => { this.overlayOpen = false; res.again(); });
     this.on(r, '[data-a=menu]', () => { this.overlayOpen = false; g.exitToMenu(); });

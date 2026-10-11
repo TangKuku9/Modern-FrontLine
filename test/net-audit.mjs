@@ -714,6 +714,9 @@ sec('I. M10 转义：全仓只留一份，以及三处命门');
     // HU-08 之后脚注那一句取自 netStatusText()（与常驻 HUD 同一处措辞）。桩缺这一格会
     // TypeError —— 缺口在桩里补齐，不动被测对象（与 test/net-feel.mjs 同一条纪律）。
     netStatusText() { return NetClient.prototype.netStatusText.call(this); },
+    // HU-18 之后记分板还会调大房点名那一句，桩里同样给本体（这一份夹具没有 board.total，
+    // 本体自己会判"榜上齐了 ⇒ 一个字都不说"，所以这里量不到那句，转义那条判据不受影响）。
+    bigRoomCutText(rows) { return NetClient.prototype.bigRoomCutText.call(this, rows); },
     board: { rows: [{ cid: 1, team: 'B', name: XSS, s: 0, k: 0, d: 0, a: 0, rank: 1 },
       { cid: 7, team: 'A', name: '我', s: 1, k: 2, d: 3, a: 4, rank: 2 }] },
   };

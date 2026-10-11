@@ -265,6 +265,9 @@ html, body { position: fixed; inset: 0; }
 .res-stats { display: flex; justify-content: center; gap: 40px; margin: 30px 0; }
 .res-stats div { font-size: 13px; color: #999; }
 .res-stats b { display: block; font-size: 34px; color: #fff; }
+/* 结算屏上"按下这一格会发生什么"的那一句（HU-20）。放在按钮下面而不是标题里：
+   它是关于按钮的说明，标题那一格已经写着胜负了。 */
+.res-note { font-size: 12px; color: #9ab; letter-spacing: 1px; margin-top: 12px; }
 
 /* HUD */
 #hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
@@ -449,8 +452,11 @@ html, body { position: fixed; inset: 0; }
 .sbt th { text-align: left; font-size: 11px; color: #888; letter-spacing: 2px; padding: 6px 10px; font-weight: 400; }
 .sbt td { padding: 6px 10px; border-top: 1px solid rgba(255,255,255,.05); }
 .sbt tr.me td { background: rgba(212,242,74,.12); color: var(--acc); font-weight: 700; }
-.sbt.A th:first-child { color: var(--ally); } .sbt.B th:first-child { color: var(--enemy); }
+.sbt.A th.sb-lb { color: var(--ally); } .sbt.B th.sb-lb { color: var(--enemy); }
 .sbt tr.dead td { opacity: .5; }
+/* 榜首那一枚小标（HU-19 的结算/记分板高亮）。不写 MVP：这一仓库里没有发奖的裁决，
+   名次只是 ranking() / pushBoard 排出来的事实（HU-01 同族）。 */
+.sb-mvp { font-style: normal; font-size: 10px; letter-spacing: 1px; color: #0a0c0e; background: var(--acc); border-radius: 2px; padding: 1px 5px; margin-left: 8px; vertical-align: 1px; }
 .sbnet { font-size: 12px; color: #8a9; letter-spacing: 2px; margin-bottom: 10px; }
 #clickToPlay { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.35); font-size: 22px; letter-spacing: 6px; cursor: pointer; }
 .kbd { display: inline-block; border: 1px solid #888; padding: 0 6px; font-size: 12px; border-radius: 2px; margin: 0 2px; }

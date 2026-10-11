@@ -182,6 +182,40 @@ try {
   ok('E1b【判别臂】按住 Tab 记分板真的出来、松开就收（拦焦点不等于拦功能 —— 这把键两半都得还在）',
     sbUp && sbDown, `按住=${sbUp}·松开=${sbDown}`);
 
+  // ── G 段：HU-17 按住 Tab 的那一屏会不会自己更新（只有真浏览器量得到）──
+  // 进程内那一份（test/hud-ux.mjs T 段）钉的是"重画路径在不在、松开拆不拆表、签名门、不叠表"；
+  // 这一份量的是审计当时**量不出来**的那件事：旧写法只挂在 keydown 沿，之后靠不靠得住
+  // OS 键重复取决于浏览器 —— 现在的判据是"不靠那个行为也照样在动"。
+  await page.evaluate(() => {
+    window.__sbLog = [];
+    window.__sbObs = new MutationObserver(() => window.__sbLog.push(1));
+    window.__sbObs.observe(document.getElementById('scoreboard'), { childList: true, subtree: true });
+  });
+  await page.keyboard.down('Tab'); await sleep(150);
+  const html0 = await page.evaluate(() => document.getElementById('scoreboard').innerHTML);
+  // 输入由这里给：等 Bot 自己在五秒里打死人是不成立的（dune 3v3 那一局 5 秒可以一个都不死，
+  // 上一版就是这么红的）。改的是**被测对象读的那本账**（mode.ranking() 取的就是 bot.kills），
+  // 断言的是界面跟没跟上 —— 不是把界面改成什么样再量它。
+  const changed = await page.evaluate(() => {
+    const before = game.mode.ranking().map(x => x.k + '/' + x.d).join(',');
+    game.bots[0].kills += 3;
+    return before !== game.mode.ranking().map(x => x.k + '/' + x.d).join(',');
+  });
+  await sleep(900);                       // 跨过至少一个 500ms 的重画点
+  const cntHeld = await page.evaluate(() => window.__sbLog.length);
+  const html1 = await page.evaluate(() => document.getElementById('scoreboard').innerHTML);
+  ok('G1【先决】这一次改的数真的进了榜单的输入（少了这条，"榜没刷"与"数据没变"在同一把尺下长得一样）',
+    changed === true && html0.length > 0, `changed=${changed}·榜面长度=${html0.length}`);
+  ok('G1 按住不放、榜单数据一变 ⇒ 那一屏自己跟上（旧写法冻在按下那一刻，全靠 OS 键重复赌一把）',
+    html1 !== html0 && cntHeld > 0, `改DOM=${cntHeld}次·榜面变了=${html1 !== html0}`);
+  await page.keyboard.up('Tab'); await sleep(200);
+  await page.evaluate(() => { window.__sbLog.length = 0; game.bots[0].kills += 9; });
+  await sleep(1300);
+  const cntAfter = await page.evaluate(() => window.__sbLog.length);
+  ok('G2【反方向】松开之后那一屏必须停（定时器漏在 keyup 外 = 藏着的面板每 0.5 秒白拆一次 DOM）',
+    cntAfter === 0, `松开后又写了 ${cntAfter} 次`);
+  await page.evaluate(() => window.__sbObs.disconnect());
+
   // ── F 段：暂停也算菜单（服务端照跑那一段，玩家需要的正是能看能走的这一屏）──
   await page.evaluate(() => game.pause(true)); await sleep(700);
   ok('F0 暂停屏画出来了', (await page.evaluate(() => [game.paused, game.menu.screen].join('/'))) === 'true/pause');

@@ -9,6 +9,7 @@ import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
 import { StreakBook, MatchRules, WP_SECONDS, killScore, killMedals, medalSay, KILL_POINTS, onKillPerks, uavHints, maybeDropWeapon, flagsTick, domBotGoal, spawnWavesTick, chooseSpawn, SAY, SAY_START, ANNOUNCE, DOM_RADIUS_WEAK } from './match-rules.js';
 import { addLocalXp } from './progress.mjs';
+import { scoreboardTables } from './scoreboard.mjs';
 
 // Bot 拿什么枪、装哪些配件。**导出**给联机权威端（server/room.mjs:spawnBot）共用：
 // 这是"联机的 Bot 和单机的 Bot 手感一样"唯一的一处定义。抄一份的话，两边的 Bot
@@ -642,12 +643,31 @@ export class MPMatch {
   }
   scoreboardHTML() {
     const game = this.game, pl = game.player;
-    const row = (x, i) => `<tr class="${x.e.isPlayer ? 'me' : ''} ${x.e.alive ? '' : 'dead'}"><td>${i + 1}. ${x.e.name}</td><td>${x.s}</td><td>${x.k}</td><td>${x.d}</td><td>${x.e.isPlayer ? pl.stats.assists : '-'}</td></tr>`;
-    const head = (t, cls) => `<table class="sbt ${cls}"><tr><th>${t}</th><th>得分</th><th>击杀</th><th>死亡</th><th>助攻</th></tr>`;
+    // 表形状在 js/scoreboard.mjs（HU-16）：这一处只把本局的对象映射成 entries，
+    // 不再自己拼 `<tr>`。名次取的是**全榜**的位次（ranking() 排好的那一份），
+    // 不是"本队第几"—— 分队的两张表各从 1 数起是旧写法的行为，而联机那侧的 rank 是
+    // 服务端按全房排的（server/room.mjs:pushBoard），两端同一个数位得是同一件事。
     const all = this.ranking();
-    if (this.ffa) return head('自由混战', 'A') + all.map(row).join('') + '</table>';
+    const rankOf = new Map(all.map((x, i) => [x.e, i + 1]));
+    const entry = (x) => ({
+      rank: rankOf.get(x.e), name: x.e.name, s: x.s, k: x.k, d: x.d,
+      // 单机 Bot 的助攻**没有这本账**（ai.js:57 建了 captures 却没建 assists，补它要在
+      // mp.js:330 那条伤害记账上加分支 = 规则侧，不在本分支"只动表现层"的前提里）。
+      // 交 null 而不是 0：界面上那一格是"量不出来"，不是"他没助攻"。
+      a: x.e.isPlayer ? pl.stats.assists : null,
+      c: x.e.isPlayer ? pl.stats.captures : x.e.captures,
+      alive: x.e.alive !== false, me: !!x.e.isPlayer,
+      // 全榜第一打一枚"榜首"（HU-19 的结算屏高亮）。两张分队表合起来只能有一枚：
+      // 每队各标一个第一，读起来像这局出了两个头名。称号不写 MVP：这一仓库里没有
+      // 发奖的裁决，榜位只是 ranking() 排出来的事实（HU-01 同族）。
+      mvp: rankOf.get(x.e) === 1,
+    });
+    if (this.ffa) return scoreboardTables([{ label: '自由混战', cls: 'A', entries: all.map(entry) }]);
     const A = all.filter(x => x.e.team === pl.team), B = all.filter(x => x.e.team !== pl.team);
-    return head(`联合特遣队 · ${Math.floor(this.scores.A)}`, 'A') + A.map(row).join('') + '</table>' + head(`敌方部队 · ${Math.floor(this.scores.B)}`, 'B') + B.map(row).join('') + '</table>';
+    return scoreboardTables([
+      { label: `联合特遣队 · ${Math.floor(this.scores.A)}`, cls: 'A', entries: A.map(entry) },
+      { label: `敌方部队 · ${Math.floor(this.scores.B)}`, cls: 'B', entries: B.map(entry) },
+    ]);
   }
   minimapMarkers() { return []; }
   end(winner) {
@@ -674,6 +694,11 @@ export class MPMatch {
     addLocalXp(game.profile, xp); game.saveProfile();
     game.audio.say(win === 'win' ? SAY.win : win === 'draw' ? SAY.draw : SAY.lose);
     game.hud.announce(win === 'win' ? '胜利' : win === 'draw' ? '平局' : '失败', '', 3);
+    // HU-19：终局那一刻就把榜单拉起来，别让这 2.5 s 只剩一行大字。世界已经冻住
+    // （`game.ending` ⇒ main.js 的输入闸 + 渲染层 cameraFreeze 在播 slow-mo），榜上写的
+    // 就是终局名次；面板到点由 menu.showResults 收尾（它第一件事就是 showScoreboard(false)）。
+    // 联机那一侧的同一件事在 js/net/client.mjs 的 matchOver 分支里早就有了，这是补单机的一半。
+    game.hud.showScoreboard(true);
     setTimeout(() => {
       if (document.pointerLockElement) document.exitPointerLock();
       game.menu.showResults({

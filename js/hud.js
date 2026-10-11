@@ -89,6 +89,9 @@ export class HUD {
     // 累加器给满，让进对局第一拍就把小地图/敌名画出来。
     this._eqSig = undefined; this._stkSig = undefined; this.sweepT = 1; this.mmT = 1;
     this._hpSig = undefined; this._drySig = false; this._netSig = undefined; this._taSig = undefined;
+    // 记分板那一条（HU-17）：签名归位 + 定时重画一并拆掉。留着计时器的症状是"上一局的
+    // 榜单还在往 DOM 里刷"，而它刷的是这一局刚清空的 mode —— 与 _eqSig 那一族同一个坑。
+    this._sbSig = undefined; clearInterval(this._sbT); this._sbT = 0;
     // 水圈的两个缓存指向的是**刚被清掉的那批 DOM**（上面清了 #scorebar）：留着既吊着
     // detached 节点，又让 flagWaters 里"元素换了人"那条重建判据失真。
     this._fwEl = null; this._fwNodes = null; this._fwSig = '';
@@ -716,10 +719,23 @@ export class HUD {
 
   showScoreboard(v) {
     const el = $('scoreboard');
+    // HU-17：按住 Tab 期间榜单要**自己活着**。以前只在 keydown 那一沿画一次，之后这一屏
+    // 就冻在按下那一刻的数据上 —— 联机的行表每 2 秒才换一班（server/room.mjs:pushBoard），
+    // 按住不动的人看到的是一张最多晚两秒的旧表，而代码里没有任何东西保证浏览器会因为
+    // OS 键重复再派一次 keydown（能不能保活取决于浏览器，审计时点量不出来）。
+    // 显式给一条重画路径，就不必赌那个行为。签名门照旧：没变就一行 DOM 都不写
+    // （60Hz 的 innerHTML 是本仓库的铁律禁区，同款见 js/mp.js:hudScore）。
+    clearInterval(this._sbT); this._sbT = 0;
     if (!v) { el.classList.add('hidden'); return; }
-    const mode = this.game.mode;
-    if (!mode || !mode.scoreboardHTML) return;
-    el.innerHTML = mode.scoreboardHTML();
+    const paint = () => {
+      const mode = this.game.mode;
+      if (!mode || !mode.scoreboardHTML) return;
+      const html = mode.scoreboardHTML();
+      if (html === this._sbSig) return;
+      this._sbSig = html; el.innerHTML = html;
+    };
+    paint();
     el.classList.remove('hidden');
+    this._sbT = setInterval(paint, 500);
   }
 }
