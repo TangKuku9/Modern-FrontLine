@@ -48,6 +48,8 @@ export class Audio {
     this.listener = { x: 0, y: 0, z: 0, yaw: 0 };
     this.loops = {};
     this.voice = true;
+    this.voiceVol = 1;
+    this.busVol = { sfx: 1, amb: 1 };
     this.picked = null;
   }
   init() {
@@ -56,6 +58,11 @@ export class Audio {
     if (!AC) { this.enabled = false; return; }
     const c = this.ctx = new AC();
     this.master = c.createGain(); this.master.gain.value = this.volume;
+    // 频道总线挂在 master **之下**：master 仍是那个总乘数，音效/环境声各调自己那一档。
+    // 反过来（总线盖在 master 之上）会让"主音量"压不住整体，两条链也开始互相顶。
+    this.bus = { sfx: c.createGain(), amb: c.createGain() };
+    this.bus.sfx.gain.value = this.busVol.sfx; this.bus.amb.gain.value = this.busVol.amb;
+    this.bus.sfx.connect(this.master); this.bus.amb.connect(this.master);
     this.comp = c.createDynamicsCompressor(); this.comp.threshold.value = -14; this.comp.ratio.value = 6;
     this.master.connect(this.comp); this.comp.connect(c.destination);
     // 混响
@@ -64,6 +71,8 @@ export class Audio {
     for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3); }
     this.reverb.buffer = ir;
     this.revGain = c.createGain(); this.revGain.gain.value = 0.35;
+    // 混响返回不进总线：送出端全是音效，接回 bus.sfx 就转成 sfx→reverb→sfx 的环；
+    // 环境声这一路本来不送混响，接成 amb 独占又等于让"环境声"滑杆去管枪声的空间尾音。
     this.reverb.connect(this.revGain); this.revGain.connect(this.master);
     // 噪声
     const nl = c.sampleRate * 2; this.noise = c.createBuffer(1, nl, c.sampleRate);
@@ -78,6 +87,15 @@ export class Audio {
     this.clip = dc;
   }
   setVolume(v) { this.volume = v; if (this.master) this.master.gain.value = v; }
+  // busVol 先于图存在：设置面板在启动时就写频道，AudioContext 要等首次手势才建 ——
+  // 这里记下、init() 建总线时再套上，否则那一次写入会凭空蒸发。
+  setBus(channel, v) {
+    if (channel !== 'sfx' && channel !== 'amb') return;
+    v = Math.max(0, Math.min(1, Number(v) || 0));
+    this.busVol[channel] = v;
+    if (this.bus) this.bus[channel].gain.value = v;
+  }
+  setVoiceVol(v) { this.voiceVol = Math.max(0, Math.min(1, Number(v) || 0)); }
   setListener(p, yaw) { this.listener.x = p.x; this.listener.y = p.y; this.listener.z = p.z; this.listener.yaw = yaw; }
 
   // 计算空间参数。reach < 1 = 这一发"传得远"：距离项整体放缓，用于枪声与脚步这种
@@ -98,7 +116,7 @@ export class Audio {
     const c = this.ctx;
     const g = c.createGain(); g.gain.value = gain;
     const p = c.createStereoPanner ? c.createStereoPanner() : null;
-    if (p) { p.pan.value = pan; g.connect(p); p.connect(this.master); } else g.connect(this.master);
+    if (p) { p.pan.value = pan; g.connect(p); p.connect(this.bus.sfx); } else g.connect(this.bus.sfx);
     if (revSend > 0) { const r = c.createGain(); r.gain.value = revSend; g.connect(r); r.connect(this.reverb); }
     return g;
   }
@@ -267,7 +285,7 @@ export class Audio {
       const lfo = c.createOscillator(); lfo.frequency.value = 13; const lg = c.createGain(); lg.gain.value = vol * 0.9;
       lfo.connect(lg); lg.connect(g.gain); lfo.start(); this.loops[name + '_lfo'] = lfo;
     } else if (kind === 'fire') { f.type = 'bandpass'; f.frequency.value = 800; f.Q.value = 0.5; }
-    n.connect(f); f.connect(g); g.connect(this.master); n.start();
+    n.connect(f); f.connect(g); g.connect(this.bus.amb); n.start();
     this.loops[name] = { n, g };
   }
   setLoopVol(name, v) { const l = this.loops[name]; if (l && l.g) l.g.gain.value = v; }
@@ -284,7 +302,12 @@ export class Audio {
       const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
       const speak = (v, canRetry) => {
         const u = new SpeechSynthesisUtterance(text);
-        u.lang = 'zh-CN'; u.rate = rate; u.pitch = pitch; u.volume = Math.min(1, this.volume + 0.1);
+        u.lang = 'zh-CN'; u.rate = rate; u.pitch = pitch;
+        // speechSynthesis 走的是系统那条链，完全不经过 WebAudio 的 master ——
+        // 不乘 volume 的话"语音播报"滑杆就绕开了"主音量"，主音量拉到底仍在念。
+        // 那个 +0.1 是这一格本来就有的余量（语音要略响过枪声才听得清），
+        // 新增的 voiceVol 只是乘在它上面：滑杆停在 1 时，出来的数与改动前逐位相同。
+        u.volume = Math.max(0, Math.min(1, this.voiceVol * Math.min(1, this.volume + 0.1)));
         if (v) u.voice = v;
         // 在线音色断网时会报网络类错误 —— 降级到本地音色再说一遍；cancel 触发的
         // interrupted/canceled 不在此列，否则 stopAll() 之后会把刚掐掉的句子重播出来。

@@ -24,6 +24,10 @@ import { killfeedIdent, killerRemote } from './net/identity.mjs';
 import { LobbyClient } from './net/lobby.mjs';
 import { buildGun } from './gunmodel.js';
 import { DEFAULT_CLASSES, DEFAULT_STREAKS, MP_MODES, streakSlotOf } from './data.js';
+// 设置与键位各收成一张表（HU-37）：默认值/区间在 js/settings.mjs，"哪个物理键干哪个动作"
+// 在 js/keybinds.mjs。这里只是这两张表的两个读者之一（另一个是设置屏）。
+import { loadSettings, sanitizeSettings, applyDisplaySettings } from './settings.mjs';
+import { resolveBinds, anyHeld } from './keybinds.mjs';
 import { repairClass } from './loadout.mjs';
 import { applyAccountXp } from './progress.mjs';
 // damp 之外还要加载条那张台阶表（HUD 审计 HU-31）：文字与百分比同取 js/util.js 那一份，
@@ -83,7 +87,8 @@ const MAX_STEPS_PER_FRAME = 8;     // 单帧最多补几步，超出就丢时间
 
 class Game {
   constructor() {
-    this.settings = Object.assign({ sens: 1.0, adsSens: 0.9, fov: 78, quality: 'high', volume: 0.8, voice: true, invertY: false, showFps: true, fixedStep: true, fpsCap: 0 }, JSON.parse(localStorage.getItem('mf_settings') || '{}'));
+    this.settings = loadSettings(localStorage);
+    this._binds = null;      // binds() 的缓存，applySettings() 里失效（见那两个方法）
     this.profile = Object.assign({ xp: 0, xpLocal: 0, classes: JSON.parse(JSON.stringify(DEFAULT_CLASSES)), streaks: [...DEFAULT_STREAKS], selClass: 0, campaignBest: null, muted: [] }, JSON.parse(localStorage.getItem('mf_profile') || '{}'));
     if (!this.profile.classes || this.profile.classes.length < 5) this.profile.classes = JSON.parse(JSON.stringify(DEFAULT_CLASSES));
     // 存档里读出来的东西要过一遍表：mf_profile 是玩家能自己编辑的文件，一个不存在的枪 id
@@ -136,9 +141,43 @@ class Game {
     this._ndFps = (this._ndFps || 0) * 0.9 + raw * 0.1;
   }
   saveProfile() { localStorage.setItem('mf_profile', JSON.stringify(this.profile)); }
-  saveSettings() { localStorage.setItem('mf_settings', JSON.stringify(this.settings)); }
+  // 写盘前再过一次表：这一份内存里的 settings 可能被别处（旧存档、控制台）改脏，
+  // 落盘的那一份必须是表认得的形状，否则下一次开机的读档路径就成了唯一兜底。
+  saveSettings() { localStorage.setItem('mf_settings', JSON.stringify(sanitizeSettings(this.settings))); }
+  // 当前这份"动作 → 键码"表。缓存是必需的：snapshotInput 每帧都读它（60Hz 现算 24 组
+  // 数组就是在每帧扔 24 个小对象），而改绑的唯一入口 applySettings() 会把缓存作废。
+  binds() { return this._binds || (this._binds = resolveBinds(this.settings.binds)); }
+  // 设置改了之后**落地**的那一处（HU-36/37）：画面那几格写 CSS 变量、HUD 的 canvas 尺寸，
+  // 音频那几格进 AudioContext。设置屏每根滑杆都调它，而不是在菜单里各写一份"哪一格该改什么"——
+  // 那种分布式的 if (k === 'volume') 正是"屏上能选、选完没生效"这一族症状的产地。
+  applySettings() {
+    // 归位是**原地**写的：设置屏每一行的监听器抓着的就是 this.settings 这一个对象，
+    // 换成新对象的话第二下拖滑杆改的就是那个已经没人看的旧对象 —— 症状是"第一下有效，之后不动"。
+    const clean = sanitizeSettings(this.settings);
+    for (const k in clean) this.settings[k] = clean[k];
+    this._binds = null;
+    applyDisplaySettings(this.settings);
+    if (this.hud) this.hud.syncDisplay();
+    const a = this.audio;
+    if (a) {
+      a.setVolume(this.settings.volume);
+      a.voice = this.settings.voice;
+      a.setBus?.('sfx', this.settings.volSfx);
+      a.setBus?.('amb', this.settings.volAmbient);
+      a.setVoiceVol?.(this.settings.volVoice);
+    }
+    // 帧数那一格（从设置屏的 if 串挪到这里）：屏上关掉它就该立刻没了，而不是
+    // "等下一局 hud.update 那一拍读设置才发现"。
+    const fEl = document.getElementById('fps');
+    if (fEl) fEl.classList.toggle('hidden', !this.settings.showFps);
+    return this.settings;
+  }
 
   async init() {
+    // 存档里的 HUD 缩放/小地图尺寸在**建 HUD 之前**就要写进 CSS 变量（HU-36）：
+    // 加载屏之后那一屏是菜单，菜单不读这些变量，但 #hud 一挂上就得是玩家选的那一档，
+    // 不能"先进对局是默认大小、按一下设置才变成他存的值"。
+    applyDisplaySettings(this.settings);
     const q = this.settings.quality;
     setTextureSize(q === 'low' ? 256 : 512);
     const r = this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
@@ -160,6 +199,12 @@ class Game {
     this.vmScene.add(this.vmHemi, this.vmSun, this.vmSun.target, this.vmFill);
     this.audio = new Audio();
     this.audio.setVolume(this.settings.volume); this.audio.voice = this.settings.voice;
+    // 分声道（HU-37）：音效与环境声各一条总线（都在 master 之下，所以主音量仍是总乘子）。
+    // 语音播报不在 AudioContext 里 —— speechSynthesis 不吃 gain 节点，它的音量是乘进
+    // utterance.volume 的（见 js/audio.js 的 setVoiceVol）。
+    this.audio.setBus?.('sfx', this.settings.volSfx);
+    this.audio.setBus?.('amb', this.settings.volAmbient);
+    this.audio.setVoiceVol?.(this.settings.volVoice);
     const fill = document.getElementById('loadFill'), txt = document.getElementById('loadText');
     // 性能审查 C4/C5：起一个常驻 Worker —— 加载期跑贴图生成的逐像素循环（占加载
     // CPU 的大头），之后兼跑离线 bot 的 A* 寻路。起不来（file://、老浏览器、策略封锁）
@@ -666,6 +711,10 @@ class Game {
     const I = this.input;
     const cv = this.canvas;
     window.addEventListener('keydown', e => {
+      const B = this.binds();
+      // 记分板那一键现在归绑定表（HU-37）。上面那行 Tab 的字面量守卫**故意留着**：
+      // 就算记分板被绑到别的键，对局里 Tab 也不许去挪页面焦点（那是浏览器抢走键盘的路）。
+      const sbKey = B.scoreboard.includes(e.code);
       // Tab：对局里它是"记分板"，不许顺带把页面焦点切走；而菜单里它是键盘用户唯一的导航键，
       // 拦不得（HU-06 —— 以前是无条件 preventDefault，于是连输入框之间都跳不动）。
       // 暂停也算菜单：那会儿没有对局可打断，Tab 得能走到"继续 / 设置 / 退出"那几行。
@@ -673,20 +722,25 @@ class Game {
       if (!I.keys[e.code]) I.pressed[e.code] = true;
       I.keys[e.code] = true;
       if (this.state === 'play') {
-        if (e.code === 'Tab') this.hud.showScoreboard(true);
+        if (sbKey && !this.paused) e.preventDefault();
+        if (sbKey) this.hud.showScoreboard(true);
+        // Esc 不在绑定表里，也**不许**进表：它是离开这一屏的唯一出路（暂停、设置、重绑捕获态
+        // 全靠它兜底），让玩家把它绑走最坏的情况是把自己锁在界面里 —— 见 keybinds 的 FIXED_KEYS。
         if (e.code === 'Escape' && !document.pointerLockElement && !this.paused && !this.menu.overlayOpen) this.pause(true);
-        if (this.dead && e.code === 'KeyC' && this.mode && this.mode.canChangeClass) this.menu.showClassSelect();
+        if (this.dead && B.classChange.includes(e.code) && this.mode && this.mode.canChangeClass) this.menu.showClassSelect();
         // 对局内聊天（差距 43）：Enter 全体、Y 队伍。**只在联机局里**开 ——
         // 单机没有第二个说话的人，开了就是个发不出去的输入框。断线后也不开：
         // 那时 Enter 归"按 Enter 重新连接"（netLostUi），抢过来会让重连这条路消失。
+        const chatTeam = B.chatTeam.includes(e.code);
+        const chatAll = B.chatAll.includes(e.code);
         if (this.net && !this.net.lost && !this.paused && !this.menu.overlayOpen && !this.hud.chatActive
-          && (e.code === 'Enter' || e.code === 'NumpadEnter' || e.code === 'KeyY')) {
-          this.hud.chatOpen(e.code === 'KeyY' ? 'team' : 'match');
+          && (chatAll || chatTeam)) {
+          this.hud.chatOpen(chatTeam ? 'team' : 'match');
           e.preventDefault();
         }
       }
     });
-    window.addEventListener('keyup', e => { I.keys[e.code] = false; if (e.code === 'Tab' && this.state === 'play') this.hud.showScoreboard(false); });
+    window.addEventListener('keyup', e => { I.keys[e.code] = false; if (this.state === 'play' && this.binds().scoreboard.includes(e.code)) this.hud.showScoreboard(false); });
     // 鼠标位移过滤：浏览器（尤其 Windows 版 Chrome/Edge）在指针锁定下偶尔会给出
     // 巨大的错误 movementX/Y（光标被拉回中心时的跳变、锁定刚生效时的第一帧等），
     // 表现为视角"闪现"。这里丢弃锁定后最初的事件，并剔除相对近期平均值异常巨大的单次跳变。
@@ -795,18 +849,28 @@ class Game {
       for (const k in P) delete P[k];
       I.mdx = 0; I.mdy = 0; I.wheel = 0; I.buttons = 0;
     }
+    // 键位从绑定表读（HU-37）：这一份对象字面量以前住着 20 个 `e.code` 字面量，而设置屏
+    // 那张键位表是它的**一份抄本**（写着 WASD，却什么都改不了）。现在两边同一张表。
+    const B = this.binds();
+    // 鼠标加速（HU-37 新增的那个开关）放在客户端成型，而不是 player.js：
+    // player.js 两端共用（服务端拿它算权威视角），它吃的 sens/invertY 是 join 帧带上去的
+    // 每玩家一份 —— 再多加一个字段就越出本分支"不动协议"的前提了。这里成型之后，
+    // 上行与本地预测吃的是同一份数，权威端不需要知道加速曲线存在。
+    const acc = this.settings.mouseAccel;
+    const shape = d => acc ? d * (1 + 0.55 * Math.min(1, Math.abs(d) / 260)) : d;
     const s = {
-      fwd: K.KeyW, back: K.KeyS, left: K.KeyA, right: K.KeyD,
-      sprint: K.ShiftLeft || K.ShiftRight, jumpPressed: P.Space, crouchPressed: P.KeyC || P.ControlLeft,
-      pronePressed: P.KeyZ,   // 趴/起（KEY.Prone,bit 16384 —— keys 的位还够,见 js/quant.js）
-      leanL: K.KeyQ, leanR: K.KeyE,   // 探头：按住的侧倾（BTN.LeanL/LeanR，住 buttons —— keys 只剩一格）
+      fwd: anyHeld(K, B.fwd), back: anyHeld(K, B.back), left: anyHeld(K, B.left), right: anyHeld(K, B.right),
+      sprint: anyHeld(K, B.sprint), jumpPressed: anyHeld(P, B.jump), crouchPressed: anyHeld(P, B.crouch),
+      pronePressed: anyHeld(P, B.prone),   // 趴/起（KEY.Prone,bit 16384 —— keys 的位还够,见 js/quant.js）
+      leanL: anyHeld(K, B.leanL), leanR: anyHeld(K, B.leanR),   // 探头：按住的侧倾（BTN.LeanL/LeanR，住 buttons —— keys 只剩一格）
       fire: !!(I.buttons & 1), ads: !!(I.buttons & 4),
-      reloadPressed: P.KeyR, swapPressed: I.wheel !== 0, slot1: P.Digit1, slot2: P.Digit2,
-      meleePressed: P.KeyV || P.Mouse3, grenadePressed: P.Digit4,   // CS 制投掷：4 切雷，左键（fire/firePressed）烹饪/出手
-      interact: K.KeyF, interactPressed: P.KeyF, nvgPressed: P.KeyN,
-      streak: streakSlotOf(P),      // 键位与 HUD 文案同源：js/data.js 的 STREAK_KEYS
-      firePressed: P.Mouse0, adsPressed: P.Mouse2,
-      mdx: I.mdx, mdy: I.mdy,
+      reloadPressed: anyHeld(P, B.reload), swapPressed: I.wheel !== 0,
+      slot1: anyHeld(P, B.slot1), slot2: anyHeld(P, B.slot2),
+      meleePressed: anyHeld(P, B.melee) || P.Mouse3, grenadePressed: anyHeld(P, B.grenade),   // CS 制投掷：4 切雷，左键（fire/firePressed）烹饪/出手
+      interact: anyHeld(K, B.interact), interactPressed: anyHeld(P, B.interact), nvgPressed: anyHeld(P, B.nvg),
+      streak: streakSlotOf(P, this.settings.binds),      // 键位与 HUD 文案同源：js/keybinds.mjs 那张表
+      firePressed: P.Mouse0, adsPressed: P.Mouse2,       // 这两个与侧键不进表：它们不是 KeyboardEvent.code
+      mdx: shape(I.mdx), mdy: shape(I.mdy),
     };
     I.mdx = 0; I.mdy = 0; I.wheel = 0;
     for (const k in P) delete P[k];
@@ -1032,6 +1096,10 @@ class Game {
         this.snapshotInput();
         this.acc = 0;
       }
+      // 暂停屏那一栏要有自己的节拍（HU-39）：paused 时 state 仍是 'play'，走的是这一支，
+      // 而 menu.update() 只在 'menu' 那一支被调 —— 于是右侧那栏冻在按下 Esc 那一刻的快照上。
+      // 只喂 pauseTick：菜单那套 3D 场景动画（尘埃、士兵、灯光）在这里没在渲染，白算一遍。
+      if (this.paused) this.menu.pauseTick(rdt);
       // 视图模型按渲染帧走，与 tick 解耦：144Hz 屏上枪的手感不再被 60Hz 绑住，
       // 而弹道、后坐、相机仍然只在 tick 上变，服务端能逐位复现
       if (!this.paused && this.player && this.player.alive && this.player.ws) this.player.ws.updateRender(rdt);

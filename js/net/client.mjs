@@ -11,6 +11,7 @@ import { decodeSnapshot, encodeInput, INPUT_SIZE } from '../../server/codec.mjs'
 import { packInput, teamId, weaponId, FLAG, WORLD, uavBit, roundLook } from '../quant.js';
 import { uavFromFlags, SAY, streakOwn, SAY_START, medalSay, DOM_RADIUS_WEAK } from '../match-rules.js';
 import { streakKeyLabel, streakNotReadyText, streakRejectText } from '../data.js';
+import { bindsOf } from '../keybinds.mjs';
 import { kitsOf } from '../loadout.mjs';
 import { rollback } from './predict.mjs';
 import { foldJudge } from './idle-ruler.mjs';
@@ -1025,7 +1026,7 @@ export class NetClient {
         if (ev.cid === this.cid) {
           this.setStreakSlot(ev.id, { ready: true });
           const i = this.streakState.findIndex(s => s.id === ev.id);
-          this.game.hud.announce(`${ev.name} 就绪`, `按 [${streakKeyLabel(i)}] 呼叫`, 2.5);
+          this.game.hud.announce(`${ev.name} 就绪`, `按 [${streakKeyLabel(i, bindsOf(this.game))}] 呼叫`, 2.5);
           this.game.audio.say(SAY.ready(ev.name)); this.game.audio.beep(3);
         }
       } else if (ev.e === 'streak') {
@@ -1198,7 +1199,7 @@ export class NetClient {
         const rows = (this.board && this.board.rows) || [];
         const me = rows.find(r => r.cid === this.cid) || null;
         const lead = rows[0] && rows[0].cid !== this.cid ? rows[0] : rows[1];
-        html = `<div class="sb-team a"><small style="font-size:10px;color:#9cf">我</small> ${me ? me.k : 0}</div><div class="sb-time">${mm}<br><small style="font-size:11px;color:#aaa">第 ${me ? me.rank : '-'} 名</small></div><div class="sb-team b"><small style="font-size:10px;color:#f96">榜首</small> ${lead ? lead.k : 0}</div>`;
+        html = `<div class="sb-team a"><small style="font-size:.625rem;color:#9cf">我</small> ${me ? me.k : 0}</div><div class="sb-time">${mm}<br><small style="font-size:.6875rem;color:#aaa">第 ${me ? me.rank : '-'} 名</small></div><div class="sb-team b"><small style="font-size:.625rem;color:#f96">榜首</small> ${lead ? lead.k : 0}</div>`;
       } else {
         // 据点水圈不是普通 html：scorebar 里只放一个空容器，水圈由 hud.flagWaters 养
         // （结构变了才重建、水位每拍直写 —— 见下面）。数据：domFlags 0.5s 一班 + 记分板兜底。

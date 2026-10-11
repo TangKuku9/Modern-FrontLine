@@ -24,6 +24,7 @@
 <link rel="modulepreload" href="js/escape.js">
 <link rel="modulepreload" href="js/gunmodel.js">
 <link rel="modulepreload" href="js/hud.js">
+<link rel="modulepreload" href="js/keybinds.mjs">
 <link rel="modulepreload" href="js/loadout.mjs">
 <link rel="modulepreload" href="js/main.js">
 <link rel="modulepreload" href="js/maps.js">
@@ -47,6 +48,7 @@
 <link rel="modulepreload" href="js/quant.js">
 <link rel="modulepreload" href="js/rng.js">
 <link rel="modulepreload" href="js/scoreboard.mjs">
+<link rel="modulepreload" href="js/settings.mjs">
 <link rel="modulepreload" href="js/soldier.js">
 <link rel="modulepreload" href="js/textures-core.js">
 <link rel="modulepreload" href="js/textures.js">
@@ -77,7 +79,7 @@
 <div id="app"></div>
 
 <!-- 加载 -->
-<div id="loading">
+<div id="loading" role="status" aria-live="polite" aria-label="加载中">
   <div class="load-inner">
     <div class="logo"><span class="l1">现代战线</span><span class="l2">MODERN FRONTLINE</span></div>
     <div class="load-bar"><div id="loadFill"></div></div>
@@ -90,47 +92,51 @@
 </div>
 
 <!-- HUD -->
-<div id="hud" class="hidden">
-  <div id="vignette"></div>
-  <div id="nvgFrame" class="hidden"></div>
-  <div id="scope" class="hidden"><div class="scope-hole"></div><div class="scope-h"></div><div class="scope-v"></div><div class="scope-dot"></div></div>
-  <div id="crosshair"><i class="ct"></i><i class="cb"></i><i class="cl"></i><i class="cr"></i></div>
-  <div id="hitmarker"><i></i><i></i><i></i><i></i></div>
-  <div id="dmgDirs"></div>
-  <div id="markers"></div>
-  <div id="compass"><div id="compassStrip"></div><div class="compass-tick"></div></div>
-  <div id="minimapWrap"><canvas id="minimap" width="220" height="220"></canvas><div id="mmLabel"></div><div id="teamAlive"></div></div>
+<!-- aria-live 只点在"事件到了才变"的那几格（据点失守、击杀条、字幕、网络读数），弹匣/备弹/血量
+     数字/帧数那种每拍都在动的读数一律 aria-live="off"。理由：每拍变动的数被朗读器念出来等于念噪声，
+     比不念更糟 —— 耳朵里全是噪声时，真正要通知的那一句反而听不见。装饰层（准星、小地图、受击方向、
+     闪光/淡入淡出）整块 aria-hidden：它们没有文本可对，念出来只会添乱。 -->
+<div id="hud" class="hidden" role="region" aria-label="游戏内信息面板">
+  <div id="vignette" aria-hidden="true"></div>
+  <div id="nvgFrame" class="hidden" aria-hidden="true"></div>
+  <div id="scope" class="hidden" aria-hidden="true"><div class="scope-hole"></div><div class="scope-h"></div><div class="scope-v"></div><div class="scope-dot"></div></div>
+  <div id="crosshair" aria-hidden="true"><i class="ct"></i><i class="cb"></i><i class="cl"></i><i class="cr"></i></div>
+  <div id="hitmarker" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+  <div id="dmgDirs" aria-hidden="true"></div>
+  <div id="markers" aria-hidden="true"></div>
+  <div id="compass" aria-hidden="true"><div id="compassStrip"></div><div class="compass-tick"></div></div>
+  <div id="minimapWrap"><canvas id="minimap" width="220" height="220" aria-hidden="true"></canvas><div id="mmLabel" aria-hidden="true"></div><div id="teamAlive" aria-live="polite"></div></div>
   <div id="scorebar"></div>
-  <div id="killfeed"></div>
+  <div id="killfeed" aria-live="polite" aria-relevant="additions"></div>
   <!-- 对局内聊天（差距 43）：行在 .ct-log，输入行只在 chatOpen 时出现（Enter 全体 / Y 队伍） -->
   <div id="chatBox" class="hidden">
-    <div id="chatLog"></div>
-    <div id="chatIn"><span id="chatCh">全体</span><input id="chatSay" maxlength="120" autocomplete="off" spellcheck="false"></div>
+    <div id="chatLog" aria-live="polite" aria-relevant="additions"></div>
+    <div id="chatIn"><span id="chatCh">全体</span><input id="chatSay" maxlength="120" autocomplete="off" spellcheck="false" aria-label="聊天输入"></div>
   </div>
-  <div id="objective"></div>
+  <div id="objective" aria-live="polite"></div>
   <div id="ammoBox">
     <div id="weaponName"></div>
-    <div class="ammo-row"><span id="ammoMag">30</span><span id="ammoRes">/ 120</span></div>
-    <div id="equipRow"></div>
+    <div class="ammo-row"><span id="ammoMag" aria-live="off">30</span><span id="ammoRes" aria-live="off">/ 120</span></div>
+    <div id="equipRow" aria-live="off"></div>
   </div>
-  <div id="healthBox"><div id="healthFill"></div><div id="hpNum"></div></div>
+  <div id="healthBox"><div id="healthFill"></div><div id="hpNum" aria-live="off"></div></div>
   <div id="streaks"></div>
   <div id="popups"></div>
-  <div id="prompt"></div>
+  <div id="prompt" aria-live="polite"></div>
   <div id="progress"><div id="progressFill"></div></div>
-  <div id="subtitles"></div>
-  <div id="announce"></div>
+  <div id="subtitles" aria-live="polite"></div>
+  <div id="announce" role="alert"></div>
   <div id="enemyName"></div>
-  <div id="alertEdge"></div>
+  <div id="alertEdge" aria-hidden="true"></div>
   <!-- 常驻网络读数（HU-08）：ping/回正/掉线状态以前只在按住 Tab 的记分板脚注里，
        被拽回时屏幕上一点解释都没有。文案由 NetClient.netStatus() 一处出，两端不各拼一遍。 -->
-  <div id="netStat"></div>
-  <div id="fps"></div>
-  <div id="flashOverlay"></div>
-  <div id="fade"></div>
+  <div id="netStat" aria-live="polite"></div>
+  <div id="fps" aria-live="off"></div>
+  <div id="flashOverlay" aria-hidden="true"></div>
+  <div id="fade" aria-hidden="true"></div>
 </div>
 
-<div id="deathScreen" class="hidden">
+<div id="deathScreen" class="hidden" role="status" aria-live="assertive">
   <div class="death-inner">
     <div class="death-title">你已阵亡</div>
     <div id="killerInfo"></div>
@@ -140,12 +146,14 @@
   </div>
 </div>
 
-<div id="scoreboard" class="hidden"></div>
+<div id="scoreboard" class="hidden" role="region" aria-label="记分板" aria-live="off"></div>
 
 <!-- 菜单层 -->
-<div id="menu"></div>
+<div id="menu" role="region" aria-label="菜单"></div>
 
-<div id="clickToPlay" class="hidden"><div>点击屏幕继续</div></div>
+<!-- 掉锁之后"点一下接着打"那一层。它是真 <button>（HU-40）：以前是带 role="button" 的 div，
+     那样键盘用户按 Enter/Space 什么都不会发生 —— 语义标签浏览器不会替你接事件。 -->
+<button id="clickToPlay" class="hidden"><span>点击屏幕继续</span></button>
 
 <script type="module" src="js/main.js"></script>
 </body>

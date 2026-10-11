@@ -4,6 +4,7 @@ import { Player } from './player.js';
 import { Bot } from './ai.js';
 import { MAPS } from './maps.js';
 import { KILLSTREAKS, BOT_NAMES, WEAPONS, ATTACHMENTS, attachmentAllowed, computeStats, streakKeyLabel, streakNotReadyText } from './data.js';
+import { bindsOf } from './keybinds.mjs';
 import { fireHitscan, clusterStrike as spawnCluster, phosphorusSweep } from './combat.js';
 import { mat } from './materials.js';
 import { rand, pick, fmtTime, spreadDir, DEG, clamp, rayAABB, raySphere, rng, shuffle } from './util.js';
@@ -400,7 +401,7 @@ export class MPMatch {
     this.streakKills = this.streakBook.progress;
     for (const i of this.streakBook.charge(v)) {
       const def = KILLSTREAKS.find(k => k.id === this.streakState[i].id);
-      this.game.hud.announce(def.name + ' 就绪', `按 [${streakKeyLabel(i)}] 呼叫`, 2.5);
+      this.game.hud.announce(def.name + ' 就绪', `按 [${streakKeyLabel(i, bindsOf(this.game))}] 呼叫`, 2.5);
       this.game.audio.say(SAY.ready(def.name));
       this.game.audio.beep(3);
     }
@@ -620,7 +621,7 @@ export class MPMatch {
       const lead = r[0];
       // 左右两格加"我/榜首"小字：红蓝格子本来就是团队模式的壳，不标的话领跑者两格
       // 同数（自己超自己时右格显第二名），看起来像比分出了问题（联机同款，client.mjs）。
-      html = `<div class="sb-team a"><small style="font-size:10px;color:#9cf">我</small> ${pl.stats.kills}</div><div class="sb-time">${t}<br><small style="font-size:11px;color:#aaa">第 ${me + 1} 名</small></div><div class="sb-team b"><small style="font-size:10px;color:#f96">榜首</small> ${lead.e.isPlayer ? (r[1] ? r[1].k : 0) : lead.k}</div>`;
+      html = `<div class="sb-team a"><small style="font-size:.625rem;color:#9cf">我</small> ${pl.stats.kills}</div><div class="sb-time">${t}<br><small style="font-size:.6875rem;color:#aaa">第 ${me + 1} 名</small></div><div class="sb-team b"><small style="font-size:.625rem;color:#f96">榜首</small> ${lead.e.isPlayer ? (r[1] ? r[1].k : 0) : lead.k}</div>`;
     } else {
       // 据点水圈不是普通 html：水位的 CSS 过渡需要元素**活着**，所以 scorebar 里只放
       // 一个空容器，水圈由 hud.flagWaters 养（结构变了才重建，水位每拍直写 style）。

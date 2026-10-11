@@ -33,7 +33,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { STREAK_KEYS, STREAK_KEY_LABELS, streakKeyLabel, streakSlotOf } from '../js/data.js';
+import { STREAK_KEYS, STREAK_KEY_LABELS, streakKeyLabel, streakSlotOf, streakKeyLabels, KILLSTREAKS } from '../js/data.js';
 import { NetRoom } from '../server/room.mjs';
 
 const R = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -135,19 +135,38 @@ ok('B4 越界下标给空串而不是 "undefined" 字样', streakKeyLabel(99) ==
 const MENU_SRC = src('js/menu.js');
 const hardcodedStreak = t => /<span class="kbd">5\/6\/7<\/span>连杀奖励|<b>5 \/ 6 \/ 7<\/b>连杀奖励/.test(t);
 ok('B5 主菜单与设置那两份键位表都改从同一处派生（字面量 5/6/7 已不存在）',
-  MENU_SRC.includes('STREAK_KEY_LABELS') && !hardcodedStreak(MENU_SRC));
+  MENU_SRC.includes('streakKeyLabels(binds)') && MENU_SRC.includes('BIND_ACTIONS') && !hardcodedStreak(MENU_SRC));
 ok('B5b【反证臂】把派生代回旧字面量，同一把尺子当场认出来',
-  hardcodedStreak(MENU_SRC.replace("${STREAK_KEY_LABELS.join('/')}", '5/6/7')));
+  hardcodedStreak(MENU_SRC.replace("${streakKeyLabels(binds).join('/')}", '5/6/7')));
+// HU-37 之后"派生"必须是从**当前绑定**派生，而不是从那份默认常量：留着默认表的抄本，
+// 症状就是玩家改了键、屏上那张表还在写旧键（HU-01 那一族的换皮复发）。
+ok('B5c 菜单层里不再留着一份默认键位表的抄本', !MENU_SRC.includes('STREAK_KEY_LABELS'));
 
 const MP_SRC = src('js/mp.js'), NET_SRC = src('js/net/client.mjs');
 const oldAnnounce = t => t.includes('按 [${i + 3}]');
-ok('B6 单机与联机的就绪播报都走 streakKeyLabel（`i + 3` 不许回潮）',
-  MP_SRC.includes('按 [${streakKeyLabel(i)}]') && NET_SRC.includes('按 [${streakKeyLabel(i)}]')
-  && !oldAnnounce(MP_SRC) && !oldAnnounce(NET_SRC));
+// HU-37 把连杀键位做成可重绑之后，播报那一句必须吃**这一台当前的绑定**，
+// 否则重绑的键在屏幕上仍写着旧数字 —— 那正是 HU-01 的原症状，换了个触发条件复发。
+const ANN = '按 [${streakKeyLabel(i, bindsOf(this.game))}]';
+ok('B6 单机与联机的就绪播报都走 streakKeyLabel，且吃的是当前绑定（`i + 3` 不许回潮）',
+  MP_SRC.includes(ANN) && NET_SRC.includes(ANN) && !oldAnnounce(MP_SRC) && !oldAnnounce(NET_SRC));
 ok('B6b【反证臂】把 mp.js 那一处代回 i + 3，检查器必须认得出',
-  oldAnnounce(MP_SRC.replace('按 [${streakKeyLabel(i)}]', '按 [${i + 3}]')));
+  oldAnnounce(MP_SRC.replace(ANN, '按 [${i + 3}]')));
 ok('B7 绑定侧也收成一处（snapshotInput 不再各写一份 Digit5/6/7 三元）',
-  src('js/main.js').includes('streak: streakSlotOf(P)') && !src('js/main.js').includes('P.Digit5 ? 0 :'));
+  src('js/main.js').includes('streak: streakSlotOf(P, this.settings.binds)') && !src('js/main.js').includes('P.Digit5 ? 0 :'));
+// HU-01 的闭环在重绑之后仍然成立：屏上写的数字喂回 streakSlotOf，回来的还是同一个槽。
+ok('B8【HU-37×HU-01 闭环】1 号槽改绑 Digit8 ⇒ 数字跟着变 8，喂回去仍是 0 号槽，旧键 Digit5 不再算按下',
+  (() => {
+    const b = { streak1: ['Digit8'] };
+    const l = streakKeyLabel(0, b);
+    return l === '8' && streakSlotOf({ Digit8: true }, b) === 0 && streakSlotOf({ Digit5: true }, b) === -1
+      && streakKeyLabels(b).join('/') === '8/6/7';
+  })(), `label0=${streakKeyLabel(0, { streak1: ['Digit8'] })}`);
+ok('B8b【反证臂】把 streakCodes 退回硬编码 Digit5/6/7（不读绑定），闭环当场断',
+  (() => {
+    const hard = i => String(i + 5);            // HU-01 修之前的那份"抄本"
+    const b = { streak1: ['Digit8'] };
+    return !(hard(0) === streakKeyLabel(0, b) && streakSlotOf({ Digit8: true }, b) === 0);
+  })());
 
 // ───────────────────────── C 段：HU-04 / HU-21 reset 归位 ─────────────────────────
 hud.reset();
@@ -456,10 +475,17 @@ const el = id => DOM.getElementById(id);       // rec() 给的是账本，style 
   ally.pos.z = -20;
   ok('K5 #mmLabel 有读数了（过去是死 DOM：HTML 里留了格子，JS 从不写）',
     rec('mmLabel').text === '半径 45m', rec('mmLabel').text);
-  const mmSize = +(HUD_SRC.match(/const MM_SIZE = (\d+)/) || [])[1];
+  // HU-37 把 MM_SIZE 从 hud.js 搬进 js/settings.mjs：它现在是设置项的默认值、能在屏上调，
+  // 而 index.html 那两个 canvas 属性必须仍然与它是同一个数 —— 对账的两边换了，钉的事没换。
+  const SET_SRC = src('js/settings.mjs');
+  const mmSize = +(SET_SRC.match(/export const MM_SIZE = (\d+)/) || [])[1];
   const canvasAttr = /<canvas id="minimap" width="(\d+)" height="(\d+)"/.exec(HTML_SRC);
   ok('K6 绘制尺寸与 <canvas> 的 width/height 是同一个数（抄两份的话一边画 220、一边裁 200）',
-    !!canvasAttr && +canvasAttr[1] === mmSize && +canvasAttr[2] === mmSize, `hud.js=${mmSize}·html=${canvasAttr && canvasAttr[1]}`);
+    !!canvasAttr && +canvasAttr[1] === mmSize && +canvasAttr[2] === mmSize, `settings.mjs=${mmSize}·html=${canvasAttr && canvasAttr[1]}`);
+  ok('K6c【HU-36】hud.js 不许再自己抄一份尺寸：默认从 settings.mjs 取，绘制吃 this.mmSize（syncDisplay 落 canvas）',
+    /import \{[^}]*\bMM_SIZE\b[^}]*\} from '\.\/settings\.mjs'/.test(HUD_SRC)
+    && /const ctx = this\.mm, S = this\.mmSize/.test(HUD_SRC)
+    && !/const MM_SIZE = \d+;/.test(HUD_SRC));
   const mmR = +(HUD_SRC.match(/const MM_RADIUS = (\d+)/) || [])[1];
   ok('K6b 标签上写的半径就是绘制用的那个数（"半径 45m"配一张 60m 的图是新的一种谎）',
     rec('mmLabel').text === `半径 ${mmR}m` && mmR === 45, `MM_RADIUS=${mmR}`);
@@ -1275,10 +1301,13 @@ const ROOM_ST = ({ host = true, ready = true, canStart = true, why = '', playing
     ok('Y6d 名字那一格转义（Bot 名是服务端起的，但这一屏所有行都走同一条拼接）',
       !s.m.botSeatRow({ bid: 1, name: '<b>x</b>', skill: 0 }, true).includes('<b>x</b>'));
     ok('Y7【HU-25·形状】底部那一行不再是 12px 的 #999（整个房间屏唯一说"接下来按哪个"的地方，小到要凑近才读得见）',
-      /\.rm-foot #rmWhy \{ margin-left: auto; font-size: 13px; color: #cfcfcf; \}/.test(CSS_SRC),
+      /\.rm-foot #rmWhy \{ margin-left: auto; font-size:0\.8125rem; color: var\(--txt-2\); \}/.test(CSS_SRC),
       (CSS_SRC.match(/\.rm-foot #rmWhy[^\n]*\n?/) || [''])[0].trim());
+    // P4 之后字号单位是 rem、颜色是令牌（HU-33/34）；这一条盯的还是 HU-25 那件事：
+    // 不许退回"12px 的一行灰字"。反证臂把两处一起代回旧写法。
     ok('Y7b【反证臂·同文件代回】把它抄回 12px #999，尺子当场认出来',
-      !/\.rm-foot #rmWhy \{ margin-left: auto; font-size: 13px; color: #cfcfcf; \}/.test(CSS_SRC.replace('font-size: 13px; color: #cfcfcf', 'font-size: 12px; color: #999')));
+      !/\.rm-foot #rmWhy \{ margin-left: auto; font-size:0\.8125rem; color: var\(--txt-2\); \}/.test(
+        CSS_SRC.replace('font-size:0.8125rem; color: var(--txt-2)', 'font-size: 12px; color: #999')));
   } finally {
     Object.assign(globalThis, { setTimeout: REAL.st, clearTimeout: REAL.ct });
   }
@@ -1429,6 +1458,357 @@ const ROOM_ST = ({ host = true, ready = true, canStart = true, why = '', playing
     && nativeShape.test(SET_BODY.replace('this.resetSaveDialog()', " confirm('确定要重置所有配装与经验值吗？')")));
   ok('AB4d 改名那一格自带焦点（原生 prompt 本来就有这件事，换成层内那一格就得自己补 —— 不然点开之后还得先点一下才能打字）',
     /f\.focus\(\)/.test(bodyOf(MENU_SRC, /\n {2}renameClass\(/) || ''));
+}
+
+// ───────────────────────── AC–AG 段：第五批（P4 适配性 HU-32~HU-37 / HU-39 / HU-40）─────────────────────────
+// 这一批的判据分两层：**这一份**钉的是"单位、令牌、区间、接线在不在"（源码形状 + 直接驱动纯函数），
+// 真几何、真颜色、真视口那一半在 test/hud-keys.mjs（AC/AD/AE 三段，三档视口各量一次）。
+// 分这么两层的原因与本仓库反复写的那条一致：形状判据只兜底，不当证明。
+const cssBody = sel => {
+  // 选择器前面不许再有一层限定（`.bind-key` 不能被 `button.bind-key { … }` 那条复位规则冒充）
+  const m = new RegExp('(?<![.\\w#-])' + sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\{([^}]*)\\}').exec(CSS_SRC);
+  return m ? m[1] : null;
+};
+const CSS_ONLY = CSS_SRC.replace(/\/\*[\s\S]*?\*\//g, '');   // 注释里提到旧色号是历史，不是现役声明
+// WCAG 的相对亮度与对比度，判据自己算（"看着挺亮"不是量具）
+const lum = hex => {
+  const v = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map(c => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)));
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+};
+const contrast = (a, b) => { const l1 = lum(a), l2 = lum(b); return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05); };
+
+// ───────────────────────── AC 段：HU-33 字号单位 ─────────────────────────
+{
+  const JS_FILES = ['js/menu.js', 'js/mp.js', 'js/net/client.mjs', 'js/hud.js', 'js/main.js', 'js/campaign.js'];
+  const pxIn = t => t.match(/font-size:\s*[\d.]+px/g) || [];
+  const cssPx = pxIn(CSS_SRC), jsPx = JS_FILES.flatMap(f => pxIn(src(f)).map(x => f + ' ' + x));
+  ok('AC0【量具自证】这把尺子认得出"固定字号"这个形状（先证明它数得出来，再拿它说 0）',
+    pxIn('a { font-size: 13px; }').length === 1 && pxIn('a { font-size:.8rem; }').length === 0);
+  ok('AC1 style.css 里 font-size 全是相对单位（HU-33：浏览器"字号"设置过去完全不跟随）',
+    cssPx.length === 0, cssPx.slice(0, 3).join(' '));
+  ok('AC2 JS 模板串里的内联 font-size 同样清零（审计点名的 menu.js 配件描述 11px 就在这一份里）',
+    jsPx.length === 0, jsPx.slice(0, 3).join(' '));
+  ok('AC3【反证臂】把一条 rem 代回 12px，同一把尺子当场认出来',
+    pxIn(CSS_SRC.replace('.mbtn .md { font-size:0.75rem;', '.mbtn .md { font-size:12px;')).length === 1);
+  ok('AC4 --hu = 1rem × HUD 缩放：两个自由度都在（浏览器字号 × 游戏内 HUD 缩放），不是其中之一',
+    /--hu:\s*calc\(1rem \* var\(--hud-scale\)\)/.test(CSS_ONLY));
+  const hudN = (CSS_SRC.match(/font-size:calc\(var\(--hu\)/g) || []).length;
+  const remN = (CSS_SRC.match(/font-size:[\d.]+rem/g) || []).length;
+  ok('AC5 两套单位各就各位：HUD 区吃 --hu（随缩放），菜单区吃 rem（不随缩放）',
+    hudN >= 25 && remN >= 35, `hu=${hudN} rem=${remN}`);
+  ok('AC6 HUD 里不许用 em 定字号（em 会连乘：.marker 12px 里再写 12px 会变成 9px，而这两处本来同大）',
+    !/font-size:\s*[\d.]+em/.test(CSS_ONLY));
+  ok('AC7 内联样式的字色也走了令牌（HU-34 的那一份抄本住在 JS 模板里，CSS 达标不等于界面达标）',
+    !/(menu|mp|client)\.(js|mjs)/.test(jsPx.join('')) && !/color:#(555|666|777|888|999)\b/.test(
+      ['js/menu.js', 'js/mp.js', 'js/net/client.mjs'].map(src).join('\n').replace(/\/\/.*$/gm, '')));
+}
+
+// ───────────────────────── AD 段：HU-34 对比度（源码侧那一半）─────────────────────────
+{
+  const BAD = ['#555', '#666', '#777', '#5a5a5a', '#8a8a8a', '#9ab', '#9a9a9a'];
+  const uses = BAD.filter(c => new RegExp('color:\\s*' + c + '\\b', 'i').test(CSS_ONLY));
+  ok('AD0【量具自证】灰字写进**声明**里这把尺子就认得，只写在注释里不算（注释里提旧色号是历史）',
+    new RegExp('color:\\s*#666\\b').test('x{color:#666}')
+    && !new RegExp('color:\\s*#666\\b').test('/* color:#666 */ x{color:#8d8d8d}'.replace(/\/\*[\s\S]*?\*\//g, '')));
+  ok('AD1 那批灰字面量不再当文字色用（真比值在 hud-keys 的 AC 段逐格量）', uses.length === 0, uses.join(' '));
+  ok('AD2【反证臂】把 .menu-foot 代回 #666，同一把尺子当场认出来',
+    BAD.includes('#666') && new RegExp('color:\\s*#666\\b').test(
+      CSS_ONLY.replace('.menu-foot { margin-top: auto; padding-bottom: clamp(12px, 4vh, 30px); font-size:0.75rem; color: var(--txt-4);', '.menu-foot { color: #666;')));
+  const TOKENS = ['--txt', '--txt-2', '--txt-3', '--txt-4', '--hud-txt', '--hud-txt-2', '--hud-txt-3'];
+  const missTok = TOKENS.filter(k => !new RegExp('(?:^|\\s)' + k + ':\\s*#[0-9a-fA-F]{6}').test(CSS_ONLY));
+  ok('AD3 文字令牌全部定义了（缺一档就是某一处还在吃硬编码）', missTok.length === 0, missTok.join(' '));
+  const t4 = /(?:^|\s)--txt-4:\s*(#[0-9a-fA-F]{6})/.exec(CSS_ONLY);
+  ok('AD4 最暗的一档对最暗的底色 #060809 仍然 ≥4.5:1（这里现算相对亮度，不引用谁的说法）',
+    !!t4 && contrast(t4[1], '#060809') >= 4.5, t4 ? `${t4[1]} = ${contrast(t4[1], '#060809').toFixed(2)}:1` : '读不到 --txt-4');
+  ok('AD4b【尺子会红】同一把算法判旧的那档 #666 不达标（4.5 这条线不是摆设）',
+    contrast('#666666', '#060809') < 4.5 && contrast('#8d8d8d', '#060809') >= 4.5,
+    `#666=${contrast('#666666', '#060809').toFixed(2)} #8d8d8d=${contrast('#8d8d8d', '#060809').toFixed(2)}`);
+  // 可达性暗示不许只长在 :hover 上（HU-34 的第二半）：菜单层每一个"看起来能点"的选择器
+  // 都得有一个键盘可见落点。跨文件对账 menu.js 的 KEYPICK 与 style.css 的焦点名单。
+  const kp = /const KEYPICK = '([^']+)'/.exec(MENU_SRC)[1].split(',').map(s => s.trim()).filter(Boolean);
+  const noFocus = kp.filter(sel => !new RegExp(
+    sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*(?::hover|:focus-visible)?[^{}]*:focus-visible').test(CSS_ONLY)
+    && !new RegExp('button\\.' + sel.replace(/^\./, '') + '[\\s,{]').test(CSS_ONLY));
+  ok('AD5 KEYPICK 里每一类可点元素都有 :focus-visible 落点（触屏与键盘用户看不到"这行能点"就是没有）',
+    noFocus.length === 0, `缺:${noFocus.join(',') || '无'}（名单 ${kp.length} 项）`);
+  ok('AD5b【先决】这条对账不是遍历空集合：KEYPICK 至少 10 项', kp.length >= 10, `KEYPICK=${kp.length}`);
+}
+
+// ───────────────────────── AE 段：HU-32 响应式 / HU-35 目标 / HU-36 HUD 几何 ─────────────────────────
+{
+  const med = CSS_ONLY.match(/@media[^{]+/g) || [];
+  ok('AE1 有媒体查询且两条轴都覆盖（窄 / 矮 / 超宽；审计点名的是 1024×768 与 2560×1080）',
+    med.length >= 4 && med.some(m => /max-width/.test(m)) && med.some(m => /max-height/.test(m)) && med.some(m => /min-width/.test(m)),
+    med.length + ' 条');
+  ok('AE1b 审计那条 grep 快照已经翻案（当年 grep -c "@media" style.css → 0，就是这一条把 HU-32 立成结构性欠账）',
+    (src('style.css').match(/@media/g) || []).length >= 4, `现在 ${(src('style.css').match(/@media/g) || []).length} 处`);
+  const WIDE = ['.menu-left', '.settings', '.results', '#scoreboard', '.brief', '.gate-card', '.lb-right', '.gs-stats', '.gs-right', '.classes', '#chatBox', '#killfeed', '.mbtn', '#equipRow'];
+  const bare = WIDE.filter(sel => {
+    const b = cssBody(sel);
+    return b && /(?:^|[;{]\s*)(?:max-)?width:\s*\d{3,}px/.test(b) && !/(?:^|[;{]\s*)(?:max-)?width:\s*(?:min|max|clamp)\(/.test(b);
+  });
+  ok('AE2 那些固定宽度都改成了 min()/clamp() 包裹（HU-32：窄窗里它们把内容推出视口）',
+    bare.length === 0, `还是裸 px:${bare.join(',') || '无'}`);
+  ok('AE2b【反证臂】把 .settings 的宽度代回 620px，尺子当场认出来',
+    (() => {
+      const back = CSS_SRC.replace('.settings { margin: auto; width: min(680px, 94vw);', '.settings { margin: auto; width: 620px;');
+      const b = /\.settings\s*\{([^}]*)\}/.exec(back)[1];
+      return /(?:^|[;{]\s*)width:\s*\d{3,}px/.test(b) && !/width:\s*(?:min|max|clamp)\(/.test(b);
+    })());
+  const SCROLL = ['.settings', '.results', '.gate-card', '.brief', '#scoreboard', '.lobby-body', '.gs-right', '.pick-grid', '.cls-detail', '.chat-lines'];
+  const noScroll = SCROLL.filter(sel => { const b = cssBody(sel); return !b || !/overflow[^:]*:\s*[^;]*auto/.test(b); });
+  ok('AE3 会长的每一屏自己就能滚（HU-32 实测：1280×720 下设置屏最后一行落在视口外，鼠标点不到它）',
+    noScroll.length === 0, `缺:${noScroll.join(',') || '无'}`);
+  const CENTERED = ['.settings', '.results', '.brief', '.gate-card'];
+  const noCap = CENTERED.filter(sel => { const b = cssBody(sel); return !b || !/max-height/.test(b); });
+  ok('AE3b 靠 margin:auto 居中的那几屏都封了 max-height：不封顶的话 auto 边距会把多出来的部分推到视口**上方**，那里连滚动都到不了',
+    noCap.length === 0, `缺:${noCap.join(',') || '无'}`);
+  ok('AE3b 菜单层自己可滚（html,body 是 overflow:hidden，这一层是唯一出路）',
+    /#menu > \.screen \{ overflow: hidden auto/.test(CSS_ONLY));
+  const TAP = ['.mbtn', '.btn', '.btn.small', '.seg div', '.cfg-row .seg div', '.seat', '.room-row', '.sp-flag', '.cls', '.pick', '.gs-slot', '.gs-att', '.chat-in input', '.bind-key'];
+  const small = TAP.filter(sel => { const b = cssBody(sel); return !b || !/min-height:\s*3[2-9]px|min-height:\s*[4-9]\dpx/.test(b); });
+  ok('AE4 每一类可点元素都有 ≥32px 的高度下限（HU-35：房间设置那 6 档挤在 ~30px 里，触屏按不准）',
+    small.length === 0, `缺:${small.join(',') || '无'}`);
+  ok('AE4b【反证臂】把 .seg div 的 min-height 摘掉，尺子当场认出来',
+    !/min-height:\s*\d+px/.test((cssBody('.seg div') || '').replace('min-height: 34px;', '')));
+  // HU-36 罗盘：460 / 230 / ×4 那三份抄本收成一处
+  const compassRule = cssBody('#compass') || '';
+  ok('AE5 罗盘的三个魔数不再各写各的（#compass 里那条 460 与 hud.js 里那句 style.left 都没了，改读 --cp-pxd / this.cpPxd）',
+    compassRule.includes('calc(var(--cp-pxd)') && !/width:\s*460px/.test(compassRule)
+    && !/margin-left:\s*-230px/.test(compassRule) && !/style\.left = \(230 - deg \* 4/.test(HUD_SRC)
+    && /style\.transform = `translateX\(\$\{-deg \* this\.cpPxd\}px\)`/.test(HUD_SRC)
+    && /export const COMPASS_PXD = 4/.test(src('js/settings.mjs')), compassRule.slice(0, 56));
+  ok('AE5b【反证臂】把 left = 230 − deg×4 代回 hud.js 那一行，同一把尺子认出来',
+    /230 - deg \* 4/.test(HUD_SRC.replace("style.transform = `translateX(${-deg * this.cpPxd}px)`", "style.left = (230 - deg * 4) + 'px'")));
+  ok('AE6 准星的臂长在两处同源：CSS 读 var(--cross-size)，hud.js 读设置里的 crossSize（那个手抄的 −9 不许留）',
+    /height: var\(--cross-size\)/.test(CSS_ONLY) && /width: var\(--cross-size\)/.test(CSS_ONLY)
+    && /st\.crossSize/.test(HUD_SRC) && !/\(-px - 9\)/.test(HUD_SRC));
+  ok('AE6b 扩散→像素按短边定标（HU-36 反向那半：只用 innerHeight 时 21:9 上同一把枪的腰射看起来更小）',
+    /Math\.min\(window\.innerWidth/.test(HUD_SRC) && !/spread \* \(window\.innerHeight/.test(HUD_SRC));
+  ok('AE7 瞄具遮罩用 vmin 不用 vh（超宽屏上圆孔按高度定径 ⇒ 左右大片可见，21:9 那一档的症状）',
+    !/width:\s*88vh/.test(CSS_ONLY) && /width:\s*88vmin/.test(CSS_ONLY) && /width:\s*70vmin/.test(CSS_ONLY));
+  ok('AE7b 小地图尺寸是设置项：CSS 读 var(--mm-size)，HUD 画的是 this.mmSize，画布属性由 syncDisplay 落',
+    /width: var\(--mm-size\)/.test(CSS_ONLY) && /const ctx = this\.mm, S = this\.mmSize/.test(HUD_SRC)
+    && /cv\.width = size/.test(HUD_SRC));
+  ok('AE8 killfeed 与装备行都有了上限/换行（1024 宽时呼号最长 16 字，居中比分条就在它左边）',
+    /#killfeed \{[^}]*max-width/.test(CSS_ONLY) && /#equipRow \{[^}]*flex-wrap: wrap/.test(CSS_ONLY));
+  ok('AE8b 中文逐字硬折换掉了（word-break:break-all 会把拉丁词也劈开）',
+    !/word-break:\s*break-all/.test(CSS_ONLY) && /overflow-wrap: anywhere/.test(CSS_ONLY));
+}
+
+// ───────────────────────── AF 段：HU-37 设置那张表（驱动真函数）─────────────────────────
+{
+  const M = await import('../js/settings.mjs');
+  const { SET_SPEC, SET_GROUPS, SETTINGS_DEFAULTS, sanitizeSettings, formatValue, applyDisplaySettings, compassPxd, CROSS_COLORS } = M;
+  const specKeys = Object.keys(SET_SPEC).filter(k => SET_SPEC[k].type !== 'note');
+  ok('AF0【表自证】每个设置项都有默认值，num 的默认落在自己的区间里（区间写反的话 AF2 会红）',
+    specKeys.every(k => k in SETTINGS_DEFAULTS)
+    && specKeys.every(k => SET_SPEC[k].type !== 'num' || (SETTINGS_DEFAULTS[k] >= SET_SPEC[k].min && SETTINGS_DEFAULTS[k] <= SET_SPEC[k].max)));
+  ok('AF1 设置屏的分组把表里的每一项都排上了（漏一项 = 那一格在界面上根本不存在）',
+    SET_GROUPS.flatMap(g => g.rows).sort().join() === Object.keys(SET_SPEC).sort().join(),
+    SET_GROUPS.map(g => g.t + ':' + g.rows.length).join(' '));
+  ok('AF2 P4 新增的那几项真的在表上（HUD 缩放/透明度/小地图/准星三件/字幕/三条声道/加速/绑定）',
+    ['hudScale', 'hudOpacity', 'mmSize', 'crossColor', 'crossSize', 'crossGap', 'subtitles', 'volSfx', 'volAmbient', 'volVoice', 'mouseAccel', 'binds']
+      .every(k => k in SET_SPEC), Object.keys(SET_SPEC).length + ' 项');
+  const dirty = sanitizeSettings({ fov: 'abc', sens: 99, adsSens: -3, quality: 'ultra', fpsCap: '144', volume: '0.5', mmSize: 10, hudScale: 5, crossColor: '紫色', voice: 'false', showFps: 1, subtitles: 'nope', nonsense: 7, binds: { fwd: ['KeyW', 'Bogus'], nope: ['KeyZ'] } });
+  ok('AF3 脏存档过闸：区间外夹回区间内、非法枚举回默认、未知键丢掉、非数字不但不 NaN 还回默认',
+    dirty.fov === 78 && dirty.sens === 3 && dirty.adsSens === 0.3 && dirty.quality === 'high' && dirty.fpsCap === 144
+    && dirty.volume === 0.5 && dirty.mmSize === SET_SPEC.mmSize.min && dirty.hudScale === SET_SPEC.hudScale.max
+    && dirty.crossColor === '白' && dirty.voice === false && dirty.showFps === true && dirty.subtitles === true
+    && !('nonsense' in dirty) && JSON.stringify(dirty.binds) === '{}', JSON.stringify(dirty).slice(0, 90));
+  ok('AF3b 与默认一致的绑定**不写进存档**（改了默认值时旧存档不许把它钉死），真改了才留',
+    JSON.stringify(sanitizeSettings({ binds: { fwd: ['KeyG'] } }).binds) === '{"fwd":["KeyG"]}'
+    && JSON.stringify(sanitizeSettings({ binds: { fwd: ['KeyW'] } }).binds) === '{}');
+  ok('AF3b【反证臂·A/B 两方向】旧的 Object.assign 直读那份脏值会原样放行（这才是"当年为什么会炸"）',
+    Object.assign({ fov: 78 }, JSON.parse('{"fov":"abc","sens":99}')).fov === 'abc' && sanitizeSettings({ fov: 'abc', sens: 99 }).fov === 78);
+  ok('AF4 formatValue 对每一种 fmt 都给得出屏上那个数（滑杆读数与值是同一份设置的两张脸）',
+    formatValue('sens', 1.5) === '1.50' && formatValue('hudScale', 1.2) === '120' && formatValue('mmSize', 200) === '200px'
+    && formatValue('quality', 'high') === 'high' && formatValue('fpsCap', 0) === '0');
+  const root = { style: { p: {}, setProperty(k, v) { this.p[k] = v; } } };
+  applyDisplaySettings({ hudScale: 1.2, hudOpacity: 0.8, mmSize: 200, crossColor: '青', crossSize: 12, crossGap: 6 }, root);
+  const written = root.style.p;
+  ok('AF5 落地那一处把六格全写进了 CSS 变量，值都对（applyDisplaySettings 是画面这半边唯一的写点）',
+    written['--hud-scale'] === '1.2' && written['--hud-op'] === '0.8' && written['--mm-size'] === '200px'
+    && written['--cross-size'] === '12px' && written['--cross-col'] === CROSS_COLORS['青']
+    && Object.keys(written).length === 6 && written['--cp-pxd'] === String(compassPxd({ hudScale: 1.2 })), JSON.stringify(written));
+  const written2 = (() => { const r2 = { style: { p: {}, setProperty(k, v) { this.p[k] = v; } } }; applyDisplaySettings({ mmSize: 'abc', hudScale: 99 }, r2); return r2.style.p; })();
+  ok('AF6 没过闸的值写不进画面：脏设置先归位再落 CSS（滑杆后面那条路也挡一次）',
+    written2['--mm-size'] === '220px' && Number(written2['--hud-scale']) <= SET_SPEC.hudScale.max, JSON.stringify(written2));
+  // 写了没人读 = 改了没生效；读了没人写 = 永远默认。两个方向都数。
+  const SET = src('js/settings.mjs');
+  const writeSet = [...SET.matchAll(/set\('(--[a-z-]+)'/g)].map(m => m[1]);
+  const orphanWrite = writeSet.filter(v => !CSS_ONLY.includes('var(' + v));
+  const P4VARS = ['--hud-scale', '--hud-op', '--mm-size', '--cp-pxd', '--cross-col', '--cross-size'];
+  const orphanRead = P4VARS.filter(v => !writeSet.includes(v));
+  ok('AF7 跨文件对账：settings.mjs 写的变量 CSS 全都读，P4 这六个变量全都由它写（漏一头就是某一格永远不动或永远默认）',
+    orphanWrite.length === 0 && orphanRead.length === 0 && writeSet.length === 6,
+    `写了没人读:${orphanWrite.join(',') || '无'} 读了没人写:${orphanRead.join(',') || '无'}`);
+  ok('AF7b【量具自证】这条对账两个方向都会红：造一个没人读的变量、和一个没人写的变量，它都点名',
+    orphanWrite.length === 0
+    && ['--nope'].filter(v => !'a{b:var(--real)}'.includes('var(' + v)).length === 1
+    && P4VARS.filter(v => !['--hud-scale'].includes(v)).length === P4VARS.length - 1);
+  ok('AF8 compassPxd 与 HUD 缩放同向（窗口变宽的同时刻度变密，罗盘读的仍是角度而不是长度）',
+    compassPxd({ hudScale: 1 }) === M.COMPASS_PXD && compassPxd({ hudScale: 1.25 }) > compassPxd({ hudScale: 0.8 })
+    && compassPxd({}) === M.COMPASS_PXD);
+  ok('AF9 MM_SIZE 的默认就是 index.html 画布那两个属性（K6 钉过；这一条钉"设置项的默认"与它同一处）',
+    M.MM_SIZE === 220 && M.SETTINGS_DEFAULTS.mmSize === M.MM_SIZE);
+}
+
+// ───────────────────────── AG 段：HU-37 键位表与重绑（驱动真函数）─────────────────────────
+{
+  const K = await import('../js/keybinds.mjs');
+  const { BIND_ACTIONS, DEFAULT_BINDS, resolveBinds, sanitizeBinds, applyBind, isBindableCode, anyHeld, keyLabel, bindLabel, bindsOf } = K;
+  ok('AG0【表自证】每个动作都有默认键、都有中文名与分组，且默认键全过合法性闸',
+    BIND_ACTIONS.every(a => Array.isArray(DEFAULT_BINDS[a.k]) && DEFAULT_BINDS[a.k].length && a.label && a.g)
+    && BIND_ACTIONS.every(a => a.def.every(isBindableCode)), `${BIND_ACTIONS.length} 个动作`);
+  ok('AG1 Esc 进不了这张表（离开这一屏的唯一出路不许被绑走；绑走的症状是人被锁在界面里）',
+    !isBindableCode('Escape') && !BIND_ACTIONS.some(a => a.def.includes('Escape')) && !sanitizeBinds({ scoreboard: ['Escape'] }).scoreboard);
+  ok('AG2 非法码与未知动作都进不了存档；与默认一致的条目不存（改了默认值时旧存档不许把它钉死）',
+    JSON.stringify(sanitizeBinds({ fwd: ['Bogus', 'KeyG', 'KeyG'], nope: ['KeyZ'], sprint: ['ShiftLeft', 'ShiftRight'] })) === JSON.stringify({ fwd: ['KeyG'] }));
+  ok('AG3 resolveBinds(null) 就是默认表的副本，改返回的表不会污染常量表',
+    (() => { const B = resolveBinds(null); B.fwd.push('KeyZ'); return DEFAULT_BINDS.fwd.length === 1 && resolveBinds(null).fwd.join() === 'KeyW'; })());
+  ok('AG4 重绑闭环：绑到 G 之后 G 才算"前进"，W 不再算（anyHeld 读的就是这一台当前那份）',
+    (() => { const B = resolveBinds({ fwd: ['KeyG'] }); return anyHeld({ KeyG: true }, B.fwd) === true && anyHeld({ KeyW: true }, B.fwd) === false; })());
+  ok('AG5 一个键只能属于一个动作：已被别人占着就**拒绝**，并说出是谁占着（悄悄顶回默认的话，两个动作同键、按下去只有一个会动）',
+    (() => {
+      const r = applyBind({}, 'jump', 'KeyA');
+      return r.rejected === true && r.tookFrom === '左移' && JSON.stringify(r.binds) === '{}';
+    })());
+  ok('AG5b 没被占的键正常绑上；改绑自己已经占着的键不算冲突；换键之后旧键立刻失效',
+    (() => {
+      const a = applyBind({}, 'jump', 'KeyK');
+      const self = applyBind({ left: ['KeyK'] }, 'left', 'KeyK');
+      const moved = applyBind({ fwd: ['KeyG'] }, 'fwd', 'KeyH');
+      return a.rejected === false && a.binds.jump.join() === 'KeyK' && self.rejected === false
+        && !moved.binds.fwd.includes('KeyG') && resolveBinds(moved.binds).fwd.join() === 'KeyH';
+    })());
+  ok('AG5c【反证臂】把 applyBind 换成"直接覆盖不查重"，表上就多出一对抢同一个键的动作（屏上看不出来）',
+    (() => {
+      const pairs = o => {
+        const B = resolveBinds(o), seen = new Map(); let n = 0;
+        for (const k of Object.keys(B)) for (const c of B[k]) {
+          if (seen.has(c) && seen.get(c) !== k) n++; else seen.set(c, k);
+        }
+        return n;
+      };
+      const base = pairs(sanitizeBinds({}));
+      return applyBind({}, 'jump', 'KeyA').rejected === true && base === 1 && pairs({ jump: ['KeyA'] }) === base + 1;
+    })(), '默认表里那 1 对是 KeyC：蹲伏（按住）与阵亡换配装（按放），不会同拍生效');
+  ok('AG6 keyLabel 给得出人话（空格 / 回车 / 左右 Shift 那种，不是把 KeySpace 念给玩家）',
+    keyLabel('Space') === '空格' && keyLabel('Enter') === '回车' && keyLabel('ShiftLeft') === '左Shift'
+    && keyLabel('Digit5') === '5' && bindLabel(DEFAULT_BINDS.sprint) === '左Shift / 右Shift');
+  ok('AG7 bindsOf 三层都兜住（夹具里没有 settings 的场合给 null → 默认表），不是某一层漏了就抛',
+    bindsOf(null) === null && bindsOf({}) === null && bindsOf({ settings: {} }) === null && bindsOf({ settings: { binds: { fwd: ['KeyG'] } } }).fwd.join() === 'KeyG');
+  // 表上每一个动作都必须**有人读**：漏一个的症状就是玩家在设置里改了它，屏幕上什么也不发生
+  // （这正是"那张键位表是静态文字"的反面：静态的可点，但没人接）。
+  const SNAP = bodyOf(MAIN_SRC, /\n {2}snapshotInput\(/) || '';
+  const SETUP = bodyOf(MAIN_SRC, /\n {2}setupInput\(/) || '';
+  const MOVEMENT = ['fwd', 'back', 'left', 'right', 'sprint', 'jump', 'crouch', 'prone', 'leanL', 'leanR', 'reload', 'slot1', 'slot2', 'grenade', 'melee', 'interact', 'nvg'];
+  const SCREEN_KEYS = ['scoreboard', 'chatAll', 'chatTeam', 'classChange'];
+  const unread = BIND_ACTIONS.map(a => a.k).filter(k => ![...MOVEMENT, ...SCREEN_KEYS, 'streak1', 'streak2', 'streak3'].includes(k));
+  const notRead = [
+    ...MOVEMENT.filter(k => !new RegExp('anyHeld\\((K|P), B\\.' + k + '\\)').test(SNAP)),
+    ...SCREEN_KEYS.filter(k => !new RegExp('B\\.' + k + '\\.includes\\(e\\.code\\)').test(SETUP)),
+  ];
+  ok('AG8 表里 24 个动作全有读者：17 个在 snapshotInput、4 个在 setupInput、3 个走 streakSlotOf',
+    notRead.length === 0 && unread.length === 0, `没人读:${notRead.concat(unread).join(',') || '无'}`);
+  ok('AG8b【反证臂】把某一行输入读键代回硬编码 e.code，尺子当场说"这一格没人读了"',
+    (() => {
+      const back = SNAP.replace('reloadPressed: anyHeld(P, B.reload)', 'reloadPressed: P.KeyR');
+      return /reload/.test(SNAP) && !new RegExp('anyHeld\\(P, B\\.reload\\)').test(back);
+    })());
+  ok('AG9 鼠标与滚轮不进这张表（它们不是 KeyboardEvent.code；进了就会出现"设置里能改侧键，改了没人接"）',
+    !BIND_ACTIONS.some(a => a.def.some(c => /Mouse|Wheel/.test(c))) && /firePressed: P\.Mouse0/.test(SNAP));
+  ok('AG10 HUD 槽位那一格跟着绑定走（把 1 号槽改绑 Digit8，屏幕上写的就是 [8]）',
+    (() => {
+      const [h] = mkHud(mkPlayer(), { settings: { binds: { streak1: ['Digit8'] } } });
+      h.streaks([{ id: KILLSTREAKS[0].id, ready: true, cost: 3 }], 3);
+      const html = rec('streaks').html;
+      return html.includes('[8]') && !html.includes('[5]');
+    })(), (rec('streaks').html || '').slice(0, 40));
+  ok('AG11 syncDisplay 把小地图与罗盘两个数一起落地：canvas 位图、this.mmSize、this.cpPxd、刻度 innerHTML 四处同源',
+    (() => {
+      const [h] = mkHud(mkPlayer(), { settings: { mmSize: 180, hudScale: 1.25 } });
+      const canvas = DOM.getElementById('minimap');
+      const strip = rec('compassStrip').html;
+      return h.mmSize === 180 && canvas.width === 180 && canvas.height === 180
+        && Math.abs(h.cpPxd - 5) < 0.001 && strip.includes('left:75px') && !strip.includes('left:60px');
+    })(), '期望 canvas=180·pxd=5·15°=75px');
+  ok('AG11b【反证臂】hud.js 里留一份自己的 mmSize 字面量（不与设置同源）就是当年 K6 抓的那种抄本',
+    !/this\.mmSize = 220;?\s*$/.test(HUD_SRC.replace(/this\.mmSize = MM_SIZE;/g, 'this.mmSize = 220;')));
+  ok('AG12 字幕关掉只停"写进屏幕"那一步，语音播报那条通道不受它管（两个开关各管一件事）',
+    (() => {
+      const spoken = [];
+      const [h, g] = mkHud(mkPlayer(), { settings: { subtitles: false, voice: true } });
+      g.audio.say = (t) => spoken.push(t);
+      h.subtitle('指挥部', '测试字幕');
+      h.subT = 0; h.update(0.001); h.update(0.001);
+      return rec('subtitles').html === '' && spoken.includes('测试字幕');
+    })(), `html=${JSON.stringify(rec('subtitles').html)}`);
+  ok('AG12b 字幕开着时同一拍既写屏幕也念（反方向：AG12 那条不许是"永远不写"）',
+    (() => {
+      const spoken = [];
+      const [h, g] = mkHud(mkPlayer(), { settings: { subtitles: true } });
+      g.audio.say = (t) => spoken.push(t);
+      h.subtitle('指挥部', '另一句');
+      h.subT = 0; h.update(0.001); h.update(0.001);
+      return /另一句/.test(rec('subtitles').html) && spoken.includes('另一句');
+    })(), rec('subtitles').html.slice(0, 30));
+  // 重画 innerHTML 会把旧节点连带它们的监听一起扔掉 —— 这一族在进程内量不到真点击
+  // （那是 hud-keys 的 M4b），但"repaint 之后有没有重新绑"这个形状查得到，而查得到就有用：
+  // 以后谁把 repaintBinds 改回"只写 HTML"，这里当场红，而不是等到浏览器里发现 23 格是死的。
+  const repaintArm = t => {
+    const m = /repaintBinds\(\)\s*\{[\s\S]*?\n  \}/.exec(t);
+    return !!m && /this\.armBinds\(host\)/.test(m[0]);
+  };
+  ok('AG13 重画键位表之后重新绑一次监听（innerHTML 一换，旧节点上那些 click 就跟着没了）', repaintArm(MENU_SRC));
+  ok('AG13b【反证臂】把那一刀从 repaintBinds 里摘掉，同一把尺子当场认出来',
+    !repaintArm(MENU_SRC.replace('this.armBinds(host);', '')));
+}
+
+// ───────────────────────── AH 段：HU-39 暂停屏 + HU-37 设置屏的模板（驱动导出函数）─────────────────────────
+{
+  const MENU = await import('../js/menu.js');
+  const { keyHintLines, pauseKeySummary, pauseActions } = MENU;
+  ok('AH0【先决】三个导出都是函数（切不到本体下面几条就是遍历空集合的恒绿）',
+    [keyHintLines, pauseKeySummary, pauseActions].every(f => typeof f === 'function'));
+  const lines = keyHintLines(null).join(' | ');
+  ok('AH1 主菜单那三行键位提示是从绑定表算出来的（默认表下每个键各自成名，手写的 "WASD" 那种成组字面量没了）',
+    ['W', 'A', 'S', 'D', 'Shift', 'Z', 'Tab', 'F', 'R'].every(t => lines.includes(t)) && /连杀奖励/.test(lines)
+    && !lines.includes('>WASD<'), lines.slice(0, 60));
+  ok('AH2 改了键，那一行跟着改（当年它是静态文字：玩家把前进绑到 G，屏上还写 W —— HU-01 的换皮）',
+    (() => { const back = keyHintLines({ fwd: ['KeyG'] }).join(' '); return back.includes('G') && !/>\s*W\s+</.test(back); })());
+  ok('AH2b【反证臂】把这一行退回手写的 WASD 文案，正向尺子当场认出来',
+    !keyHintLines({ fwd: ['KeyG'] }).join(' ').includes('G'.repeat(0) + 'WASD') && /WASD<\/span>移动/.test('<span class="kbd">WASD</span>移动'));
+  ok('AH3 暂停屏那一小段键位摘要与设置屏同一张表（12 行以内、每行是"键名+动作名"）',
+    (() => { const s = pauseKeySummary(null); return s.includes('<b>W</b>前进') && s.includes('Esc') && (s.match(/<div>/g) || []).length >= 8; })(),
+    (pauseKeySummary(null) || '').slice(0, 46));
+  ok('AH4 暂停屏换了半透的那层底（HU-39：联机的"暂停"是假的，不透明底把比分条、水圈、击杀条全糊掉了）',
+    /showPause\(\)[\s\S]{0,6000}'scrim', 'pause'/.test(MENU_SRC)
+    && /\.screen\.scrim \{[^}]*rgba\(0,0,0,\.42\)/.test(CSS_ONLY)
+    && /\.screen\.solid \{ background: rgba\(6, 8, 9, \.9\)/.test(CSS_ONLY));
+  ok('AH4b 暂停屏右侧那一栏读的是**同一份**数据源（mode.scoreboardHTML / net.netStatusText），不抄第二份比分格式',
+    /mode && mode\.scoreboardHTML \? mode\.scoreboardHTML\(\)/.test(MENU_SRC) && /g\.net\.netStatusText \? g\.net\.netStatusText\(\)/.test(MENU_SRC));
+  ok('AH4c 那一栏自己活着：500ms 一拍，而且**暂停那一支真的在喂这一拍**（paused 时 state 仍是 play，menu.update 不会被调）',
+    /pauseTick\(dt\)\s*\{/.test(MENU_SRC) && /_pauseAcc >= 0\.5/.test(MENU_SRC)
+    && /this\._pauseSig = undefined/.test(MENU_SRC)
+    && /if \(this\.paused\) this\.menu\.pauseTick\(rdt\)/.test(MAIN_SRC));
+  ok('AH4c2【反证臂·跨文件】写了 pauseTick 却没人调 = 那一栏照样冻在按下 Esc 那一刻，同一把尺子当场认出来',
+    !/pauseTick\(rdt\)/.test(MAIN_SRC.replace('this.menu.pauseTick(rdt)', '')));
+  ok('AH4d【反证臂】把进屏时的签名作废那一刀摘掉，就是"右侧那一栏空着"那一族（render 换了节点、门却认为没变）',
+    !/_pauseSig = undefined/.test(MENU_SRC.replace('this._pauseSig = undefined;', '')));
+  ok('AH5 设置屏的行由表出（menu.js 里不再有手写的 min/max/step 那三件套）',
+    !/rng\('fov'|tog\('invertY'|data-q="1"|data-cap="1"/.test(MENU_SRC) && MENU_SRC.includes('SET_GROUPS.map'));
+  ok('AH6 键位恢复默认那一格存在，且走的是同一条落地路径（不是"清掉存档再刷新"那种）',
+    /data-a="breset"/.test(MENU_SRC) && /settings\.binds = \{\}/.test(MENU_SRC) && /commit\('binds'\)/.test(MENU_SRC));
+  ok('AH7 bindsPanel 的按钮带 aria-label（按钮的字面内容只是一个键名，读屏念不出它是什么动作）',
+    /aria-label="\$\{a\.label\}，当前 \$\{cur\}/.test(MENU_SRC) && MENU_SRC.includes('data-bind="${a.k}"'));
+  ok('AH8 捕获态优先于 escBack（否则改键那一秒按 Esc 想取消，却被退出设置屏）',
+    /if \(this\.capturing\) \{ this\.captureKey\(e\); return; \}/.test(MENU_SRC)
+    && MENU_SRC.indexOf('this.capturing') < MENU_SRC.indexOf("e.code === 'Escape' && game.paused"));
+  ok('AH8b【反证臂】把那条优先分支挪到 Esc 之后，顺序尺子当场认出来',
+    (() => { const t = MENU_SRC.replace('if (this.capturing) { this.captureKey(e); return; }', ''); return t.indexOf('this.capturing') > t.indexOf("e.code === 'Escape' && game.paused"); })());
 }
 
 // ───────────────────────── 收口 ─────────────────────────

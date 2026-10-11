@@ -1,11 +1,14 @@
 // HUD 显示
 import * as THREE from 'three';
-import { KILLSTREAKS, streakKeyLabel } from './data.js';
+import { KILLSTREAKS, streakKeyLabel, COMPASS_NAMES } from './data.js';
 import { fmtTime, clamp } from './util.js';
 import { parseChatCommand, toggleMute, chatRowHtml, isImeKey } from './net/chat.mjs';
 import { escHtml } from './escape.js';
 // 弱占领圈半径：小地图上那个虚线圆是它的**唯一**视觉（世界里刻意不画，见 flagMesh）。
 import { DOM_RADIUS_WEAK } from './match-rules.js';
+// HUD 的几何尺子（HU-36/37）：尺寸与每度像素数都从设置那张表取，不在这里抄第二份。
+import { MM_SIZE, COMPASS_PXD, compassPxd } from './settings.mjs';
+import { bindsOf } from './keybinds.mjs';
 
 const $ = id => document.getElementById(id);
 const _v = new THREE.Vector3();
@@ -16,9 +19,9 @@ const _u = new THREE.Vector3();
 // ── HUD 读数的几把尺子，全在本文件顶部（HU-07/09/10/14）──
 // 每一条都是"屏幕上写出来的数"与"代码实际用的数"必须同源的那种：抄第二份迟早会分叉，
 // 而分叉的症状是界面在说谎（见 docs/hud-ux-audit.md 的 HU-01 / HU-38 两节）。
-// MM_SIZE 与 index.html 里 <canvas id="minimap" width="220" height="220"> 是同一个数，
-// 由 test/hud-ux.mjs 的 K6 拿 index.html 对账；改一边就得同时改另一边。
-const MM_SIZE = 220;
+// MM_SIZE 现在住在 js/settings.mjs（HU-37 把它变成可调项，默认值仍是这里对账的那个数），
+// 与 index.html 里 <canvas id="minimap" width="220" height="220"> 由 test/hud-ux.mjs 的 K6 拿
+// 两份源码对账；改一边就得同时改另一边。
 const MM_RADIUS = 45;                 // 小地图显示半径（米）—— #mmLabel 上写的就是它
 const HP_LOW = 0.35;                  // 血量告警口径：条与数字共用同一个阈值
 const DMG_DIR_MAX = 4;                // 伤害方向指示同时最多几条（点射不许弧叠弧）
@@ -29,10 +32,15 @@ export class HUD {
     this.game = game;
     this.el = $('hud');
     this.mm = $('minimap').getContext('2d');
+    // 几何两把尺子的**当前值**（HU-36/37）：默认与 index.html 那两个 canvas 属性同源，
+    // syncDisplay() 是设置改之后唯一会把它们落到 canvas/CSS 上的地方。
+    this.mmSize = MM_SIZE;
+    this.cpPxd = COMPASS_PXD;
     this.hitT = 0; this.flashT = 0; this.flashMax = 1; this.alertT = 0;
     this.dmgDirs = [];
     this.subQueue = []; this.subT = 0;
     this.announceT = 0;
+    this.syncDisplay();
     this.buildCompass();
     // 小地图那一格写的半径 = 绘制用的那个数（HU-09）：#mmLabel 过去是死 DOM，
     // 建 HTML 的人留了格子，JS 从不写，于是地图上永远没有比例尺读数。
@@ -58,14 +66,29 @@ export class HUD {
     });
   }
   show(v) { this.el.classList.toggle('hidden', !v); }
+  // 设置屏那三格（HUD 缩放 / 小地图尺寸）落地的唯一一处（HU-36/37）。
+  // canvas 的**位图**尺寸与 CSS 的那个数必须一起改：只改 CSS 是位图被拉糊，只改位图是
+  // 那一格还是原来的大小；第三个数（drawMinimap 里的 S）由这两个数共用同一个 this.mmSize 保证。
+  syncDisplay() {
+    const s = (this.game && this.game.settings) || {};
+    const size = Math.round(Number.isFinite(s.mmSize) ? s.mmSize : MM_SIZE);
+    if (size !== this.mmSize) {
+      this.mmSize = size;
+      const cv = $('minimap');
+      if (cv) { cv.width = size; cv.height = size; }
+    }
+    const pxd = compassPxd(s);
+    if (pxd !== this.cpPxd) { this.cpPxd = pxd; this.buildCompass(); }
+    return { size, pxd };
+  }
   buildCompass() {
     const strip = $('compassStrip');
-    const names = { 0: '北', 45: '东北', 90: '东', 135: '东南', 180: '南', 225: '西南', 270: '西', 315: '西北' };
+    if (!strip) return;
     let html = '';
     for (let rep = -1; rep <= 1; rep++) {
       for (let a = 0; a < 360; a += 15) {
-        const x = (a + rep * 360) * 4;
-        html += names[a] !== undefined ? `<span style="left:${x}px">${names[a]}</span>` : `<span class="minor" style="left:${x}px">${a}</span>`;
+        const x = (a + rep * 360) * this.cpPxd;
+        html += COMPASS_NAMES[a] !== undefined ? `<span style="left:${x}px">${COMPASS_NAMES[a]}</span>` : `<span class="minor" style="left:${x}px">${a}</span>`;
       }
     }
     strip.innerHTML = html;
@@ -293,7 +316,9 @@ export class HUD {
     if (!list) { el.innerHTML = ''; return; }
     el.innerHTML = list.map((s, i) => {
       const def = KILLSTREAKS.find(k => k.id === s.id);
-      return `<div class="stk ${s.ready ? 'ready' : ''}"><span>${s.ready ? `[${streakKeyLabel(i)}] ` : ''}${def.name}</span><span class="k">${s.ready ? '就绪' : s.cost}</span><span class="ic">${def.icon}</span></div>`;
+      // 槽位上那个键码读的是**这张槽当前绑的键**（HU-37 重绑之后仍与生效的那把一致）：
+      // 判据 B1 量的就是这个闭环 —— 屏幕上写的数字必须能喂回 streakSlotOf 拿回同一个槽。
+      return `<div class="stk ${s.ready ? 'ready' : ''}"><span>${s.ready ? `[${streakKeyLabel(i, bindsOf(this.game))}] ` : ''}${def.name}</span><span class="k">${s.ready ? '就绪' : s.cost}</span><span class="ic">${def.icon}</span></div>`;
     }).join('') + `<div class="stk"><span>连杀</span><span class="k">${kills}</span></div>`;
   }
 
@@ -372,10 +397,19 @@ export class HUD {
     ch.style.display = hideCross ? 'none' : 'block';
     if (w && !hideCross) {
       const spread = ws.currentSpread();
-      const px = 4 + spread * (window.innerHeight / game.camera.fov) * 0.5;
+      const st = game.settings || {};
+      // 臂长与间距读设置的两个数（HU-37），而 style.css 里 #crosshair i 的宽高读的是
+      // 同一份设置写出来的 CSS 变量 —— 两处必须同源，否则"间距"这根滑杆动的是位置、
+      // 臂长那条是另一回事，玩家看到的准星会比他选的窄一截。
+      const gap = Number.isFinite(st.crossGap) ? st.crossGap : 4;
+      const arm = Number.isFinite(st.crossSize) ? st.crossSize : 9;
+      // 角度→像素按**短边**定标（HU-36）：以前只用 innerHeight，于是 21:9 的超宽屏上
+      // 同一把枪的腰射扩散看起来明显更小（同一个角直径摊到更长的边上就是更少的像素）。
+      const ref = Math.min(window.innerWidth || 1080, window.innerHeight || 1080);
+      const px = gap + spread * (ref / game.camera.fov) * 0.5;
       const cs = ch.children;
-      cs[0].style.top = (-px - 9) + 'px'; cs[1].style.top = px + 'px';
-      cs[2].style.left = (-px - 9) + 'px'; cs[3].style.left = px + 'px';
+      cs[0].style.top = (-px - arm) + 'px'; cs[1].style.top = px + 'px';
+      cs[2].style.left = (-px - arm) + 'px'; cs[3].style.left = px + 'px';
     }
     // 瞄准镜
     // pl.alive 的防护与 main.js 里 NVG/thermal 同一条（读取侧兜底）：联机死亡期间
@@ -457,14 +491,19 @@ export class HUD {
       // 几乎从不变的字符串。变了才写。
       if (eq !== this._eqSig) { this._eqSig = eq; $('equipRow').innerHTML = eq; }
     }
-    // 罗盘
+    // 罗盘（HU-36）：窗口中心 = 当前航向。以前这一行是 `left = 230 - deg * 4`，
+    // 230 抄自 style.css 的 460（半宽）、4 是每度像素 —— 窄屏把那条 460 改掉的那一刻，
+    // 这一行就已经在撒谎了。现在 #compassStrip 的原点由 CSS 钉在 left:50%，这里只写
+    // "往回退多少"，每度像素只剩 this.cpPxd 一个数（buildCompass 画的刻度用的也是它）。
     const deg = ((-pl.yaw * 180 / Math.PI) % 360 + 360) % 360;
-    $('compassStrip').style.left = (230 - deg * 4 - 0) + 'px';
-    // 字幕
+    $('compassStrip').style.transform = `translateX(${-deg * this.cpPxd}px)`;
+    // 字幕（HU-37 新增的那个开关）：关掉只停"写进屏幕"那一步。语音播报是另一个开关，
+    // 两条通道各管各的 —— 合成一个的代价是"不想看字"与"不想听念"没法分得开。
+    const subOn = !game.settings || game.settings.subtitles !== false;
     if (this.subT > 0) { this.subT -= dt; if (this.subT <= 0) $('subtitles').innerHTML = ''; }
     if (this.subT <= 0 && this.subQueue.length) {
       const s = this.subQueue.shift();
-      $('subtitles').innerHTML = `<span class="sp">${s.speaker}：</span>${s.text}`;
+      if (subOn) $('subtitles').innerHTML = `<span class="sp">${s.speaker}：</span>${s.text}`;
       this.subT = s.dur;
       game.audio.say(s.text, 1.15, s.speaker.includes('指挥部') ? 0.7 : 0.9);
       if (s.speaker) game.audio.beep(1);
@@ -611,7 +650,7 @@ export class HUD {
 
   drawMinimap() {
     const game = this.game, pl = game.player, world = game.world;
-    const ctx = this.mm, S = MM_SIZE, R = MM_RADIUS; // 显示半径（米），与 #mmLabel 那行同源
+    const ctx = this.mm, S = this.mmSize, R = MM_RADIUS; // 显示半径（米），与 #mmLabel 那行同源
     const scale = S / (R * 2);
     ctx.save();
     ctx.clearRect(0, 0, S, S);

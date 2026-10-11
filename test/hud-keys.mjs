@@ -405,12 +405,32 @@ try {
   // ── K 段：HU-29 重置存档那一层 ──
   await page.evaluate(() => game.menu.showMain()); await sleep(600);
   await page.click('.mbtn[data-a=settings]'); await sleep(700);
-  // 这里走 DOM 的 click() 而不是 page.click：1280×720 下「重置存档」那一格**落在视口外面**
-  // （设置屏比视口高，而这一层没有滚动 —— HU-32 那条"零响应式"的现场，实测读数记在审计里）。
-  // K 段要量的是那一层本身，不是先把视口调大。
-  ok('K0【顺带量到的 HU-32 现场】1280×720 下设置屏最后一行落在视口外（鼠标点不到它，只能滚 —— 而这一屏不滚）',
-    await page.evaluate(() => { const b = document.querySelector('[data-a=resetp]'); if (!b) return false; const r = b.getBoundingClientRect(); return r.bottom > innerHeight || r.top < 0; }),
-    await page.evaluate(() => { const b = document.querySelector('[data-a=resetp]'); return b ? Math.round(b.getBoundingClientRect().bottom) + '/' + innerHeight : '没这一格'; }));
+  // K 段要量的是那一层本身（重置存档的页内弹窗），K0 现在量的是"最后一行够得着吗"。
+  // 原来这一条写的是**症状**（1280×720 下设置屏最后一行落在视口外、鼠标点不到 —— HU-32 的现场，
+  // 读数当时就记在 docs/hud-ux-audit.md 里）。修好之后同一把尺子必须翻方向，否则它就恒绿。
+  const reach = await page.evaluate(() => {
+    const b = document.querySelector('[data-a=resetp]');
+    if (!b) return { ok: false, why: '没这一格' };
+    const r0 = b.getBoundingClientRect();
+    const inView = r0.bottom <= innerHeight && r0.top >= 0;
+    b.scrollIntoView({ block: 'nearest' });
+    const r1 = b.getBoundingClientRect();
+    return { ok: inView || (r1.bottom <= innerHeight && r1.top >= 0), scrolled: !inView,
+      before: Math.round(r0.bottom) + '/' + innerHeight, after: Math.round(r1.bottom) + '/' + innerHeight };
+  });
+  ok('K0【HU-32 翻向】设置屏最后一行（重置存档）在 1280×720 下够得着：要么本来就在视口里，要么这一屏自己能滚到它',
+    reach.ok, `${reach.before} → 滚后 ${reach.after}（${reach.scrolled ? '走了滚动' : '本来就在框内'}）`);
+  ok('K0b【判别臂】把设置屏那层的封顶与滚动临时摘掉，最后一行立刻回到视口外 —— "够得着"靠的是这一修，不是窗口本来就大',
+    await page.evaluate(() => {
+      const st = document.createElement('style');
+      st.textContent = '.settings { max-height: none !important; overflow: visible !important; }';
+      document.head.appendChild(st);
+      const b = document.querySelector('[data-a=resetp]');
+      const r = b.getBoundingClientRect();
+      const out = r.bottom > innerHeight || r.top < 0;
+      st.remove();
+      return out;
+    }));
   await page.evaluate(() => document.querySelector('[data-a=resetp]').click()); await sleep(600);
   const dlgtxt = await page.evaluate(() => { const d = document.querySelector('.picker'); return d ? d.textContent : ''; });
   ok('K1【命门】重置存档走的是页面内那一层，它列得清"会丢哪几样"，浏览器弹窗一次都没被叫过',
@@ -426,6 +446,354 @@ try {
     /^mf-profile-.*\.json$/.test(dlf || '') && !!(await page.evaluate(() => localStorage.getItem('mf_profile'))), String(dlf));
   ok('K2b【反方向】没有"点一下就静默清库 + 刷新整页"那条路了：确认按钮点下去之前，存档读子仍在',
     !!(await page.evaluate(() => localStorage.getItem('mf_profile'))));
+
+  // ══ L 段：P4 适配性 —— 真浏览器量的那一半（HU-32 三档视口 / HU-33 缩放 / HU-34 对比度 / HU-35 目标）══
+  // 进程内那份（test/hud-ux.mjs 的 AC~AH）钉的是单位、令牌、区间与接线；这一段的读数全部来自
+  // 浏览器：getComputedStyle 的色与字号、getBoundingClientRect 的落点。审计里那句
+  // "别靠算，要截图 + 元素 rect"（需真浏览器复验 第 3 条）就是在要这一段。
+  const contrastRows = sels => page.evaluate(ss => {
+    const P = c => { const m = /rgba?\(([^)]+)\)/.exec(c); if (!m) return null; const a = m[1].split(/[,\s/]+/).filter(x => x !== '').map(Number); return { r: a[0], g: a[1], b: a[2], a: a.length > 3 ? a[3] : 1 }; };
+    const LU = c => { const f = v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }; return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b); };
+    const BL = (fg, bk) => ({ r: fg.r * fg.a + bk.r * (1 - fg.a), g: fg.g * fg.a + bk.g * (1 - fg.a), b: fg.b * fg.a + bk.b * (1 - fg.a), a: 1 });
+    const bgOf = el => { const st = []; let e = el; while (e) { const c = P(getComputedStyle(e).backgroundColor); if (c && c.a > 0) st.push(c); e = e.parentElement; } let o = { r: 0, g: 0, b: 0, a: 1 }; for (let i = st.length - 1; i >= 0; i--) o = BL(st[i], o); return o; };
+    const RT = (a, b) => { const l1 = LU(a), l2 = LU(b); return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05); };
+    const rows = [];
+    for (const s of ss) for (const el of document.querySelectorAll(s)) {
+      const cs = getComputedStyle(el); const fg = P(cs.color); if (!fg) continue;
+      const size = parseFloat(cs.fontSize), bold = parseFloat(cs.fontWeight) >= 700;
+      rows.push({ s, ratio: +RT(fg, bgOf(el)).toFixed(2), size, need: (size >= 24 || (size >= 18.66 && bold)) ? 3 : 4.5, text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 12) });
+      if (rows.length >= 80) return rows;
+    }
+    return rows;
+  }, sels);
+  const CT_SEL = ['.menu-title', '.menu-sub', '.mbtn .mt', '.mbtn .md', '.menu-foot', '.menu-keys', '.menu-ver',
+    '.hdr', '.hdr small', '.set-row span', '.set-row .val', '.set-sec', '.set-note', '.bind-row span', '.bind-key', '.bind-hint', '.btn'];
+
+  await page.evaluate(() => game.menu.showSettings('main')); await sleep(500);
+  const crows = await contrastRows(CT_SEL);
+  const cworst = crows.slice().sort((a, b) => a.ratio - b.ratio)[0] || { s: '没读到', ratio: 99 };
+  ok('L0【量具自证】这一屏读得到足够多的文字格（少于 10 格就是名单没落到 DOM 上，下面的比值全不可信）',
+    crows.length >= 10, `${crows.length} 格`);
+  ok('L1 设置屏每一格文字的对比度都过 WCAG AA（小字 4.5:1、大字 3:1）—— HU-34 要的就是这个读数，不是源码里有几个 var()',
+    crows.every(r => r.ratio >= r.need), `最低 ${cworst.ratio}:1 @ ${cworst.s} "${cworst.text}" (${cworst.size}px)`);
+  // 判别臂走的是**同一个函数**：往那一屏挂一个 #666 的小字，再让 contrastRows 去读它。
+  // 另抄一份算法的臂只能证明"我抄的这份会算"，同一把尺子才证明这格没过是因为它真的没过。
+  const probeHost = await page.evaluate(() => {
+    const host = document.querySelector('.settings'); if (!host) return false;
+    const d = document.createElement('div');
+    d.className = 'probe-lowcontrast';
+    d.style.cssText = 'color:#666;font-size:12px'; d.textContent = 'probe';
+    host.appendChild(d); return true;
+  });
+  const prow = (await contrastRows(['.probe-lowcontrast']))[0] || null;
+  await page.evaluate(() => { const d = document.querySelector('.probe-lowcontrast'); if (d) d.remove(); });
+  ok('L1b【判别臂·同一把尺子】现场造一个当年那档 #666 的小字，contrastRows 必须判它不达标（≥4.5 的那条线拦得住它）',
+    probeHost && !!prow && prow.ratio < prow.need, prow ? `${prow.ratio}:1 < 需要 ${prow.need}:1` : '探针没挂上去 / 没读到');
+
+  // HU-33：浏览器"字号"设置要跟随 —— 把根字号改成 150%，量computed 有没有真的长
+  const scaleTest = await page.evaluate(() => {
+    const el = document.querySelector('.set-row span');
+    const b = parseFloat(getComputedStyle(el).fontSize);
+    document.documentElement.style.fontSize = '150%';
+    const a = parseFloat(getComputedStyle(el).fontSize);
+    document.documentElement.style.fontSize = '';
+    return { b: +b.toFixed(2), a: +(a / b).toFixed(3) };
+  });
+  ok('L2 根字号 ×1.5 ⇒ 菜单文字的计算字号真的 ×1.5（HU-33：以前全是 px，浏览器放大字号一步都不跟）',
+    Math.abs(scaleTest.a - 1.5) < 0.02, `${scaleTest.b}px → ${scaleTest.a}×`);
+  const hudScaleTest = await page.evaluate(() => {
+    const el = document.getElementById('hpNum');
+    const b = parseFloat(getComputedStyle(el).fontSize);
+    document.documentElement.style.setProperty('--hud-scale', '1.25');
+    const a = parseFloat(getComputedStyle(el).fontSize);
+    document.documentElement.style.setProperty('--hud-scale', '1');
+    return { b: +b.toFixed(2), a: +(a / b).toFixed(3) };
+  });
+  ok('L3 HUD 缩放那一格落在 HUD 字号上（--hud-scale ×1.25 ⇒ #hpNum 的 computed 字号 ×1.25），且不牵连菜单（与 L2 两条轴分开）',
+    Math.abs(hudScaleTest.a - 1.25) < 0.02, `${hudScaleTest.b}px → ${hudScaleTest.a}×`);
+
+  // HU-35：点击目标尺寸。1024×768 是这一族最紧的一档。
+  await page.setViewportSize({ width: 1024, height: 768 }); await sleep(300);
+  const taps = await page.evaluate(() => {
+    const out = [];
+    for (const s of ['.seg div', '.btn.small', '.bind-key', '.mbtn', '.set-row input[type=range]']) {
+      for (const el of document.querySelectorAll(s)) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) continue;
+        out.push({ s, h: Math.round(r.height), w: Math.round(r.width) });
+        if (out.filter(x => x.s === s).length >= 6) break;
+      }
+    }
+    return out;
+  });
+  const tooSmall = taps.filter(t => t.h < 32);
+  ok('L4 1024×768 下每个可点目标的高度都 ≥32px（HU-35：房间设置那 6 档原来挤在 ~30px 里，触屏按不准）',
+    taps.length >= 12 && tooSmall.length === 0, `读了 ${taps.length} 个·最矮 ${Math.min(...taps.map(t => t.h))}px${tooSmall.length ? ' 超标:' + tooSmall.map(t => t.s + '=' + t.h).join(',') : ''}`);
+
+  // HU-32：三档视口逐屏扫一遍 —— 横向不许出视口，纵向每一个可点元素都够得着。
+  const sweep = async (w, h) => {
+    await page.setViewportSize({ width: w, height: h }); await sleep(250);
+    const screens = [];
+    const visit = async (name, act) => {
+      await act(); await sleep(420);
+      const r = await page.evaluate(() => {
+        const PICK = '.mbtn,.btn,.pick,.cls,.slotc,.gs-att,.gs-slot,.mode,.mapc,.diff,.seg div,.camo,.bind-key';
+        const bad = [];
+        for (const el of document.querySelectorAll(PICK)) {
+          const a = el.getBoundingClientRect();
+          if (a.width < 1 || a.height < 1) continue;
+          if (a.right > innerWidth + 2 || a.left < -2) { bad.push({ why: '横向出界', cls: el.className, x: Math.round(a.left) + '..' + Math.round(a.right) }); continue; }
+          el.scrollIntoView({ block: 'nearest' });
+          const b = el.getBoundingClientRect();
+          if (b.bottom > innerHeight + 2 || b.top < -2) bad.push({ why: '滚也到不了', cls: el.className, y: Math.round(b.top) + '..' + Math.round(b.bottom) });
+        }
+        const host = document.scrollingElement || document.documentElement;
+        return { bad, overflowX: Math.max(host.scrollWidth, document.body.scrollWidth) - innerWidth };
+      });
+      screens.push({ name, bad: r.bad, overflowX: r.overflowX });
+    };
+    await visit('main', () => page.evaluate(() => game.menu.showMain()));
+    await visit('settings', () => page.evaluate(() => game.menu.showSettings('main')));
+    await visit('lobby', () => page.evaluate(() => game.menu.showLobby()));
+    await visit('loadout', () => page.evaluate(() => game.menu.showLoadouts('main')));
+    // 枪匠是"进那一屏之后再点一层"才出现的，所以 act 自己等：420ms 的那一刀量到的是
+    // 配装屏，等于把 loadout 扫了两遍、枪匠那一屏根本没进（HU-32 点名的重叠恰恰在它身上）。
+    await visit('gunsmith', async () => {
+      await page.evaluate(() => game.menu.showLoadouts('main')); await sleep(350);
+      await page.evaluate(() => { const g = document.querySelector('[data-g=primary]'); if (g) g.click(); });
+      await sleep(800);
+    });
+    return screens;
+  };
+  for (const [w, h] of [[1024, 768], [1280, 720], [2560, 1080]]) {
+    const sc = await sweep(w, h);
+    const flat = sc.flatMap(s => s.bad.map(b => s.name + ':' + b.why + ' ' + b.cls));
+    ok(`L5 ${w}×${h}：五屏里每一个可点元素都在视口内或滚得到，且没有横向溢出（HU-32 点名却没量过的两档，现在各量一次）`,
+      flat.length === 0 && sc.every(s => s.overflowX <= 2), `${flat.slice(0, 3).join(' ⏐ ')} 溢出X=${Math.max(...sc.map(s => s.overflowX))}`);
+  }
+  // HU-32 的枪匠那一族：窄窗下中列与数值板重叠（审计原话）。量 rect，不靠算。
+  await page.setViewportSize({ width: 1024, height: 768 }); await sleep(250);
+  await page.evaluate(() => { game.menu.showLoadouts('main'); }); await sleep(300);
+  await page.evaluate(() => { const g = document.querySelector('[data-g=primary]'); if (g) g.click(); }); await sleep(900);
+  const gsOver = await page.evaluate(() => {
+    const R = s => { const el = document.querySelector(s); if (!el) return null; const r = el.getBoundingClientRect(); return { l: r.left, t: r.top, r: r.right, b: r.bottom, w: r.width, h: r.height }; };
+    const hit = (a, b) => a && b && a.l < b.r - 1 && b.l < a.r - 1 && a.t < b.b - 1 && b.t < a.b - 1;
+    const L = R('.gs-left'), Rt = R('.gs-right'), St = R('.gs-stats'), T = R('.gs-title');
+    return [['左列×数值板', hit(L, St)], ['右列×数值板', hit(Rt, St)], ['标题×右列', hit(T, Rt), T && Rt ? Math.round(T.r) + ' vs ' + Math.round(Rt.l) : '']];
+  });
+  ok('L6 1024×768 的枪匠：中列、右列、数值板三块互不压（窄窗下重叠是 HU-32 里点名的原状）',
+    gsOver.every(x => x[1] === false), gsOver.map(x => x[0] + '=' + (x[1] ? '重叠' : '不碰') + (x[2] ? '(' + x[2] + ')' : '')).join(' '));
+  // HU-36 反向那一半（超宽屏上瞄具遮罩必须是**圆**）挪到 M9 之后的对局内去量：
+  // #scope 住在 #hud 里，而菜单态下 #hud 整块是 display:none（getBoundingClientRect 全 0），
+  // 在这一屏量到的是"量具没接上"，不是"遮罩不圆"。
+
+  // ══ L8： HU-32 的"看得见却点不到"那一族 ══
+  // 倒推自 npm run test:all 里 net-drop 那一条红：`.lb-rooms` 写成 `flex:1`（允许被压到内容以下）之后，
+  // 那一栏被压到 38px 高而它自己的内容是 150px，溢出的房间行画在下一块**有不透明底色**的面板底下 ——
+  // querySelector 找得到、`scrollIntoView` 之后 rect 也在框内，`click()` 却一直点不到。
+  // 所以这一族不能只量 rect，还得问浏览器"那个坐标上的顶层元素是谁"。
+  // 装数据源 → 真渲染器 → 量 rect 与落点，**全部在同一拍里做完**。
+  // 分成两次 evaluate 的上一版量到 n=0：那一屏在两次 evaluate 之间被大厅自己的推送重画过一次
+  // （真那份房间表是空的），于是两条判据都"因为没有行"而失配。同一拍做完，量具与被测对象之间就没有这道缝。
+  const lobbyProbe = oldCss => {
+    if (oldCss) { window.__lbSt = document.createElement('style'); window.__lbSt.textContent = oldCss; document.head.appendChild(window.__lbSt); }
+    game.menu.showOnlineLobby();
+    // 夹具写的是**这一屏自己读的那本账**（game.lobby 在 H/I 段之后是活的客户端，不是 null），
+    // 所以量完必须原样还回去：留在里面的一份假房间表会让后面那一屏之后每一次推送都在说谎。
+    const keep = { has: !!game.lobby, connected: game.lobby && game.lobby.connected, lost: game.lobby && game.lobby.lost,
+      online: game.lobby && game.lobby.online, rooms: game.lobby && game.lobby.rooms };
+    game.lobby = Object.assign(game.lobby || {}, { connected: true, lost: false, online: 3, rooms: [
+      { id: 'probe-a', title: '甲房', map: 'dune', mode: 'tdm', time: 10, players: 3, max: 16, state: 'waiting', ready: 1 },
+      { id: 'probe-b', title: '乙房', map: 'frost', mode: 'tdm', time: 10, players: 16, max: 16, state: 'waiting', ready: 0 }] });
+    game.menu.renderRooms();
+    const bad = [];
+    for (const el of document.querySelectorAll('#lbRows .room-row, #lbRows [data-a=joinRow]')) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) { bad.push({ why: '零尺寸', cls: String(el.className) }); continue; }
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (hit === el || (hit && (el.contains(hit) || hit.contains(el)))) continue;
+      bad.push({ why: '被盖住', cls: String(el.className).slice(0, 16),
+        by: hit ? hit.tagName + '.' + String(hit.className).slice(0, 20) + (hit.dataset && hit.dataset.a ? '[a=' + hit.dataset.a + ']' : '') : 'null' });
+    }
+    const pnl = document.querySelector('.lb-rooms');
+    const out = { n: document.querySelectorAll('#lbRows .room-row').length,
+      btn: document.querySelectorAll('#lbRows [data-a=joinRow]').length, bad,
+      panel: pnl ? { h: Math.round(pnl.getBoundingClientRect().height), sh: pnl.scrollHeight } : null };
+    if (window.__lbSt) { window.__lbSt.remove(); window.__lbSt = null; }
+    if (keep.has) Object.assign(game.lobby, { connected: keep.connected, lost: keep.lost, online: keep.online, rooms: keep.rooms });
+    return out;
+  };
+  // L8 的夹具是两份房间（一份进得去、一份满员），走的是真那一份渲染器（renderRooms 读的就是
+  // game.lobby.rooms —— 服务端推来的那本账），不是手搓两行 HTML 假装是那一屏。
+  const lr = await page.evaluate(lobbyProbe);
+  ok('L8 大厅那两张房卡在 1280×720 下每一格都点得到：那一栏没被压到内容以下、每格的落点就是它自己（HU-32 这一族的病根是"被后面的面板压在底下"）',
+    lr.n === 2 && lr.btn === 2 && lr.bad.length === 0 && !!lr.panel && lr.panel.h + 2 >= lr.panel.sh, JSON.stringify(lr));
+  const lrOld = await page.evaluate(lobbyProbe, '.lb-rooms { flex: 1 1 0 !important; min-height: 0 !important; }');
+  ok('L8b【判别臂·同一把尺子】把 `.lb-rooms` 的 flex-shrink 放开（就是 net-drop 那一红当时的写法），同一把尺子当场认出被压住的那几格',
+    lrOld.bad.length > 0 && !!lrOld.panel && lrOld.panel.h < lrOld.panel.sh - 2, JSON.stringify(lrOld));
+
+  // ══ M 段：HU-37 设置与重绑，在浏览器里真生效 ══
+  await page.setViewportSize({ width: 1280, height: 720 }); await sleep(250);
+  await page.evaluate(() => game.menu.showSettings('main')); await sleep(500);
+  const setRows = await page.evaluate(() => {
+    const ks = [...document.querySelectorAll('[data-k]')].map(e => e.dataset.k);
+    return { n: ks.length, has: ['hudScale', 'hudOpacity', 'mmSize', 'crossColor', 'crossSize', 'crossGap', 'subtitles', 'volSfx', 'volAmbient', 'volVoice', 'mouseAccel'].every(k => ks.includes(k)), binds: document.querySelectorAll('.bind-key').length };
+  });
+  ok('M1 设置屏真的长出了那一批新格（P4 新增 11 项都在），键位那一格里有 ' + setRows.binds + ' 枚按钮',
+    setRows.n >= 16 && setRows.has && setRows.binds >= 20, `[data-k]=${setRows.n}·bind=${setRows.binds}`);
+  const mm = await page.evaluate(() => {
+    const inp = document.querySelector('input[data-k=mmSize]');
+    inp.value = '160'; inp.dispatchEvent(new Event('input', { bubbles: true }));
+    const cv = document.getElementById('minimap');
+    return { css: getComputedStyle(document.documentElement).getPropertyValue('--mm-size').trim(), attr: cv.width, live: game.hud.mmSize, stored: JSON.parse(localStorage.getItem('mf_settings')).mmSize };
+  });
+  ok('M2 拖「小地图尺寸」那一格：CSS 变量、<canvas> 位图、绘制用的那个数、存档 —— 四处一起动（漏一处就是"滑杆动了屏幕不动"）',
+    mm.css === '160px' && mm.attr === 160 && mm.live === 160 && mm.stored === 160, JSON.stringify(mm));
+  const cc = await page.evaluate(() => {
+    const seg = document.querySelector('.seg[data-k=crossColor]');
+    const q = [...seg.querySelectorAll('div')].find(d => d.dataset.v === '青');
+    q.click();
+    const arm = document.querySelector('#crosshair i');
+    return { css: getComputedStyle(document.documentElement).getPropertyValue('--cross-col').trim(), arm: getComputedStyle(arm).backgroundColor };
+  });
+  ok('M3 准星颜色：CSS 变量与那四根臂的实际底色同时改色（屏上选的颜色 = 屏幕上打出来的颜色，HU-01 那一族的闭环）',
+    cc.css.toLowerCase() === '#4fe3ff' && cc.arm === 'rgb(79, 227, 255)', JSON.stringify(cc));
+  await page.evaluate(() => { document.querySelector('.bind-key[data-bind=fwd]').click(); }); await sleep(220);
+  await page.keyboard.press('KeyG'); await sleep(320);
+  const rb = await page.evaluate(() => {
+    const cell = document.querySelector('.bind-key[data-bind=fwd]');
+    game.input.keys = { KeyG: true }; const fwdG = game.snapshotInput().fwd;
+    game.input.keys = { KeyW: true }; const fwdW = game.snapshotInput().fwd;
+    game.input.keys = {};
+    return { text: (cell.textContent || '').trim(), stored: JSON.parse(localStorage.getItem('mf_settings')).binds, fwdG, fwdW, live: game.binds().fwd.join() };
+  });
+  ok('M4 真重绑闭环：点那一格、按 G ⇒ 格上写 G、存档里存着、喂 G 真的前进、喂 W 不再前进（"表是静态文字"就是这一条的反面）',
+    rb.text === 'G' && rb.live === 'KeyG' && rb.fwdG === true && rb.fwdW === false
+    && rb.stored && rb.stored.fwd && rb.stored.fwd.join() === 'KeyG', JSON.stringify(rb));
+  // 重画之后那一格还点得动吗：repaintBinds() 换掉的是 .binds 那块的 innerHTML，新节点上
+  // 必须重新绑一次监听。少了那一刀的症状是"第一个键绑上了，后面 23 格全是死的"，
+  // 而下面 M5/M6 会因为捕获态根本没进去而一起红 —— 所以这一条单独立着，让失败说出自己的名字。
+  const armed = await page.evaluate(() => {
+    const c = document.querySelector('.bind-key[data-bind=jump]');
+    if (!c) return { found: false, cap: '' };
+    c.click();
+    return { found: true, cap: game.menu.capturing };
+  });
+  ok('M4b【命门·重画之后那一格还是活的】绑完一个键再点下一格，真的进捕获态（repaint 换掉的 innerHTML 必须重新绑监听）',
+    armed.found && armed.cap === 'jump', JSON.stringify(armed));
+  await page.evaluate(() => { document.querySelector('.bind-key[data-bind=jump]').click(); }); await sleep(200);
+  await page.keyboard.press('KeyG'); await sleep(300);
+  const clash = await page.evaluate(() => ({
+    msg: (document.querySelector('.bind-msg') || {}).textContent || '',
+    jump: game.binds().jump.join(), fwd: game.binds().fwd.join(),
+  }));
+  ok('M5 一个键不给两个动作：把跳跃也绑到 G 会被拒，并说出是「前进」占着（悄悄让两个动作同键的症状是按下只有一个动）',
+    /前进/.test(clash.msg) && clash.jump === 'Space' && clash.fwd === 'KeyG', JSON.stringify(clash));
+  await page.evaluate(() => { document.querySelector('.bind-key[data-bind=reload]').click(); }); await sleep(200);
+  await page.keyboard.press('Escape'); await sleep(300);
+  const cap = await page.evaluate(() => ({
+    screen: game.menu.screen, cap: game.menu.capturing, reload: game.binds().reload.join(),
+    cell: (document.querySelector('.bind-key[data-bind=reload]') || {}).textContent || '',
+  }));
+  ok('M6 捕获态里的 Esc 是"取消这一次"，不是"退出这一屏"（当年那条路会把人一脚踹出设置屏，而玩家以为自己已经取消了）',
+    cap.screen === 'settings' && !cap.cap && cap.reload === 'KeyR' && cap.cell.trim() === 'R', JSON.stringify(cap));
+  await page.evaluate(() => { document.querySelector('[data-a=breset]').click(); }); await sleep(300);
+  const rst = await page.evaluate(() => ({
+    binds: JSON.parse(localStorage.getItem('mf_settings')).binds || {}, fwd: game.binds().fwd.join(),
+    cell: (document.querySelector('.bind-key[data-bind=fwd]') || {}).textContent || '',
+  }));
+  ok('M7 「键位恢复默认」把表清回去、输入层立刻按默认读（不是只清了屏上的字）',
+    JSON.stringify(rst.binds) === '{}' && rst.fwd === 'KeyW' && rst.cell.trim() === 'W', JSON.stringify(rst));
+  const ariaN = await page.evaluate(() => ({
+    live: ['killfeed', 'subtitles', 'objective', 'announce', 'chatLog', 'netStat', 'teamAlive', 'prompt']
+      .filter(id => { const e = document.getElementById(id); return e && (e.getAttribute('aria-live') || e.getAttribute('role') === 'alert'); }).length,
+    roleBtn: document.querySelectorAll('#menu [role=button]').length,
+    alert: !!document.querySelector('[role=alert]'),
+  }));
+  ok('M8 动态区都有 aria-live/role=alert（对局里那些只写在屏幕上的事，读屏用户现在收得到）',
+    ariaN.live >= 8 && ariaN.alert, `live=${ariaN.live}/8·alert=${ariaN.alert}`);
+  ok('M8b 可达性树里这些格子真的有名有姓：按角色 + 名字找得到（量的就是"读得到名字"，不是源码里有几个 aria-）',
+    (await page.getByRole('button', { name: /前进，当前/ }).count()) >= 1
+    && (await page.getByRole('button', { name: '开' }).count()) >= 1,
+    `前进那格=${await page.getByRole('button', { name: /前进，当前/ }).count()}·开关那批=${await page.getByRole('button', { name: '开' }).count()}`);
+
+  // HU-39：暂停屏 —— 要真进一局才量得到（联机暂停是假的这一条本来就只有对局里才成立）。
+  // 进局走的是 E 段同一把钥匙（game.startGame），不靠大厅那个按钮：那一格能不能点
+  // 是 H/I 段的事，这里要的是"确实有一个在跑的对局可以按暂停"。
+  await page.evaluate(() => { game.exitToMenu(); }); await sleep(600);
+  await page.evaluate(() => { game.menu.showMain(); game.startGame('mp',
+    { mode: 'tdm', map: 'dune', diff: 1, allies: 3, enemies: 3, scoreLimit: 200, timeLimit: 5 }); });
+  const inPlay = await wait(() => game.state === 'play' && !game.paused, 60000);
+  ok('M9【先决】单机那一局开起来了（下面几条量的是对局内的屏，开不起来就必须红）', inPlay, `state=${await page.evaluate(() => game.state)}`);
+  if (inPlay) {
+    // HU-36 超宽那一档：**在真对局里**量（#scope 住在 #hud 内，菜单态整块 display:none，
+    // 在那里量到的是 0×0 —— 量具没接上，不是遮罩不圆）。
+    await page.setViewportSize({ width: 2560, height: 1080 }); await sleep(400);
+    const scopeShape = await page.evaluate(() => {
+      const sc = document.getElementById('scope');
+      const old = sc.className;
+      sc.classList.remove('hidden'); sc.className = 'sniper';
+      const hole = document.querySelector('.scope-hole'); const r = hole.getBoundingClientRect();
+      const cs = getComputedStyle(hole);
+      // border-radius 写的是 50%，computed 也就原样回 '50%' —— 直接 parseFloat 得到 50，
+      // 与"半径 = 边长一半"那条尺对不上（量具读错了量，不是遮罩不圆）。换算成像素再比。
+      const br = cs.borderTopLeftRadius, pc = /^([\d.]+)%$/.exec(br);
+      const radius = pc ? parseFloat(pc[1]) / 100 * r.width : parseFloat(br);
+      sc.className = old;
+      return { hudShown: !document.getElementById('hud').classList.contains('hidden'),
+        w: Math.round(r.width), h: Math.round(r.height), ar: +(r.width / r.height).toFixed(3),
+        radius: Math.round(radius), centeredX: Math.round(r.left + r.width / 2),
+        centeredY: Math.round(r.top + r.height / 2) };
+    });
+    ok('L7 2560×1080 的对局里瞄具遮罩仍是正圆，且圆心就是屏幕中心（vmin 定径；当年 88vh ⇒ 圆孔按 1080 高定，2560 宽里左右各露出一大片）',
+      scopeShape.hudShown && Math.abs(scopeShape.ar - 1) < 0.02
+      && Math.abs(scopeShape.radius - scopeShape.w / 2) < 2
+      && Math.abs(scopeShape.centeredX - 1280) < 3 && Math.abs(scopeShape.centeredY - 540) < 3,
+      `${scopeShape.w}×${scopeShape.h} aspect=${scopeShape.ar}·圆角=${scopeShape.radius}·圆心=(${scopeShape.centeredX},${scopeShape.centeredY})`);
+    await page.setViewportSize({ width: 1280, height: 720 }); await sleep(400);
+    await page.evaluate(() => game.pause(true)); await sleep(700);
+    const pz = await page.evaluate(() => {
+      const sc = document.querySelector('.screen.scrim');
+      const board = document.getElementById('pauseBoard');
+      return {
+        scrim: !!sc,
+        bg: sc ? getComputedStyle(sc).background.slice(0, 40) : '',
+        rows: board ? board.querySelectorAll('tr').length : 0,
+        hasBoard: !!board && board.textContent.length > 4,
+        keys: !!document.querySelector('.pause-keys'), vol: !!document.querySelector('[data-pv]'),
+      };
+    });
+    ok('M10 暂停屏的底是半透的（战场透得出来 —— 联机那一局服务端照跑，糊掉屏幕不等于停下）',
+      pz.scrim && /rgba?\(/.test(pz.bg), pz.bg);
+    ok('M10b 暂停屏右侧那一栏有真榜单可读（同一份 scoreboardHTML，不抄第二份格式）',
+      pz.hasBoard && pz.rows >= 1 && pz.keys && pz.vol, `行数=${pz.rows}·键位=${pz.keys}·音量=${pz.vol}`);
+    const sig0 = await page.evaluate(() => {
+      window.__pp = 0;
+      const o = game.menu.paintPauseBoard.bind(game.menu);
+      game.menu.paintPauseBoard = () => { window.__pp++; o(); };
+      return (document.getElementById('pauseBoard') || {}).innerHTML || '';
+    });
+    // 改的是被测对象自己读的那本账（scoreboardHTML 的队名那一串就是 Math.floor(scores.A)）。
+    // 明确写 A 而不是 Object.keys(...)[0]：那一局刚开局时 B 可能还没有记过账，
+    // 取到空 key 就改成"数据没变"，与"界面不刷"在同一把尺下长得一样。
+    await page.evaluate(() => { const m = game.mode; if (m && m.scores) m.scores.A = (m.scores.A || 0) + 7; });
+    // 轮询而不是死等 1.3 秒：那一拍的进料是**渲染帧的 dt**，而暂停屏带着 backdrop-filter，
+    // 在 swiftshader 下每帧 200~400ms，raw 又被 min(0.25, delta) 截掉一截 —— 实测 1.3 秒墙钟
+    // 只攒到 0.258，那 0.5 的闸门当然还没开。等的是"它到底重画没有"，不是"给我固定多久"。
+    await page.evaluate(w => { window.__sig0 = w; }, sig0);
+    const repainted = await wait(() => (document.getElementById('pauseBoard') || {}).innerHTML !== window.__sig0, 12000, 250);
+    const sig1 = await page.evaluate(() => (document.getElementById('pauseBoard') || {}).innerHTML || '');
+    // 红了要一眼看出断在哪一环：pp=节拍根本没来 / acc 不涨=那一支没被喂 / scr 不是 pause=屏早换了。
+    const diag = await page.evaluate(() => ({
+      pp: window.__pp, acc: +(game.menu._pauseAcc || 0).toFixed(3), scr: game.menu.screen,
+      paused: game.paused, state: game.state, A: game.mode && game.mode.scores && game.mode.scores.A,
+      sig: (game.menu._pauseSig || '').length,
+    }));
+    ok('M10c 挂着不动它自己也活着：改了榜单的输入，那一栏真的重画，而且画它的是那一拍（不是按下 Esc 那一刻的快照）',
+      repainted && sig1 !== sig0 && sig1.length > 4 && diag.pp >= 1,
+      `${sig0.length}→${sig1.length} 字节·那一拍跑了 ${diag.pp} 次 ` + JSON.stringify(diag));
+    await page.evaluate(() => game.pause(false)); await sleep(300);
+  }
 
   ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 2).join(' ⏐ '));
   await ctx.close(); srv.kill();

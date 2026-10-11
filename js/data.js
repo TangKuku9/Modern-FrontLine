@@ -258,19 +258,15 @@ export const KILLSTREAKS = [
 ];
 
 // 连杀槽位的键位：**实际绑定与屏幕上写的键码共用这一份**（HU-01）。
-// 以前是三处各写各的字面量 —— 播报拼 `i + 3`（js/mp.js、js/net/client.mjs）、槽位自绘拼
-// `i + 5`（js/hud.js）、真键是 Digit5/6/7（js/main.js 的 snapshotInput）。漂移不报错也不崩，
-// 症状是玩家照提示按键、叫出来的是别的连杀（按 4 还会切出投掷物）。
-// 4 让给了 CS 制投掷物，所以连杀从 5 起 —— 这条理由只在这里记一次。
-export const STREAK_KEYS = ['Digit5', 'Digit6', 'Digit7'];
-export const STREAK_KEY_LABELS = STREAK_KEYS.map(k => k.replace(/^Digit/, ''));
-export const streakKeyLabel = i => STREAK_KEY_LABELS[i] || '';
-// 按下的是哪个连杀槽（-1 = 没按）。绑定做成函数是为了让判据能直接喂一份按键表进来量，
-// 而不必去 grep 某个调用点的写法。
-export const streakSlotOf = pressed => {
-  for (let i = 0; i < STREAK_KEYS.length; i++) if (pressed && pressed[STREAK_KEYS[i]]) return i;
-  return -1;
-};
+// 这张表从 HU-37 起住在 js/keybinds.mjs（那里是"哪个物理键干什么"的唯一一份，现在还能重绑），
+// 这里把老名字原样转出去：五个读取点与判据都不必改 import 路径，而实现只有一份。
+// 4 让给了 CS 制投掷物，所以连杀从 5 起 —— 这条理由记在 keybinds.mjs 的表注释里。
+export { STREAK_KEYS, STREAK_KEY_LABELS, streakKeyLabel, streakKeyLabels, streakSlotOf } from './keybinds.mjs';
+
+// 罗盘的八方位名（HU-36）：以前是 js/hud.js 的 buildCompass 里一个局部字面量，于是
+// "换语言"在这一格没有落点 —— 剩下那些 15° 的刻度本来就不带名字，能改的只有这八个字。
+// 放在这里与 BOT_SKILL_NAMES 那种显示名表同一层：JS 画罗盘、判据核对，都查这一张表。
+export const COMPASS_NAMES = { 0: '北', 45: '东北', 90: '东', 135: '东南', 180: '南', 225: '西南', 270: '西', 315: '西北' };
 // 连杀呼叫失败的回执（HU-12）。四条失败路都从这里取话：单机按了没就绪的槽、联机按了没就绪的槽、
 // 权威端拒收集束落点、权威端拿不到槽。各写一份的症状是"同一种失败在两种模式下有两种说法"
 // （与 HU-38 同族）。以前这四条**一句都不说**，玩家只会反复按同一个键。

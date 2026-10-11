@@ -1,7 +1,7 @@
 // 菜单系统：主菜单、战役简报、多人大厅、配装、枪匠、设置、暂停、结算
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, STREAK_KEY_LABELS, MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, DOM_SCORES, DOM_MINUTES, MP_TEAM_SIZES, scoreOptions, minutesOptions, DEFAULT_MINUTES, mapAllowed, mapsForMode, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
+import { WEAPONS, PRIMARY_ORDER, SECONDARY_ORDER, SLOT_NAMES, ATTACHMENTS, CAMOS, computeStats, statBars, PERKS, LETHALS, TACTICALS, KILLSTREAKS, MP_MAPS, MP_MODES, MP_MINUTES, MP_SCORES, DOM_SCORES, DOM_MINUTES, MP_TEAM_SIZES, scoreOptions, minutesOptions, DEFAULT_MINUTES, mapAllowed, mapsForMode, BOT_SKILLS, BOT_SKILL_NAMES, attachmentAllowed, findAttachment } from './data.js';
 // DEFAULT_SCORE_LIMIT：切模式时旧的目标偏好不在新模式的档位表里，就落回那个模式的默认。
 // 默认只此一份（规则内核的家），界面不要自己再写一个 200/50。
 import { DEFAULT_SCORE_LIMIT } from './match-rules.js';
@@ -14,6 +14,10 @@ import { escHtml } from './escape.js';
 // 等级按两半之和算，档案卡那一行文案也在那儿）。在存档卡、结算面板、房间座位栏里
 // 各画一份的话，换算法就要改三处，而漏掉那处只会显示出一个偏低的等级，没人会报错。
 import { levelOf, totalXp, xpText, applyAccountXp } from './progress.mjs';
+// 设置那一屏从这张表长出来（HU-37）：行的种类、区间、默认值、格式化都在 js/settings.mjs，
+// 键位表与"点了没生效"的落地都在 js/keybinds.mjs + main.js 的 applySettings()。
+import { SET_SPEC, SET_GROUPS, formatValue, CROSS_COLORS } from './settings.mjs';
+import { BIND_ACTIONS, bindAction, resolveBinds, bindLabel, applyBind, keyLabel, isBindableCode, streakKeyLabels } from './keybinds.mjs';
 
 const DIFF_NAMES = ['新兵', '正规军', '老兵'];
 const MAX_ATT = 5;
@@ -144,6 +148,30 @@ export function pauseActions({ camp, online }) {
   };
 }
 
+// 主菜单右下角那三行键位提示（HU-37）。以前它是手写的三段中文，写着"WASD 移动"、
+// 而玩家把前进改到 G 之后它还在写 W —— 与 HU-01 同一族（一份键位事实的两份抄本，
+// 症状是界面在说一件没在发生的事）。现在每一格都从 js/keybinds.mjs 那张表算出来。
+export function keyHintLines(binds) {
+  const B = resolveBinds(binds);
+  const L = k => bindLabel(B[k]);
+  return [
+    `<span class="kbd">${L('fwd')} ${L('back')} ${L('left')} ${L('right')}</span>移动 <span class="kbd">${L('sprint')}</span>冲刺 <span class="kbd">${L('crouch')}</span>蹲/滑铲 <span class="kbd">${L('prone')}</span>趴 <span class="kbd">${L('leanL')} / ${L('leanR')}</span>探头 <span class="kbd">${L('jump')}</span>跳跃 <span class="kbd">${L('reload')}</span>换弹 <span class="kbd">${L('melee')} / 侧键</span>近战`,
+    `<span class="kbd">${L('grenade')}</span>投掷物（左键烹饪/投出） <span class="kbd">${L('interact')}</span>互动 <span class="kbd">${L('nvg')}</span>夜视仪 <span class="kbd">${streakKeyLabels(binds).join('/')}</span>连杀奖励 <span class="kbd">${L('scoreboard')}</span>记分板`,
+    `<span class="kbd">${L('chatAll')} / ${L('chatTeam')}</span>全体 / 队伍聊天（联网对局） <span class="kbd">${L('classChange')}</span>阵亡换配装（多人对局） <span class="kbd">Esc</span>暂停 / 返回`,
+  ];
+}
+// 暂停屏右侧那一小段键位摘要（HU-39）。同一张表的第三个读者 —— 所以它和设置屏、
+// 主菜单那两处永远不会各说各话。
+export function pauseKeySummary(binds) {
+  const B = resolveBinds(binds);
+  const one = (k, n) => `<div><b>${bindLabel(B[k])}</b>${n}</div>`;
+  return ['fwd', 'sprint', 'jump', 'crouch', 'prone', 'reload', 'grenade', 'melee', 'interact', 'scoreboard']
+    .map(k => {
+      const a = bindAction(k);
+      return one(k, a.label);
+    }).join('') + `<div><b>Esc</b>暂停 / 返回（不可重绑）</div>`;
+}
+
 export class Menu {
   constructor(game) {
     this.game = game;
@@ -193,6 +221,9 @@ export class Menu {
       e.preventDefault(); t.click();
     });
     window.addEventListener('keydown', e => {
+      // 重绑捕获态优先（HU-37）：这一会儿玩家按下的那个键**是要绑成动作的**，不是快捷键。
+      // 不先吃掉它的话，捕获 Esc 的那一秒恰好是 escBack 先跑 —— 症状是"想改键，结果被退出设置屏"。
+      if (this.capturing) { this.captureKey(e); return; }
       if (e.code === 'Escape' && game.paused && this.screen === 'pause' && performance.now() - this.pauseAt > 300) this.resume();
       else if (e.code === 'Escape' && this.screen === 'classSelect') this.hideClassSelect();
       else if (e.code === 'Escape') this.escBack(e);
@@ -330,6 +361,7 @@ export class Menu {
     }
     p.needsUpdate = true;
     this.fireLight.intensity = 5 + Math.sin(t * 13) * 0.8 + Math.sin(t * 7.3) * 0.8;
+    this.pauseTick(dt);
   }
   onResize() {
     this.camera3d.aspect = window.innerWidth / window.innerHeight;
@@ -349,7 +381,16 @@ export class Menu {
   // 补在**唯一的渲染点**上（每屏都过 render()，所以不会有哪一屏漏掉）：可点的都进 Tab 序列，
   // 而"激活之后干什么"仍然走既有的那套委托 —— constructor 里那条委托 keydown 只把 Enter/空格
   // 变成一次 click，不新增第二套语义。
-  keyify(root) { root.querySelectorAll(KEYPICK).forEach(el => { el.tabIndex = 0; }); }
+  keyify(root) {
+    root.querySelectorAll(KEYPICK).forEach(el => {
+      el.tabIndex = 0;
+      // 可达性的另一半（HU-40）：上面那行让键盘走得到，读屏软件却仍只读到"一段文字"——
+      // 这一层的按钮是 div + 委托点击，缺的是**角色**。补 role=button 之后同一批元素读成
+      // "按钮 继续游戏"，名字来自元素内容本身，不另写一份 aria-label（那份副本迟早和文案分叉）。
+      // 原生 BUTTON/INPUT 一律跳过：给它们声明 role 是重复表达，还可能盖掉原生语义。
+      if (!/^(BUTTON|INPUT|SELECT|TEXTAREA|A)$/.test(el.tagName)) el.setAttribute('role', 'button');
+    });
+  }
   // Esc 走的是 ESC_EXIT 那张表（为什么是"点本屏本来就有的出口"而不是另写一套，表旁边写着）。
   // 覆盖层优先：开着选枪/选连杀那种 picker 时，Esc 先把它合上，退一层是一层。
   escBack(e) {
@@ -382,10 +423,10 @@ export class Menu {
     // 消失就又回到"主菜单看不到战绩"那一格）。
     const A = this.game.account, u = (A && A.loggedIn && A.user) || null;
     const rec = u ? `场次 ${u.matches | 0} · 胜 ${u.wins | 0}` : '场次 — · 胜 —';
-    return `<div class="player-card"><div class="lvl">${L.lv}</div><div><div style="font-weight:700;letter-spacing:2px">指挥官</div><div style="font-size:11px;color:#999">${line}</div><div style="font-size:11px;color:#999">${rec}</div><div class="xpbar"><div style="width:${Math.round(L.frac * 100)}%"></div></div></div></div>`;
+    return `<div class="player-card"><div class="lvl">${L.lv}</div><div><div style="font-weight:700;letter-spacing:2px">指挥官</div><div style="font-size:.6875rem;color:var(--txt-3)">${line}</div><div style="font-size:.6875rem;color:var(--txt-3)">${rec}</div><div class="xpbar"><div style="width:${Math.round(L.frac * 100)}%"></div></div></div></div>`;
   }
   showLoadingOverlay(text) {
-    this.render(`<div style="margin:auto;text-align:center"><div class="logo"><div class="l1">现代战线</div><div class="l2">MODERN FRONTLINE</div></div><div class="load-bar" style="width:420px;margin:0 auto"><div style="height:100%;width:100%;background:var(--acc);animation:ldpulse 1s infinite"></div></div><div style="margin-top:14px;color:#999;letter-spacing:3px;font-size:13px">${esc(text)}</div></div><style>@keyframes ldpulse{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}</style>`, 'solid', 'loading');
+    this.render(`<div style="margin:auto;text-align:center"><div class="logo"><div class="l1">现代战线</div><div class="l2">MODERN FRONTLINE</div></div><div class="load-bar" style="width:420px;margin:0 auto"><div style="height:100%;width:100%;background:var(--acc);animation:ldpulse 1s infinite"></div></div><div style="margin-top:14px;color:var(--txt-3);letter-spacing:3px;font-size:.8125rem">${esc(text)}</div></div><style>@keyframes ldpulse{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}</style>`, 'solid', 'loading');
   }
 
   // ---------------- 主菜单 ----------------
@@ -412,11 +453,9 @@ export class Menu {
         <div class="mbtn" data-a="settings"><div class="ico">☰</div><div><div class="mt">设置</div><div class="md">画面 · 操作 · 音频</div></div></div>
       </div>
       ${this.playerCard()}
-      <div style="position:absolute;right:40px;bottom:30px;text-align:right;font-size:12px;color:#777;line-height:1.9">
-        <div><span class="kbd">WASD</span>移动 <span class="kbd">Shift</span>冲刺 <span class="kbd">C</span>蹲/滑铲 <span class="kbd">Z</span>趴 <span class="kbd">Q/E</span>探头 <span class="kbd">空格</span>跳跃 <span class="kbd">R</span>换弹 <span class="kbd">V</span>近战</div>
-        <div><span class="kbd">4</span>投掷物（左键烹饪/投出） <span class="kbd">F</span>互动 <span class="kbd">N</span>夜视仪 <span class="kbd">${STREAK_KEY_LABELS.join('/')}</span>连杀奖励 <span class="kbd">Tab</span>记分板</div>
-        <div><span class="kbd">Enter / Y</span>全体 / 队伍聊天（联网对局） <span class="kbd">C</span>阵亡换配装（多人对局） <span class="kbd">Esc</span>暂停 / 返回</div>
-        <div style="color:#555;margin-top:6px">v1.0</div>
+      <div class="menu-keys">
+        ${keyHintLines(this.game.settings && this.game.settings.binds).map(l => `<div>${l}</div>`).join('')}
+        <div class="menu-ver">v1.0</div>
       </div>`, 'dim', 'main');
     this.on(r, '[data-a]', el => {
       const a = el.dataset.a;
@@ -459,9 +498,9 @@ export class Menu {
         <div class="hdr">多人对战<small>对战 AI · 本地对局</small></div>
         <div class="lobby-body">
           <div class="lobby-col">
-            <div style="font-size:12px;color:#888;letter-spacing:3px">游戏模式</div>
+            <div style="font-size:.75rem;color:var(--txt-4);letter-spacing:3px">游戏模式</div>
             <div class="modes">${MP_MODES.map(m => `<div class="mode ${m.id === L.mode ? 'sel' : ''}" data-m="${m.id}"><b>${m.name}</b><span>${m.desc}</span></div>`).join('')}</div>
-            <div style="font-size:12px;color:#888;letter-spacing:3px;margin-top:10px">地图</div>
+            <div style="font-size:.75rem;color:var(--txt-4);letter-spacing:3px;margin-top:10px">地图</div>
             <div class="maps">${MP_MAPS.map(m => `<div class="mapc ${m.id === L.map ? 'sel' : ''}" data-map="${m.id}"><div class="mapart">${MAP_ART[m.id] || ''}</div><div class="mapinfo"><b>${m.name}</b><span>${m.style} — ${m.desc}</span></div></div>`).join('')}</div>
           </div>
           <div class="lobby-col" style="flex:1;max-width:460px">
@@ -471,15 +510,15 @@ export class Menu {
               <div>敌人数量</div>${seg('enemies', MP_TEAM_SIZES, MP_TEAM_SIZES.map(String))}
               <div>时间限制</div>${seg('time', MINUTES_ALL, MINUTES_ALL.map(v => v + ' 分'))}
               <div>胜利目标</div>${seg('score', SCORES_ALL, SCORES_ALL.map(String), L.score)}
-              <div id="limitTxt" class="note-wide" style="color:#777"></div>
+              <div id="limitTxt" class="note-wide" style="color:var(--txt-4)"></div>
             </div></div>
             <div class="panel">
-              <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">当前配装</div>
+              <div style="font-size:.75rem;color:var(--txt-4);letter-spacing:3px;margin-bottom:8px">当前配装</div>
               <div style="display:flex;justify-content:space-between;align-items:center">
-                <div><div style="font-size:20px;font-weight:800">${esc(cls.name)}</div><div style="font-size:12px;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name} · ${cls.perks.map(id => this.perk(id).name).join(' / ')}</div></div>
+                <div><div style="font-size:1.25rem;font-weight:800">${esc(cls.name)}</div><div style="font-size:.75rem;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name} · ${cls.perks.map(id => this.perk(id).name).join(' / ')}</div></div>
                 <button class="btn small ghost" data-a="loadout">编辑</button>
               </div>
-              <div style="font-size:12px;color:#888;margin-top:10px">连杀奖励：${P.streaks.map(id => KILLSTREAKS.find(k => k.id === id)).sort((a, b) => a.kills - b.kills).map(k => `${k.icon} ${k.name}(${k.kills})`).join('　')}</div>
+              <div style="font-size:.75rem;color:var(--txt-4);margin-top:10px">连杀奖励：${P.streaks.map(id => KILLSTREAKS.find(k => k.id === id)).sort((a, b) => a.kills - b.kills).map(k => `${k.icon} ${k.name}(${k.kills})`).join('　')}</div>
             </div>
             <div class="lobby-foot" style="margin-top:auto"><button class="btn ghost" data-a="back">返回</button><button class="btn" data-a="go">开始对局</button></div>
           </div>
@@ -674,7 +713,7 @@ export class Menu {
     const box = document.createElement('div');
     box.className = 'panel recov-banner';
     box.innerHTML = `
-      <div style="font-size:13px;color:var(--acc);letter-spacing:6px">${p.afterRecover ? '密码已重设' : '注册成功'} · 恢复码</div>
+      <div style="font-size:.8125rem;color:var(--acc);letter-spacing:6px">${p.afterRecover ? '密码已重设' : '注册成功'} · 恢复码</div>
       <div class="note-wide" style="margin:6px 0 10px">忘了密码时，在登录那一屏点「忘了密码？」，填呼号 + 其中<b>任意一张</b> + 新密码就能重设。<br>
          它们<b>只显示这一次</b>，用掉任何一张，其余的一起作废（同时会发一叠新的）。</div>
       <div id="recovList" style="user-select:text;font:14px/2 ui-monospace,Consolas,monospace;letter-spacing:2px">${p.codes.map(c => esc(c)).join('<br>')}</div>
@@ -725,9 +764,9 @@ export class Menu {
           <div class="lobby-col lb-right">
             <div class="panel" id="idPanel"></div>
             <div class="panel">
-              <div style="font-size:12px;color:#888;letter-spacing:3px;margin-bottom:8px">进场装备</div>
+              <div style="font-size:.75rem;color:var(--txt-4);letter-spacing:3px;margin-bottom:8px">进场装备</div>
               <div style="display:flex;justify-content:space-between;align-items:center">
-                <div><div style="font-size:18px;font-weight:800">${esc(cls.name)}</div><div style="font-size:12px;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name}</div></div>
+                <div><div style="font-size:1.125rem;font-weight:800">${esc(cls.name)}</div><div style="font-size:.75rem;color:#aaa;margin-top:4px">${WEAPONS[cls.primary].name} · ${WEAPONS[cls.secondary].name}</div></div>
                 <button class="btn small ghost" data-a="loadout">编辑</button>
               </div>
             </div>
@@ -1445,7 +1484,7 @@ export class Menu {
       box.innerHTML = `<div class="opts"><div>身份</div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
           <div><b style="letter-spacing:2px">${esc(p.name)}</b>
-            <span style="color:#999;font-size:12px;margin-left:8px">经验 ${p.xp | 0} · 场次 ${p.matches | 0} · 胜 ${p.wins | 0}</span></div>
+            <span style="color:var(--txt-3);font-size:.75rem;margin-left:8px">经验 ${p.xp | 0} · 场次 ${p.matches | 0} · 胜 ${p.wins | 0}</span></div>
           <button class="btn small ghost" data-a="logout">登出</button>
         </div>
         <div class="note-wide">数据保存在服务器。</div>
@@ -1475,7 +1514,7 @@ export class Menu {
     // 走到这里 = "要账号却没登录"：按层级他不该在大厅（守卫早该把人送进闸）。
     // 别装作没事 —— 给一个明确的去处，而不是一块空白面板。
     box.innerHTML = `<div class="opts"><div>身份</div>
-      <div style="font-size:12px;color:#e6a8c8">需要账号才能查看房间列表。</div>
+      <div style="font-size:.75rem;color:#e6a8c8">需要账号才能查看房间列表。</div>
       <div class="note-wide"><button class="btn small" data-a="toGate">去注册 / 登录</button></div>
     </div>`;
     this.on(box, '[data-a=toGate]', () => this.showOnlineGate());
@@ -1607,7 +1646,7 @@ export class Menu {
   pickPerks(ci) {
     const c = this.game.profile.classes[ci];
     const sel = [...c.perks];
-    const d = this.picker('技能选择', '每个栏位选择一项技能', `<div class="perk-cols">${PERKS.map((col, i) => `<div class="perk-col"><div style="font-size:12px;color:var(--acc);letter-spacing:4px">技能 ${i + 1}</div>${col.map(p => `<div class="pick ${sel[i] === p.id ? 'sel' : ''}" data-c="${i}" data-id="${p.id}"><b>${p.icon} ${p.name}</b><span>${p.desc}</span></div>`).join('')}</div>`).join('')}</div><div style="margin-top:20px"><button class="btn" data-a="ok">确认</button></div>`);
+    const d = this.picker('技能选择', '每个栏位选择一项技能', `<div class="perk-cols">${PERKS.map((col, i) => `<div class="perk-col"><div style="font-size:.75rem;color:var(--acc);letter-spacing:4px">技能 ${i + 1}</div>${col.map(p => `<div class="pick ${sel[i] === p.id ? 'sel' : ''}" data-c="${i}" data-id="${p.id}"><b>${p.icon} ${p.name}</b><span>${p.desc}</span></div>`).join('')}</div>`).join('')}</div><div style="margin-top:20px"><button class="btn" data-a="ok">确认</button></div>`);
     this.on(d, '.pick', el => { const i = +el.dataset.c; sel[i] = el.dataset.id; d.querySelectorAll(`.pick[data-c="${i}"]`).forEach(x => x.classList.toggle('sel', x === el)); });
     this.on(d, '[data-a=ok]', () => {
       c.perks = sel;
@@ -1618,7 +1657,7 @@ export class Menu {
   pickStreaks() {
     const P = this.game.profile;
     const sel = new Set(P.streaks);
-    const d = this.picker('连杀奖励', '选择 3 项 · 连续击杀敌人而不阵亡即可获得', `<div class="pick-grid">${KILLSTREAKS.map(k => `<div class="pick ${sel.has(k.id) ? 'sel' : ''}" data-id="${k.id}"><div class="cat">${k.kills} 连杀</div><b>${k.icon} ${k.name}</b><span>${k.desc}</span></div>`).join('')}</div><div style="margin-top:20px;display:flex;gap:14px;align-items:center"><button class="btn" data-a="ok">确认</button><span id="skc" style="color:#aaa;font-size:13px"></span></div>`);
+    const d = this.picker('连杀奖励', '选择 3 项 · 连续击杀敌人而不阵亡即可获得', `<div class="pick-grid">${KILLSTREAKS.map(k => `<div class="pick ${sel.has(k.id) ? 'sel' : ''}" data-id="${k.id}"><div class="cat">${k.kills} 连杀</div><b>${k.icon} ${k.name}</b><span>${k.desc}</span></div>`).join('')}</div><div style="margin-top:20px;display:flex;gap:14px;align-items:center"><button class="btn" data-a="ok">确认</button><span id="skc" style="color:#aaa;font-size:.8125rem"></span></div>`);
     const upd = () => { d.querySelector('#skc').textContent = `已选择 ${sel.size}/3`; };
     upd();
     this.on(d, '.pick', el => {
@@ -1650,17 +1689,17 @@ export class Menu {
     }).join('');
     let right = '';
     if (this.gsSlot === 'camo') {
-      right = `<div class="gs-att" style="cursor:default"><b>迷彩涂装</b><div class="gs-camos">${CAMOS.map(cm => { const sw = cm.id === 'none' ? null : camoSwatch(cm.id); return `<div class="camo ${c[camoKey] === cm.id ? 'sel' : ''}" data-c="${cm.id}" title="${cm.name}" style="background:${sw ? `url(${sw}) center/cover` : '#26282a'}"></div>`; }).join('')}</div><div style="font-size:12px;color:#999;margin-top:8px">${(CAMOS.find(x => x.id === c[camoKey]) || CAMOS[0]).name}</div></div>`;
+      right = `<div class="gs-att" style="cursor:default"><b>迷彩涂装</b><div class="gs-camos">${CAMOS.map(cm => { const sw = cm.id === 'none' ? null : camoSwatch(cm.id); return `<div class="camo ${c[camoKey] === cm.id ? 'sel' : ''}" data-c="${cm.id}" title="${cm.name}" style="background:${sw ? `url(${sw}) center/cover` : '#26282a'}"></div>`; }).join('')}</div><div style="font-size:.75rem;color:var(--txt-3);margin-top:8px">${(CAMOS.find(x => x.id === c[camoKey]) || CAMOS[0]).name}</div></div>`;
     } else {
       const list = (ATTACHMENTS[this.gsSlot] || []).filter(a => attachmentAllowed(id, this.gsSlot, a));
-      right = `<div class="gs-att ${!att[this.gsSlot] ? 'sel' : ''}" data-id=""><b>无</b><div class="fx"><span style="color:#999">移除该栏位配件</span></div></div>` +
-        list.map(a => `<div class="gs-att ${att[this.gsSlot] === a.id ? 'sel' : ''}" data-id="${a.id}"><b>${a.name}</b><div class="fx">${fxList(a.fx)}</div>${a.desc ? `<div style="font-size:11px;color:#888;margin-top:4px">${a.desc}</div>` : ''}</div>`).join('');
+      right = `<div class="gs-att ${!att[this.gsSlot] ? 'sel' : ''}" data-id=""><b>无</b><div class="fx"><span style="color:var(--txt-3)">移除该栏位配件</span></div></div>` +
+        list.map(a => `<div class="gs-att ${att[this.gsSlot] === a.id ? 'sel' : ''}" data-id="${a.id}"><b>${a.name}</b><div class="fx">${fxList(a.fx)}</div>${a.desc ? `<div style="font-size:.6875rem;color:var(--txt-4);margin-top:4px">${a.desc}</div>` : ''}</div>`).join('');
     }
     const r = this.render(`
       <div class="gunsmith">
         <div class="gs-left">${slotHtml}</div>
         <div class="gs-title"><div class="c">枪匠 · ${w.cls}</div><div class="n">${w.name}</div><div class="cnt">配件 ${count}/${MAX_ATT}　·　拖拽旋转 / 滚轮缩放</div></div>
-        <div class="gs-right">${right}<div id="gsMsg" style="color:#ff6a5a;font-size:13px;min-height:18px"></div></div>
+        <div class="gs-right">${right}<div id="gsMsg" style="color:#ff6a5a;font-size:.8125rem;min-height:18px"></div></div>
         <div class="gs-stats" id="gsStats"></div>
         <div class="gs-foot"><button class="btn ghost small" data-a="reset">清空配件</button><button class="btn" data-a="done">完成</button></div>
       </div>`, '', 'gunsmith');
@@ -1672,7 +1711,7 @@ export class Menu {
       r.querySelector('#gsStats').innerHTML = ['精准度', '伤害', '射程', '射速', '机动性', '操控性'].map(k => {
         const b = base[k], p = pv[k], lo = Math.min(b, p), dlt = p - b;
         return `<div class="stat">${k}<span style="float:right;color:${dlt > 0.5 ? '#8fe06a' : dlt < -0.5 ? '#ff6a5a' : '#888'}">${Math.round(p)}${Math.abs(dlt) > 0.5 ? ` (${dlt > 0 ? '+' : ''}${Math.round(dlt)})` : ''}</span><div class="bar"><div class="b0" style="width:${lo}%"></div>${Math.abs(dlt) > 0.5 ? `<div class="bd" style="left:${lo}%;width:${Math.abs(dlt)}%;background:${dlt > 0 ? '#8fe06a' : '#ff6a5a'}"></div>` : ''}</div></div>`;
-      }).join('') + `<div class="stat" style="grid-column:span 2;color:#999;display:flex;justify-content:space-between"><span>弹匣 <b style="color:#fff">${st.mag}</b></span><span>射速 <b style="color:#fff">${st.rpm}</b> RPM</span><span>换弹 <b style="color:#fff">${st.reload.toFixed(2)}</b>s</span><span>开镜 <b style="color:#fff">${Math.round(st.ads * 1000)}</b>ms</span><span>射程 <b style="color:#fff">${Math.round(st.rangeFar)}</b>m</span></div>`;
+      }).join('') + `<div class="stat" style="grid-column:span 2;color:var(--txt-3);display:flex;justify-content:space-between"><span>弹匣 <b style="color:#fff">${st.mag}</b></span><span>射速 <b style="color:#fff">${st.rpm}</b> RPM</span><span>换弹 <b style="color:#fff">${st.reload.toFixed(2)}</b>s</span><span>开镜 <b style="color:#fff">${Math.round(st.ads * 1000)}</b>ms</span><span>射程 <b style="color:#fff">${Math.round(st.rangeFar)}</b>m</span></div>`;
     };
     drawStats(null);
     this.on(r, '.gs-slot', el => { this.gsSlot = el.dataset.s; this.showGunsmith(ci, which); });
@@ -1703,66 +1742,122 @@ export class Menu {
   }
 
   // ---------------- 设置 ----------------
+  // 这一屏从 js/settings.mjs 那张表长出来（HU-37）。原来每行的 min/max/step 是这里手写的，
+  // 与 main.js 构造函数里那份默认值是两份口径：屏上能选出一个引擎不接受的值，而"改了要不要
+  // 落地"每格还得在这里再写一个 if —— 漏掉那个 if 的症状就是"滑杆动了、游戏没变"。
+  // 现在：行由表出，落点只有一个（game.applySettings），键位那一格从 js/keybinds.mjs 现取。
   showSettings(from) {
     this.settingsFrom = from;
     const S = this.game.settings;
     const inGame = from === 'pause';
     if (!inGame) this.setCam('lobby');
-    const rng = (k, label, min, max, step, fmt = v => v) => `<div class="set-row"><span>${label}</span><div style="display:flex;align-items:center;gap:12px"><input type="range" data-k="${k}" min="${min}" max="${max}" step="${step}" value="${S[k]}"><span class="val" data-v="${k}">${fmt(S[k])}</span></div></div>`;
-    const tog = (k, label) => `<div class="set-row"><span>${label}</span><div class="seg" data-t="${k}"><div data-v="1" class="${S[k] ? 'sel' : ''}">开</div><div data-v="0" class="${!S[k] ? 'sel' : ''}">关</div></div></div>`;
-    const fmts = { sens: v => (+v).toFixed(2), adsSens: v => (+v).toFixed(2), fov: v => v, volume: v => Math.round(v * 100) };
+    this.capturing = '';
+    const ctl = (k, s) => {
+      if (s.type === 'num') return `<div class="set-ctl"><input type="range" data-k="${k}" min="${s.min}" max="${s.max}" step="${s.step}" value="${S[k]}"><span class="val" data-v="${k}">${formatValue(k, S[k])}</span></div>`;
+      if (s.type === 'bool') return `<div class="seg" data-k="${k}"><div data-v="1" class="${S[k] ? 'sel' : ''}">开</div><div data-v="0" class="${!S[k] ? 'sel' : ''}">关</div></div>`;
+      if (s.type === 'enum') return `<div class="seg" data-k="${k}">${s.opts.map(([v, n]) => `<div data-v="${v}" class="${S[k] === v ? 'sel' : ''}">${n}</div>`).join('')}</div>`;
+      return '';
+    };
+    const rows = g => g.rows.map(k => {
+      const s = SET_SPEC[k];
+      if (s.type === 'note') return `<div class="set-note">${s.text}</div>`;
+      if (s.type === 'binds') return `<div class="binds" data-binds>${this.bindsPanel(S.binds)}</div>`;
+      return `<div class="set-row"><span>${s.label}</span>${ctl(k, s)}</div>`;
+    }).join('');
     const r = this.render(`
       <div class="settings">
-        <div class="hdr" style="margin-bottom:20px">设置<small>画面 · 操作 · 音频</small></div>
-        <div class="set-row"><span>画面质量</span><div class="seg" data-q="1">${['low', 'medium', 'high'].map((q, i) => `<div data-v="${q}" class="${S.quality === q ? 'sel' : ''}">${['低', '中', '高'][i]}</div>`).join('')}</div></div>
-        <div class="set-row"><span>帧率上限</span><div class="seg" data-cap="1">${[['0', '不锁'], ['144', '144'], ['120', '120'], ['60', '60'], ['30', '30']].map(([v, n]) => `<div data-v="${v}" class="${(S.fpsCap | 0) === +v ? 'sel' : ''}">${n}</div>`).join('')}</div></div>
-        ${rng('fov', '视野 (FOV)', 65, 100, 1, fmts.fov)}
-        ${rng('sens', '鼠标灵敏度', 0.2, 3, 0.05, fmts.sens)}
-        ${rng('adsSens', '开镜灵敏度倍率', 0.3, 1.5, 0.05, fmts.adsSens)}
-        ${rng('volume', '主音量', 0, 1, 0.01, fmts.volume)}
-        ${tog('invertY', '反转 Y 轴')}
-        ${tog('voice', '语音播报')}
-        ${tog('showFps', '显示帧数')}
-        <div style="font-size:11px;color:#777;margin-top:8px">阴影与纹理质量将在下次载入地图后生效。</div>
-        <div class="keys">
-          <div><b>WASD</b>移动</div><div><b>鼠标左/右键</b>射击 / 瞄准</div>
-          <div><b>Shift</b>战术冲刺</div><div><b>C / Ctrl</b>蹲伏 · 冲刺中滑铲</div>
-          <div><b>Z</b>趴下 / 起身（天花板低时起到蹲）</div><div><b>Q / E</b>探头（左 / 右）</div>
-          <div><b>空格</b>跳跃</div><div><b>R</b>换弹</div>
-          <div><b>1 / 2 / 滚轮</b>切换武器</div>
-          <div><b>V / 鼠标侧键</b>近战</div><div><b>4</b>切出投掷物（再按 4 换种）</div>
-          <div><b>左键</b>按住烹饪 / 松手投出</div><div><b>F</b>互动 / 拾取武器</div>
-          <div><b>N</b>夜视仪（战役）</div><div><b>${STREAK_KEY_LABELS.join(' / ')}</b>连杀奖励</div>
-          <div><b>Tab</b>记分板</div><div><b>Esc</b>暂停 / 返回上一层</div>
-          <div><b>Enter / Y</b>全体 / 队伍聊天（联网对局里）</div><div><b>C</b>阵亡时换配装（多人对局，战役里不换）</div>
+        <div class="hdr" style="margin-bottom:16px">设置<small>画面 · HUD · 音频 · 操作</small></div>
+        ${SET_GROUPS.map(g => `<div class="set-sec">${g.t}</div>${rows(g)}`).join('')}
+        <div class="set-foot">
+          <button class="btn" data-a="back">返回</button>
+          <button class="btn ghost small" data-a="breset">键位恢复默认</button>
+          <button class="btn ghost small" data-a="resetp">重置存档</button>
         </div>
-        <div style="margin-top:24px;display:flex;gap:12px"><button class="btn" data-a="back">返回</button><button class="btn ghost small" data-a="resetp">重置存档</button></div>
       </div>`, inGame ? 'solid' : 'dim', 'settings');
+    const commit = k => {
+      this.game.applySettings();
+      // quality 是这里唯一还需要"另外踢一脚"的那一格：它改的是渲染器的阴影与贴图尺寸，
+      // 而那两样在 build 时就烘进材质里了（所以那一格自己写着"下次载入地图后生效"）。
+      if (k === 'quality' && this.game.applyQuality) this.game.applyQuality();
+      this.game.saveSettings();
+    };
     r.querySelectorAll('input[type=range]').forEach(inp => inp.addEventListener('input', () => {
       const k = inp.dataset.k; S[k] = +inp.value;
-      r.querySelector(`[data-v="${k}"]`).textContent = fmts[k](S[k]);
-      if (k === 'volume') this.game.audio.setVolume(S[k]);
-      this.game.saveSettings();
+      r.querySelector(`[data-v="${k}"]`).textContent = formatValue(k, S[k]);
+      commit(k);
     }));
-    r.querySelectorAll('.seg[data-t]').forEach(sg => sg.querySelectorAll('div').forEach(d => d.addEventListener('click', () => {
-      const k = sg.dataset.t; S[k] = d.dataset.v === '1';
+    r.querySelectorAll('.seg[data-k]').forEach(sg => sg.querySelectorAll('div').forEach(d => d.addEventListener('click', () => {
+      const k = sg.dataset.k, s = SET_SPEC[k];
+      S[k] = s.type === 'bool' ? d.dataset.v === '1' : (typeof s.def === 'number' ? +d.dataset.v : d.dataset.v);
       sg.querySelectorAll('div').forEach(x => x.classList.toggle('sel', x === d));
-      if (k === 'voice') this.game.audio.voice = S[k];
-      if (k === 'showFps') { const f = document.getElementById('fps'); if (f) f.classList.toggle('hidden', !S[k]); }
-      this.game.saveSettings();
+      commit(k);
     })));
-    r.querySelectorAll('.seg[data-q] div').forEach(d => d.addEventListener('click', () => {
-      S.quality = d.dataset.v; r.querySelectorAll('.seg[data-q] div').forEach(x => x.classList.toggle('sel', x === d));
-      this.game.saveSettings(); this.game.applyQuality();
-    }));
-    // 帧率上限:即时生效(frame() 每帧读设置),0=不锁。只跳帧不 sleep —— 跳掉的帧
-    // 其 dt 会攒着补给下一个放行帧,所以模拟仍按真实墙钟推进,锁帧不改变对局结果。
-    r.querySelectorAll('.seg[data-cap] div').forEach(d => d.addEventListener('click', () => {
-      S.fpsCap = +d.dataset.v; r.querySelectorAll('.seg[data-cap] div').forEach(x => x.classList.toggle('sel', x === d));
-      this.game.saveSettings();
-    }));
+    // 重绑那一格：点了进入捕获态，下一个按键就是它的新键。捕获态由 constructor 里那条
+    // window keydown 优先接管（否则想改 Esc 的近邻键，却被 escBack 一脚踹出设置屏）。
+    this.armBinds(r);
+    this.on(r, '[data-a=breset]', () => {
+      this.game.settings.binds = {};
+      this.capturing = ''; this._bindMsg = '键位已恢复默认';
+      commit('binds'); this.repaintBinds();
+    });
     this.on(r, '[data-a=back]', () => { if (inGame) this.showPause(); else this.showMain(); });
     this.on(r, '[data-a=resetp]', () => this.resetSaveDialog());
+  }
+  // 键位那一格的表体（HU-37）。单独成一个方法是为了 repaint：捕获完一个键只换这一块的 HTML，
+  // 不重画整屏 —— 重画整屏会把滚动位置与焦点打回顶部，而键盘用户正站在那一格上。
+  bindsPanel(binds, cap = this.capturing) {
+    const B = resolveBinds(binds);
+    const groups = new Map();
+    for (const a of BIND_ACTIONS) { if (!groups.has(a.g)) groups.set(a.g, []); groups.get(a.g).push(a); }
+    const row = a => {
+      const on = cap === a.k;
+      const cur = bindLabel(B[a.k]);
+      const changed = JSON.stringify(B[a.k]) !== JSON.stringify(a.def);
+      // aria-label 是这里**该写**的那一种：按钮的字面内容是 "W"，读屏念到的就是"W"，
+      // 而 W 是什么意思只有旁边的标签知道（HU-40 那条"读得到名字"的判据量的正是这个）。
+      return `<div class="bind-row"><span>${a.label}</span><button type="button" class="bind-key${on ? ' cap' : ''}${changed ? ' changed' : ''}" data-bind="${a.k}" aria-label="${a.label}，当前 ${cur}${changed ? '（已改）' : ''}">${on ? '按下按键…' : cur}</button></div>`;
+    };
+    return `<div class="bind-grp">按键重绑定 · 点一格，再按你要的键（Esc 取消）</div>`
+      + [...groups].map(([g, list]) => `<div class="bind-grp">${g}</div>` + list.map(row).join('')).join('')
+      + `<div class="bind-hint">${this._bindMsg ? `<span class="bind-msg">${escHtml(this._bindMsg)}</span> · ` : ''}`
+      + `不可重绑：鼠标左键射击 / 右键瞄准 / 滚轮换枪 / 侧键近战 / Esc 暂停与返回。</div>`;
+  }
+  // 捕获态吃掉的那一下（HU-37）。三条出路都要给得出：绑上、Esc 取消、按了一个不能绑的键。
+  captureKey(e) {
+    e.preventDefault(); e.stopPropagation();
+    const act = this.capturing;
+    this.capturing = '';
+    this._bindMsg = '';
+    if (e.code === 'Escape') { this.repaintBinds(); return; }      // 取消：表一个字节都不动
+    if (!act) { this.repaintBinds(); return; }
+    if (!isBindableCode(e.code)) { this._bindMsg = `${keyLabel(e.code)} 不能用来绑动作`; this.repaintBinds(); return; }
+    const S = this.game.settings;
+    const { binds, tookFrom, rejected } = applyBind(S.binds, act, e.code);
+    if (rejected) {
+      // 拒绝要说得出**是谁占着**：只回一句"绑定失败"的话，玩家只能一个键一个键试过去。
+      this._bindMsg = tookFrom ? `${keyLabel(e.code)} 已绑给「${tookFrom}」· 请先改那一格` : `${keyLabel(e.code)} 不能用来绑动作`;
+      this.repaintBinds(); return;
+    }
+    S.binds = binds;
+    this.game.applySettings(); this.game.saveSettings();
+    this._bindMsg = `已绑到 ${keyLabel(e.code)}`;
+    this.repaintBinds();
+  }
+  // 键位格子的监听绑在**当前那一批节点**上。repaintBinds() 换掉的是那一块的 innerHTML，
+  // 新节点上一个监听都没有 —— 少了这一刀的症状很具体：进设置屏只能绑成功第一个键，
+  // 之后每一格点了都没反应，而玩家以为在"取消"时按下的 Esc 会把人直接踹出这一屏。
+  armBinds(root) {
+    this.on(root, '[data-bind]', el => { this.capturing = el.dataset.bind; this.repaintBinds(); });
+  }
+  repaintBinds() {
+    const host = this.el.querySelector('[data-binds]');
+    if (!host) return;
+    host.innerHTML = this.bindsPanel(this.game.settings.binds);
+    this.armBinds(host);
+    // 焦点跟到新那一格：捕获完若焦点掉了，键盘用户每绑一个键都要从头 Tab 一遍
+    // （与 AB4d 给改名那一格补焦点同一条理由）。
+    const back = this.el.querySelector('.bind-key:not(.cap)');
+    if (back) back.focus();
   }
 
   // 重置存档（HU-29）。原来：`confirm('确定要重置所有配装与经验值吗？')` → removeItem → reload。
@@ -1799,6 +1894,9 @@ export class Menu {
   }
 
   // ---------------- 暂停 ----------------
+  // HU-39：这一屏原来是 .screen.solid —— 不透明底加 blur，把比分条、据点水圈、击杀条全糊掉，
+  // 而联机那一局服务端照跑（暂停是假的，只有单机停下）。按 Esc 之后屏幕上对"现在战况如何"
+  // 的回答只剩一行小字。现在底是半透的，右侧那一列把战况、键位、音量直接搬进来。
   showPause() {
     this.pauseAt = performance.now();
     const g = this.game;
@@ -1806,18 +1904,40 @@ export class Menu {
     // 三种语义的差别（联机的"暂停"是假的、以及为什么)全在 pauseActions 里，见它的注释。
     const online = !!(g.net && g.state === 'play');
     const P = pauseActions({ camp, online });
+    const S = g.settings;
+    // 每次进这一屏都把签名作废：render() 刚换过 #pauseBoard 那个节点，留着旧签名会让
+    // 第一拍 paint 被门跳过去 —— 症状是右侧那一栏空着（与 hud.reset() 那批签名门同一个坑）。
+    this._pauseSig = undefined;
     const r = this.render(`
-      <div class="pause">
-        <div class="hdr" style="margin-bottom:30px">${P.title}<small>${P.sub}</small></div>
-        <div class="mbtn" data-a="resume"><div class="ico">▶</div><div class="mt">继续游戏</div></div>
-        ${camp ? '<div class="mbtn" data-a="cp"><div class="ico">↺</div><div class="mt">读取检查点</div></div>' : ''}
-        ${P.changeClass ? '<div class="mbtn" data-a="class"><div class="ico">⚙</div><div class="mt">更换配装</div></div>' : ''}
-        ${P.restart ? `<div class="mbtn" data-a="restart"><div class="ico">⟲</div><div class="mt">${camp ? '重新开始任务' : '重新开始对局'}</div></div>` : ''}
-        ${P.leaveMatch ? '<div class="mbtn" data-a="leaveMatch"><div class="ico">✕</div><div class="mt">退出本局</div></div>' : ''}
-        <div class="mbtn" data-a="settings"><div class="ico">☰</div><div class="mt">设置</div></div>
-        <div class="mbtn" data-a="quit"><div class="ico">✕</div><div class="mt">退出到主菜单</div></div>
-        <div style="margin-top:20px;font-size:12px;color:#777">${P.note}</div>
-      </div>`, 'solid', 'pause');
+      <div class="pause-wrap">
+        <div class="pause">
+          <div class="hdr" style="margin-bottom:22px">${P.title}<small>${P.sub}</small></div>
+          <div class="mbtn" data-a="resume"><div class="ico">▶</div><div class="mt">继续游戏</div></div>
+          ${camp ? '<div class="mbtn" data-a="cp"><div class="ico">↺</div><div class="mt">读取检查点</div></div>' : ''}
+          ${P.changeClass ? '<div class="mbtn" data-a="class"><div class="ico">⚙</div><div class="mt">更换配装</div></div>' : ''}
+          ${P.restart ? `<div class="mbtn" data-a="restart"><div class="ico">⟲</div><div class="mt">${camp ? '重新开始任务' : '重新开始对局'}</div></div>` : ''}
+          ${P.leaveMatch ? '<div class="mbtn" data-a="leaveMatch"><div class="ico">✕</div><div class="mt">退出本局</div></div>' : ''}
+          <div class="mbtn" data-a="settings"><div class="ico">☰</div><div class="mt">设置</div></div>
+          <div class="mbtn" data-a="quit"><div class="ico">✕</div><div class="mt">退出到主菜单</div></div>
+          <div class="pause-note">${P.note}</div>
+        </div>
+        <div class="pause-side">
+          <div class="panel"><div class="pause-t">这一局</div><div class="pause-board" id="pauseBoard"></div></div>
+          <div class="panel"><div class="pause-t">音量</div>
+            <div class="pause-vol"><span>主音量</span><input type="range" data-pv="volume" min="0" max="1" step="0.01" value="${S.volume}"><span class="val" data-pvv="volume">${Math.round(S.volume * 100)}</span></div>
+            <div class="pause-vol"><span>语音播报</span><input type="range" data-pv="volVoice" min="0" max="1" step="0.01" value="${S.volVoice}"><span class="val" data-pvv="volVoice">${Math.round(S.volVoice * 100)}</span></div>
+          </div>
+          <div class="panel"><div class="pause-t">键位（改键去设置）</div>
+            <div class="pause-keys">${pauseKeySummary(g.settings && g.settings.binds)}</div>
+          </div>
+        </div>
+      </div>`, 'scrim', 'pause');
+    this.paintPauseBoard();
+    r.querySelectorAll('[data-pv]').forEach(inp => inp.addEventListener('input', () => {
+      const k = inp.dataset.pv; S[k] = +inp.value;
+      const v = r.querySelector(`[data-pvv="${k}"]`); if (v) v.textContent = formatValue(k, S[k]);
+      g.applySettings(); g.saveSettings();
+    }));
     this.on(r, '[data-a=resume]', () => this.resume());
     this.on(r, '[data-a=cp]', () => { g.paused = false; this.hide(); if (g.player.alive) { g.player.alive = false; g.dead = true; } g.mode.respawn(); });
     this.on(r, '[data-a=class]', () => this.showClassSelect(true));
@@ -1827,6 +1947,31 @@ export class Menu {
     this.on(r, '[data-a=leaveMatch]', () => { g.paused = false; if (g.lobby && g.lobby.connected) g.returnToRoom(); else g.exitToMenu(); });
     this.on(r, '[data-a=settings]', () => this.showSettings('pause'));
     this.on(r, '[data-a=quit]', () => g.exitToMenu());
+  }
+  // 暂停屏右侧那一栏（HU-39）。数据源就是按住 Tab 那一屏用的同一份 —— mode.scoreboardHTML()
+  // 与 net.netStatusText()，不在这里抄第二份比分格式（HU-01/HU-38 同一条纪律）。
+  // 签名门 + 500ms 一拍：与 hud.showScoreboard 同法（60Hz 写 innerHTML 是本仓库的铁律禁区）。
+  // 暂停屏那一栏得自己活着（HU-39 与联机那条"暂停是假的"）：这一屏挂着的时候服务端照跑，
+  // 一次性的快照读数是"按下 Esc 那一刻的战况"，两秒后就成了一句谎。
+  // 拆成一个方法而不是留在 update() 里：暂停时 game.state 仍是 'play'，渲染循环走的是 play
+  // 那一支，根本不调 menu.update() —— 挂在 update 里的那一拍永远收不到，症状就是那一栏冻住。
+  // 不用 setInterval：少了"离开这一屏却忘了拆定时器"那条路（hud.js 的 _sbT 是那样处理的）。
+  pauseTick(dt) {
+    if (this.screen !== 'pause') { this._pauseAcc = 0; return; }
+    this._pauseAcc = (this._pauseAcc || 0) + dt;
+    if (this._pauseAcc >= 0.5) { this._pauseAcc = 0; this.paintPauseBoard(); }
+  }
+  paintPauseBoard() {
+    const host = this.el.querySelector('#pauseBoard');
+    if (!host) return;
+    const g = this.game, mode = g.mode;
+    let html = mode && mode.scoreboardHTML ? mode.scoreboardHTML() : '';
+    if (!html) html = '<div class="note-wide">这一局没有榜单（战役按目标计，不在这里列）。</div>';
+    const net = g.net && g.net.netStatusText ? g.net.netStatusText() : '';
+    const next = html + (net ? `<div class="sbnet">${escHtml(net)}</div>` : '');
+    if (next === this._pauseSig) return;
+    this._pauseSig = next;
+    host.innerHTML = next;
   }
   resume() {
     const g = this.game;
@@ -1842,7 +1987,7 @@ export class Menu {
     const r = this.render(`
       <div style="margin:auto;width:760px">
         <div class="hdr" style="margin-bottom:18px">选择配装<small>将在下次部署时生效</small></div>
-        <div class="pick-grid" style="grid-template-columns:1fr">${P.classes.map((c, i) => `<div class="pick ${i === P.selClass ? 'sel' : ''}" data-i="${i}" style="display:flex;justify-content:space-between;align-items:center"><div><b>${esc(c.name)}</b><span>${WEAPONS[c.primary].name}${Object.keys(c.patt || {}).length ? ' (' + Object.keys(c.patt).length + '配件)' : ''} · ${WEAPONS[c.secondary].name} · ${(LETHALS.find(x => x.id === c.lethal) || {}).name || ''} · ${(TACTICALS.find(x => x.id === c.tactical) || {}).name || ''}</span></div><div style="font-size:12px;color:#aaa;text-align:right">${c.perks.map(id => this.perk(id).icon + ' ' + this.perk(id).name).join('<br>')}</div></div>`).join('')}</div>
+        <div class="pick-grid" style="grid-template-columns:1fr">${P.classes.map((c, i) => `<div class="pick ${i === P.selClass ? 'sel' : ''}" data-i="${i}" style="display:flex;justify-content:space-between;align-items:center"><div><b>${esc(c.name)}</b><span>${WEAPONS[c.primary].name}${Object.keys(c.patt || {}).length ? ' (' + Object.keys(c.patt).length + '配件)' : ''} · ${WEAPONS[c.secondary].name} · ${(LETHALS.find(x => x.id === c.lethal) || {}).name || ''} · ${(TACTICALS.find(x => x.id === c.tactical) || {}).name || ''}</span></div><div style="font-size:.75rem;color:#aaa;text-align:right">${c.perks.map(id => this.perk(id).icon + ' ' + this.perk(id).name).join('<br>')}</div></div>`).join('')}</div>
         <div style="margin-top:16px"><button class="btn ghost" data-a="close">取消</button></div>
       </div>`, 'solid', 'classSelect');
     this.classFromPause = !!fromPause;
@@ -1871,10 +2016,10 @@ export class Menu {
     const r = this.render(`
       <div class="results">
         <div class="big ${res.win === 'win' ? 'win' : res.win === 'lose' ? 'lose' : ''}">${esc(res.title)}</div>
-        <div style="font-size:18px;color:#ccc;letter-spacing:4px">${esc(res.sub || '')}</div>
+        <div style="font-size:1.125rem;color:#ccc;letter-spacing:4px">${esc(res.sub || '')}</div>
         <div class="res-stats">${res.stats.map(([k, v]) => `<div><b>${v}</b>${k}</div>`).join('')}</div>
         ${res.board ? `<div id="sbCopy" style="max-height:38vh;overflow-y:auto;text-align:left;margin-bottom:20px">${res.board}</div>` : ''}
-        <div style="font-size:13px;color:#999;margin-bottom:20px">等级 ${L.lv} · <div style="display:inline-block;width:200px;height:4px;background:#333;vertical-align:middle"><div style="height:100%;width:${Math.round(L.frac * 100)}%;background:var(--acc)"></div></div></div>
+        <div style="font-size:.8125rem;color:var(--txt-3);margin-bottom:20px">等级 ${L.lv} · <div style="display:inline-block;width:200px;height:4px;background:#333;vertical-align:middle"><div style="height:100%;width:${Math.round(L.frac * 100)}%;background:var(--acc)"></div></div></div>
         <div style="display:flex;gap:12px;justify-content:center"><button class="btn" data-a="again">${esc(res.againLabel || '再来一局')}</button>${res.againMenu ? '' : '<button class="btn ghost" data-a="menu">返回主菜单</button>'}</div>
         ${res.againNote ? `<div class="res-note">${esc(res.againNote)}</div>` : ''}
       </div>`, 'solid', 'results');
