@@ -187,14 +187,21 @@ export class Terrain {
   // 渲染缓冲：顶点 (x,y,z)、UV（按世界尺度铺，贴图不随图变大而缩密）、可选逐顶点色、三角索引。
   // 法线由 three 的 computeVertexNormals 从同一批三角形算出 —— 采样用的面和画出来的面
   // 必须是同一张（见开头纪律①），所以这里只交出位置与索引。
-  // colorFn(x, z, y, slope) -> [r,g,b]（0..1，可选）。**道路与岩面就是靠它画出来的**：
+  // colorFn(x, z, y, slope) -> [r,g,b] 或 [r,g,b, 权重…]（0..1，可选）。**道路与岩面就是靠它画出来的**：
   // 一条压着坡面的路没法用平板去铺（会一段段翘起来），而逐顶点色天然贴合每一张面。
-  render(stride = 6, colorFn = null) {
+  render(stride = 6, colorFn = null, blendN = 0) {
     const n = this.n, c = this.cell, half = this.half, n1 = n + 1;
     const vcount = n1 * n1;
     const pos = new Float32Array(vcount * 3);
     const uv = new Float32Array(vcount * 2);
     const col = colorFn ? new Float32Array(vcount * 3) : null;
+    // blendN：前 3 项之后还要带几个**材质混合权重**通道（0 = 只出逐顶点色，既有行为不变）。
+    // 这些通道不进颜色，由 buildTerrainMesh 挂成 `aBlend` 顶点属性给地形着色器。
+    // 为什么单开一路：顶点色是**乘**在贴图上的（three 的 color_fragment 在 map_fragment 之前），
+    // 它改不了"用哪张法线/粗糙度"，于是把崖壁乘成灰色只得到"灰色的草纹"，质感仍然假。
+    // 通道数由调用方（def.terrainBlend）给死，不从第一个顶点的返回长度里猜 —— 那样"首个顶点
+    // 恰好少一项"会把整张图的掩膜静默错位，而这种错没有任何读数会喊。
+    const blend = colorFn && blendN > 0 ? new Float32Array(vcount * blendN) : null;
     const idx = new Uint32Array(n * n * 6);
     for (let j = 0; j <= n; j++) {
       for (let i = 0; i <= n; i++) {
@@ -209,8 +216,34 @@ export class Terrain {
           // 坡度用相邻格点差分（不递归调 slope —— 那会在格点重复算三次同样的中心差分）
           const dx = this.at(i + 1, j) - this.at(i - 1, j);
           const dz = this.at(i, j + 1) - this.at(i, j - 1);
-          const rgb = colorFn(x, z, y, Math.hypot(dx, dz) / (2 * c));
+          // splat 掩膜要的两个低频几何量，顺手在这里算好传出去（高度场就在手上，比让
+          // colorFn 回头调 shape() 便宜一个量级：实测 ridges 烘焙 190ms → 63ms）。
+          // **偏移取 4 格**：ridges.color 的回退分支用 ε=8m 自估，c=2m 时 4 格恰好 8m、
+          // 两式的除数同为 16c²=64 与 8c=16 —— 必须逐位同值，否则"打了补丁"与"没打"
+          // 是两套读数，那比没有更难查。曲率符号约定：**>0 = 凹**（邻域均值高于中心）。
+          // 图缘 4 格内 at() 夹边会让这几项退化，实测色差 ≤1.2e-3 且只落在最外缘一圈。
+          const hE = this.at(i + 4, j), hW = this.at(i - 4, j);
+          const hS = this.at(i, j + 4), hN = this.at(i, j - 4);
+          const rgb = colorFn(x, z, y, Math.hypot(dx, dz) / (2 * c),
+            (hE + hW + hS + hN - 4 * y) / (16 * c * c), (hE - hW) / (8 * c), (hS - hN) / (8 * c));
           col[k * 3] = rgb[0]; col[k * 3 + 1] = rgb[1]; col[k * 3 + 2] = rgb[2];
+          if (blend) {
+            // 只给 3 项 = 这张图还没有掩膜这一说，权重全 0（= 单层底图，既有行为）。
+            // 给了 4/5 项却不足 blendN 才是错：那是**错位**，画出来"看着像那么回事"、
+            // 只能靠肉眼发现，所以当场崩。这一路两端都会跑（headless 也走
+            // finalize→buildTerrainMesh），要崩也是两端同一次崩，不会只崩一边。
+            // 长度只许两种：恰好 3（这张图还没有掩膜这一说，权重全 0 = 单层底图，既有行为）
+            // 或恰好 3+blendN。**两个方向都要拦**：少一项是错位，多一项是**静默丢弃** ——
+            // 后者更阴："加了第四个通道、忘了把 terrainBlend 改成 4"画出来照样像样，
+            // 而那一层材质永远不会出现。
+            if (rgb.length === 3) {
+              for (let b = 0; b < blendN; b++) blend[k * blendN + b] = 0;
+            } else if (rgb.length === 3 + blendN) {
+              for (let b = 0; b < blendN; b++) blend[k * blendN + b] = rgb[3 + b];
+            } else {
+              throw new Error(`colorFn 返回长度对不上：terrainBlend=${blendN}，要么 3 要么 ${3 + blendN}，给了 ${rgb.length} @(${i},${j})`);
+            }
+          }
         }
       }
     }
@@ -223,7 +256,7 @@ export class Terrain {
         idx[p++] = b; idx[p++] = d; idx[p++] = e;
       }
     }
-    return { pos, uv, idx, col, n1 };
+    return { pos, uv, idx, col, blend, blendN, n1 };
   }
 
   // 法线（由采样点两侧的面法线平均得到，只给摆件用：让树/箱子贴合坡向，不参与模拟）

@@ -122,7 +122,7 @@ fireHitscan/traceBullet）、bot 感知与哨戒炮/直升机的 LOS（ai.js / m
 - 失败全兜底：Worker 起不来（file://、老浏览器、策略封锁）、脚本 404、生成抛错、
   30s 看门狗 —— 任何一路失败整条退回同步路重生成（纯函数，重生成安全）。
 
-**验收**：worker-core（C4a-e：确定性/工单形状/同步路 19 种 TEX 全就位/Node 回退标记）；
+**验收**：worker-core（C4a-e：确定性/工单形状/同步路**工单表里每一种 TEX** 全就位（名单长度从 `KEYS` 取，不写死数字）/Node 回退标记）；
 worker-live A 臂（真浏览器：`__texViaWorker === true`）。gunvisual/optic/viewmodel 等
 截图套件全绿 = Worker 生成的纹理与旧主线程产物像素级同貌。
 

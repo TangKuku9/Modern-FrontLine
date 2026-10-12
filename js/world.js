@@ -2,7 +2,8 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Sky } from 'three/addons/objects/Sky.js';
-import { mat } from './materials.js';
+import { mat, terrainSplatSet } from './materials.js';
+import { applyTerrainSplat } from './terrain-splat.js';
 import { rayAABB, TileNoise, mulberry32, clamp, rng } from './util.js';
 import { astarPath } from './pathfind.js';
 import { Terrain, SLOPE } from './terrain.js';
@@ -1000,7 +1001,7 @@ export class World {
     const T = this.terrain;
     if (!T) return;
     const cfn = this.def.terrainColor;
-    const { pos, uv, idx, col } = T.render(this.def.terrainStride || 6, cfn);
+    const { pos, uv, idx, col, blend } = T.render(this.def.terrainStride || 6, cfn, this.def.terrainBlend || 0);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
@@ -1008,6 +1009,9 @@ export class World {
     // 逐顶点色：道路与岩面靠它画出来。一条压着坡面的路没法用平板去铺（会一段段翘起来），
     // 而逐顶点色天然贴合每一张面。
     if (col) g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    // 材质混合掩膜（裸岩/碎石/裸土各一通道，草是余量）。逐顶点算，与颜色同源同一批坐标，
+    // 所以"看到的色"与"用的贴图"不会各走一路。着色器侧的用法见 js/terrain-splat.js。
+    if (blend) g.setAttribute('aBlend', new THREE.BufferAttribute(blend, this.def.terrainBlend));
     g.computeVertexNormals();
     // 基底贴图取 def.terrainBase（默认 surface）。逐顶点色是**乘**在贴图上的，
     // 所以底图要浅：拿 dirt（深棕）乘草绿会得到一片发黑的泥地（实测截图里
@@ -1015,6 +1019,10 @@ export class World {
     const base = mat(this.def.terrainBase || this.def.surface || 'dirt');
     const m = new THREE.Mesh(g, col ? base.clone() : base);
     if (col) { m.material.vertexColors = true; m.material.color.set(0xffffff); }
+    // 有掩膜就上 splat：按 aBlend 在 草/裸土/碎石/裸岩 之间混 albedo+法线+粗糙度。
+    // 只有带 terrainBlend 的图走这一路，其余地图的几何没有 aBlend，材质保持单层不变。
+    // 缺贴图就直接抛 —— 静悄悄退回单层的话，"加了 splat"这件事在画面上根本没有证据。
+    if (blend) applyTerrainSplat(m.material, terrainSplatSet(), this.def.terrainSplatOpt);
     m.castShadow = true;
     m.receiveShadow = true;
     this.root.add(m);

@@ -4,7 +4,7 @@
 // 且 Worker 里没有 import map —— 'three' 裸说明符解析失败，所以这两个核心必须零 THREE。
 // 这份判据钉三件事：
 //   ① 核心确定性：同参数两次生成逐位一致（核心里不许混入 Math.random / 时钟）；
-//   ② 工单完备性：initTextures 同步回退路跑完 19 种 TEX 全部就位 —— 工单表
+//   ② 工单完备性：initTextures 同步回退路跑完，工单表里的 TEX 全部就位 —— 工单表
 //      （materials.js 的 texJobs）是 Worker 路与同步路唯一的数据源，漏一种就是
 //      "加载屏走完但某格材质空了"；
 //   ③ 寻路等价：world.findPath（两端同步路）== astarPath 直调（Worker 持格子拷贝后
@@ -36,12 +36,13 @@ const ok = (label, cond, extra = '') => out.push([!!cond, label + (extra ? '  ' 
     fab.color.length === 64 * 64 * 4 && fab.N === 64 && !fab.rough);
   const camo = genCamoData('gold');
   ok('C4c 迷彩工单形状（256²，无粗糙度图）', camo.color.length === 256 * 256 * 4 && camo.N === 256 && !camo.rough);
-  // 同步回退路整条跑通：19 种 TEX 全部就位（这条同时钉住工单表完备性 —— 加种类只改
-  // texJobs()，漏了这里当场红）
+  // 同步回退路整条跑通：工单表里的 TEX 全部就位（这条同时钉住工单表完备性 —— 加种类只改
+  // texJobs()，漏了这里当场红）。名单长度**取自 KEYS.length 而不是手写数字**：早先这里写死
+  // "19 种"，加两种之后文案就说谎了，而判据照样绿 —— 计数一写死就成了会漂的东西。
   await initTextures();
-  const KEYS = ['concrete', 'plaster', 'brick', 'sand', 'snow', 'asphalt', 'metal', 'wood', 'crate', 'dirt', 'grass', 'rock', 'sandbag', 'tiles', 'fab_ally', 'fab_enemy', 'fab_snowA', 'fab_snowB', 'fab_urbanB'];
+  const KEYS = ['concrete', 'plaster', 'brick', 'sand', 'snow', 'asphalt', 'metal', 'wood', 'crate', 'dirt', 'grass', 'rock', 'sandbag', 'tiles', 'scree', 'micro', 'fab_ally', 'fab_enemy', 'fab_snowA', 'fab_snowB', 'fab_urbanB'];
   const missing = KEYS.filter(k => { const t = tex(k); return !t || !t.map || !t.normalMap; });
-  ok('C4d initTextures 同步路：19 种 TEX 全部就位（含 map/normalMap）', missing.length === 0, missing.length ? '缺 ' + missing.join(',') : '');
+  ok(`C4d initTextures 同步路：${KEYS.length} 种 TEX 全部就位（含 map/normalMap）`, missing.length === 0, missing.length ? `缺 ${missing.join(',')}` : '');
   ok('C4e Node（无 Worker）标记为同步回退路', globalThis.__texViaWorker === false);
 }
 

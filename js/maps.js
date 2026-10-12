@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import { mulberry32, pick } from './util.js';
 import { shape as ridgeShape, color as ridgeColor, SITE as RIDGE, Y as RIDGE_Y, CORRIDOR as RIDGE_ROADS, RAMPS as RIDGE_RAMPS, FLAG_POS as RIDGE_FLAGS } from './maps/ridges.js';
+import { SLOPE } from './terrain.js';
 
 const V = (x, z) => new THREE.Vector3(x, 0, z);
 
@@ -237,6 +238,9 @@ export const MAPS = {
     // 30m 把整条路的影响范围都圈进来。
     terrainRoadHalf: 30,
     terrainColor: ridgeColor,
+    // color() 在 r,g,b 之后再给 3 项混合权重：**[裸岩, 碎石, 裸土]**（草是余量，不占通道）。
+    // 顺序是契约，world.js 的地形着色器按这个下标取贴图；改顺序要同时改两边。
+    terrainBlend: 3,
     terrainBase: 'grass',        // 底图用草：逐顶点色是乘在上面的，深棕底图会把丘陵糊成一片黑
     // 底图铺开 16m 一格：草贴图是 6m 一格（materials.js 的 texScale），
     // 360m 的图上 6m 会密到看不出地形、只剩"刷子纹"。16m 配逐顶点色，
@@ -841,6 +845,115 @@ export const MAPS = {
         if (!free(x, z, 1.0)) continue;
         P(x, z);
         w.rock(x, z, 0.22 + r() * 0.38, 'rock', false);
+      }
+
+      // ===== 崖面岩脊 + 崖脚碎石裙（几何起伏）=====
+      // 上面那层"崖脚碎石"只摸近处；色带只读远处。中段缺的是**剪影与真阴影**：
+      // 陡崖在几何上仍是一片光滑土坡。这里沿等高线给崖面长出岩脊串，并在崖脚
+      // 顺下降方向铺一圈碎石裙（talus），让"陡 = 上不去"这件事在轮廓上可读。
+      //
+      // **随机流必须新开一路（mulberry32(41802)）。** 顶部的 r(=71) 是全图共用的，
+      // 在这一段消耗它的任何一个数，**后面所有**摆件（路床之后的出生/据点读数）
+      // 与整张图的既有布局都会静默移位——本段只从 rcv 取数，绝不碰 r。
+      //
+      // **全部 collide=false，注释清原因**：坡度 ≥0.85（SLOPE.STEEP，terrain.js
+      // 的分级表：0.85 以上是真崖、玩家硬挡）的崖面玩家本来就上不去，给岩脊加
+      // 碰撞只会凭空多出几百个碰撞盒并改动导航网格——拿视觉去动模拟，不划算也
+      // 不必要。碎石裙与既有 260 块同性质（纯视觉、不进导航），同样不加碰撞。
+      // 实例走既有 rockInst→finalize 合成管线，按 材质|变体 分组，只多个位数 draw call。
+      const rcv = mulberry32(41802);
+      const STEEP_CLIFF = SLOPE.STEEP;   // 读 terrain.js 的分级表，不在这里另写一份阈值
+      const CAP_RIDGE = 240, CAP_TALUS = 200; // 预算闸：合计 ≤440 ≤ 450 块上限
+      // 语义排除圈：与上面"崖脚碎石"同一套（营区 44 / 出生 24 / 旗位 12），
+      // 石片压水泥路、长在围墙上都是用户报过的原话级问题（判据 B21 盯路面净空）。
+      const cliffSiteOK = (x, z) => {
+        if (Math.abs(x) > 172 || Math.abs(z) > 172) return false;
+        if (Math.hypot(x - RIDGE.camp.x, z - RIDGE.camp.z) < 44) return false;
+        if (Math.hypot(x - RIDGE.spawnA.x, z - RIDGE.spawnA.z) < 24) return false;
+        if (Math.hypot(x - RIDGE.spawnB.x, z - RIDGE.spawnB.z) < 24) return false;
+        if (RIDGE_FLAGS.some(([fx, fz]) => Math.hypot(x - fx, z - fz) < 12)) return false;
+        return true;
+      };
+
+      // ── 1) 岩脊串：扫高度场找崖面，沿等高线（垂直于 T.grad）成串摆石 ──
+      // 串头按 6m 网格过筛（slope ≥ 0.85）+ 抖动，彼此间距 ≥15m —— 保证串与串
+      // 之间有缺口，不会铺成整面墙。每串 2~4 块、块距 3~5m，单块 1.2~3.0m。
+      const cliffPts = [];               // 已摆岩脊的崖面点（含下降方向），喂给碎石裙
+      let ridgeN = 0;
+      {
+        const anchors = [];
+        for (let ax = -168; ax <= 168; ax += 6) {
+          for (let az = -168; az <= 168; az += 6) {
+            if (flat(ax, az) < STEEP_CLIFF) continue;
+            if (!cliffSiteOK(ax, az)) continue;
+            const jx = ax + (rcv() - 0.5) * 4, jz = az + (rcv() - 0.5) * 4;
+            if (anchors.some(([px, pz]) => Math.hypot(px - jx, pz - jz) < 15)) continue;
+            anchors.push([jx, jz]);
+          }
+        }
+        for (const [ax, az] of anchors) {
+          if (ridgeN >= CAP_RIDGE) break;
+          let x = ax, z = az;
+          const n = 2 + Math.floor(rcv() * 3);        // 一串 2~4 块
+          for (let i = 0; i < n; i++) {
+            const s = 1.2 + rcv() * 1.8;              // 1.2~3.0m：崖面要有米的量级感
+            const rad = s * 0.7;                       // 与判据 B21 同口径的自身半径
+            if (flat(x, z) >= STEEP_CLIFF && cliffSiteOK(x, z) &&
+                clearOfRoad(x, z, rad) && free(x, z, rad)) {
+              P(x, z);
+              w.rock(x, z, s, 'rock', false);          // collide=false：见本段头部说明
+              ridgeN++;
+              const gc = T.grad(x, z);
+              cliffPts.push([x, z, gc.x, gc.z]);
+            }
+            if (ridgeN >= CAP_RIDGE) break;
+            // 下一步：重取局部梯度、沿等高线切向走 3~5m，再横抖 ±0.9m 贴着坡形转弯
+            const g = T.grad(x, z);
+            let tx = g.z, tz = -g.x;
+            const m = Math.hypot(tx, tz);
+            if (m < 1e-6) break;                       // 梯度塌了（局部平地），串到此为止
+            tx /= m; tz /= m;
+            const stepD = 3 + rcv() * 2;
+            const side = (rcv() - 0.5) * 1.8;
+            x += tx * stepD - tz * side;
+            z += tz * stepD + tx * side;
+          }
+        }
+      }
+
+      // ── 2) 碎石裙：崖面脚下（顺梯度下降 2~8m、坡度掉回 0.85 以下那一圈）撒小石 ──
+      // 每个崖面点先沿下降方向走到出崖的那一点，再以二次衰减的偏置向外撒 3 块，
+      // 越远离崖面越稀 —— 碎石裙的物理直觉就是贴着崖脚最厚。
+      let talusN = 0;
+      for (const [cx0, cz0, gx0, gz0] of cliffPts) {
+        if (talusN >= CAP_TALUS) break;
+        const mg = Math.hypot(gx0, gz0);
+        if (mg < 1e-6) continue;
+        // 从崖面点沿下降方向（-梯度）每步 0.8m 走，直到坡度掉下 0.85 或超出 8m
+        let px = cx0 - gx0 / mg * 1.5, pz = cz0 - gz0 / mg * 1.5, walked = 1.5;
+        while (walked < 8 && flat(px, pz) >= STEEP_CLIFF) {
+          const g = T.grad(px, pz);
+          const m = Math.hypot(g.x, g.z);
+          if (m < 1e-6) break;
+          px -= g.x / m * 0.8; pz -= g.z / m * 0.8; walked += 0.8;
+        }
+        if (flat(px, pz) >= STEEP_CLIFF) continue;     // 走到 8m 仍是崖：这一圈留给别的点
+        for (let k = 0; k < 3; k++) {
+          if (talusN >= CAP_TALUS) break;
+          const g = T.grad(px, pz);
+          const m = Math.hypot(g.x, g.z) || 1e-6;
+          const out = rcv() * rcv() * 6;               // 二次偏置：密度随离崖面距离衰减
+          const lat = (rcv() - 0.5) * 3.2;
+          const x = px - g.x / m * out - g.z / m * lat;
+          const z = pz - g.z / m * out + g.x / m * lat;
+          const s = 0.3 + rcv() * 0.6;                 // 0.3~0.9m 的小石
+          const rad = s * 0.7;
+          if (flat(x, z) >= STEEP_CLIFF) continue;     // 裙必须落在 <0.85 的坡脚上
+          if (!cliffSiteOK(x, z) || !clearOfRoad(x, z, rad) || !free(x, z, rad)) continue;
+          P(x, z);
+          w.rock(x, z, s, 'rock', false);              // 与既有 260 块同性质：纯视觉
+          talusN++;
+        }
       }
 
       // ===== 盘山路建模路床：顶点色画的是路肩（B20b），真正的"路"是这层几何板

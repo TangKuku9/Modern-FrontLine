@@ -295,7 +295,9 @@ npm run test:all      # 上面两档全跑
 - `test/world-equiv.mjs`：碰撞宽相（`js/world.js` 的 `buildBroad`/`_query`）与旧全量线性扫的**逐位等价**差分 —— 两端共用这份文件，候选集漏一个盒就是预测/回滚分叉。改 `rayAABB`/`_query`/碰撞常数之后先过这里
 - `test/terrain.mjs`：高度场第一次成了**模拟输入**（着地判定吃它），五段各带反证 —— 采样与渲染网格严格同面 / 摆件落地净空≈0 / **两处高地必须连通** / 两端逐位一致 / 放一个 NaN 必须当场红
 - `test/props.mjs`：**看不见但摸得着**那一类 —— 摆件贴地、无裸露碰撞盒、卡车盒容得下视觉、岩石不压墙、地坪不用外接方盒、光照三个量一起看
-- `test/worker-core.mjs` 同参两次生成逐位一致、同步回退路 19 种 TEX 全就位、`findPath` == `astarPath` · `test/preload-graph.mjs` `modulepreload` 清单必须**等于**源码模块图闭包，并核对生产白名单发得出去 · `test/image.mjs` 容器配方里不需要 docker 守护进程的那一半（`node test/image.mjs A` 分段跑）· `server/xenv.mjs` 按引擎指纹自校准成两档的跨环境一致性
+- `test/terrainmat.mjs`：双丘地表从"一张草贴图 × 逐顶点色"换成 **splat 四层混合**之后，专盯这条链路上的**静默失效**（上面几条一条都不会为它们变红）：`color()` 的权重项数必须 == `maps.js` 的 `terrainBlend`（两边各改各的时多出来的通道是**静默丢弃**，画出来照样像样）· 字节序拿一个"每通道一个可辨值"的假 colorFn 量，不复制 `render()` 的算法 · 裸岩必须长在崖上（slope>0.85 均值 ≥0.9 vs slope<0.10 的 ≤0.02）而**着色路面**（`CORRIDOR`，只有顶点色、没有几何板）中心线上岩+碎石必须 ≈0 · 边界真的被侵蚀过 = 掩膜**不是坡度的单值函数**：在 177 万对"坡度差 <0.005"的点对里，掩膜差 >0.5 的占 2.39%、最大差 1.000（单值的话那就是一圈等高线）· `M3b`【反证臂】拿纯坡度阈值版的同一把尺子量，最大差 0.124 贴住"过渡带斜率×坡度容差"的解析上限 0.150 ⇒ **门槛是从定义导出来的，不是手填的**；这条换过两版才立住，先量岩区"周长/面积"密度（无 warp 对照组自己也不平滑，只差 12%，量不出）、再量边界处坡度展宽（对照组反而比真掩膜**更宽**，因为坡度场在 2m 网格上本身就是糙的），**两版都被它自己的对照组否掉** · 非草覆盖率有预算（12%~35%，岩 ≤20%、碎石 ≤15%）——第一版把"通体绿"改成了"通体灰"（42%），那次是我用眼睛抓的，现在它是个会红的数 · 掩膜两次构建逐位 + 跨进程 sha256 一致 · 补丁六个锚点命中与两个对照开关真的翻 uniform。它**第一版就红了两条**：营区旗心压在走廊中心线 0.85m 上、旧写法把它的裸土整个乘掉（色说土、材质说水泥），而出生台那一圈同类——两处都改成"与颜色行同一套优先级"，`M2g`/`M2h` 从此钉住这条不变量。真 GL 那一半（程序真编译、像素真的因此不同）在下面的浏览器档里。
+- `test/terrainmat-gl.mjs` 上面那条唯一量不到的东西：**真编译、真出图**。G1 数 `onBeforeCompile` 在"第一次渲染之前 = 0、之后 ≥1"（离线那份是判据自己手工调的，只有渲染器调过才算接上了线）；G2 是**先决臂**，`readPixels` 平均亮度 >20 且 `info.render.calls` >50，G2b 再把 `composer.render` 打桩成空操作、当场塌到 0.00/0（"两张全黑也能差出九万个噪声像素"那次事故的免疫针）；G3 是**对照臂**：同机位同帧间隔翻 `uSplatOn`，逐像素差均值 15.06 而重复帧差 0.00000，G3c 再把 `setOn` 换成空操作 → 同一把尺子读数立刻归 0（对照臂是假的，G3 就失效而不是恒绿）。G4 量"崖面高频能量 on/off = ×1.59"（岩贴图与三向投影在起作用，不是颜色变了），G5 量细节法线近景 mad 3.60 / 俯瞰 **逐位相同** 0.000（视距淡出真的在退场）。两条工装事实钉在注释里，将来任何用 `renderer.info` 的浏览器判据都要先知道：`info` 每次 `renderer.render()` 开头自重置，一帧里被调四五次 ⇒ 不关 `autoReset` 就只能读到最后一个后处理 quad 的 `1`；以及 `rotation.order='YXZ'` 下朝向 `(dx,dz)` 的 yaw 是 `atan2(-dx,-dz)`（符号写反时近景机位朝了下坡，G5a 只量到 1.5% 像素变化）。
+- `test/worker-core.mjs` 同参两次生成逐位一致、同步回退路**工单表里每一种 TEX** 全就位（名单长度从 `KEYS` 取，不写死数字——原来那句"19 种"加两种之后就说谎了而判据照样绿）、`findPath` == `astarPath` · `test/preload-graph.mjs` `modulepreload` 清单必须**等于**源码模块图闭包，并核对生产白名单发得出去 · `test/image.mjs` 容器配方里不需要 docker 守护进程的那一半（`node test/image.mjs A` 分段跑）· `server/xenv.mjs` 按引擎指纹自校准成两档的跨环境一致性
 
 **表现层与手感**
 
@@ -313,9 +315,9 @@ npm run test:all      # 上面两档全跑
 - `test/net-play.mjs` / `test/net-drop.mjs`：两个真浏览器对打（延迟补偿与客户端帧时序唯一一起参与的地方）、掉线四种情形分开验收；另外量奖章弹窗、房间屏"补人"那一格、账号闸上的"忘了密码？"
 - `test/tab-session.mjs` 同源双标签页（cookie 按"源"共享，两个 page 放进同一个 context）· `test/worker-live.mjs` Worker 双路真浏览器离线实跑，B 臂把 `window.Worker` 封锁死
 
-**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` / `tab-session` / `worker-live` / `hud-keys` —— 名单**从源码推**（谁 `import { chromium } from 'playwright'` 就是谁），漏写和多写都红。其余判据都在进程内跑完，不碰浏览器。
+**要真浏览器**：`xenv` / `fps` / `viewmodel` / `gunvisual` / `optic` / `state-leak` / `net-play` / `net-drop` / `tab-session` / `worker-live` / `hud-keys` / `terrainmat-gl` —— 名单**从源码推**（谁 `import { chromium } from 'playwright'` 就是谁），漏写和多写都红。其余判据都在进程内跑完，不碰浏览器。
 
-这 11 份的 `launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本机绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据，由 G 段逐份核（少一档就红）。
+上面这一行的每一份，`launch()` 都按同一顺序试三档：**系统 Chrome** → **Playwright 自带的那一份**（不带 `channel` / `executablePath`，所以 `npx playwright install chromium` 装的就是它）→ 本机绝对路径。中间那一档是"别人的机器能不能跑起来"的全部依据，由 G 段逐份核（少一档就红）。份数不写在这里 —— 名单由 E 段从源码推，写死一个数就是一个会漂的谎。
 
 ## 已知缺口
 

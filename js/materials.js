@@ -6,7 +6,9 @@ const TEX = {};
 const MATS = {};
 const CAMO = {};
 
-const TEX_KINDS = ['concrete', 'plaster', 'brick', 'sand', 'snow', 'asphalt', 'metal', 'wood', 'crate', 'dirt', 'grass', 'rock', 'sandbag', 'tiles'];
+// scree/micro 是双丘 splat 地形的贴图：scree = 碎石坡层，micro = 细节法线层（只喂
+// normalMap）。加载期每加一种就是一趟 512² 逐像素循环，此处**只**多这两种，别再加。
+const TEX_KINDS = ['concrete', 'plaster', 'brick', 'sand', 'snow', 'asphalt', 'metal', 'wood', 'crate', 'dirt', 'grass', 'rock', 'sandbag', 'tiles', 'scree', 'micro'];
 const FABRICS = {
   fab_ally: [[150, 130, 95], [110, 100, 70], [85, 90, 60], [175, 155, 115]],
   fab_enemy: [[48, 50, 52], [32, 33, 35], [70, 68, 62], [58, 60, 64]],
@@ -20,7 +22,14 @@ const CAMO_KINDS = ['desert', 'woodland', 'digital', 'tiger', 'gold', 'dragon'];
 // 出发，加种类只改这里，两条路不会漂。
 function texJobs() {
   const jobs = [];
-  for (const k of TEX_KINDS) jobs.push({ key: k, kind: k, opts: { rough: k === 'asphalt' || k === 'metal' || k === 'tiles', normal: k === 'metal' ? 4 : 3 } });
+  for (const k of TEX_KINDS) {
+    // micro 只供细节法线：256² 省加载时间，normal 强度显著高于其它种类（着色器只读
+    // 它的 normalMap，不需要 roughnessMap）。工单仍走这张表 —— Worker 路与同步路同源。
+    const opts = k === 'micro'
+      ? { size: 256, normal: 10 }
+      : { rough: k === 'asphalt' || k === 'metal' || k === 'tiles' || k === 'scree', normal: k === 'metal' ? 4 : k === 'scree' ? 5 : 3 };
+    jobs.push({ key: k, kind: k, opts });
+  }
   for (const k of Object.keys(FABRICS)) jobs.push({ key: k, kind: 'fabric', opts: { size: 256, normal: 1, cfg: { colors: FABRICS[k] } } });
   return jobs;
 }
@@ -118,6 +127,7 @@ function buildMaterials() {
   MATS.grass = std('grass', 6);
   MATS.rock = std('rock', 5);
   MATS.rockSnow = std('rock', 5, { color: 0xc8ccd4 });
+  MATS.scree = std('scree', 4);
   MATS.sandbag = std('sandbag', 1);
   MATS.tarp = new THREE.MeshStandardMaterial({ color: 0x55603f, roughness: 0.95, side: THREE.DoubleSide });
   MATS.clothRed = new THREE.MeshStandardMaterial({ color: 0x9a2b22, roughness: 0.95, side: THREE.DoubleSide });
@@ -182,6 +192,15 @@ function buildMaterials() {
 
 export function mat(name) { const m = MATS[name]; if (!m) { (window.__matMiss = window.__matMiss || new Set()).add(name); return MATS.concrete; } return m; }
 export function tex(name) { return TEX[name]; }
+
+// 地形 splat 着色器要吃的贴图集合（双丘战区四层混合：草为余量，裸岩/碎石/裸土走
+// aBlend 通道）。每项是 {map, normalMap, roughnessMap?}，直接复用 TEX 里现成的那份
+// —— 不要另起第二套贴图加载路径。
+// **必须在 initTextures()  resolve 之后调用**：此前 TEX 是空的，返回对象里全是
+// undefined，着色器会静悄悄拿到全黑贴图。
+export function terrainSplatSet() {
+  return { grass: TEX.grass, dirt: TEX.dirt, rock: TEX.rock, scree: TEX.scree, micro: TEX.micro };
+}
 
 const camoCache = {};
 export function camoMaterial(camo, base) {
