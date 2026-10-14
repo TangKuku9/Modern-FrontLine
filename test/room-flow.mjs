@@ -766,6 +766,49 @@ try {
   x.close(); y.close();
   srv6.kill();
 
+  // ── I2：占领进联机（用户报"联网里没有占点"）──
+  // 上游是**界面**那一半（js/menu.js 曾把"按当前地图"反过来滤模式，「占领↔双丘战区」互为专属
+  // 于是死锁 ⇒ 大厅里点不到占领，判据在 test/hud-ux.mjs 的 AJ 段与 test/hud-keys.mjs 的 L11）。
+  // 这里量的是**这条链路真的通**：大厅建房（dom）→ 开局 → welcome 带回 dom/ridges →
+  // 据点那一班事件真的在下发（domFlags 每 15 拍一班，3 面旗 —— 少了它客户端那三面旗永远是空的）。
+  // 反证臂是 tdm 房：同一段等待里一条 domFlags 都不许来（"有事件"不能是靠"任何房间都发"凑出来的）。
+  console.log('\n── I2：占领进联机（模式随 welcome 下发 + 据点那一班事件真的在跑）──');
+  const srv6b = await withServer({ REQUIRE_ACCOUNT: '0', JOIN_CODE: '' });
+  const domWait = 12000;
+  const mkPair = async (roomId, mode, n1, n2) => {
+    const c1 = client(srv6b.ws, n1), c2 = client(srv6b.ws, n2);
+    await c1.opened; await c2.opened;
+    c1.send({ t: 'lobby' }); await c1.until(j => j.t === 'lobby');
+    c2.send({ t: 'lobby' }); await c2.until(j => j.t === 'lobby');
+    c1.send({ t: 'createRoom', room: roomId, name: n1, title: roomId, mode });
+    await c1.until(j => j.t === 'room' && j.room && j.room.id === roomId, 6000);
+    c2.send({ t: 'joinRoom', room: roomId, name: n2 });
+    await c2.until(j => j.t === 'room' && j.me, 6000);
+    c2.send({ t: 'ready', on: true });
+    await c1.until(j => j.t === 'room' && j.canStart === true, 6000);
+    c1.send({ t: 'start' });
+    const w1 = await c1.until(j => j.t === 'welcome', 15000);
+    return { c1, c2, w1 };
+  };
+  const domRun = await mkPair('domroom', 'dom', '占甲', '占乙');
+  ok('dom 房开得起来：welcome 带回 mode=dom 与「双丘战区」（房主建房时只选了模式，图由服务端兜到 dom 的专属图）',
+    !!domRun.w1 && domRun.w1.mode === 'dom' && domRun.w1.map === 'ridges',
+    JSON.stringify(domRun.w1 && { mode: domRun.w1.mode, map: domRun.w1.map }));
+  const domEv = await domRun.c1.until(j => j.t === 'ev' && (j.ev || []).some(e => e.e === 'domFlags'), domWait);
+  const domF = domEv ? (domEv.ev.find(e => e.e === 'domFlags') || {}).f : null;
+  ok('据点那一班事件真的在下发：domFlags 带着 3 面旗（A/B/C，开局都还没归属）—— 客户端那三面 3D 旗与水圈就靠这一条喂',
+    !!domF && domF.length === 3 && domF.map(f => f.n).join('') === 'ABC' && domF.every(f => !f.o),
+    JSON.stringify(domF));
+  // 反证臂：tdm 房里同一条等待里不该有 domFlags —— 否则上面那条量的只是"任何房间都发事件"。
+  const tdmRun = await mkPair('tdmroom', 'tdm', '死甲', '死乙');
+  ok('【先决·反证臂的另一半】tdm 房照旧开得起来（welcome.mode=tdm）',
+    !!tdmRun.w1 && tdmRun.w1.mode === 'tdm', JSON.stringify(tdmRun.w1 && tdmRun.w1.mode));
+  const tdmEv = await tdmRun.c1.until(j => j.t === 'ev' && (j.ev || []).some(e => e.e === 'domFlags'), 1500);
+  ok('【反证臂】tdm 房里一条 domFlags 都没有（没有据点的一局不该发据点读数 —— 发了的话上面那条绿是白来的）',
+    !tdmEv, JSON.stringify(tdmEv && tdmEv.ev));
+  for (const c of [domRun.c1, domRun.c2, tdmRun.c1, tdmRun.c2]) c.close();
+  srv6b.kill();
+
   console.log('\n── J：对局中的聊天与举报（差距 43/45）──');
   // 聊天以前只长在大厅/房间两屏：对局中发不出去也收不到。判据的形状与别处一样 ——
   // 每一种失效都是静默的（"发了没人看见""对面收到了我不该看见的话""举报石沉大海"），

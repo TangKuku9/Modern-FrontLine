@@ -1911,6 +1911,82 @@ const contrast = (a, b) => { const l1 = lum(a), l2 = lum(b); return (Math.max(l1
     (() => { m.screen = 'main'; m.chatTick(2); return m._chatAcc === 0 && m._chatSig === '' && box.__rec.writes === wAged + 1; })());
 }
 
+// ───────────────────────── AJ 段：联网里选得到「占领」（HU-44 · 用户报"是不是还没有占点模式"）─────────────────────────
+// 服务端与规则内核一直是支持占点的（room-flow 的 dom 那几段、mp-rules 的 O 段都在量它），
+// 战役/单机屏也一直选得到。缺的是**界面**：大厅与房间屏各多了一句"模式按当前地图藏"，
+// 而「占领」只在「双丘战区」、双丘战区只在占领（js/data.js 两侧互为专属）——
+// 两边互相设门就是死锁：dune 上 dom 被藏、tdm 下 ridges 被藏，玩家点遍屏幕上所有看得见的格子
+// 也到不了这一对。所以这一段的被测对象不是"某个字符串在不在"，而是**可达性**：
+// 从默认态出发、只许点屏幕上看得见的格子，枚举报到得了哪些 (模式, 图)。
+{
+  const { mapAllowed, mapsForMode, MP_MAPS, MP_MODES } = await import('../js/data.js');
+  const ONLINE = MP_MODES.filter(m => m.net).map(m => m.id);
+  ok('AJ0【先决·跨文件对账】线上模式表就是 MP_MODES 里 net 的那几个，而且**每个模式至少有一张图**（两个屏的"落回该模式第一张图"都靠这条不变量；dom↔ridges 互为专属是这一条的现场）',
+    /const ONLINE_MODES = MP_MODES\.filter\(m => m\.net\);/.test(MENU_SRC)
+    && ONLINE.length === MP_MODES.length
+    && MP_MODES.every(m => mapsForMode(m.id).length > 0)
+    && !mapAllowed('dune', 'dom') && !mapAllowed('ridges', 'tdm') && mapAllowed('ridges', 'dom'),
+    `线上模式 ${JSON.stringify(ONLINE)}·每模式的图 ${JSON.stringify(MP_MODES.map(m => m.id + ':' + mapsForMode(m.id).length))}`);
+
+  // 可达性枚举。两个规则只差一处：**模式那一行按不按当前图藏**。
+  // 「点一格模式之后图会不会跟着迁」在两个规则里是同一句（syncSegs 里那一句没动过），
+  // 所以枚举里也共用同一句 —— 差的就只有"这一格看得见吗"。
+  const reachable = (modesFilteredByMap) => {
+    const start = ['tdm', 'dune'];
+    const seen = new Set([start.join('|')]);
+    const q = [start];
+    while (q.length) {
+      const [mode, map] = q.shift();
+      const modes = modesFilteredByMap ? ONLINE.filter(m => mapAllowed(map, m)) : ONLINE;
+      for (const m of modes) {
+        const ms = mapsForMode(m);
+        const nm = (mapAllowed(map, m) || !ms.length) ? map : ms[0].id;   // syncSegs 的迁移那一句
+        const k = m + '|' + nm;
+        if (!seen.has(k)) { seen.add(k); q.push([m, nm]); }
+      }
+      for (const mp of MP_MAPS) {
+        if (!mapAllowed(mp.id, mode)) continue;
+        const k = mode + '|' + mp.id;
+        if (!seen.has(k)) { seen.add(k); q.push([mode, mp.id]); }
+      }
+    }
+    return seen;
+  };
+  const oldReach = reachable(true), newReach = reachable(false);
+  const hasMode = (set, m) => [...set].some(k => k.split('|')[0] === m);
+  const hasMap = (set, m) => [...set].some(k => k.split('|')[1] === m);
+  ok('AJ1【复现用户报的那一条】按**旧规则**（模式也跟着当前图藏）从默认的 (团队死斗, 沙丘镇) 出发：占领与双丘战区**一个都到不了** —— 玩家把屏幕上所有看得见的格子点遍也不行（这句话就是"联网里没有占点"的成因）',
+    !hasMode(oldReach, 'dom') && !hasMap(oldReach, 'ridges'),
+    `可达 ${[...oldReach].join(' ')}`);
+  ok('AJ1b【修复的定义】同一把尺子、同一出发点，把模式那一行的过滤摘掉（只按模式藏图）：占领与双丘战区**都到得了**（这一条与 AJ1 是同一条判据的两个方向，缺一个就分不清"修好了"与"量具没接上"）',
+    hasMode(newReach, 'dom') && hasMap(newReach, 'ridges') && newReach.has('dom|ridges'),
+    `可达 ${[...newReach].join(' ')}`);
+
+  // 两个屏各自的那一句（进程内驱动不了这几格的点击：夹具的 innerHTML 不解析，见 test/hud-ux.mjs 头注；
+  // **真点击那一半在 test/hud-keys.mjs 的 L11**）。
+  const hidesModeByMap = t => /for \(const m of ONLINE_MODES\) togg\('segMode'/.test(t);
+  ok('AJ2 大厅那一屏不再"按当前图藏模式"（只按模式藏图）—— 那多出来的一句正是死锁的另一半',
+    !hidesModeByMap(MENU_SRC)
+    && /for \(const m of MP_MAPS\) togg\('segMap', m\.id, mapAllowed\(m\.id, L\.mode\)\);/.test(MENU_SRC));
+  ok('AJ2b【反证臂】把那一句代回大厅的 syncSegs，同一把尺子当场认出来',
+    hidesModeByMap(MENU_SRC.replace("for (const m of MP_MAPS) togg('segMap', m.id, mapAllowed(m.id, L.mode));",
+      "for (const m of MP_MAPS) togg('segMap', m.id, mapAllowed(m.id, L.mode));\n      for (const m of ONLINE_MODES) togg('segMode', m.id, mapAllowed(L.map, m.id));")));
+  ok('AJ3 房间屏的模式那一行也不再按当前图滤（`roomModes` 就是三张常驻卡；按图滤的话 dune/tdm 房里只剩 tdm，还会退化成 cfg-one 那句陈述，房主换不到占领）',
+    /const roomModes = ONLINE_MODES;/.test(MENU_SRC) && !/const roomModes = ONLINE_MODES\.filter/.test(MENU_SRC));
+  ok('AJ3b【反证臂】把按图滤那一版代回去，同一把尺子当场认出来',
+    /const roomModes = ONLINE_MODES\.filter/.test(MENU_SRC.replace('const roomModes = ONLINE_MODES;',
+      "const roomModes = ONLINE_MODES.filter(m => mapAllowed(room.map, m.id));")));
+
+  const modeClick = (/if \(key === 'mode'\) \{[\s\S]*?\n        \}/.exec(MENU_SRC) || [''])[0];
+  ok('AJ4 房间内换模式那一支把"这一帧过后的组合"一起发出去：mode + map + minutes + scoreLimit（只发 mode 的话，互为专属那一对里另一头还停在旧值上，服务端按并起来的组合当场拒 —— 玩家看到的只是"点了没反应"；minutes/scoreLimit 不归位的话，房间标题上那两个数字从此是假的）',
+    /setCfg\(\{ mode: v, map, minutes, scoreLimit \}\)/.test(modeClick)
+    && /mapsForMode\(v\)/.test(modeClick) && /DEFAULT_MINUTES\(v\)/.test(modeClick) && /DEFAULT_SCORE_LIMIT\(v\)/.test(modeClick),
+    modeClick.slice(0, 40).replace(/\s+/g, ' '));
+  ok('AJ4b【反证臂】把那一支退回"只发单格"的老写法，同一把尺子当场认出来',
+    !/setCfg\(\{ mode: v, map, minutes, scoreLimit \}\)/.test(
+      modeClick.replace('setCfg({ mode: v, map, minutes, scoreLimit })', 'setCfg({ [key]: v })')));
+}
+
 // ───────────────────────── 收口 ─────────────────────────
 const bad = out.filter(([g]) => !g);
 for (const [g, label] of out) console.log(`  ${g ? '✅' : '❌'} ${label}`);

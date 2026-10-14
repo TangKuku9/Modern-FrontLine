@@ -787,7 +787,12 @@ export class Menu {
     // 藏掉不收的项、迁移落选的偏好（图 / 目标），再把 sel 与目标行的"杀/分"后缀拨回
     // 真相 —— 与单机屏同一套"画全集 + 藏"的手法。点击任何一格后都要跑一遍。
     const syncSegs = () => {
-      if (!mapAllowed(L.map, L.mode)) L.map = mapsForMode(L.mode)[0].id;
+      // 兜底：当前图不被新模式收 → 落回该模式第一张可用的图（每个模式至少一张，
+      // 判据 AJ1 钉着这条不变量）。写成 ms[0].id 直接取的话，将来有人加一个"没有图"的
+      // 模式就是一句 TypeError —— 而这里宁可不换图（服务端的 mapGate 会用一句人话拒掉），
+      // 也不该在渲染路径上抛。
+      const ms = mapsForMode(L.mode);
+      if (!mapAllowed(L.map, L.mode) && ms.length) L.map = ms[0].id;
       if (!scoreOptions(L.mode).includes(L.score)) L.score = DEFAULT_SCORE_LIMIT(L.mode);
       // 时长那格同一套规矩：旧偏好不在新模式的档位表里（tdm 的 10 分切到 dom）就落回
       // 该模式的默认 —— 不归位的话选择器没有选中项，发出去的建房帧带着一个表外值，
@@ -797,8 +802,12 @@ export class Menu {
         const el = r.querySelector(`#${id} div[data-v="${val}"]`);
         if (el) el.style.display = allow ? '' : 'none';
       };
+      // **图跟着模式藏，模式不跟着图藏**（HU-44 的命门就是后一句）。
+      // 「占领」只在「双丘战区」、双丘战区只在占领 —— 这是 js/data.js 两侧互为专属的绑定。
+      // 两边互相设门就成了死锁：dune 上 dom 被藏、tdm 下 ridges 被藏，玩家点遍屏幕上
+      // 所有看得见的格子也到不了这一对（"联网里没有占点"这句用户报告的成因）。
+      // 单机屏（showLobby）从来没有这一步，它只滤图、模式三张卡常驻 —— 所以单机一直点得到。
       for (const m of MP_MAPS) togg('segMap', m.id, mapAllowed(m.id, L.mode));
-      for (const m of ONLINE_MODES) togg('segMode', m.id, mapAllowed(L.map, m.id));
       for (const v of MINUTES_ALL) togg('segMin', v, minutesOptions(L.mode).includes(v));
       for (const v of SCORES_ALL) togg('segScore', v, scoreOptions(L.mode).includes(v));
       r.querySelectorAll('#segScore div').forEach(x => { x.textContent = this.scoreLabel(+x.dataset.v, L.mode); });
@@ -1384,11 +1393,17 @@ export class Menu {
       // 别处那套"画全集 + 藏"。服务端（server/lobby.mjs:mapGate）是后盾：绕过界面
       // 发帧的组合会被当场拒掉，而不是悄悄换掉一边。
       const roomMaps = MP_MAPS.filter(m => mapAllowed(m.id, room.mode));
-      const roomModes = ONLINE_MODES.filter(m => mapAllowed(room.map, m.id));
+      // 模式那一行**不按当前图滤**（HU-44）。「占领」只在双丘战区、双丘战区只在占领：
+      // 两边互相设门的话，dune/tdm 的房里 mode 只剩 [tdm]（还会退化成 cfg-one 那句陈述），
+      // 而图那一行又按 tdm 滤掉了 ridges —— 房主点遍这一栏也换不到占领。
+      // 换模式那一路由**同帧下发一致的组合**兜底（见下面 click 处理里 mode 那一支）。
+      const roomModes = ONLINE_MODES;
       cfg.innerHTML = `<div class="lb-hd"><span>${me.isHost ? '房间设置' : '本局设置'}</span><span>${me.isHost ? '改动立刻随列表广播' : '由房主决定'}</span></div>`
         + row('地图', 'rmMap', roomMaps.map(m => m.id), roomMaps.map(m => m.name), room.map)
         // 只有一种玩法可选时不画选择器：一个撑满整行的亮块看着像"还能点出别的"，
-        // 而它其实是一句陈述。id 两边同名，判据不必跟着形状改。
+        // 而它其实是一句陈述。id 两边同名，判据不必跟着形状改。（今天 ONLINE_MODES 三门
+        // 常驻，所以这一支只在"以后只剩一种玩法"时才用得上；留着是因为它是一条**陈述**，
+        // 而不是一个可以随手删掉的分支。）
         + (roomModes.length > 1
           ? row('模式', 'rmMode', roomModes.map(m => m.id), roomModes.map(m => m.name), room.mode)
           : `<div class="cfg-row"><span>模式</span><div class="cfg-one" id="rmMode">${esc((roomModes[0] || mode).name)}</div></div>`)
@@ -1409,6 +1424,21 @@ export class Menu {
       cfg.querySelectorAll('.seg div[data-dis="0"]').forEach(d => d.addEventListener('click', () => {
         const sg = d.parentElement, v = isNaN(+d.dataset.v) ? d.dataset.v : +d.dataset.v;
         const key = sg.id === 'rmMap' ? 'map' : sg.id === 'rmMode' ? 'mode' : sg.id === 'rmScore' ? 'scoreLimit' : sg.id === 'rmBot' ? 'botSkill' : sg.id === 'rmFill' ? 'fill' : 'minutes';
+        // 换模式要**把这一帧过后那个组合一起发**（HU-44）。服务端验的是"这一帧要落成的
+        // (图, 模式)"（server/lobby.mjs:roomCfg），只发 mode 的话，互为专属那一对里另一头
+        // 还停在旧值上 —— 「占领」只在双丘战区，所以"dune 房里点占领"会被当场拒，
+        // 而玩家看到的只是一句拒绝/点了没反应，正是这一轮要消灭的那类静默失效。
+        // 三格一起给：图迁到新模式的第一张（不被收才迁），时长与目标也按新模式的档位表
+        // 归位（dom 是 15/25/35 与 100/200/500；不归位的话房间标题上那个数字从此是假的，
+        // 而服务端只在**带了这一格**时才清洗，见 roomCfg 里那两句注释）。
+        if (key === 'mode') {
+          const ms = mapsForMode(v);
+          const map = mapAllowed(room.map, v) || !ms.length ? room.map : ms[0].id;
+          const minutes = minutesOptions(v).includes(room.time) ? room.time : DEFAULT_MINUTES(v);
+          const scoreLimit = scoreOptions(v).includes(room.score) ? room.score : DEFAULT_SCORE_LIMIT(v);
+          this.roomAsk(l => l.setCfg({ mode: v, map, minutes, scoreLimit }));
+          return;
+        }
         this.roomAsk(l => l.setCfg({ [key]: v }));
       }));
     }

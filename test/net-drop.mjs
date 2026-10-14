@@ -358,27 +358,53 @@ try {
       !!(await wait(a, () => (window.game.menu || {}).screen === 'onlineRoom'
         && document.querySelectorAll('#seatA .seat, #seatB .seat').length >= 2
         && !!document.querySelector('#rmChat') && !!document.querySelector('[data-a=start]') && !!document.querySelector('[data-a=leave]'))));
-    // 房间屏那一格滤的是**这间房的地图**允许的玩法（js/menu.js:renderRoom 那句
-    // "模式牵制地图、地图也牵制模式"，ridges 只在占领、占领只在 ridges）：房主在 frost
-    // 的房里点不到一开局就会被服务端 mapGate 拒掉的玩法。所以期望值按 room.map 算，
-    // 不是按"全部 net 玩法"算 —— 后者在地图过滤上线之后永远多出一格（2026-10-09 大房
-    // 那轮之后这条一直红着）。它不是"滤得越狠越对"：下面那条先决要求这一格**非空且含
-    // 团队死斗**，把候选滤成空会被它当场抓住；而"占领在别处可达、且只在双丘可达"由
-    // test/room-flow.mjs 的 dom 建房那两条（含两个拒绝方向）钉着，这里不重复。
-    ok('房间设置那一格与**这间房的地图**开放的玩法一字不差（房主点不到服务端判不了的）',
-      await a.evaluate(async () => {
-        const { MP_MODES, mapAllowed } = await import('/js/data.js');
-        const s = document.querySelector('#rmMode');
-        const map = window.game.lobby.state.room.map;
-        return !!s && s.textContent.replace(/\s+/g, '') === MP_MODES.filter(m => m.net && mapAllowed(map, m.id)).map(m => m.name).join('');
-      }),
-      JSON.stringify(await a.evaluate(() => ({ shown: (document.querySelector('#rmMode') || {}).textContent, map: window.game.lobby.state.room.map }))));
-    ok('先决：这一格非空、含团队死斗、且不含这间房的地图打不了的占领',
-      await a.evaluate(() => {
-        const t = ((document.querySelector('#rmMode') || {}).textContent || '').replace(/\s+/g, '');
-        return t.length > 0 && t.includes('团队死斗') && !t.includes('占领');
-      }),
-      await a.evaluate(() => (document.querySelector('#rmMode') || {}).textContent));
+    // 房间屏那一格与"这间房的地图"是**一对互相牵制**的候选（js/data.js：ridges 只在占领、
+    // 占领只在 ridges）。原则只有一条：**界面给出的每一格都必须落得下去** —— 房主点得到的玩法，
+    // 一按就要得到服务端认可的组合，不许有"点了被当场拒"的死按钮；同时这一格也不许被滤成空。
+    // 【改判 2026-10-14 · 审计 HU-44】这条原则的前一版量的是**文字**（"与这间房的地图允许的玩法
+    // 一字不差"），而那正是 2026-10-09 地图过滤上线后的形状：它把「占领」滤掉了，而「占领」与
+    // 双丘战区互为专属 ⇒ dune/frost 的房里**永远换不到占领**（旧注释里那句"这条一直红着"记的
+    // 就是这件事：红着的是尺子在被迁就，见那天的形状）。现在量**行为**：按下去，看服务端收没收、
+    // 收成了什么 —— 界面上滤掉了而服务端其实收得下（旧形状），或者界面上给着而按下去被拒
+    // （一个真的死按钮），两种都会红。
+    const rmClick = (sel, v) => a.evaluate(([s, val]) => {
+      const e = document.querySelector(s); if (!e) return false;
+      const d = [...e.querySelectorAll('div')].find(x => x.dataset.v === val);
+      if (!d || d.getBoundingClientRect().height === 0) return false;
+      d.click(); return true;
+    }, [sel, v]);
+    const rmNow = () => a.evaluate(() => {
+      const r = (window.game.lobby.state || {}).room || {};
+      const sel = id => { const e = document.getElementById(id); if (!e) return null; const s = e.querySelector('div.sel'); return s ? s.dataset.v : null; };
+      const shown = id => { const e = document.getElementById(id); return e ? [...e.querySelectorAll('div')].filter(x => x.getBoundingClientRect().height > 0).map(x => x.dataset.v).join(',') : null; };
+      return { mode: r.mode, map: r.map, time: r.time, score: r.score, minSel: sel('rmMin'), minShown: shown('rmMin'), scoreSel: sel('rmScore') };
+    });
+    const shownModes = await a.evaluate(() => (document.querySelector('#rmMode') || {}).textContent.replace(/\s+/g, ''));
+    ok('先决：房间设置那一格非空、含团队死斗（把候选滤成空、或滤掉当前模式自身，都会被这一条抓住）',
+      shownModes.length > 0 && shownModes.includes('团队死斗'), shownModes);
+    await rmClick('#rmMode', 'dom');
+    await wait(a, () => ((window.game.lobby.state || {}).room || {}).mode === 'dom', 8000);
+    const domRoom = await rmNow();
+    ok('房间里点得到「占领」、而且按下去真的落地：这一间变成 dom + 双丘战区，两组档位同时换表（时长选中 25、候选 15/25/35；目标选中 200）—— 同帧下发的是**一致的组合**，所以界面给的这一格不是死按钮（旧形状里这一格在 frost/dune 的房里根本不存在）',
+      domRoom.mode === 'dom' && domRoom.map === 'ridges' && domRoom.time === 25 && domRoom.score === 200
+      && domRoom.minSel === '25' && domRoom.minShown === '15,25,35' && domRoom.scoreSel === '200',
+      JSON.stringify(domRoom));
+    await rmClick('#rmMode', 'tdm');
+    await wait(a, () => ((window.game.lobby.state || {}).room || {}).mode === 'tdm', 8000);
+    const backTdmRoom = await rmNow();
+    ok('再点回「团队死斗」同样落地：变回 tdm、图落在该模式的第一张（沙丘镇）、时长回到 10（25 不在 tdm 的档位表里 ⇒ 归位），目标 200 本来就在 tdm 的表里 ⇒ 留着 —— 两个方向都不留一个服务端判不了的组合',
+      backTdmRoom.mode === 'tdm' && backTdmRoom.map === 'dune' && backTdmRoom.time === 10
+      && backTdmRoom.minSel === '10' && backTdmRoom.minShown === '3,5,10,15',
+      JSON.stringify(backTdmRoom));
+    // 量完归位：后面那一串判据（大厅里那一行的 meta、以及最后开的那一局）读的都是**这一间房**，
+    // 它得回到进来时的样子（tdm / 寒霜炼厂 / 10 分 / 50 杀）。这三下本身也是"单格改设置"那一支的落点。
+    await rmClick('#rmMap', 'frost');
+    await rmClick('#rmMin', '10');
+    await rmClick('#rmScore', '50');
+    await wait(a, () => { const r = ((window.game.lobby.state || {}).room) || {}; return r.map === 'frost' && r.time === 10 && r.score === 50; }, 8000);
+    const restored = await rmNow();
+    ok('【归位】量完把这间放回原样（寒霜炼厂 / 10 分 / 50 杀）—— 后面读的是同一间房，不归位就是把后面的判据换了一个被测对象',
+      restored.mode === 'tdm' && restored.map === 'frost' && restored.time === 10 && restored.score === 50, JSON.stringify(restored));
     ok('一个人的时候不给开局，且把原因写在按钮旁边（不是把按钮藏起来）',
       await a.evaluate(() => { const s = document.querySelector('[data-a=start]'); return !!s && s.disabled === true && /至少/.test((document.querySelector('#rmWhy') || {}).textContent || ''); }),
       JSON.stringify(await a.evaluate(() => ({ d: (document.querySelector('[data-a=start]') || {}).disabled, why: (document.querySelector('#rmWhy') || {}).textContent }))));

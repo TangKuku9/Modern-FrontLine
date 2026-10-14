@@ -328,6 +328,18 @@ export const RETIRED_RULERS = [
     gone: [/const step = stepMeasured !== null \? stepMeasured : Math\.hypot\(pl\.vel/],
     must: [/foldJudge\(\{ corrected: r\.corrected/, /foldFloor/],
   },
+  {
+    id: '房间设置的模式那一格"与这间房的地图允许的玩法一字不差"（把 dom↔ridges 锁死成死锁的那把尺子）',
+    file: 'test/net-drop.mjs',
+    why: '"滤掉当前图打不了的玩法"这条口径与 js/data.js 的**互为专属**绑定（占领只在双丘、双丘只在占领）'
+      + '撞成死锁：dune/frost 的房里模式那一格永远没有「占领」，而图那一行又按模式滤掉了双丘 ⇒ '
+      + '房主点遍这一栏也换不到占领（用户报的"联网里是不是还没有占点模式"）。旧注释里那句'
+      + '"地图过滤上线之后这条一直红着"记的正是**尺子在被迁就**（2026-10-09）—— 判据红了先怀疑口径那条。',
+    closed: '审计 HU-44（改判记在那一节）+ test/net-drop.mjs 改成"按下去看服务端收没收"三条（含先决与【归位】）'
+      + ' · test/hud-ux.mjs AJ 段（可达性两个方向 / 两屏契约 / 同帧组合）· test/hud-keys.mjs L11/L11b~L11e（真点击 + 真开局）',
+    gone: [/MP_MODES\.filter\(m => m\.net && mapAllowed\(map, m\.id\)\)/, /不含这间房的地图打不了的占领/],
+    must: [/房间里点得到「占领」/, /再点回「团队死斗」同样落地/, /【归位】/, /一致的组合/, /先决：房间设置那一格非空、含团队死斗/],
+  },
 ];
 
 // 尺子架在源码上：文件读不到也算一条红，不是静默跳过（跳过就等于这张表恒绿）。

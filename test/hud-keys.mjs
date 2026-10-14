@@ -731,6 +731,76 @@ try {
     chatBefore === 2 && agedInTime && chatAfter.length === 1 && /还很新/.test(chatAfter[0] || '') && !/马上过期/.test(chatAfter.join('')),
     `进屏 ${chatBefore} 条 → ${JSON.stringify(chatAfter)}`);
 
+  // ── L11：联网里点得到「占领」（HU-44 · 用户报"联网对战是不是还没有占点模式"）──
+  // 成因（大厅/房间屏各多了一句"模式按当前图藏"，与「占领↔双丘战区」互为专属撞成死锁）
+  // 与可达性的两个方向在 test/hud-ux.mjs 的 AJ 段（那把尺子量的是"点遍看得见的格子到不到得了"）。
+  // 这里量的是**用户真的点得到、而且点出来的东西是对的**：模式那一行常驻三张卡、图那一行仍按模式滤，
+  // 点「占领」之后图自己迁到双丘战区，建房与房内改设置之后屏幕上写的都是这一局（连档位表都换过）。
+  const readRoomCfg = () => {
+    const opts = id => { const e = document.getElementById(id); return e ? [...e.querySelectorAll('div')].filter(x => x.getBoundingClientRect().height > 0).map(x => x.dataset.v + (x.classList.contains('sel') ? '*' : '')).join(',') : null; };
+    return { meta: (document.getElementById('rmMeta') || {}).textContent || '', mode: opts('rmMode'), map: opts('rmMap'), min: opts('rmMin'), score: opts('rmScore') };
+  };
+  const lobbyDom = await page.evaluate(() => {
+    if (game.menu.screen !== 'online') game.menu.showOnlineLobby();
+    const vis = sel => [...document.querySelectorAll(sel)].filter(e => e.getBoundingClientRect().height > 0).map(e => e.dataset.v);
+    const before = { modes: vis('#segMode div'), maps: vis('#segMap div') };
+    const d = [...document.querySelectorAll('#segMode div')].find(x => x.dataset.v === 'dom');
+    const clickable = !!d && d.getBoundingClientRect().height > 0;
+    if (clickable) d.click();
+    return { before, clickable, after: { modes: vis('#segMode div'), maps: vis('#segMap div'), mode: game.menu.lobby.mode, map: game.menu.lobby.map } };
+  });
+  ok('L11 大厅默认那一档（团队死斗 + 沙丘镇）下「占领」就是可见可点的（修前被"按当前图藏模式"那一句藏起来），点它之后**图自己迁到双丘战区**、图那一行只剩它；同时图那一行仍按模式滤（tdm 下双丘战区是藏着的）—— 两个方向都量，免得把"整行不再过滤"当成修好',
+    lobbyDom.before.modes.join() === 'tdm,dom,ffa' && lobbyDom.before.maps.join() === 'dune,frost,neon,yard'
+    && lobbyDom.clickable && lobbyDom.after.mode === 'dom' && lobbyDom.after.map === 'ridges'
+    && lobbyDom.after.maps.join() === 'ridges' && lobbyDom.after.modes.join() === 'tdm,dom,ffa',
+    JSON.stringify(lobbyDom));
+  await page.fill('#roomTitle', '占领验证房');
+  await page.click('[data-a=create]');
+  const roomOpened = await page.waitForFunction(() => game.menu.screen === 'onlineRoom' && !!document.getElementById('rmMode'), null, { timeout: 30000 }).then(() => true).catch(() => false);
+  await sleep(700);
+  const roomDom = await page.evaluate(readRoomCfg);
+  ok('L11b 建房之后房间屏上写的就是这一局：模式「占领」+ 图「双丘战区」+ **档位换过表**（时长 15/25/35 选 25、目标 100/200/500 选 200）—— 只换名字不换档位的话，房间标题上那两个数字从此是假的',
+    roomOpened && /dom\*/.test(roomDom.mode || '') && roomDom.map === 'ridges*' && roomDom.min === '15,25*,35'
+    && /200\*/.test(roomDom.score || '') && /占领/.test(roomDom.meta) && /双丘战区/.test(roomDom.meta), JSON.stringify(roomDom));
+  const clickCfg = (id, v) => page.evaluate(([i, val]) => {
+    const e = document.getElementById(i); if (!e) return false;
+    const d = [...e.querySelectorAll('div')].find(x => x.dataset.v === val);
+    if (!d || d.getBoundingClientRect().height === 0) return false;
+    d.click(); return true;
+  }, [id, v]);
+  const waitMin = v => page.waitForFunction(x => {
+    const e = document.getElementById('rmMin');
+    return !!e && [...e.querySelectorAll('div')].some(d => d.dataset.v === x && d.classList.contains('sel'));
+  }, v, { timeout: 15000 }).catch(() => { });
+  await clickCfg('rmMode', 'tdm');
+  await waitMin('10');
+  await sleep(350);
+  const backTdm = await page.evaluate(readRoomCfg);
+  ok('L11c 房间里把模式换回「团队死斗」真的生效：图跟着迁回沙丘镇、时长换回 3/5/10/15（25 不在 tdm 的表里 ⇒ 落回 10），目标 200 在 tdm 的表里 ⇒ 留着 —— 这一帧发出去的是**一致的组合**；只发 mode 那一版会被服务端当场拒（症状就是"点了没反应"）',
+    /tdm\*/.test(backTdm.mode || '') && /^dune\*/.test(backTdm.map || '') && backTdm.min === '3,5,10*,15'
+    && /200\*/.test(backTdm.score || ''), JSON.stringify(backTdm));
+  await clickCfg('rmMode', 'dom');
+  await waitMin('25');
+  await sleep(350);
+  const backDom = await page.evaluate(readRoomCfg);
+  ok('L11d 再换回「占领」同样生效（图那行只剩双丘战区、时长回到 15/25/35 选 25）—— 两个方向都量，免得把"某一支恰好写死"当成通',
+    /dom\*/.test(backDom.mode || '') && backDom.map === 'ridges*' && backDom.min === '15,25*,35', JSON.stringify(backDom));
+  // 开局。这一条才是"联网里真的打得了占点"的端到端那一半：房是**真大厅 UI** 建出来的，
+  // 不是把 modeId 按进去（net-play 那份 dom 判据是后者 —— 量的是同一条链的另一半，入口不同）。
+  await page.click('[data-a=addA]'); await sleep(300);
+  await page.click('[data-a=addA]'); await sleep(500);
+  await page.click('[data-a=start]');
+  const domPlaying = await page.waitForFunction(() => game.state === 'play' && game.net && game.net.modeId === 'dom', null, { timeout: 180000 }).then(() => true).catch(() => false);
+  await sleep(2000);
+  const domLive = await page.evaluate(() => ({
+    modeId: game.net && game.net.modeId, map: game.net && game.net.mapId,
+    flags: game.net && game.net.flags ? game.net.flags.length : -1,
+  }));
+  ok('L11e 从这一屏真开得起一局占点：客户端按 dom 建起 3 面旗（A/B/C）—— 走的是"大厅 → 建房 → 房内改设置 → 开局"整条真界面链',
+    domPlaying && domLive.modeId === 'dom' && domLive.map === 'ridges' && domLive.flags === 3, JSON.stringify(domLive));
+  await page.evaluate(() => game.exitToMenu());
+  await page.waitForFunction(() => game.state === 'menu' && game.menu.screen === 'main', null, { timeout: 60000 }).catch(() => { });
+
   // ══ M 段：HU-37 设置与重绑，在浏览器里真生效 ══
   await page.setViewportSize({ width: 1280, height: 720 }); await sleep(250);
   await page.evaluate(() => game.menu.showSettings('main')); await sleep(500);
