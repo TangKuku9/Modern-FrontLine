@@ -119,6 +119,14 @@ html, body { position: fixed; inset: 0; }
    那个按钮不是点不动，是根本看不见（Playwright 的报错原文：element is outside of the viewport）。
    所以在 .opts 里写自由文字时，要么给它这个类，要么自己写 grid-column:1/-1。 */
 .note-wide { grid-column: 1 / -1; font-size:0.75rem; color: var(--txt-4); line-height: 1.7; min-height: 16px; }
+/* .opts 里那些"只有控件、没有标签"的行（HU-24 的「按房号加入」那一格，以及以后任何一格）。
+   .opts 的排版是「标签列 + 控件列」**逐格交替**（label, control, label, control…），
+   所以一个没有标签的控件必须自己声明 grid-column:2。少了这一句它按 auto-placement 落进
+   **第 1 列**，后面每一对 (标签, 控件) 就整体错开一格 —— 症状是全部 .seg 挤进 110px 的标签列
+   里每行只放得下一个选项、标签跑到右边与控件同列（看着像"标签浮在选项旁边"）。
+   实测（1280×720，真浏览器）：segMap 142px、segScore 214px 高，这一栏总高 998px，
+   把下面那块面板整个顶出视口 —— 与 .note-wide 那条是同一族错位，只是换了个方向。 */
+.opts .opt-ctl { grid-column: 2; display: flex; gap: 8px; }
 /* #lbErr / #rmErr 那一格（HU-25）：它写的是"刚才那一下失败了 + 服务端原话"，现在还不带定时器、
    会一直留在屏上。它必须与旁边的说明文字一眼能分开，否则要人读完一整段才知道哪句是错误。 */
 .note-wide.err { color: #ffb3a6; font-size:0.8125rem; }

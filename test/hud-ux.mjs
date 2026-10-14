@@ -1811,6 +1811,106 @@ const contrast = (a, b) => { const l1 = lum(a), l2 = lum(b); return (Math.max(l1
     (() => { const t = MENU_SRC.replace('if (this.capturing) { this.captureKey(e); return; }', ''); return t.indexOf('this.capturing') > t.indexOf("e.code === 'Escape' && game.paused"); })());
 }
 
+// ───────────────────────── AI 段：用户实测报的两条（大厅 .opts 错位 · 全服频道不清理）─────────────────────────
+// 这两条不在原审计那 41 条里，是**用户拿截图报的**，所以从症状倒推：
+//   ① 联网大厅左栏"大乱"：地图/模式/时长/目标四行选项挤成一根竖条、标签浮到右边、那一栏被撑到 ~1000px；
+//   ② 全服频道消息永远不清理：前一晚那几条刷屏第二天进大厅还在聊天框里。
+// ①的**几何**那一半在 test/hud-keys.mjs（真浏览器，量 left/height）—— 这里量的是它的成因：
+//   .opts 是「标签列 + 控件列」逐格交替的自动排版，任何**没有标签的控件**必须自己声明
+//   grid-column:2；少这一句它落进第 1 列，后面每一对 (标签, 控件) 就整体错开一格。
+// ②分两半：服务端那份（回填/说一句/发历史三处）在 test/room-flow.mjs 的 F 段，驱动的是 Lobby 本体；
+//   这里量客户端这一半 —— 画上去的那一份，以及"开着不动的那一屏怎么自己老化"。
+{
+  const MENU = await import('../js/menu.js');
+  const { freshChat, CHAT_TTL_MS, chatRowHtml } = await import('../js/net/chat.mjs');
+  const LB_SRC = src('js/net/lobby.mjs'), SRV_LOBBY_SRC = src('server/lobby.mjs');
+
+  // ── ① .opts 的自动排版契约 ──
+  // 读法（不抄 markup）：从真源码里抠出「#joinRoomId 那一行的开标签属性」。抠不到就红 ——
+  // 静默给空串的话，这条会变成"检查一段不存在的 markup"而永远绿。
+  const joinRowAttrs = (t) => {
+    const m = /<(div|section)([^>]*)>\s*<input id="joinRoomId"/.exec(t);
+    return m ? m[2] : null;
+  };
+  const declaresCol2 = (attrs) => !!attrs && (/class="[^"]*\bopt-ctl\b/.test(attrs) || /grid-column\s*:\s*2/.test(attrs));
+  const attrs = joinRowAttrs(MENU_SRC);
+  const segsWanted = ['segMap', 'segMode', 'segMin', 'segScore'].filter(id => MENU_SRC.includes(`seg('${id}'`));
+  ok('AI1【先决】抠得到"按房号加入"那一行的开标签、且大厅那一栏真是「四行 标签 + 选择器」的形状（抠不到 / 形状变了，下面那条就该红，而不是恒绿）',
+    !!attrs && segsWanted.length === 4 && ['地图', '模式', '时长', '目标'].every(t => MENU_SRC.includes(`<div>${t}</div>`)),
+    `attrs=${String(attrs).slice(0, 40)}·segs=${segsWanted.length}/4`);
+  ok('AI2 那一行自己声明了 grid-column:2（它是"只有控件、没有标签"的行；少了这一句它占掉第 1 列，后面四对标签/选择器全部错开一格 —— 屏幕上的样子就是选项挤成一根竖条、标签浮到右边、那栏高到 998px）',
+    declaresCol2(attrs), String(attrs).slice(0, 60));
+  ok('AI2b【反证臂】把那一格退回错位前的写法（裸 div + style=display:flex，不带 opt-ctl）→ 同一把尺子当场认出来',
+    !declaresCol2('<div style="display:flex;gap:8px">') && declaresCol2('<div class="opt-ctl">')
+    && !declaresCol2(null));
+  ok('AI2c 那条 CSS 规则真在（.opts .opt-ctl 定 grid-column:2）—— markup 上写了类而样式里没有这一条，等于没写',
+    /\.opts\s+\.opt-ctl\s*\{[^}]*grid-column\s*:\s*2/.test(CSS_ONLY));
+  ok('AI2d【反证臂】把那条规则从 CSS 里摘掉，同一把尺子当场认出来',
+    !/\.opts\s+\.opt-ctl\s*\{[^}]*grid-column\s*:\s*2/.test(CSS_ONLY.replace(/\.opts \.opt-ctl \{[^}]*\}/, '')));
+
+  // ── ② 全服频道的时间窗：一份定义、三处读者 ──
+  const readsFresh = (t) => /from '[^']*chat\.mjs'/.test(t) && /\bfreshChat\b/.test(t);
+  const CALLERS = [['js/menu.js', MENU_SRC], ['js/net/lobby.mjs', LB_SRC], ['server/lobby.mjs', SRV_LOBBY_SRC]];
+  const missing = CALLERS.filter(([, t]) => !readsFresh(t)).map(([f]) => f);
+  ok('AI3【先决】时间窗只有一份定义，三处读者都从 js/net/chat.mjs 取它（屏幕这一份、大厅客户端那一份、服务端那一份）—— 三处各写一个数就会出现"服务端清掉了、屏幕上还留着"',
+    Number.isFinite(CHAT_TTL_MS) && CHAT_TTL_MS > 0 && typeof freshChat === 'function' && missing.length === 0,
+    `TTL=${CHAT_TTL_MS}ms·没读到的是 ${JSON.stringify(missing)}`);
+  const brokenMenu = [['js/menu.js', MENU_SRC.replace("from './net/chat.mjs'", "from './nowhere.mjs'")],
+    ['js/net/lobby.mjs', LB_SRC], ['server/lobby.mjs', SRV_LOBBY_SRC]];
+  ok('AI3b【反证臂·跨文件】把菜单那一处换成别的模块：同一把尺子当场点名是 js/menu.js（不是只说"有东西不对"）',
+    !readsFresh(brokenMenu[0][1]) && brokenMenu.filter(([, t]) => !readsFresh(t)).map(([f]) => f).join() === 'js/menu.js');
+
+  const T = Date.now();
+  const R = (text, ageMs) => ({ ch: 'lobby', from: '甲', name: '甲', text, at: T - ageMs });
+  const buf = [R('八小时前', 8 * 3600e3), R('三小时前', 3 * 3600e3), R('一分钟前', 60e3)];
+  ok('AI4 窗外丢掉、窗内留着：8 小时前与 3 小时前那两条走，一分钟前那条在（条数上限只管"最多几行"，管不住"多旧的行"—— 用户报的就是后者）',
+    freshChat(buf, T).map(x => x.text).join() === '一分钟前', JSON.stringify(freshChat(buf, T).map(x => x.text)));
+  ok('AI4b【判别臂·旧写法】同一份缓冲走"只按条数裁"的旧管线（slice(-40)）会画出 3 条 —— AI4 的绿来自时间窗，不是条数顺手裁掉的',
+    buf.slice(-40).length === 3 && freshChat(buf, T).length === 1);
+  ok('AI4c 边界与 fail-open：正好卡在窗口上那一条算过期、窗口内 1ms 算活着；**定不了日期的行保留**（丢别人的话是不可见的失效）；非数组给空数组',
+    freshChat([R('卡线', CHAT_TTL_MS)], T).length === 0
+    && freshChat([R('差1ms', CHAT_TTL_MS - 1)], T).length === 1
+    && freshChat([{ text: '没有 at' }, { text: 'at 是 NaN', at: NaN }], T).length === 2
+    && freshChat(null, T).length === 0 && freshChat(undefined, T).length === 0);
+
+  // ── ③ 画上去的那一份 + 开着不动的那一屏 ──
+  const box = mk('lbChat');
+  const lb = lbStub();
+  lb.chat = buf.slice();
+  const { m } = menuStub({ lb, el: { querySelector: s => (s === '#lbChat' ? box : null), querySelectorAll: () => [] } });
+  const drawn = () => (String(box.__rec.html).match(/class="chat-line/g) || []).length;
+  m.renderChat(m.el, 'lobby');
+  ok('AI5 进屏画的那一份也不含窗外的行：#lbChat 里只有 1 条（老写法会把 3 条全画上去 —— 用户截图里那几条"跨了 8 小时还在最上面"就是这么来的）',
+    drawn() === 1, `画出 ${drawn()} 条`);
+  ok('AI5b【反证臂·同一把尺子量旧管线】把这一份缓冲交给旧管线（rows.slice(-40) 逐条渲染），同一把尺子数出 3 条 —— 归因到时间窗',
+    buf.slice(-40).filter(x => chatRowHtml(x, { muted: [] })).length === 3);
+
+  // chatTick：开着的这一屏自己老化。先是"喂了没有"（写了不喂 = 这一屏永远不老化），再是三档行为。
+  ok('AI6【命门·跨方法】Menu.update() 里真的喂了 chatTick（与 pauseTick 同一个位置）—— 写了不喂的话这一屏永远不老化；反证臂把那一行摘掉，同一把尺子当场认出来',
+    /this\.chatTick\(dt\)/.test(MENU_SRC) && /this\.pauseTick\(dt\);\s*\n\s*this\.chatTick\(dt\);/.test(MENU_SRC)
+    && !/this\.chatTick\(dt\)/.test(MENU_SRC.replace('this.chatTick(dt);', '')));
+  const live = R('刚好过期', 0);
+  lb.chat = [live];
+  m.renderChat(m.el, 'lobby');
+  const w0 = box.__rec.writes;
+  m.chatTick(0.5);
+  const wHalf = box.__rec.writes;
+  m.chatTick(0.6);
+  const wSame = box.__rec.writes;
+  live.at = T - 11 * 60e3;                       // 推出窗外
+  m.chatTick(1.1);
+  const wAged = box.__rec.writes;
+  ok('AI7 三档行为一次量齐：不到 1 秒不跑（0.5s 无写）· 满 1 秒但这一屏没老（签名没变，不重画）· 真老掉了就重画一次且那一行从 DOM 掉出去',
+    wHalf === w0 && wSame === w0 && wAged === w0 + 1 && drawn() === 0,
+    `writes ${w0}→${wHalf}→${wSame}→${wAged}·剩 ${drawn()} 条`);
+  m._chatSig = '错的签名';                        // 人为把门弄拧：证明"没重画"是门挡住的，不是 tick 没跑
+  m.chatTick(1.2);
+  ok('AI7b 签名门真的在起作用：把它人为拧错，同一拍立刻重画（少了这一条，AI7 的"没重画"分不清是门挡住的还是那一拍根本没跑）',
+    box.__rec.writes === wAged + 1, `writes ${wAged}→${box.__rec.writes}`);
+  ok('AI7c 离开这一屏就归零（`_chatAcc`/`_chatSig` 都清）—— 不回零的话下一次进大厅会凭上一屏的签名判定"这一屏没变过"，那一屏就停在旧内容上',
+    (() => { m.screen = 'main'; m.chatTick(2); return m._chatAcc === 0 && m._chatSig === '' && box.__rec.writes === wAged + 1; })());
+}
+
 // ───────────────────────── 收口 ─────────────────────────
 const bad = out.filter(([g]) => !g);
 for (const [g, label] of out) console.log(`  ${g ? '✅' : '❌'} ${label}`);

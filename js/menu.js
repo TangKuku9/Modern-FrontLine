@@ -117,8 +117,15 @@ const esc = escHtml;
 // 只会表现为"玩家手快"，所以它必须能被判据直接走一遍。
 // 定义搬到 js/net/chat.mjs（对局内的聊天输入也要同一把尺子，两个定义迟早分叉）；
 // 这里留再导出，老的判据入口（test/net-feel.mjs 从 menu 认它）不用跟着动。
-import { isImeKey, parseChatCommand, toggleMute, chatRowHtml } from './net/chat.mjs';
+import { isImeKey, parseChatCommand, toggleMute, chatRowHtml, freshChat } from './net/chat.mjs';
 export { isImeKey };
+
+// 聊天框那一屏的签名（条数 + 首尾那条的时间戳）：pushChat 追加完记一次、renderChat 画完记一次、
+// chatTick 每拍比一次 —— 三处共用这一份，门才不会自己跟自己错开（错开的症状是"每秒白重画一次"，
+// 而那正是这一屏刻意避开的写法，见 pushChat 上面那句）。
+// 为什么带上首尾时间戳、不只数条数：条数满了之后新来的一条会把最旧的一条顶掉（条数不变），
+// 只数条数的那一版就"看不出这一屏变过"。
+const chatSig = fresh => (fresh.length ? fresh.length + '|' + fresh[0].at + '|' + fresh[fresh.length - 1].at : '0|');
 
 // 配装改名（HU-29：那一格原来用原生 prompt）。抽成纯函数与 pauseActions 同一个理由：
 // 它住在 DOM 事件回调里，进程内够不到，而它的**清洗口径**是玩家看得见的规则
@@ -362,6 +369,7 @@ export class Menu {
     p.needsUpdate = true;
     this.fireLight.intensity = 5 + Math.sin(t * 13) * 0.8 + Math.sin(t * 7.3) * 0.8;
     this.pauseTick(dt);
+    this.chatTick(dt);
   }
   onResize() {
     this.camera3d.aspect = window.innerWidth / window.innerHeight;
@@ -753,7 +761,7 @@ export class Menu {
               <!-- 按房号加入（HU-24）。房名是给人看的、房号才是寻址用的那一格，服务端把它们
                    洗成两样东西（中文房名当房号会被洗成空串），所以这里**另开一格**而不是
                    复用上面那个房名框。 maxlength 抄的是服务端那个长度上限，跨文件对账钉住。 -->
-              <div style="display:flex;gap:8px"><input id="joinRoomId" maxlength="${ROOM_ID_MAX}" placeholder="已有房号（A-Z a-z 0-9 . - _）" autocomplete="off" value="${esc(L.room || '')}" style="${inp};flex:1;min-width:0"><button class="btn small ghost" data-a="joinId">按房号加入</button></div>
+              <div class="opt-ctl"><input id="joinRoomId" maxlength="${ROOM_ID_MAX}" placeholder="已有房号（A-Z a-z 0-9 . - _）" autocomplete="off" value="${esc(L.room || '')}" style="${inp};flex:1;min-width:0"><button class="btn small ghost" data-a="joinId">按房号加入</button></div>
               <div>地图</div>${seg('segMap', MP_MAPS.map(m => m.id), MP_MAPS.map(m => m.name), L.map)}
               <div>模式</div>${seg('segMode', ONLINE_MODES.map(m => m.id), ONLINE_MODES.map(m => m.name), this.onlineMode())}
               <div>时长</div>${seg('segMin', MINUTES_ALL, MINUTES_ALL.map(v => v + ' 分'), L.minutes)}
@@ -1119,14 +1127,41 @@ export class Menu {
       if (e.key === 'Enter') { e.preventDefault(); fire(); }
     });
   }
+  // 聊天框**这一屏该显示哪几行**。renderChat（进屏画一次）、pushChat（来一条追加一次）、
+  // chatTick（老了行就重画一次）三处都读它 —— 三处各算一次的症状是它们对"现在该有几行"
+  // 各持一份答案，于是签名门永远对不上、每秒重画一次（而"只追加不重画"正是这屏的纪律）。
+  chatRows(ch) {
+    const lb = this.game.lobby;
+    const rows = ch === 'lobby' ? (lb ? lb.chat : []) : ((lb && lb.state && lb.state.chat) || []);
+    // 时间窗在这里也过一遍（与 js/net/chat.mjs:CHAT_TTL_MS 同一条尺子）：缓冲区里可能
+    // 还躺着已经过期的行 —— 服务端那份是**进大厅那一刻**发来的，而这一屏可以开着过夜。
+    // 少了这一道，症状就是用户报的"消息永远不清理"：屏幕上那一屏对话谁也不去动它。
+    return freshChat(rows).slice(-40);
+  }
   // 聊天行**只往容器里追加**，不整块重画：重画会把人正打到一半的输入框和滚动位置一起抹掉。
   renderChat(root, ch) {
     const box = root.querySelector(ch === 'lobby' ? '#lbChat' : '#rmChat');
     if (!box) return;
-    const lb = this.game.lobby;
-    const rows = ch === 'lobby' ? (lb ? lb.chat : []) : ((lb && lb.state && lb.state.chat) || []);
-    box.innerHTML = rows.slice(-40).map(x => this.chatLine(x)).join('');
+    const fresh = this.chatRows(ch);
+    this._chatSig = chatSig(fresh);        // 画完就把签名记上：下一拍 chatTick 才不会白白重画一次
+    box.innerHTML = fresh.map(x => this.chatLine(x)).join('');
     box.scrollTop = box.scrollHeight;
+  }
+  // 聊天框的老化（用户报"全服频道消息永远不清理"）。renderChat 只在进屏那一刻跑一次，
+  // 之后这一屏可以一直开着：一行过期了没有任何人把它从 DOM 里拿掉。所以补一拍。
+  // ① 挂在 update(dt) 里（大厅/房间都是 menu 屏，渲染循环走 menu 那一支，这一拍收得到）；
+  // ② 1 秒一拍：TTL 是分钟级的量，60Hz 上跑它是白烧 —— 与 pauseTick 同一套节制；
+  // ③ 签名门：**只有真的老掉了行才重画**（重画整块 innerHTML 是本仓库的禁区，见 pushChat 的注释）。
+  chatTick(dt) {
+    const ch = this.screen === 'online' ? 'lobby' : this.screen === 'onlineRoom' ? 'room' : '';
+    if (!ch) { this._chatAcc = 0; this._chatSig = ''; return; }
+    this._chatAcc = (this._chatAcc || 0) + dt;
+    if (this._chatAcc < 1) return;
+    this._chatAcc = 0;
+    const sig = chatSig(this.chatRows(ch));
+    if (sig === this._chatSig) return;
+    this._chatSig = sig;
+    this.renderChat(this.el, ch);
   }
   chatLine(x) {
     // 渲染（含时间戳与屏蔽过滤）在 js/net/chat.mjs:chatRowHtml —— 与对局 HUD 共用一份，
@@ -1147,6 +1182,9 @@ export class Menu {
     box.insertAdjacentHTML('beforeend', html);
     while (box.children.length > 40) box.removeChild(box.firstChild);
     box.scrollTop = box.scrollHeight;
+    // 只追加也要把签名跟上：否则下一拍 chatTick 认不出"这一屏就是它刚追加的那一屏"，
+    // 会在 1 秒后把整块 innerHTML 重画一次 —— 追加那一刀的意义（不抹滚动位置）就白费了。
+    this._chatSig = chatSig(this.chatRows(ch));
   }
   // 本地回执（/mute /report 的结果）：只进自己这台机器的聊天条，不是发言、不上行。
   // 进**缓冲**而不只是 DOM：hist 一到就整块重画（renderChat），只画 DOM 的话回执会被抹掉。

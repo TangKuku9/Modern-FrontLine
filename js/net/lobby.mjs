@@ -19,6 +19,9 @@
 import { decodeSnapshot } from '../../server/codec.mjs';
 import { openSocket, tabNonce } from '../account.js';
 import { viewSettingsOf } from '../player.js';
+// 全服频道的时间窗（用户报"消息永远不清理"）：服务端存的那份与这里这份**同一条尺子** ——
+// 两处各写一个数就会出现"服务端已经清掉、屏幕上还留着"（或者反过来，人一进来那段历史凭空少几句）。
+import { freshChat } from './chat.mjs';
 
 const TIMEOUT_MS = 12000;
 
@@ -157,12 +160,15 @@ export class LobbyClient {
       this.state = j;
       this.onRoom(j);
     } else if (j.t === 'chat') {
-      if (Array.isArray(j.hist)) { if (j.ch === 'lobby') this.chat = j.hist.slice(); }
+      if (Array.isArray(j.hist)) { if (j.ch === 'lobby') this.chat = freshChat(j.hist); }
       else {
-        if (j.ch === 'lobby') { this.chat.push(j); if (this.chat.length > 60) this.chat.shift(); }
+        // 追加之后按时间窗 + 条数各裁一次（与 server/lobby.mjs:say 那两道是同两条）。
+        // 少了时间窗这一道，一个开着大厅过夜的页面会把傍晚的刷屏一直留在缓冲里，
+        // 而"离开大厅再进来"也救不了它 —— 历史是从服务端整段重画的。
+        if (j.ch === 'lobby') { this.chat.push(j); this.chat = freshChat(this.chat); if (this.chat.length > 60) this.chat.shift(); }
         // 只有**房间频道**进房间历史。match/team（对局里的话）与 sys（举报回执）不进 ——
         // 混进来的症状是"打完回到房间，聊天框里翻出上一局对战中的闲聊"，而且删不掉。
-        else if (j.ch === 'room' && this.state && this.state.chat) { this.state.chat.push(j); if (this.state.chat.length > 60) this.state.chat.shift(); }
+        else if (j.ch === 'room' && this.state && this.state.chat) { this.state.chat.push(j); this.state.chat = freshChat(this.state.chat); if (this.state.chat.length > 60) this.state.chat.shift(); }
       }
       this.onChat(j);
     } else if (j.t === 'welcome') {

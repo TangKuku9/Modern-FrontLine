@@ -632,6 +632,105 @@ try {
   ok('L8b【判别臂·同一把尺子】把 `.lb-rooms` 的 flex-shrink 放开（就是 net-drop 那一红当时的写法），同一把尺子当场认出被压住的那几格',
     lrOld.bad.length > 0 && !!lrOld.panel && lrOld.panel.h < lrOld.panel.sh - 2, JSON.stringify(lrOld));
 
+  // ── L9：联网大厅那一栏的 .opts 排版（**用户截图报的**"大厅 UI 大乱"）──
+  // 症状：地图/模式/时长/目标四行选项挤进 110px 的标签列里（每行只放得下一个），标签浮到右边
+  // 与控件同列，那一栏被撑到 998px —— 1280×720 下整块被顶出视口。
+  // 成因是 .opts 的「标签列 + 控件列」逐格交替排版被一个**没有标签的控件行**（HU-24 的
+  // 「按房号加入」）错开了一格；成因那一半（markup 与 CSS 的契约）在 test/hud-ux.mjs 的 AI 段，
+  // 这里量的是屏幕上真正发生的事：谁在控件列、每个选择器几行、标签与它那一行是不是同带。
+  // 与 L8 同法：装数据源 → 真渲染器 → 量 rect，**全部在同一拍里做完**（分两次 evaluate 会撞上大厅推送重画）。
+  const optsProbe = oldCss => {
+    if (oldCss) { window.__opSt = document.createElement('style'); window.__opSt.textContent = oldCss; document.head.appendChild(window.__opSt); }
+    game.menu.showOnlineLobby();
+    const opts = document.querySelector('.lobby .opts');
+    const out = { found: !!opts };
+    if (opts) {
+      const title = document.getElementById('roomTitle');
+      const ctlLeft = title ? title.getBoundingClientRect().left : null;
+      const segs = [...opts.querySelectorAll('.seg')].map(s => {
+        const r = s.getBoundingClientRect();
+        const vis = [...s.children].filter(c => c.getBoundingClientRect().height > 0);
+        const tops = vis.map(c => c.getBoundingClientRect().top);
+        return { id: s.id, left: r.left, h: r.height, n: vis.length, oneLine: tops.every(t => Math.abs(t - tops[0]) < 2) };
+      });
+      // 标签 = .opts 里那些"不含表单控件、也不是 .seg/.note-wide"的直接子元素（不抄标签文字：
+      // 文案改了不该让这一条红，位置关系才是被测对象）
+      const labels = [...opts.children].filter(e => !e.classList.contains('seg') && !e.classList.contains('note-wide') && !e.querySelector('input,button'));
+      const rows = segs.map(s => {
+        const r = opts.querySelector('#' + s.id).getBoundingClientRect();
+        const lab = labels.find(e => { const b = e.getBoundingClientRect(); const c = b.top + b.height / 2; return c >= r.top - 2 && c <= r.bottom + 2; });
+        return { id: s.id, lab: lab ? (lab.textContent || '').trim().slice(0, 6) : null };
+      });
+      out.ctlLeft = ctlLeft; out.segs = segs; out.rows = rows; out.h = opts.getBoundingClientRect().height;
+    }
+    if (window.__opSt) { window.__opSt.remove(); window.__opSt = null; }
+    return out;
+  };
+  await page.setViewportSize({ width: 1280, height: 720 }); await sleep(250);
+  const op = await page.evaluate(optsProbe);
+  const opOff = op.segs ? op.segs.filter(s => Math.abs(s.left - op.ctlLeft) > 2) : [];
+  const opWrap = op.segs ? op.segs.filter(s => !s.oneLine || s.h > 40) : [];
+  const opOrphan = op.rows ? op.rows.filter(r => !r.lab) : [];
+  ok('L9 1280×720 下大厅那一栏：四个选择器都排在控件列（左边界与「房间名」输入框同一条）、每个只占一行、标签与它那一行同带，整栏高 ≤420px',
+    op.found && op.segs.length === 4 && op.ctlLeft !== null
+    && opOff.length === 0 && opWrap.length === 0 && opOrphan.length === 0 && op.h <= 420,
+    `ctlLeft=${op.ctlLeft === null ? 'null' : Math.round(op.ctlLeft)}·栏高=${Math.round(op.h)}·离列=${opOff.map(s => s.id + '@' + Math.round(s.left)).join(',') || '无'}·换行=${opWrap.map(s => s.id + '=' + Math.round(s.h)).join(',') || '无'}·无标签=${opOrphan.map(r => r.id).join(',') || '无'}`);
+  ok('L9a【先决】那四个选择器各自都画出了可见选项（"都在控件列"若是在一组空选择器上成立，L9 就是遍历空集合的恒绿）',
+    op.segs && op.segs.every(s => s.n >= 2), JSON.stringify((op.segs || []).map(s => s.id + ':' + s.n)));
+  // 反证臂：现场把那一格还原成 auto（就是用户截图那一版）—— 同一把尺子必须当场报出
+  // "选择器离列 + 有换行 + 那一栏高到 900+"。少了这一条，L9 的绿分不清是"排对了"还是"量具没接上"。
+  const opOld = await page.evaluate(optsProbe, '.opts .opt-ctl { grid-column: auto !important; }');
+  const opOldOff = opOld.segs.filter(s => Math.abs(s.left - opOld.ctlLeft) > 2);
+  ok('L9b【反证臂·现场装回错位那一版】把 .opt-ctl 的 grid-column 还原成 auto，同一把尺子当场报出"四个选择器全部离列 + 至少一个换行 + 那一栏高到 500px 以上"',
+    opOldOff.length === 4 && opOld.segs.some(s => !s.oneLine || s.h > 40) && opOld.h > 500 && opOld.h > op.h + 200,
+    `离列 ${opOldOff.length}/4·栏高=${Math.round(opOld.h)}（修好时 ${Math.round(op.h)}）`);
+  // 同一把尺子在窄档上再过一遍：1280 那版的高度是内容撑出来的，窄窗下更容易顶出视口。
+  await page.setViewportSize({ width: 1024, height: 768 }); await sleep(250);
+  const opNarrow = await page.evaluate(optsProbe);
+  ok('L9c 1024×768 下同一把尺子同样过（那四行是内容撑高的，窄档才是最容易把它顶出视口的一档）',
+    opNarrow.found && opNarrow.segs.every(s => Math.abs(s.left - opNarrow.ctlLeft) <= 2) && opNarrow.h <= 420,
+    `ctlLeft=${Math.round(opNarrow.ctlLeft)}·栏高=${Math.round(opNarrow.h)}`);
+
+  // ── L10：全服频道的时间窗在真浏览器里自己走（用户报的"消息永远不清理"）──
+  // 进程内那一半在 test/hud-ux.mjs 的 AI 段（驱动真渲染器与真 tick 本体）；这里量的是**这一拍真被喂着**：
+  // 往缓冲里放一条"还有 1.2 秒过期"的行，之后谁都不点、什么都不按 —— 它必须自己消失。
+  // ⚠ 不赌机器速度：这一档的 rAF 慢到 200~400ms 一帧，而 dt 还被 min(0.25,…) 截过一刀（本仓库
+  // 在 pauseTick 那一轮踩过同一脚：1.3 秒墙钟只攒到 0.258，"死等一个固定秒数"等于替测试赌机器速度）。
+  // 所以：先单独量"这一拍真的在攒 dt"（三次采样，tick 触发时会把 `_chatAcc` 归零，单次读数可能是 0），
+  // 再**等条件**（那一行从 DOM 里消失）而不是等固定秒数。
+  const feed = await page.evaluate(async () => {
+    if (game.menu.screen !== 'online') game.menu.showOnlineLobby();
+    const m = game.menu, sample = async () => { const v = []; for (let i = 0; i < 3; i++) { v.push(Number((m._chatAcc || 0).toFixed(3))); await new Promise(r => setTimeout(r, 400)); } return v; };
+    m._chatAcc = 0;
+    const on = await sample();
+    m.showMain(); await new Promise(r => setTimeout(r, 600));
+    const off = await sample();
+    m.showOnlineLobby();
+    return { on, off, screen: m.screen };
+  });
+  ok('L10a【先决·命门】大厅这一屏真的被渲染循环喂着 chatTick（三次采样里至少一次在攒 dt），而离开这一屏就停在 0 —— 少了这半句，"等一会儿它自己消失"在下一次重构里会变成一句空话',
+    feed.on.some(v => v > 0) && feed.off.every(v => v === 0) && feed.screen === 'online', JSON.stringify(feed));
+  await page.evaluate(() => {
+    const now = Date.now();
+    game.lobby.chat = [
+      { ch: 'lobby', from: '甲', text: '马上过期', at: now - 10 * 60e3 + 1200 },
+      { ch: 'lobby', from: '乙', text: '还很新', at: now },
+    ];
+    game.menu.renderChat(game.menu.el, 'lobby');
+  });
+  const chatBefore = await page.evaluate(() => document.querySelectorAll('#lbChat .chat-line').length);
+  let agedInTime = true;
+  try { await page.waitForFunction(() => document.querySelectorAll('#lbChat .chat-line').length === 1, null, { timeout: 30000 }); }
+  catch { agedInTime = false; }
+  const chatAfter = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('#lbChat .chat-line')].map(x => x.textContent || '');
+    game.lobby.chat = [];
+    return rows;
+  });
+  ok('L10 进屏时两条都在，之后谁都不点：那条过期的行自己从聊天框里消失，新那句留着（时间窗在真浏览器里真的走到了 DOM 上，不是只写在源码里）',
+    chatBefore === 2 && agedInTime && chatAfter.length === 1 && /还很新/.test(chatAfter[0] || '') && !/马上过期/.test(chatAfter.join('')),
+    `进屏 ${chatBefore} 条 → ${JSON.stringify(chatAfter)}`);
+
   // ══ M 段：HU-37 设置与重绑，在浏览器里真生效 ══
   await page.setViewportSize({ width: 1280, height: 720 }); await sleep(250);
   await page.evaluate(() => game.menu.showSettings('main')); await sleep(500);

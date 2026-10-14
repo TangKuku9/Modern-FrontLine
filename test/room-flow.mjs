@@ -985,6 +985,70 @@ try {
   ok('【反证】没设 ACCOUNTS_DB 的部署就是没有（这段红了 = 判据在量缓存而不是落盘）',
     !hist3.some(r => r.text === '只在内存里的一句话'), JSON.stringify(hist3.map(r => r.text)));
 
+  // ── F：全服频道的时间窗（用户报「消息永远不清理」）──
+  // 这一族没法用真服务端量：要造"8 小时前那一行"，得让进程等 8 小时、或者直接去改 SQLite 里那份
+  // meta。而 Lobby 的时间窗判定**本来就和存储解耦**（loadChat/saveChat 是注入的钩子，见它构造函数
+  // 那段注释），所以这里按内存版注入、驱动**本体**：回填（构造器）、说一句（say）、发历史（attach）。
+  // 反证臂在 F1b：同一份夹具走"只按条数裁"的旧实现 —— 那条 8 小时前的行照样留着。少了这一条，
+  // F1/F2/F3 的绿分不清是"时间窗生效"还是"条数上限顺手裁掉了"。
+  console.log('\n── F：全服频道的时间窗（用户报「消息永远不清理」）──');
+  const { Lobby, LOBBY_CHAT_HIST } = await import('../server/lobby.mjs');
+  const { CHAT_TTL_MS, freshChat } = await import('../js/net/chat.mjs');
+  const oldRow = { ch: 'lobby', from: '甲', name: '甲', text: '八小时前的刷屏', at: Date.now() - 8 * 3600e3 };
+  const freshRow = (t) => ({ ch: 'lobby', from: '乙', name: '乙', text: t, at: Date.now() });
+  const mkWs = (name) => ({ __name: name, readyState: 1, frames: [], send() { /* 帧收在 frames 里 */ } });
+  const mkLobby = (hist, saved) => new Lobby({
+    send: (ws, m) => ws.frames.push(JSON.parse(String(m))),
+    loadChat: () => hist.slice(), saveChat: r => { if (saved) saved.push(r); },
+  });
+
+  ok('F0【先决】两条上限都在：时间窗是有限正数、条数上限是正数（缺时间那一条就是用户报的那个现象）',
+    Number.isFinite(CHAT_TTL_MS) && CHAT_TTL_MS > 0 && LOBBY_CHAT_HIST > 0, `TTL=${CHAT_TTL_MS}ms·hist=${LOBBY_CHAT_HIST}`);
+
+  const lb1 = mkLobby([oldRow, freshRow('刚说的')], null);
+  ok('F1 回填那一关就按时间窗滤：存下来的历史里那条 8 小时前的行进不了内存（这份历史活得过重启，不滤的话第二天进大厅会被整段重画回来 —— 这就是"永远不清理"的来源）',
+    !lb1.chat.some(r => r.text === '八小时前的刷屏') && lb1.chat.some(r => r.text === '刚说的'),
+    JSON.stringify(lb1.chat.map(r => r.text)));
+  const countOnly = [oldRow, freshRow('刚说的')].slice(-LOBBY_CHAT_HIST);
+  ok('F1b【反证臂·旧写法】同一份夹具走"只按条数裁"的旧实现（rows.slice(-50)）：那条 8 小时前的行照样留着 —— F1 的绿来自时间窗，不是被条数上限顺手裁掉的',
+    countOnly.some(r => r.text === '八小时前的刷屏'));
+
+  const saved2 = [];
+  const lb2 = mkLobby([], saved2);
+  const wsA = mkWs('阿甲'), wsB = mkWs('阿乙');
+  lb2.attach(wsA); lb2.attach(wsB);
+  lb2.chat.unshift(oldRow);                     // 构造之后才变旧的（大厅开着过了 8 小时）
+  wsB.frames.length = 0;
+  lb2.say(wsA, { ch: 'lobby', text: '现在说的一句' });
+  const bcast = wsB.frames.filter(f => f.t === 'chat');
+  ok('F2 说一句：新那一句在、挂在缓冲里那 8 小时前的一条当场走（滤在"追加之后"而不是之前 —— 滤在之前会把刚说的这句一起吃掉，症状是"发了但自己看不见"）',
+    lb2.chat.some(r => r.text === '现在说的一句') && !lb2.chat.some(r => r.text === '八小时前的刷屏')
+    && bcast.some(f => f.text === '现在说的一句') && !bcast.some(f => f.text === '八小时前的刷屏'),
+    JSON.stringify(lb2.chat.map(r => r.text)));
+  ok('F2b 落盘的那一份同样是干净的：saveChat 收到的那份里也没有窗外那条（否则重启之后它又回来了）',
+    saved2.length > 0 && !saved2[saved2.length - 1].some(r => r.text === '八小时前的刷屏'),
+    `saveChat 收到 ${saved2.length} 次`);
+
+  const lb3 = mkLobby([freshRow('欢迎')], null);
+  lb3.chat.unshift(oldRow);                     // 同上：构造之后才变旧的
+  const wsC = mkWs('阿丙');
+  lb3.attach(wsC);
+  const histC = wsC.frames.find(f => f.t === 'chat' && Array.isArray(f.hist));
+  ok('F3 新进大厅的人拿到的那份历史里没有窗外那条（先决：hist 帧真的发了 —— 少了这半句，这一条就是遍历空集合的恒绿）',
+    !!histC && !histC.hist.some(r => r.text === '八小时前的刷屏') && histC.hist.some(r => r.text === '欢迎'),
+    JSON.stringify(histC && histC.hist.map(r => r.text)));
+
+  const lb4 = mkLobby([], null);
+  for (let i = 0; i < LOBBY_CHAT_HIST + 10; i++) lb4.say(mkWs('刷' + i), { ch: 'lobby', text: '第' + i + '句' });
+  ok('F4 时间窗没有把"最多 50 条"那一道顶掉：窗口内灌 60 句，留下的正好是上限那 50 条、且是最新那一批',
+    lb4.chat.length === LOBBY_CHAT_HIST && lb4.chat[lb4.chat.length - 1].text === `第${LOBBY_CHAT_HIST + 9}句`
+    && lb4.chat[0].text === `第10句`, `留下 ${lb4.chat.length} 条·首 ${lb4.chat[0] && lb4.chat[0].text}`);
+
+  // 两条上限是**同一条尺子上的两个方向**：新鲜的必须留住（否则"刚进大厅什么都看不到"），
+  // 过期的必须走。只量一个方向的话，把 freshChat 换成"永远返回空数组"也是全绿。
+  ok('F5 反向：窗口内的行一条都不许被吞（把 freshChat 写成"永远返回空"也能让 F1~F4 全绿，这一条堵的就是那个假绿）',
+    freshChat([freshRow('a'), freshRow('b')]).length === 2 && lb1.chat.length === 1);
+
   console.log(`\n${bad ? '❌' : '✅'} ${n - bad}/${n} 通过`);
   for (const line of String(srv2.log()).split('\n').filter(x => /^\[room|开局|结果|拒绝/.test(x)).slice(-6)) console.log('  服务端: ' + line);
   process.exit(bad ? 1 : 0);

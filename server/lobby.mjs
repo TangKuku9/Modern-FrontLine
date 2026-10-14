@@ -19,6 +19,9 @@
 // 按钮置灰只是体验；改得动的东西不算权限（和 /api/rooms 的 401、WS 握手的 401 同源）。
 import { MP_MAPS, MP_MODES, MP_MINUTES, minutesOptions, DEFAULT_MINUTES, scoreOptions, mapAllowed, mapsForMode, BOT_NAMES, BOT_SKILLS } from '../js/data.js';
 import { DEFAULT_SCORE_LIMIT } from '../js/match-rules.js';
+// 全服频道的时间窗（用户报"消息永远不清理"）：条数上限挡不住"多旧的行"，
+// 而这份历史活得过重启 —— 定义只有一处，客户端画的那一份读的是同一个常量与同一个函数。
+import { freshChat } from '../js/net/chat.mjs';
 
 // 一间的上限。和 net-server:pickRoom 里那个"人最多且没满"是同一个数 ——
 // 两处各写一份的话，改一处的症状是"列表说还能进、进去说满了"。
@@ -36,7 +39,9 @@ export const MAX_PER_TEAM = MAX_SEATS / 2;
 // 一条聊天多少字。上限的理由不是"防刷长文"，是它会被广播给一屋子人：
 // 没有上限的话一条 64 KB 的"消息"就是 16 份 64 KB 下行（maxPayload 只管单帧，不管扇出）。
 export const CHAT_LEN = 120;
-export const LOBBY_CHAT_HIST = 50;                  // 全服频道留多少条历史
+// 全服频道留多少条历史。**与 js/net/chat.mjs 的 CHAT_TTL_MS 是一对**：条数管"最多几行"、
+// 时间窗管"多旧的行"。只有条数那一版在夜里永远够不着上限，于是那几条会一直挂在大厅上。
+export const LOBBY_CHAT_HIST = 50;
 export const ROOM_CHAT_HIST = 40;
 // 聊天速率：稳态每 600 ms 一条，另给 10 秒窗口内 6 条的突发余量。
 // 正常打字快的人一秒也就两三条；不限的话"进对局"就变成"谁的刷屏赢"。
@@ -163,7 +168,9 @@ export class Lobby {
     // 只有"这间房在"才有这段对话的语境，为它存档只会留一堆没人认领的旧话。
     this.loadChat = opts.loadChat || (() => []);
     this.saveChat = opts.saveChat || (() => {});
-    const hist = this.loadChat();
+    // 过一遍时间窗再进内存：存下来的那份可能带着上一夜的对话（历史活得过重启），
+    // 不回填时先滤的话，第一个进大厅的人看到的还是昨天那一屏。
+    const hist = freshChat(this.loadChat());
     this.chat = Array.isArray(hist) ? hist : [];
     // 跨进程房间目录（net-server 注入，没开目录就是空数组）：别台的行跟着本地的一起推进
     // 大厅帧 —— "ws 大厅帧"与"/api/rooms"必须是同一份名单，分两处各拼一遍就会漂移。
@@ -297,6 +304,9 @@ export class Lobby {
     const fresh = !this.conns.has(ws);
     this.conns.add(ws);
     this.send(ws, JSON.stringify(this.lobbyState()));
+    // 发给新进来的人之前先按时间窗滤一遍：滤掉的那些在这一层就出不去（不回存是刻意的 ——
+    // attach 是一条热路径，落盘那一步留在 say 里；重启后由构造器那份滤网兜住）。
+    this.chat = freshChat(this.chat);
     if (this.chat.length) this.send(ws, JSON.stringify({ t: 'chat', ch: 'lobby', hist: this.chat.slice() }));
     if (fresh) this.pushLobby();          // 在线人数变了，别人那份列表也要跟着变（不重推就永远少一个人）
   }
@@ -823,6 +833,10 @@ export class Lobby {
       this.touch(room);
     } else {
       this.chat.push(row);
+      // 两道上限，缺一不可：时间窗（多旧的行）与条数（最多几行）。
+      // 只留条数那一版就是用户报的那句"消息永远不清理" —— 夜里没人说话的服上，
+      // 条数上限永远够不着，傍晚的刷屏就一直挂在大厅里。
+      this.chat = freshChat(this.chat, now);
       if (this.chat.length > LOBBY_CHAT_HIST) this.chat.splice(0, this.chat.length - LOBBY_CHAT_HIST);
       this.saveChat(this.chat);                     // 落盘（重启后 hist 要接得上，差距 45）
       const m = JSON.stringify({ t: 'chat', ch, ...row });

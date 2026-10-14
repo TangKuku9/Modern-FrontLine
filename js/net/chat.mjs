@@ -50,10 +50,29 @@ export function chatRowHtml(x, opts = {}) {
 }
 
 // 时间戳：只画 时:分。聊天行是"刚才那句话"的语境，秒数是噪声；日期更没必要 ——
-// 一局最多打十几分钟，跨天的行不存在（历史不落盘，见差距 45 仍未收的那几项）。
+// 一局最多打十几分钟，日期的区分度落不到任何一条判据上。
 export function chatTime(at) {
   const d = new Date(at || Date.now());
   return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+// ── 全服频道的"还留着"窗口 ──
+// 条数上限（服务端 LOBBY_CHAT_HIST=50 / 客户端缓冲 60 / 画面上 40）只管得住"最多几行"，
+// 管不住"多旧的行"：夜里没什么人的服上，傍晚那几条刷屏会一直待在"最近 50 条"里出不去 ——
+// 而全服频道的历史**活得过服务重启**（server/lobby.mjs 的 loadChat/saveChat 接到 store.meta），
+// 所以第二天进大厅，那一屏早该过去的话会被原样重画回来。症状就是用户报的那句
+// "全服频道消息永远不清理"：错过的一屏对话永远停在聊天框里，谁也清不掉它。
+// 时间这一维必须自己有一条上限，两端（服务端存的那份、客户端画的那份）共用这一条。
+// 10 分钟：全服频道是"现在谁在说什么"的语境，不是留言板；房间频道共用一个窗口
+// （房间本身不活过重启，但一间等很久的房同样会把开场白一直挂在屏幕上）。
+export const CHAT_TTL_MS = 10 * 60 * 1000;
+
+// 只留窗口内的行。**没有 at / at 不是有限数的行保留**（fail-open）：定不了日期的行
+// 宁可多显示一条，也不该在这一层被静默丢掉 —— 丢掉的是别人的话，而屏幕上少一句话
+// 没有任何人会发现。调用方自己做条数裁剪（那是另一条上限）。
+export function freshChat(rows, now = Date.now()) {
+  if (!Array.isArray(rows)) return [];
+  return rows.filter(x => !x || !Number.isFinite(x.at) || now - x.at < CHAT_TTL_MS);
 }
 
 // 屏蔽判定：按**名字**。理由与服务端"身份只认座位上那份"同源 —— 聊天行里能拿来
