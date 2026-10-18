@@ -44,7 +44,7 @@ async function launch() {
   // 所以 `npx playwright install chromium` 装的就是它）→ 这台开发机上实际存在的那一份 1234
   // （Playwright 1.63 默认要 1243，机器上只有 1234）。中间这一档是**别人的机器能跑起来**的前提：
   // 少了它，README 里那句"没有 Chrome 的机器先 npx playwright install chromium"就是假的
-  // （`test/docs-guard.mjs` 的 G 段拿这一档当判据，8 份浏览器判据逐个核）。
+  // （`test/docs-guard.mjs` 的 G 段拿这一档当判据，浏览器判据逐个核）。
   const tries = [
     ['chrome', { channel: 'chrome', args: ARGS }],
     ['playwright-chromium', { args: ARGS }],

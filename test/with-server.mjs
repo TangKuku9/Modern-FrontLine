@@ -27,8 +27,11 @@ export async function withServer(env = {}) {
   let log = '';
   srv.stdout.on('data', d => { log += d; });
   srv.stderr.on('data', d => { log += d; });
-  for (let i = 0; i < 240 && !log.includes('权威对局服务'); i++) await new Promise(r => setTimeout(r, 50));
-  if (!log.includes('权威对局服务')) { srv.kill(); throw new Error('临时服务没起来：\n' + log); }
+  // 等的是启动日志的哨兵行，不是第一行 listen 回调：机器被别的进程拖热时，第一行已经
+  // 进了管道、后面的初始化还在跑，拿第一行当就绪会把握手判据变成竞态。
+  // 20 秒是量具的耐心上限，不是判据线；绿色路径通常在 1 秒内看到哨兵就返回。
+  for (let i = 0; i < 400 && !log.includes('启动完成'); i++) await new Promise(r => setTimeout(r, 50));
+  if (!log.includes('启动完成')) { srv.kill(); throw new Error('临时服务没起来：\n' + log); }
   return {
     port: PORT,
     proc: srv,

@@ -21,12 +21,15 @@
 ## 0. 先把自己关在门外看一遍（改代码之后必跑）
 
 ```bash
-npm test          # 主体档：gate / docs-guard / rollback / reconcile-chain / world-equiv / terrain / props / terrainmat / worker-core / preload-graph / net-journal / stance-recoil / codec / lagcomp / mp-rules / accounts / progress / hardening / service-guards / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / xenv / fps / viewmodel / gunvisual / net-feel / net-audit / heli-armor / optic / state-leak / hud-ux
-                  # 其中要一个真浏览器的那几份，名单见 README《验收》（从源码推的，别在这儿抄第二份）
-npm run test:all  # 再加真浏览器判据：net-play 对打、net-drop 掉线、tab-session 同源双标签页、worker-live 离线实跑 Worker 双路、hud-keys 菜单层键盘可达、terrainmat-gl 地表 splat 真编译真像素（份数不写死，C 段按脚本逐档点名）
+npm test          # 主体档（串行）：gate / docs-guard / rollback / reconcile-chain / world-equiv / terrain / props / terrainmat / worker-core / preload-graph / net-journal / stance-recoil / codec / lagcomp / mp-rules / accounts / progress / hardening / service-guards / room-flow / room-bots / room-dir / image / net-probe / deploy-probe / net-feel / net-audit / heli-armor / hud-ux / xenv
+                  # xenv 是主体档里唯一要一个真浏览器的那份；其余浏览器判据都在 test:browser / test:all
+npm run test:fast # 只跑进程内判据，迭代用（不碰浏览器；文件集 = 上面去掉 xenv）
+npm run test:browser # 真浏览器判据：net-play 对打、net-drop 掉线、tab-session 同源双标签页、worker-live 离线实跑 Worker 双路、hud-keys 菜单层键盘可达、terrainmat-gl 地表 splat 真编译真像素、fps 帧率无关性、viewmodel 视图模型接缝、optic 瞄具通透性与角直径、state-leak 三处状态残留（份数不写死，C 段按清单逐档点名）
+npm run test:smoke# 最小冒烟组：gate / docs-guard / codec / rollback / mp-rules / hud-ux
+npm run test:all  # npm test + test:browser 全跑（串行）
 ```
 
-期望：两条都 `EXIT=0`，末行是 `GREEN n/n`。
+期望：每条都 `EXIT=0`；末行是 runner 的 `GREEN n/n 份判据通过`（红了会打印 `RED`、失败份数与逐份日志路径）。
 
 红了怎么看：**看退出码和 `RED n/m` 那一行**，不要 grep 正文里的关键词 ——
 这个仓库里有判据的文案和被测行为是分开的，grep 正文会把"反证臂印出来的偏差量"当成失败。
@@ -281,7 +284,7 @@ docker run -d --name mw-room -p 8090:8090 --env-file .env -v mw-accounts:/data m
 - ~~登录只有密码，没有找回~~ 已收口（2026-09-30）：注册与每次重设各发一叠 5 张一次性恢复码，
   用掉任意一张即整叠作废并换发新的；重设成功 = 登录 + 作废该账号全部旧会话；服主侧补发口
   `server/recover.mjs`（只能发码，不能设密码）+ 审计 `recover:cli_issued`。判据 `test/accounts.mjs`
-  的 K 段、`test/hardening.mjs` 的 J 段、`test/net-drop.mjs` 的 I 段；设计理由与两次"能不能红"
+  的 K 段、`test/hardening.mjs` 的 J 段；设计理由与两次"能不能红"
   的实测见 `docs/net-vs-local-gaps.md` 附十二。没接邮箱/短信 —— 码丢了只能找服主，这是有意的一条。
 - ~~没有审计日志~~ 已收口（2026-09-26）：`audit` 表 + `server/audit-dump.mjs` 读取口，
   判据在 `test/accounts.mjs` 的 J 段。上面第 5 节写了用法。
@@ -314,4 +317,4 @@ docker run -d --name mw-room -p 8090:8090 --env-file .env -v mw-accounts:/data m
 那把尺子（`js/net/idle-ruler.mjs`：静止下限 + 族群臂，net-play 假红的源头拆了）与 `test/image.mjs` 的段过滤器，
 量了"未补偿空跑窗"的分布（决定继续当读数），给共用账号库补了探针读数（`server/multi-account-probe.mjs`）
 并把**进程内**那一半修掉（`test/accounts.mjs` L 段）；仍欠的是容器真机读数、8 份浏览器判据 `launch()`
-中间档的本机实测、跨进程房间目录。同一节末尾另有一份"别把这些当成遗留"的清单（有意为之的那些）。
+中间档的本机实测、跨进程房间目录（2026-10-18 测试瘦身后浏览器判据为 11 份，D′/E/G 段逐份核）。同一节末尾另有一份"别把这些当成遗留"的清单（有意为之的那些）。

@@ -123,8 +123,8 @@ fireHitscan/traceBullet）、bot 感知与哨戒炮/直升机的 LOS（ai.js / m
   30s 看门狗 —— 任何一路失败整条退回同步路重生成（纯函数，重生成安全）。
 
 **验收**：worker-core（C4a-e：确定性/工单形状/同步路**工单表里每一种 TEX** 全就位（名单长度从 `KEYS` 取，不写死数字）/Node 回退标记）；
-worker-live A 臂（真浏览器：`__texViaWorker === true`）。gunvisual/optic/viewmodel 等
-截图套件全绿 = Worker 生成的纹理与旧主线程产物像素级同貌。
+worker-live A 臂（真浏览器：`__texViaWorker === true`）。optic/viewmodel 等
+截图套件全绿 = Worker 生成的纹理与旧主线程产物像素级同貌（`gunvisual` 已于 2026-10-18 测试瘦身删除）。
 
 ### C5 · A* 寻路 Worker 化 —— 已落地（客户端离线路）
 
@@ -333,8 +333,8 @@ onGridRebuilt/requestPath）、`server/headless-game.mjs`（同名同步 request
 5. **失败全兜底**：Worker 构造失败/脚本 404/生成抛错/30s 看门狗/运行中 onerror，
    任何一路失败都整条退回主线程同步路（纯函数重生成安全）；worker-live B 臂把
    `window.Worker` 封锁死做了整条回退的真浏览器实证。
-6. **手动喂帧的套件必须关 Worker 寻路**（viewmodel/optic/gunvisual/state-leak/fps
-   五份，`g.pathWorker = null`）：它们在**一段同步 evaluate 里**驱动整局 —— 同步块内
+6. **手动喂帧的套件必须关 Worker 寻路**（viewmodel/optic/state-leak/fps
+   四份，`g.pathWorker = null`；`gunvisual` 已于 2026-10-18 测试瘦身删除）：它们在**一段同步 evaluate 里**驱动整局 —— 同步块内
    Worker 消息永远送不进来，bot 会卡死在 pathPending（pending 门反而不放行重试）、
    全体直奔目标，走位与旧代码不同步不说，真会把测试玩家打死（viewmodel 首跑就是这么
    红的：玩家死亡后 updateRender 停摆，adsT 恒 0、reload 永不推进）。这些套件要的

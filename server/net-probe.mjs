@@ -25,8 +25,9 @@ let srvLog = '';
 srv.stdout.on('data', d => { srvLog += d; });
 srv.stderr.on('data', d => { srvLog += d; });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-for (let i = 0; i < 120 && !srvLog.includes('权威对局服务'); i++) await sleep(50);
-if (!srvLog.includes('权威对局服务')) { console.log('服务端没起来:\n' + srvLog); srv.kill(); process.exit(1); }
+// 与 test/with-server.mjs 同一个理由：等启动哨兵，不等第一行 listen 回调。
+for (let i = 0; i < 400 && !srvLog.includes('启动完成'); i++) await sleep(50);
+if (!srvLog.includes('启动完成')) { console.log('服务端没起来:\n' + srvLog); srv.kill(); process.exit(1); }
 
 const checks = [];
 const ok = (label, cond, extra = '') => { checks.push([!!cond, label + (extra ? '  ' + extra : '')]); return !!cond; };
@@ -43,6 +44,10 @@ function client(name) {
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
   ws.binaryType = 'arraybuffer';
   const c = { ws, name, cid: null, snaps: [], evs: [], bytes: 0, err: null };
+  c.opened = new Promise((res, rej) => {
+    ws.addEventListener('open', res, { once: true });
+    ws.addEventListener('error', rej, { once: true });
+  });
   ws.onmessage = (m) => {
     if (typeof m.data === 'string') {
       const j = JSON.parse(m.data);
@@ -63,7 +68,9 @@ function client(name) {
 const send = (c, buf) => c.ws.send(buf, { binary: true });
 
 const A = client('A'), B = client('B');
-await new Promise(r => setTimeout(r, 300));
+// 先等两条握手真的 open 再发 join。机器被拖热时 300 ms 不够，send 会落在 CONNECTING 上
+// （ws 抛 "WebSocket is not open"），症状正是"两个客户端都拿不到 cid"。
+await Promise.all([A.opened, B.opened]);
 // ── join 里的 name 必须是合法呼号（白名单 2~16 个字）──
 // 这个探针跑在访客可玩的服上（REQUIRE_ACCOUNT=0，见文件头），那条路上呼号没有会话可依、
 // 只能用自报的这个，于是服务端拿注册用的同一个白名单验它，不合法就直接**拒绝进场**。
@@ -72,7 +79,7 @@ await new Promise(r => setTimeout(r, 300));
 A.ws.send(JSON.stringify({ t: 'join', room: 'probe', name: '探针甲', team: 'A' }));
 await sleep(200);
 B.ws.send(JSON.stringify({ t: 'join', room: 'probe', name: '探针乙', team: 'B' }));
-for (let i = 0; i < 60 && !(A.cid && B.cid); i++) await sleep(50);
+for (let i = 0; i < 200 && !(A.cid && B.cid); i++) await sleep(50);
 ok('两个客户端都拿到 cid', A.cid === 1 && B.cid === 2, `A=${A.cid} B=${B.cid}`);
 ok('welcome 里带出生点', Array.isArray(A.welcome?.pos) && A.welcome.pos.length === 3);
 // 只有第二个人加入时对手才存在：A 先进来，A 的 welcome 里 others 必须是空
@@ -83,7 +90,7 @@ ok('加入过程服务端没报错', !A.err && !B.err, (A.err || B.err || ''));
 // 先决断言：一个快照都没收到时后面全是空指针，那种红没有信息量 —— 直接报名字并倒日志
 // 必须等一个明确的采样窗口：连接握手刚结束时 B 甚至可能还没轮到一次下行，
 // 拿"握手返回的那一刻"当判据窗口，测到的就是竞态而不是节拍（这条曾经以 1 包/0 包红过一次）。
-for (let i = 0; i < 40 && !(A.snaps.length >= 3 && B.snaps.length >= 3); i++) await sleep(50);
+for (let i = 0; i < 120 && !(A.snaps.length >= 3 && B.snaps.length >= 3); i++) await sleep(50);
 if (!A.last || !B.last) {
   ok('收到了快照', false, `A ${A.snaps.length} 包 / B ${B.snaps.length} 包`);
   for (const [f, label] of checks) console.log(`  ${f ? '✅' : '❌'} ${label}`);
@@ -202,8 +209,10 @@ ok(`模块按 text/javascript 发出（${js.ct}）`, js.code === 200 && /^text\/
   await sleep(150);
   const markC = (C.idsets || []).length;
   C.ws.send(JSON.stringify({ t: 'join', room: 'other-' + PORT, name: '探针丙', team: 'A' }));
-  for (let i = 0; i < 60 && !(C.cid && A.idsets.length > markA + 4 && B.idsets.length > markB + 4); i++) await sleep(50);
-  await sleep(250);
+  // 三个方向都等到各自的包数，而不是"甲乙够了再睡 250ms"：机器被拖热时 250ms 只能来
+  // 三包，C 那一侧就变成"第二个房间没广播"的假红。上限是耐心，不是判据线。
+  for (let i = 0; i < 200 && !(C.cid && C.idsets && C.idsets.length > markC + 4
+    && A.idsets.length > markA + 4 && B.idsets.length > markB + 4); i++) await sleep(50);
   const aTail = A.idsets.slice(markA), bTail = B.idsets.slice(markB), cTail = C.idsets.slice(markC);
   const mine = [A.cid, B.cid].sort((x, y) => x - y).join(',');
   // cid 现在是全进程唯一的，所以"包里的 id 集合"就是判据本身：

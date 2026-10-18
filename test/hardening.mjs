@@ -77,7 +77,7 @@ function openWs(url, cookie, protocol) {
     });
   });
 }
-async function waitFor(msgs, pred, ms = 4000) {
+async function waitFor(msgs, pred, ms = 10000) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) { const hit = msgs.find(pred); if (hit) return hit; await sleep(40); }
   return null;

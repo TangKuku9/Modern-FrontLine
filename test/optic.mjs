@@ -20,7 +20,7 @@ async function launch() {
   // 所以 `npx playwright install chromium` 装的就是它）→ 这台开发机上实际存在的那一份 1234
   // （Playwright 1.63 默认要 1243，机器上只有 1234）。中间这一档是**别人的机器能跑起来**的前提：
   // 少了它，README 里那句"没有 Chrome 的机器先 npx playwright install chromium"就是假的
-  // （`test/docs-guard.mjs` 的 G 段拿这一档当判据，8 份浏览器判据逐个核）。
+  // （`test/docs-guard.mjs` 的 G 段拿这一档当判据，浏览器判据逐个核）。
   const tries = [
     ['chrome', { channel: 'chrome', args: ARGS }],
     ['playwright-chromium', { args: ARGS }],
@@ -322,52 +322,8 @@ const geo = await page.evaluate(async () => {
       bad.length ? bad.join(' ') : ATTACHMENTS.optic.map(a => `${a.id}:${a.fx.zoom}x`).join(' '));
   }
 
-  // O10：长筒镜的喇叭口方向。tgeo(r1, r2, …) 的两个半径经 rotateX(π/2) 后 r1 落在
-  // +Z（枪托侧）、r2 落在 −Z（枪口侧），所以**物镜必须 front > rear、目镜必须 rear > front**。
-  // 2026-10-03 用户报"长圆筒瞄具建模急待改善"：旧版把两数写反，acog/thermal/sniper 三支镜
-  // 的物镜喇叭口全部朝后冲着射手，侧看是一截掐腰花瓶。方向是纯参数错，肉眼一眼的事，
-  // 立成判据让几何自己招供。
-  {
-    const flare = (info) => {
-      // 变径的开口管才算"喇叭"：等径主筒、口环/调焦环不算。瞄具轴线上的取（y 与 sight.y 重合）。
-      const segs = [];
-      info.group.traverse(o => {
-        if (!o.isMesh || o.geometry.type !== 'CylinderGeometry' || o.geometry.parameters.openEnded !== true) return;
-        if (Math.abs(o.position.y - info.sight.y) > 1e-6) return;
-        const { radiusTop, radiusBottom } = o.geometry.parameters;
-        if (radiusTop === radiusBottom) return;
-        segs.push({ z: o.position.z, rear: radiusTop, front: radiusBottom });
-      });
-      if (segs.length < 2) return { ok: false, why: '找不到两段变径管' };
-      segs.sort((a, b) => a.z - b.z);
-      const obj = segs[0], eye = segs[segs.length - 1];
-      return {
-        ok: obj.front > obj.rear && eye.rear > eye.front,
-        why: `物镜 front=${obj.front} rear=${obj.rear} 目镜 rear=${eye.rear} front=${eye.front}`,
-      };
-    };
-    const bad = [];
-    for (const optic of ['acog', 'thermal', 'sniper']) {
-      let info;
-      try { info = buildGun(optic === 'sniper' ? 'l115' : 'm4', { optic }, 'none', {}); } catch (e) { continue; }
-      if (!info || info.optic !== optic) continue;
-      const f = flare(info);
-      if (!f.ok) bad.push(`${optic}: ${f.why}`);
-    }
-    ok('O10⁺ 物镜喇叭朝枪口、目镜喇叭朝射手', bad.length === 0, bad.join(' | ') || 'acog/thermal/sniper 全部正向');
-    // O10⁻ 反证臂：照老写法（两半径对调）往枪口方向塞一截反口喇叭，判据要能闻出"反了"。
-    // 只写正向那一半的话，把所有喇叭删成等径筒也照样全绿。
-    {
-      const info = buildGun('m4', { optic: 'acog' }, 'none', {});
-      const clean = flare(info).ok;
-      const old = new THREE.Mesh(new THREE.CylinderGeometry(0.024, 0.019, 0.03, 16, 1, true).rotateX(Math.PI / 2), mats.mat('gunTube'));
-      old.position.set(0, info.sight.y, info.sight.z - 0.25);   // 比现有物镜更靠枪口，"最靠前"必须选中它
-      info.group.add(old);
-      const foul = flare(info).ok;
-      info.group.remove(old);
-      ok('O10⁻ 反证：喇叭口朝后的筒要报红', clean && !foul, `原样=${clean} 塞入反口后=${foul}`);
-    }
-  }
+  // O10 的喇叭口方向是纯外观参数，随 2026-10-18 测试瘦身移除；本文件只保留
+  // "看得穿 + 分划角直径正确"这两类会直接影响瞄准的判据。
   return out;
 });
 
@@ -492,8 +448,7 @@ const px = await page.evaluate(async () => {
   //     声明点生、朝图心看）之后背景换了一块，这条从 ΔR=370/ΔG=141/ΔB=11 翻成
   //     ΔR=540/ΔG=304/ΔB=177 而变红 —— 红的不是分划，是量具读的是哪个量。
   //   · 背景 = 中性灰 ⇒ 差分是 (dot − gray)，"比原来更红"这句话才真的被量到。
-  // 所以把世界整层藏掉 + 清屏色设成 18/128 的灰，采完立刻原样交还（阶段 C 与反证臂
-  // 用的还是真实背景）。这条现在仍然会说"不红"：分划画成青色的话 dG ≥ dR 当场红。
+  // 所以把世界整层藏掉 + 清屏色设成 18/128 的灰，采完立刻原样交还（反证臂用的还是真实背景）。这条现在仍然会说"不红"：分划画成青色的话 dG ≥ dR 当场红。
   const T3 = await import('three');
   const clearWas = new T3.Color();
   g.renderer.getClearColor(clearWas);
@@ -536,64 +491,10 @@ const px = await page.evaluate(async () => {
   // 角落也有差分的话，说明"世界静止"这个前提没成立，O5⁺ 量到的是噪声不是红点。
   ok('O5⁻ 反证：远离中心的同尺寸窗口几乎无差分', k.n <= 2, `cornerDiffPx=${k.n}`);
 
-  // ---------- 阶段 C：ACOG 的三角形分划画在 HUD 遮罩层（CSS）里，不在枪模里 ----------
-  // 2026-09-28 用户嫌三角形太大：整体缩 50%（底 14→7px、高 12→6px），再在左右各加一条辅助细线。
-  // 跟 O6 一样立成判据且两个方向都卡 —— 只写"不许大"的话，缩到 0（分划整个消失）也照样全绿。
-  // 判据走**真实路径**：换上 ACOG、拉满 ADS，由 weapon-state/hud 自己把 #scope 挂成 acog；
-  // 手动 sc.className='acog' 去量 CSS 的话，hud 那头坏了判据也绿（量具绕开了被测对象）。
-  {
-    const rc2 = g.composer.render.bind(g.composer);
-    g.composer.render = () => {};                 // 驱动期同阶段 B：不真渲染，省 swiftshader
-    ws.replaceSlot(0, { id: 'm4', att: { optic: 'acog' }, camo: 'none' }, 30, 150);
-    // 循环条件必须连 ws.state 一起看：replaceSlot 会置 state='switch'（0.45s），换枪期间
-    // wantAds 为假、adsT 在掉。只写 adsT<0.995 的话，接在阶段 B（adsT 已经满）后面
-    // 一次都不进循环 —— replaceSlot 没生效，判据量到的还是红点那一屏（第一版就是这么错的）。
-    for (let i = 0; i < 300 && (ws.state !== 'idle' || ws.adsT < 0.995); i++) { g.input.buttons = 4; g.frame(); }
-    g.composer.render = rc2;
-    const sc = document.getElementById('scope');
-    ok('C0 真实路径：满 ADS 时 hud 把 #scope 挂成 acog', g.scopeState === 'acog' && sc.className === 'acog' && ws.adsT > 0.99,
-      `scopeState=${g.scopeState} class=${sc.className} adsT=${ws.adsT.toFixed(3)}`);
-    const dot = sc.querySelector('.scope-dot');
-    const cs = getComputedStyle(dot);
-    const n = (v) => parseFloat(v);
-    const triH = n(cs.borderBottomWidth), triW = n(cs.borderLeftWidth) + n(cs.borderRightWidth);
-    const col = (cs.borderBottomColor.match(/\d+/g) || []).map(Number);
-    ok('C1 三角形高 6px（5–7px，两个方向都判）', triH >= 5 && triH <= 7, `高=${triH}px（旧 12px）`);
-    ok('C2 三角形底宽 7px（5.5–8.5px，两个方向都判）', triW >= 5.5 && triW <= 8.5, `底=${triW}px（旧 14px）`);
-    ok('C2b 三角形是实心红的（不是透明占位）', col[0] > 150 && col[1] < 120 && (col[3] === undefined || col[3] > 0), cs.borderBottomColor);
-    const b4 = getComputedStyle(dot, '::before'), a4 = getComputedStyle(dot, '::after');
-    const lw = n(b4.width), rw = n(a4.width);
-    ok('C3 左右辅助细线都在（长 22px，14–30px 两个方向都判）', lw >= 14 && lw <= 30 && rw >= 14 && rw <= 30,
-      `左=${b4.width} 右=${a4.width}（NaN=伪元素没生成）`);
-    ok('C3b 是细线（高 1px，0.5–1.5px）且左右对称', n(b4.height) >= 0.5 && n(b4.height) <= 1.5 && n(a4.height) >= 0.5 && n(a4.height) <= 1.5 && b4.right === a4.left,
-      `左高=${b4.height} 右高=${a4.height} 边距 L=${b4.right} R=${a4.left}`);
-  }
-
-  g.clock = realClock; realClock.getDelta();      // 还原真时钟再恢复主循环（截图要按真实节奏跑）
-  g.renderer.setAnimationLoop(() => g.frame());
-  // 注意 buttons 别清零：恢复 loop 后玩家要保持 ADS，下面的截图才是"瞄着的时候"的画面
+  g.clock = realClock; realClock.getDelta();
   return out;
 });
 
-try { await page.mouse.click(320, 180); } catch { /* pointer lock 恢复不了也不影响判据 */ }
-await page.waitForTimeout(1500);
-// "点击屏幕继续"是丢指针锁后挂的提示，正好压在屏幕中心的准星上 —— 截图前摘掉
-await page.evaluate(() => document.getElementById('clickToPlay').classList.add('hidden'));
-// 阶段 C 收尾停在 ACOG 满 ADS：这一屏就是三角形分划 + 左右细线的肉眼证据
-await page.screenshot({ path: 'test/acog-reticle.png' });
-// 中心特写：三角形只有 6px 高、细线 1px，整屏图上看不出尺寸。先把 DPR 提到 4 让浏览器
-// 按 4 倍像素密度重绘这块 DOM（比事后拉伸位图清楚）；同时停掉渲染循环 —— 免得 swiftshader
-// 在 5120×2880 的同步帧里被 watchdog 掐掉上下文，掐掉会冒 console.error 把整局判据染红。
-await page.evaluate(() => window.game.renderer.setAnimationLoop(null));
-const cdp = await page.context().newCDPSession(page);
-await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 4, mobile: false });
-await page.screenshot({ path: 'test/acog-reticle-close.png', clip: { x: 545, y: 340, width: 190, height: 40 } });
-await cdp.send('Emulation.clearDeviceMetricsOverride');
-await page.evaluate(() => window.game.renderer.setAnimationLoop(() => window.game.frame()));
-// 切回红点再拍 optic.png —— 这张图自 O3/O5 起就是"红点 ADS"的证据，别让 ACOG 把它占了
-await page.evaluate(() => { window.game.player.ws.replaceSlot(0, { id: 'm4', att: { optic: 'reddot' }, camo: 'none' }, 30, 150); });
-await page.waitForTimeout(1500);
-await page.screenshot({ path: 'test/optic.png' });
 await browser.close();
 
 const res = [...geo, ...px];

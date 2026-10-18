@@ -1,18 +1,18 @@
 // 文档守卫。README《验收》/ README《已知缺口》/ docs/deploy-checklist.md §0 与
-// package.json 的脚本之间，过去**没有任何判据** —— 于是漂移是静默的：
+// test/manifest.mjs 的分档清单之间，过去**没有任何判据** —— 于是漂移是静默的：
 // 新增一份 test/*.mjs 忘了写进文档，两份清单就一起变旧（`test/gunvisual.mjs` 就是这样漏的：
 // 它一直在 `npm test` 里跑，README 上一个字都没有）；而文档漂移的下一站更贵 ——
 // "README 写着还没收口的缺口，其实上一轮就收了"（本文件 D 段钉的就是这一类）。
 //
 // 七段判据，各配反证臂。只写"坏的要红"那一半的话，把这几份文档整个删掉也能全绿，
 // 而那正是本仓库最怕的那种绿（见 README《验收》开头那句）。
-//   A 覆盖（正向）：脚本里跑到的每个 .mjs，必须在 README《验收》里被点名。
+//   A 覆盖（正向）：清单里登记的每个 .mjs，必须在 README《验收》里被点名。
 //   B 覆盖（反向）：README《验收》里点名的每个 .mjs，不能是"仓库里已经没有这个文件"
 //                    —— 指着一个被删掉/改名的测试文件，与漏写是同一类漂移。
 //                    文件还在、只是不作为三档脚本里的一站（说明性引用，例如
 //                    `server/fps-independence.mjs` 那种一次性测量脚本）不报红，只打印。
 //   C 清单（第二层）：`docs/deploy-checklist.md` §0 是"改代码之后必跑"那一节，
-//                    它逐档点名要跑什么（写的是不带扩展名的 stem），同样按脚本核对。
+//                    它逐档点名要跑什么（写的是不带扩展名的 stem），同样按清单核对。
 //   D 已推翻的断言：正文里那些"当时是真的、后来收口了"的话，一张
 //                    (不能再出现的话 × 必须还在的话) 表：
 //                    gone 命中 ⇒ 红；must 不命中 ⇒ 红（有人把整段删了来让 gone 变绿）。
@@ -27,26 +27,27 @@
 //                    那么每份浏览器判据的 `launch` 链里就必须有一档**交给 Playwright 自己解析**
 //                    （不带 `channel` / `executablePath`）—— 装的正是那一份。8 份源码原来只有
 //                    "系统 Chrome + 这台开发机上的绝对路径"两档，于是那句安装提示在别人机器上是假的。
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, resolve } from 'node:path';
+import { TIERS } from './manifest.mjs';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 // ---------- 判据本体（纯函数：下面用合成夹具走一遍，证明它们真的会红） ----------
 
-export const SCRIPT_KEYS = ['test', 'test:browser', 'test:all'];
+export const SCRIPT_KEYS = Object.keys(TIERS);
 const MJS = /[\w./-]+\.mjs/g;
 
 export function mjsIn(text) {
   return [...new Set(String(text || '').match(MJS) || [])];
 }
 
-// 三档脚本合起来"这份仓库会跑哪些文件"。用并集而不是只看 `test`：
+// 所有档合起来"这份仓库会跑哪些文件"。用并集而不是只看 `test`：
 // 文档的承诺是"这些判据都在"，不是"它们在哪一档里"。
-export function filesRunBy(pkg) {
+export function filesRunBy(suites = TIERS) {
   const out = new Set();
-  for (const k of SCRIPT_KEYS) for (const f of mjsIn(pkg && pkg.scripts && pkg.scripts[k])) out.add(f);
+  for (const t of Object.values(suites)) for (const e of [...t.node, ...t.browser]) out.add(e.file);
   return out;
 }
 
@@ -217,8 +218,8 @@ export const STALE_CLAIMS = [
   },
   {
     id: '主体档不含浏览器',
-    why: '`npm test` 里有五份 playwright 判据（fps / viewmodel / gunvisual / optic / state-leak），都要一个真 Chrome',
-    closed: '到处都在跑：npm test 的链尾那五份',
+    why: '`npm test` 里仍有 `server/xenv.mjs`（跨环境一致性，要一个真 Chrome）；视觉类浏览器判据自 2026-10-18 起只在 `test:browser` 跑，但主体档并没有因此变成"不碰浏览器"',
+    closed: 'server/xenv.mjs 留在 npm test 的链尾（test/manifest.mjs 的 test 档）',
     gone: [/不含浏览器/],
     // 这条没有"必须还在"的正向话：A 段已经要求那一档里每个文件都被点名，
     // 把那一行删掉会让 A 红，所以不需要再钉一句文案。
@@ -330,15 +331,16 @@ export const RETIRED_RULERS = [
   },
   {
     id: '房间设置的模式那一格"与这间房的地图允许的玩法一字不差"（把 dom↔ridges 锁死成死锁的那把尺子）',
-    file: 'test/net-drop.mjs',
+    file: 'test/hud-keys.mjs',
     why: '"滤掉当前图打不了的玩法"这条口径与 js/data.js 的**互为专属**绑定（占领只在双丘、双丘只在占领）'
       + '撞成死锁：dune/frost 的房里模式那一格永远没有「占领」，而图那一行又按模式滤掉了双丘 ⇒ '
       + '房主点遍这一栏也换不到占领（用户报的"联网里是不是还没有占点模式"）。旧注释里那句'
-      + '"地图过滤上线之后这条一直红着"记的正是**尺子在被迁就**（2026-10-09）—— 判据红了先怀疑口径那条。',
-    closed: '审计 HU-44（改判记在那一节）+ test/net-drop.mjs 改成"按下去看服务端收没收"三条（含先决与【归位】）'
-      + ' · test/hud-ux.mjs AJ 段（可达性两个方向 / 两屏契约 / 同帧组合）· test/hud-keys.mjs L11/L11b~L11e（真点击 + 真开局）',
+      + '"地图过滤上线之后这条一直红着"记的正是**尺子在被迁就**（2026-10-09）—— 判据红了先怀疑口径那条。'
+      + '2026-10-18 测试瘦身把 net-drop 的 E 段（真浏览器大厅→房间）移除，同样的口径由 hud-keys L11 用真界面继续量。',
+    closed: '审计 HU-44（改判记在那一节）+ test/hud-keys.mjs L11/L11b~L11e（真点击 + 真开局）'
+      + ' · test/hud-ux.mjs AJ 段（可达性两个方向 / 两屏契约 / 同帧组合）· net-drop E 段已于 2026-10-18 移除',
     gone: [/MP_MODES\.filter\(m => m\.net && mapAllowed\(map, m\.id\)\)/, /不含这间房的地图打不了的占领/],
-    must: [/房间里点得到「占领」/, /再点回「团队死斗」同样落地/, /【归位】/, /一致的组合/, /先决：房间设置那一格非空、含团队死斗/],
+    must: [/联网里点得到「占领」/, /模式换回「团队死斗」/, /一致的组合/, /再换回「占领」同样生效/, /L11e .*真开得起一局占点/],
   },
 ];
 
@@ -366,24 +368,33 @@ const readme = readFileSync(resolve(ROOT, 'README.md'), 'utf8');
 const checklist = readFileSync(resolve(ROOT, 'docs/deploy-checklist.md'), 'utf8');
 const pkg = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8'));
 
-const files = filesRunBy(pkg);
+const files = filesRunBy();
 const acc = sectionOf(readme, '验收');
 const dep = sectionOf(checklist, '先把自己关在门外');
 const accNames = acc ? basenamesIn(acc.text) : new Set();
 const gapSec = sectionOf(readme, '已知缺口');
 
 // 先决臂：这三条红了，下面每一条的绿都没有意义（遍历到空集合也能绿）
-chk(files.size >= 18, '先决：package.json 的三档脚本里读到了测试文件（不是空集合）',
-  `${files.size} 个：${SCRIPT_KEYS.map(k => `${k}=${mjsIn(pkg.scripts[k]).length}`).join(' ')}`);
+chk(files.size >= 18, '先决：test/manifest.mjs 的分档清单里读到了测试文件（不是空集合）',
+  `${files.size} 个：${SCRIPT_KEYS.map(k => `${k}=${TIERS[k].node.length + TIERS[k].browser.length}`).join(' ')}`);
+const missingFiles = [...files].filter(f => !existsSync(resolve(ROOT, f)));
+chk(missingFiles.length === 0, '先决：清单里的每个文件都真的在仓库里',
+  missingFiles.length ? `找不到：${missingFiles.join(', ')}` : `${files.size} 个文件逐个核过`);
+const badScripts = SCRIPT_KEYS.filter(k => {
+  const s = String((pkg.scripts || {})[k] || '');
+  return !s.includes('test/run.mjs ' + k);
+});
+chk(badScripts.length === 0, '先决：package.json 的每一档脚本都把档名交给 test/run.mjs',
+  badScripts.length ? `没接上：${badScripts.join(', ')}` : SCRIPT_KEYS.join(' / '));
 chk(!!acc, '先决：README 里有《验收》一节（改名会让下面几条全绿）', acc ? `第 ${acc.from}-${acc.to} 行` : '找不到 ## 验收');
 chk(accNames.size >= 15, '先决：README《验收》真的点名了一批文件（不是"写了一句空话"）',
   `${accNames.size} 个 .mjs`);
 chk(!!dep, '先决：deploy-checklist 里有 §0 那一节', dep ? `第 ${dep.from}-${dep.to} 行` : '找不到 ## 0. …');
 chk(!!gapSec, '先决：README 里有《已知缺口》一节', gapSec ? `第 ${gapSec.from}-${gapSec.to} 行` : '找不到');
 
-// A 段：脚本跑到的，文档必须点名
+// A 段：清单跑到的，文档必须点名
 const missA = covered(files, accNames);
-chk(missA.length === 0, 'A 覆盖：脚本里跑的每个判据都在 README《验收》里被点名',
+chk(missA.length === 0, 'A 覆盖：清单里跑的每个判据都在 README《验收》里被点名',
   missA.length ? `漏写：${missA.join(', ')}` : `${files.size} 个文件全部点到`);
 
 // B 段：文档点名的，不能是"已经没人跑、也不存在"的东西
@@ -395,7 +406,7 @@ chk(rev.ghosts.length === 0, 'B 覆盖：README《验收》点名的判据没有
 
 // C 段：部署清单那一节同样对齐
 const missC = stemsMissing(dep ? dep.text : '', files);
-chk(missC.length === 0, 'C 清单：deploy-checklist §0 逐档点名了脚本里跑的每个判据',
+chk(missC.length === 0, 'C 清单：deploy-checklist §0 逐档点名了清单里跑的每个判据',
   missC.length ? `§0 漏写：${missC.join(', ')}` : `${files.size} 个文件全部点到`);
 
 // D 段：已推翻的断言
