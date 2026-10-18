@@ -20,6 +20,12 @@ const ok = (label, cond, info = '') => {
   else { bad++; console.log(`  ❌ ${label}${info ? '  ' + info : ''}`); }
 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 等条件而不是睡固定毫秒；上限是耐心，等不到就让下面那条断言自己红。
+const until = async (fn, ms = 4000, step = 40) => {
+  const t = Date.now();
+  while (Date.now() - t < ms) { if (await fn()) return true; await sleep(step); }
+  return false;
+};
 
 // 一条连接 + 一个"按类型取下一条控制帧"的队列。
 // 刻意不做成"发一句等一帧"：房间状态是**一变就推**的，一次开局会连着来好几帧
@@ -149,7 +155,7 @@ try {
   ok('阵营由服务端说回来（不是网址里那份）', !!wb && wb.team === 'B' && wa.team === 'A', JSON.stringify({ a: wa && wa.team, b: wb && wb.team }));
   ok('others 是完整的：房主看得见后到的那个人（边放人边发就会漏）',
     !!wa && (wa.others || []).length === 1 && wa.others[0].name === '小乙', JSON.stringify(wa && wa.others));
-  await sleep(800);
+  await until(() => a.binary() > 3 && b.binary() > 3, 4000);
   ok('快照开始下行（这间真的在跑权威模拟了）', a.binary() > 3 && b.binary() > 3, `甲 ${a.binary()} 包 / 乙 ${b.binary()} 包`);
   const h2 = await health(base);
   ok('/healthz 里这间成了在跑的 sim，两个人在册',
@@ -196,12 +202,11 @@ try {
   const hist = await d.until(j => j.t === 'chat' && Array.isArray(j.hist), 2000);
   ok('刚进大厅的人能看到最近几句（否则聊天永远是半截的）', !!hist || !!cl, JSON.stringify(hist && hist.hist && hist.hist.length));
   d.send({ t: 'say', ch: 'room', text: '我没在任何房间里' });
-  await sleep(300);
   ok('没进房间的人发不了房间频道（服务端不给他造一个）',
     !(await a.until(j => j.t === 'chat' && j.text === '我没在任何房间里', 800)));
   const rate0 = (await health(base)).lobby.sayRate | 0;
   for (let i = 0; i < 10; i++) d.send({ t: 'say', ch: 'lobby', text: '刷屏' + i });
-  await sleep(400);
+  await until(async () => (((await health(base)).lobby.sayRate | 0) - rate0) >= 7, 3000);
   const got = (await health(base)).lobby.say;
   const refused = (await health(base)).lobby.sayRate;
   ok('刷屏被限住：10 条里只放过一两条', refused >= 7 && refused > rate0, `放行到 ${got} 条，拒了 ${refused - rate0} 次`);
@@ -215,7 +220,7 @@ try {
   ok('房主离开之后移交给还活着的下一个人（不是留下一间永远开不了的房）', !!r5, JSON.stringify(r5 && r5.me));
   ok('移交之后自己算已准备（房主那一格不该要点才亮）', !!r5 && r5.me.ready === true);
   b.close();
-  await sleep(300);
+  await until(async () => !(await apiRooms(base)).some(x => x.id === 'hall'), 4000);
   ok('最后一个座位走了，这间就从清单上消失（不留下没人认领的门）',
     !(await apiRooms(base)).some(x => x.id === 'hall'), JSON.stringify((await apiRooms(base)).map(x => x.id)));
 
@@ -462,7 +467,7 @@ try {
 
   // ── 断线清账：走的那个人的座位，哪间都不能留 ──
   z2.close();
-  await sleep(400);
+  await until(async () => !(await apiRooms(srvM.base)).some(x => x.id === 'elsewhere'), 4000);
   ok('断线之后不留幽灵（这一间没人了就该从清单上消失）',
     !(await apiRooms(srvM.base)).some(x => x.id === 'elsewhere'),
     JSON.stringify((await apiRooms(srvM.base)).map(x => x.id)));

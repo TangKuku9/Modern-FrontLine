@@ -17,6 +17,12 @@ import { DEFAULT_CLASSES } from '../js/data.js';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const { withServer } = await import('../test/with-server.mjs');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 等条件，不等固定毫秒：上限是耐心，不是判据线。等不到就让下面那条断言自己红。
+const until = async (fn, ms = 4000, step = 40) => {
+  const t = Date.now();
+  while (Date.now() - t < ms) { if (await fn()) return true; await sleep(step); }
+  return false;
+};
 let n = 0, bad = 0;
 const ok = (label, cond, extra = '') => { n++; if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${label}${extra ? '  | ' + extra : ''}`); };
 
@@ -143,7 +149,7 @@ try {
 
   console.log('\n── 一条连接只进一次房（幽灵玩家） ──');
   good.ws.send(JSON.stringify({ t: 'join', room: 'sec-ok', name: '影子' }));
-  await sleep(400);
+  await until(() => good.json().some(m => m.t === 'err'), 3000);
   const second = good.json().filter(m => m.t === 'err');
   ok('第二次 join 被拒而不是多造一个玩家', second.length > 0, JSON.stringify(second.slice(-1)));
   const hAfter = JSON.parse(String((await get('/healthz')).buf));
@@ -157,7 +163,7 @@ try {
   // 往那条连接上 emit 'error'，没人接 ⇒ 未捕获异常 ⇒ 整个进程连同所有房间一起死。
   const watch = await joiner('watch-1', '旁观者');
   const frames = () => watch.all();
-  await sleep(400);
+  await until(() => frames() > 0, 3000);
   const f0 = frames();
   const big = new WebSocket(srv.ws, { headers: { origin: 'http://127.0.0.1' } });
   const bigClosed = new Promise(res => big.on('close', (c) => res(c)));
@@ -165,12 +171,11 @@ try {
   big.send(Buffer.alloc(200 * 1024, 7));
   const code = await Promise.race([bigClosed, sleep(1500).then(() => 'timeout')]);
   ok('超限单帧被断开（默认 100 MiB 等于请人来吃你内存）', code !== 'timeout', `close code=${code}（1009 = 消息过大）`);
-  await sleep(600);
+  await until(() => watch.ws.readyState === 1 && frames() > f0, 3000);
   ok('发坏包的那个人死了，别人的那一局没陪葬', watch.ws.readyState === 1 && frames() > f0, `观察者收到 ${f0} → ${frames()} 帧`);
   const hAlive = JSON.parse(String((await get('/healthz')).buf));
   ok('进程还活着并且还在报健康（/healthz 可查）', hAlive.ok === true, JSON.stringify(hAlive));
   const small = await joiner('sec-ok', '正常人');
-  await sleep(300);
   ok('正常大小的输入帧不受影响（上限不能砍到功能）', small.json().some(m => m.t === 'welcome'), `帧上限 16 KB`);
   small.ws.close(); watch.ws.close();
 
@@ -181,7 +186,6 @@ try {
   const r1 = await joiner('quota-1', '配额甲');
   const r2 = await joiner('quota-2', '配额乙');
   const r3 = await joiner('quota-3', '配额丙');
-  await sleep(300);
   const denied = r3.json().find(m => m.t === 'err');
   ok('超过 MAX_ROOMS 的新房被拒（客户端可以随便编房间号）', !!denied, JSON.stringify(denied || r3.json()));
   const hQ = JSON.parse(String((await get('/healthz')).buf));
@@ -194,7 +198,6 @@ try {
   ok('room=auto 时第二个人被分到同一个房间（否则大厅形同虚设）', !!wa && !!wb && wa.room === wb.room, `${wa && wa.room} vs ${wb && wb.room}`);
   ok('同一个房间里的两个人拿到不同 cid', !!wa && !!wb && wa.cid !== wb.cid, `${wa && wa.cid}/${wb && wb.cid}`);
   autoA.ws.close(); autoB.ws.close();
-  await sleep(300);
 
   console.log('\n── 空房回收 ──');
   let hR = JSON.parse(String((await get('/healthz')).buf));
@@ -274,7 +277,14 @@ try {
       { loadout: { primary: { id: 'm4', att: { optic: 1, muzzle: {} } }, perks: 'x' } },
       { loadout: { primary: { id: 'l115', att: { optic: 'thermal' } }, secondary: { id: 'rpg' }, lethal: 'molotov', tactical: 'stim', perks: ['overkill', 'ghost', 'ninja'] } },
     ].entries()) hostile.push(await joiner('gear-1', '恶意' + i, 'http://127.0.0.1', p));
-    await sleep(1200);
+    await until(() => bystander.all() - before >= 20, 3000);
+    // /healthz 的 hz 每秒才结一次账：刚开的房在第一个统计窗里读数是 0。
+    // 等它真的报出 ≥45 再断言，否则量到的是"账还没算"，不是"房间没在跑"。
+    await until(async () => {
+      const h = JSON.parse(String((await get('/healthz')).buf));
+      const r = (h.per || []).find(x => x.id === 'gear-1');
+      return !!r && r.hz > 45;
+    }, 4000);
     const hz = JSON.parse(String((await get('/healthz')).buf));
     const room = (hz.per || []).find(r => r.id === 'gear-1');
     ok('恶意载荷进来之后这间还在按 60Hz 跑（没被任何一条打死）', !!room && room.hz > 45 && room.fails === 0, JSON.stringify(room || hz.per));
@@ -287,7 +297,9 @@ try {
     ok('welcome 把服务端重建的那份装备发回去（两边只有一套 stats）', !!l4 && l4.loadout && l4.loadout.primary.id === 'l115'
       && JSON.stringify(l4.loadout.perks) === JSON.stringify(['overkill', 'ghost', 'ninja']), JSON.stringify(l4 && l4.loadout));
     for (const c of [bystander, ...hostile]) c.ws.close();
-    await sleep(300);
+    // 下面的裸 socket 走同一条 per-IP 名额：close 是异步的，没等它真的销账就拨号
+    // 会读到 429（"这台服务器名额没还回来"的假红）。等 /healthz 说在线数归零。
+    await until(async () => JSON.parse(String((await get('/healthz')).buf)).clients === 0, 3000);
   }
 
   console.log('\n── 半开连接：放宽到 15 秒，但不是不清（判据两头都要量） ──');

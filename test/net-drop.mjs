@@ -107,23 +107,23 @@ const realErrs = (logs) => logs.filter(l => !/favicon|WebGL|AudioContext|pointer
 // 这一份里造出来的每个页面都记在这儿，供 closeOpened() 收尾。
 const OPENED = [];
 
-// 收掉前面几段留下的页面。为什么要有这一步 —— 2026-09-26 实测（E 段点不动那次）：
-// 这几段各留一个还在渲染的画布页，到 E 段时同一浏览器里开着 6 个，E 页只剩 **2 fps**
-// （单独跑这一段是 6 fps）。这时 Playwright 的 locator.click 会**在 30 秒里不返回**，
+// 收掉已经跑完那几段留下的页面。为什么每段结束都要收 —— 2026-09-26 实测：
+// 这几段各留一个还在渲染的画布页，同一浏览器里攒到 6 个时，后面的页只剩 **2 fps**
+// （单独跑一段是 6 fps）。这时 Playwright 的 locator.click 会**在 30 秒里不返回**，
 // 调用日志停在 "performing click action"，一条 "element intercepts pointer events" 都没有 ——
 // 那就不是"被别的东西盖住"，而是派发这条路没回来。同一时刻同一个页面上：
 //   · evaluate 往返 1 ms ⇒ 事件循环是好的，不是页面卡死；
 //   · bringToFront() 之后再点，照样挂 ⇒ 不是"这一页不在最前面"；
 //   · page.mouse.click 能点进去，page.close() 也是毫秒级 ⇒ 是那段派发路径在重载下不行。
-// 单跑 `node test/net-drop.mjs E` 每次都绿，也就是"没有其余 5 个画布页"这个状态是好的。
 // 所以修法不是改判据（那会变成把"入口点不动"这条悄悄放过），而是**让每个用例自己收尾**。
+// 2026-10-18 又量了一次：同一份判据从 96.3s 降到 41.8s，全绿 —— 省下的是页面空转的 CPU。
 async function closeOpened() {
   const keep = OPENED.splice(0, OPENED.length);
   for (const o of keep) {
     try { await o.page.close(); } catch { /* 已经关掉的就算了 */ }
     try { await o.ctx.close(); } catch { /* 同上 */ }
   }
-  if (keep.length) console.log(`  （收掉前面几段留下的 ${keep.length} 个页面）`);
+  if (keep.length) console.log(`  （收掉已结束段落的 ${keep.length} 个页面）`);
 }
 
 const browser = await launch();
@@ -166,6 +166,7 @@ try {
     // 反证：服务活着的时候不该冒出这个提示（否则"看到断开"只是永远红的横幅）
     ok('反证：断开之前那个横幅不存在', st.state === 'play' && !st.lost, JSON.stringify(st));
     ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
+    await closeOpened();
   }
 
   if (!skip('B')) {
@@ -191,6 +192,7 @@ try {
     ok('失联走同一条横幅', /失联/.test(after.text) && after.opacity === '1', JSON.stringify(after.text));
     ok('页面没有真错误', realErrs(logs).length === 0, logs.slice(0, 3).join(' ⏐ '));
     srv.kill();
+    await closeOpened();
   }
 
   if (!skip('C')) {
@@ -236,6 +238,7 @@ try {
     ok('被拒之后 socket 是我们自己拆的（迟到的 welcome 造不出僵尸局）', diag.rs === 3 || diag.rs === 2, `readyState=${diag.rs}`);
     ok('页面没有真错误（rej 越界这一类就靠这条抓住）', realErrs(second.logs).length === 0, second.logs.slice(0, 3).join(' ⏐ '));
     srv.kill();
+    await closeOpened();
   }
   if (!skip('D')) {
     console.log('\n── D：存档被手改坏之后，页面还起得来吗、装的是哪一份装备 ──');
@@ -298,6 +301,7 @@ try {
     ok('玩家身上那份就是服务端回声的**那个对象**（两套 stats 的口子从这里堵）', st.same === true, JSON.stringify({ same: st.same }));
     ok('页面没有真错误（白屏那起就是 buildGun 读 undefined.model 抛的）', realErrs(logs).length === 0, logs.slice(0, 2).join(' ⏐ '));
     srv.kill();
+    await closeOpened();
   }
   if (!skip('J')) {
     console.log('\n── J：大厅层断线（房表要说话、点按钮不许卡在加载层、能重连） ──');

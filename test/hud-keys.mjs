@@ -81,10 +81,17 @@ try {
     for (const k of ['prompt', 'confirm', 'alert']) window[k] = () => { window.__nativeDialog++; return k === 'confirm' ? false : null; };
   });
   const wait = async (fn, ms = 20000, step = 120) => {
-    const until = Date.now() + ms;
-    while (Date.now() < until) { if (await page.evaluate(fn)) return true; await sleep(step); }
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) { if (await page.evaluate(fn)) return true; await sleep(step); }
     return false;
   };
+  // 等一个浏览器侧条件，而不是睡固定毫秒。上限是耐心，不是判据线：转换通常一两帧就完成。
+  // 仍然等不到时返回 false，让下面那条断言去红 —— 不许静默当成“应该好了”。
+  const until = async (fn, ms = 5000, arg) => {
+    try { await page.waitForFunction(fn, arg, { timeout: ms }); return true; }
+    catch { return false; }
+  };
+  const twoFrames = () => page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
   await page.goto(`${srv.base}/index.html`);
   await page.waitForFunction(() => window.game && window.game.state === 'menu' && game.menu.screen === 'main', null, { timeout: 120000 });
   await sleep(1500);   // accountSync 回来会重画"联网对战"那一格，先让重绘过完再走焦点
@@ -122,7 +129,7 @@ try {
     game.audio.ui = k => { if (k === 'click') window.__ui++; return o(k); }; });
   const uiBefore = await page.evaluate(() => window.__ui);
   await page.keyboard.press('Enter');
-  await sleep(400);
+  await until(() => game.menu.screen === 'settings', 3000);
   ok('B2 Enter 换屏：screen main → settings（全程没碰鼠标）',
     (await page.evaluate(() => game.menu.screen)) === 'settings');
   ok('B2b【先决】计数器接得上：这一次激活真的被记到',
@@ -130,7 +137,7 @@ try {
   ok('B3【反方向臂】一次 Enter 只激活一次（委托给原生 BUTTON 重复派 click 会在这里变 2）',
     (await page.evaluate(() => window.__ui)) === uiBefore + 1);
   await page.keyboard.press('Escape');
-  await sleep(400);
+  await until(() => game.menu.screen === 'main', 3000);
   ok('B4 Esc 从设置回主菜单（按的是这一屏本来就有的那个返回键，不是另写的一套去处）',
     (await page.evaluate(() => game.menu.screen)) === 'main');
   await page.keyboard.press('Escape');
@@ -139,10 +146,10 @@ try {
     (await page.evaluate(() => [game.menu.screen, game.state].join('/'))) === 'main/menu');
 
   // ── C 段：配装屏与选枪覆盖层 ──
-  await page.click('.mbtn[data-a=loadout]'); await sleep(600);
+  await page.click('.mbtn[data-a=loadout]'); await until(() => game.menu.screen === 'loadout', 3000);
   ok('C0 进配装屏', (await page.evaluate(() => game.menu.screen)) === 'loadout');
   const before = await page.evaluate(() => game.profile.classes[game.menu.selClass].primary);
-  await page.click('[data-w=primary]'); await sleep(500);
+  await page.click('[data-w=primary]'); await until(() => !!document.querySelector('.picker'), 3000);
   ok('C1 选枪覆盖层开着', !!(await page.evaluate(() => document.querySelector('.picker'))));
   // 落在**当前那张卡**上换不换得动才是关键：走到一张与现在配装不同的卡上再按 Enter，
   // 于是 C3 量的不只是"profile 动了"，而是"profile 动成了我键盘选中的那一张"。
@@ -156,26 +163,26 @@ try {
   };
   const onPick = await tabToOtherPick(before);
   ok('C2 覆盖层里的卡片 Tab 走得到（它不走 render()，keyify 单独补的那一刀在这里见真章）', !!onPick);
-  await page.keyboard.press('Enter'); await sleep(600);
+  await page.keyboard.press('Enter'); await until(() => game.profile.classes[game.menu.selClass].primary === onPick.id, 3000);
   const after = await page.evaluate(() => game.profile.classes[game.menu.selClass].primary);
   ok('C3 Enter 选中的那张卡就是落进 profile 的那一把（量被测对象的状态，不是界面）',
     !!onPick && after === onPick.id, `${before} → ${after}·键盘选的是 ${onPick && onPick.id}`);
   ok('C4 选完自动收回配装屏', (await page.evaluate(() => game.menu.screen)) === 'loadout'
     && !(await page.evaluate(() => document.querySelector('.picker'))));
-  await page.click('[data-w=primary]'); await sleep(500);
-  await page.keyboard.press('Escape'); await sleep(500);
+  await page.click('[data-w=primary]'); await until(() => !!document.querySelector('.picker'), 3000);
+  await page.keyboard.press('Escape'); await until(() => !document.querySelector('.picker') && game.menu.screen === 'loadout', 3000);
   ok('C5 Esc 只退一层：覆盖层合上，人还在配装屏',
     !(await page.evaluate(() => document.querySelector('.picker')))
     && (await page.evaluate(() => game.menu.screen)) === 'loadout');
-  await page.keyboard.press('Escape'); await sleep(500);
+  await page.keyboard.press('Escape'); await until(() => game.menu.screen === 'main', 3000);
   ok('C5b 再按一次才离开配装屏（一层是一层，不是一按到底）',
     (await page.evaluate(() => game.menu.screen)) === 'main');
 
   // ── D 段：枪匠的出路（以前必须"完成 → 返回"两跳）──
-  await page.click('.mbtn[data-a=loadout]'); await sleep(600);
-  await page.click('[data-g=primary]'); await sleep(700);
+  await page.click('.mbtn[data-a=loadout]'); await until(() => game.menu.screen === 'loadout', 3000);
+  await page.click('[data-g=primary]'); await until(() => game.menu.screen === 'gunsmith', 3000);
   ok('D0 进枪匠', (await page.evaluate(() => game.menu.screen)) === 'gunsmith');
-  await page.keyboard.press('Escape'); await sleep(600);
+  await page.keyboard.press('Escape'); await until(() => game.menu.screen === 'loadout', 3000);
   ok('D1 枪匠里按 Esc 走的是它自己那个"完成"（表里那一行写的是 data-a=done，不是又一个返回）',
     (await page.evaluate(() => game.menu.screen)) === 'loadout');
 
@@ -183,16 +190,16 @@ try {
   await page.evaluate(() => { game.menu.showMain(); game.startGame('mp',
     { mode: 'tdm', map: 'dune', diff: 1, allies: 3, enemies: 3, scoreLimit: 200, timeLimit: 5 }); });
   await page.waitForFunction(() => game.state === 'play' && !game.paused, null, { timeout: 60000 });
-  await sleep(2000);
+  await twoFrames();
   const actBefore = await page.evaluate(() => document.activeElement.tagName + '.' + document.activeElement.className);
-  await page.keyboard.press('Tab'); await sleep(300);
+  await page.keyboard.press('Tab'); await sleep(120);
   const actAfter = await page.evaluate(() => document.activeElement.tagName + '.' + document.activeElement.className);
   ok('E1 对局里按 Tab 焦点不动（记分板用的就是这把键，焦点被抢=游戏被打断）',
     actBefore === actAfter, `${actBefore} → ${actAfter}`);
   // 记分板是"按住 Tab"才在的（keyup 会收掉，main.js 那条 keyup 分支），所以这里必须 down/up 分开量。
-  await page.keyboard.down('Tab'); await sleep(250);
+  await page.keyboard.down('Tab'); await until(() => !document.getElementById('scoreboard').classList.contains('hidden'), 2000);
   const sbUp = await page.evaluate(() => !document.getElementById('scoreboard').classList.contains('hidden'));
-  await page.keyboard.up('Tab'); await sleep(250);
+  await page.keyboard.up('Tab'); await until(() => document.getElementById('scoreboard').classList.contains('hidden'), 2000);
   const sbDown = await page.evaluate(() => document.getElementById('scoreboard').classList.contains('hidden'));
   ok('E1b【判别臂】按住 Tab 记分板真的出来、松开就收（拦焦点不等于拦功能 —— 这把键两半都得还在）',
     sbUp && sbDown, `按住=${sbUp}·松开=${sbDown}`);
@@ -206,7 +213,7 @@ try {
     window.__sbObs = new MutationObserver(() => window.__sbLog.push(1));
     window.__sbObs.observe(document.getElementById('scoreboard'), { childList: true, subtree: true });
   });
-  await page.keyboard.down('Tab'); await sleep(150);
+  await page.keyboard.down('Tab'); await until(() => !document.getElementById('scoreboard').classList.contains('hidden'), 2000);
   const html0 = await page.evaluate(() => document.getElementById('scoreboard').innerHTML);
   // 输入由这里给：等 Bot 自己在五秒里打死人是不成立的（dune 3v3 那一局 5 秒可以一个都不死，
   // 上一版就是这么红的）。改的是**被测对象读的那本账**（mode.ranking() 取的就是 bot.kills），
@@ -216,33 +223,36 @@ try {
     game.bots[0].kills += 3;
     return before !== game.mode.ranking().map(x => x.k + '/' + x.d).join(',');
   });
-  await sleep(900);                       // 跨过至少一个 500ms 的重画点
+  await until(() => window.__sbLog.length > 0, 3000);   // 等真正发生重画，而不是睡过一个 500ms 重画点
+  await twoFrames();
   const cntHeld = await page.evaluate(() => window.__sbLog.length);
   const html1 = await page.evaluate(() => document.getElementById('scoreboard').innerHTML);
   ok('G1【先决】这一次改的数真的进了榜单的输入（少了这条，"榜没刷"与"数据没变"在同一把尺下长得一样）',
     changed === true && html0.length > 0, `changed=${changed}·榜面长度=${html0.length}`);
   ok('G1 按住不放、榜单数据一变 ⇒ 那一屏自己跟上（旧写法冻在按下那一刻，全靠 OS 键重复赌一把）',
     html1 !== html0 && cntHeld > 0, `改DOM=${cntHeld}次·榜面变了=${html1 !== html0}`);
-  await page.keyboard.up('Tab'); await sleep(200);
+  await page.keyboard.up('Tab'); await until(() => document.getElementById('scoreboard').classList.contains('hidden'), 2000);
   await page.evaluate(() => { window.__sbLog.length = 0; game.bots[0].kills += 9; });
-  await sleep(1300);
+  await sleep(800);                       // 跨过一个 500ms 重画点，证明松开后真的停了
   const cntAfter = await page.evaluate(() => window.__sbLog.length);
   ok('G2【反方向】松开之后那一屏必须停（定时器漏在 keyup 外 = 藏着的面板每 0.5 秒白拆一次 DOM）',
     cntAfter === 0, `松开后又写了 ${cntAfter} 次`);
   await page.evaluate(() => window.__sbObs.disconnect());
 
   // ── F 段：暂停也算菜单（服务端照跑那一段，玩家需要的正是能看能走的这一屏）──
-  await page.evaluate(() => game.pause(true)); await sleep(700);
+  // 暂停屏自己有一道 300ms 的防误触闸（menu.js 的 pauseAt）：等它过了再按 Esc，
+  // 否则量到的是"太早按了"，不是"Esc 不工作"。
+  await page.evaluate(() => game.pause(true)); await until(() => game.paused && game.menu.screen === 'pause' && performance.now() - (game.menu.pauseAt || 0) > 350, 3000);
   ok('F0 暂停屏画出来了', (await page.evaluate(() => [game.paused, game.menu.screen].join('/'))) === 'true/pause');
   const onMbtn = await tabTo('resume');
   ok('F1 暂停屏里 Tab 走得到那几行（paused 时不再拦 —— 这一条被 main.js 那个 && !this.paused 钉着）',
     !!onMbtn, onMbtn && onMbtn.hit);
-  await page.keyboard.press('Escape'); await sleep(600);
+  await page.keyboard.press('Escape'); await until(() => game.paused === false, 3000);
   ok('F2 暂停屏上 Esc 仍是继续（原有的 resume 没被新的"返回上一层"抢走）',
     (await page.evaluate(() => game.paused)) === false);
 
   // ── H 段：HU-24 / HU-25 / HU-26 联网大厅与房间屏（HU-06 当时欠的那一截）──
-  await page.evaluate(() => game.exitToMenu()); await sleep(800);
+  await page.evaluate(() => game.exitToMenu()); await until(() => game.menu.screen === 'main' && game.state === 'menu', 5000);
   await page.click('.mbtn[data-a=online]');
   ok('H0【先决】进得了联网大厅，而"按房号加入"那一格真的画出来了（HU-24：原来只有"房名 + 创建 + 快速加入"三样）',
     await wait(() => (game.menu || {}).screen === 'online' && !!document.querySelector('#joinRoomId') && !!document.querySelector('[data-a=joinId]')),
@@ -267,7 +277,7 @@ try {
     await page.evaluate(() => (document.querySelector('#lbErr') || {}).textContent || ''));
   ok('H2d 而且它自带一个看得见的落点：那一格里有一个「知道了」',
     !!(await page.evaluate(() => document.querySelector('#lbErr [data-a=errack]'))));
-  await page.click('#lbErr [data-a=errack]'); await sleep(300);
+  await page.click('#lbErr [data-a=errack]'); await until(() => (((document.querySelector('#lbErr') || {}).textContent || '').trim() === ''), 2000);
   ok('H3 「知道了」按下去那一格就空了（不蒸发 ≠ 不许关掉）',
     await page.evaluate(() => (((document.querySelector('#lbErr') || {}).textContent || '').trim() === '')),
     await page.evaluate(() => (document.querySelector('#lbErr') || {}).textContent || ''));
@@ -307,10 +317,10 @@ try {
   // 原生那一份先存起来（H7 段还要换一次计数器，测完得还得回去）。
   await page.evaluate(() => { window.__frames = []; window.__realSend = game.lobby.ws.send;
     game.lobby.ws.send = m => { window.__frames.push(String(m)); }; });
-  await page.click('[data-a=start]'); await sleep(300);
+  await page.click('[data-a=start]'); await until(() => /正在开局/.test((document.querySelector('[data-a=start]') || {}).textContent || ''), 3000);
   const label1 = await page.evaluate(() => (document.querySelector('[data-a=start]') || {}).textContent || '');
   const dis1 = await page.evaluate(() => !!(document.querySelector('[data-a=start]') || {}).disabled);
-  await page.evaluate(() => { game.menu.roomStart(); game.menu.roomStart(); }); await sleep(300);
+  await page.evaluate(() => { game.menu.roomStart(); game.menu.roomStart(); });
   const cnt1 = await page.evaluate(() => window.__frames.filter(f => /"t":"start"/.test(f)).length);
   ok('I1【命门·真浏览器】第一下之后那一格改口「正在开局…」并灰掉（旧写法：文案不动、连点三下发三帧）',
     /正在开局/.test(label1) && dis1 === true && cnt1 === 1, `label=${label1}·disabled=${dis1}·帧=${cnt1}`);
@@ -345,10 +355,10 @@ try {
       }
       if (fo) game.menu.enterRoomGuard = () => true; else delete game.menu.enterRoomGuard;
     }, forceOpen);
-    await sleep(500);
+    await until(() => game.menu.screen === 'online' && !!document.querySelector('[data-a=create]'), 3000);
     const pre = await page.evaluate(() => ({ enter: game.menu._enterRoom, screen: game.menu.screen }));
     await page.fill('#roomTitle', '量连点');
-    await page.dblclick('[data-a=create]'); await sleep(700);
+    await page.dblclick('[data-a=create]'); await until(() => window.__cc >= 1, 3000); await twoFrames();
     const r = await page.evaluate(() => ({
       f: window.__cf.filter(x => /"t":"createRoom"/.test(x)).length, h: window.__cc,
       scr: game.menu.screen, btn: !!document.querySelector('[data-a=create]'),
@@ -367,44 +377,45 @@ try {
   await page.evaluate(() => { delete game.menu.enterRoomGuard;
     delete game.menu.onlineCreate; delete game.menu.__ocReal;      // 回到原型上那一份，不在实例上留影子
     game.lobby.ws.send = window.__realSend; });
-  await page.evaluate(() => game.menu.leaveOnline()); await sleep(600);
+  await page.evaluate(() => game.menu.leaveOnline()); await until(() => game.menu.screen === 'main', 5000);
 
   // ── J 段：HU-27 键盘预览 · HU-28 滚轮 · HU-29 页内改名 ──
-  await page.evaluate(() => game.menu.showMain()); await sleep(600);
-  await page.click('.mbtn[data-a=loadout]'); await sleep(700);
-  await page.click('[data-a=rename]'); await sleep(500);
+  await page.evaluate(() => game.menu.showMain()); await until(() => game.menu.screen === 'main', 3000);
+  await page.click('.mbtn[data-a=loadout]'); await until(() => game.menu.screen === 'loadout', 3000);
+  await page.click('[data-a=rename]'); await until(() => !!document.querySelector('.picker') && document.activeElement && document.activeElement.id === 'clsName', 3000);
   ok('J1 改名开的是页面内那一层，而且焦点自己落在字格里（原生 prompt 自带这件事，换成层内就得自己做）',
     (await page.evaluate(() => !!(document.querySelector('.picker') && document.activeElement && document.activeElement.id === 'clsName'))));
-  await page.keyboard.type('键盘改名'); await page.keyboard.press('Enter'); await sleep(700);
+  await page.keyboard.type('键盘改名'); await page.keyboard.press('Enter');
+  await until(() => game.profile.classes[game.menu.selClass].name === '键盘改名', 3000);
   ok('J1b 回车就是保存，名字落进 profile（量被测对象），并且浏览器一次弹窗都没被叫过',
     (await page.evaluate(() => game.profile.classes[game.menu.selClass].name)) === '键盘改名'
     && (await page.evaluate(() => window.__nativeDialog)) === 0,
     `__nativeDialog=${await page.evaluate(() => window.__nativeDialog)}`);
 
-  await page.click('[data-g=primary]'); await sleep(1200);
+  await page.click('[data-g=primary]'); await until(() => game.menu.screen === 'gunsmith', 3000);
   ok('J2 进得了枪匠', (await page.evaluate(() => game.menu.screen)) === 'gunsmith');
   const gs0 = await page.evaluate(() => (document.getElementById('gsStats') || {}).textContent || '');
   const patt0 = await page.evaluate(() => JSON.stringify(game.profile.classes[game.menu.selClass].patt));
   await page.evaluate(() => document.body.focus());
   const onAtt = await tabTo('.gs-att');
-  await sleep(400);
+  await until(prev => ((document.getElementById('gsStats') || {}).textContent || '') !== prev, 3000, gs0);
   const gs1 = await page.evaluate(() => (document.getElementById('gsStats') || {}).textContent || '');
   ok('J3【命门·HU-27】键盘 Tab 到一张配件卡上，delta 预览就出来了（旧写法只挂 mouseenter：能走到、能回车，但全程看不到它会改什么）',
     !!onAtt && gs1 !== gs0 && /[+\-−–]\d/.test(gs1), `焦点在 ${onAtt && onAtt.cls2}`);
   ok('J3b 预览**不产生副作用**：配件一个都没被装上（看着它改 ≠ 已经改了）',
     (await page.evaluate(() => JSON.stringify(game.profile.classes[game.menu.selClass].patt))) === patt0, patt0);
   const z0 = await page.evaluate(() => game.menu.gsZoom || 1.45);
-  await page.hover('.gs-right .gs-att'); await page.mouse.wheel(0, 240); await sleep(400);
+  await page.hover('.gs-right .gs-att'); await page.mouse.wheel(0, 240); await twoFrames();
   const z1 = await page.evaluate(() => game.menu.gsZoom || 1.45);
   ok('J4【命门·HU-28】滚轮停在配件列表上时镜头不缩放（那列是唯一会滚的：列表在滚、镜头也在抢同一个手势）',
     z1 === z0, `gsZoom ${z0}→${z1}`);
-  await page.mouse.move(640, 300); await page.mouse.wheel(0, 240); await sleep(400);
+  await page.mouse.move(640, 300); await page.mouse.wheel(0, 240); await until(prev => (game.menu.gsZoom || 1.45) !== prev, 3000, z1);
   const z2 = await page.evaluate(() => game.menu.gsZoom || 1.45);
   ok('J4b【判别臂】指针回到"看枪"那块区域，滚轮照旧缩放（排除名单不许把功能一起禁掉）', z2 !== z1, `gsZoom ${z1}→${z2}`);
 
   // ── K 段：HU-29 重置存档那一层 ──
-  await page.evaluate(() => game.menu.showMain()); await sleep(600);
-  await page.click('.mbtn[data-a=settings]'); await sleep(700);
+  await page.evaluate(() => game.menu.showMain()); await until(() => game.menu.screen === 'main', 3000);
+  await page.click('.mbtn[data-a=settings]'); await until(() => !!document.querySelector('[data-a=resetp]'), 3000);
   // K 段要量的是那一层本身（重置存档的页内弹窗），K0 现在量的是"最后一行够得着吗"。
   // 原来这一条写的是**症状**（1280×720 下设置屏最后一行落在视口外、鼠标点不到 —— HU-32 的现场，
   // 读数当时就记在 docs/hud-ux-audit.md 里）。修好之后同一把尺子必须翻方向，否则它就恒绿。
@@ -431,7 +442,7 @@ try {
       st.remove();
       return out;
     }));
-  await page.evaluate(() => document.querySelector('[data-a=resetp]').click()); await sleep(600);
+  await page.evaluate(() => document.querySelector('[data-a=resetp]').click()); await until(() => !!document.querySelector('.picker'), 3000);
   const dlgtxt = await page.evaluate(() => { const d = document.querySelector('.picker'); return d ? d.textContent : ''; });
   ok('K1【命门】重置存档走的是页面内那一层，它列得清"会丢哪几样"，浏览器弹窗一次都没被叫过',
     /清掉/.test(dlgtxt) && /配装/.test(dlgtxt) && /本地经验/.test(dlgtxt) && (await page.evaluate(() => window.__nativeDialog)) === 0,
@@ -469,7 +480,7 @@ try {
   const CT_SEL = ['.menu-title', '.menu-sub', '.mbtn .mt', '.mbtn .md', '.menu-foot', '.menu-keys', '.menu-ver',
     '.hdr', '.hdr small', '.set-row span', '.set-row .val', '.set-sec', '.set-note', '.bind-row span', '.bind-key', '.bind-hint', '.btn'];
 
-  await page.evaluate(() => game.menu.showSettings('main')); await sleep(500);
+  await page.evaluate(() => game.menu.showSettings('main')); await until(() => !!document.querySelector('.settings .set-row'), 3000);
   const crows = await contrastRows(CT_SEL);
   const cworst = crows.slice().sort((a, b) => a.ratio - b.ratio)[0] || { s: '没读到', ratio: 99 };
   ok('L0【量具自证】这一屏读得到足够多的文字格（少于 10 格就是名单没落到 DOM 上，下面的比值全不可信）',
@@ -513,7 +524,7 @@ try {
     Math.abs(hudScaleTest.a - 1.25) < 0.02, `${hudScaleTest.b}px → ${hudScaleTest.a}×`);
 
   // HU-35：点击目标尺寸。1024×768 是这一族最紧的一档。
-  await page.setViewportSize({ width: 1024, height: 768 }); await sleep(300);
+  await page.setViewportSize({ width: 1024, height: 768 }); await twoFrames();
   const taps = await page.evaluate(() => {
     const out = [];
     for (const s of ['.seg div', '.btn.small', '.bind-key', '.mbtn', '.set-row input[type=range]']) {
@@ -532,10 +543,10 @@ try {
 
   // HU-32：三档视口逐屏扫一遍 —— 横向不许出视口，纵向每一个可点元素都够得着。
   const sweep = async (w, h) => {
-    await page.setViewportSize({ width: w, height: h }); await sleep(250);
+    await page.setViewportSize({ width: w, height: h }); await twoFrames();
     const screens = [];
     const visit = async (name, act) => {
-      await act(); await sleep(420);
+      await act(); await twoFrames();
       const r = await page.evaluate(() => {
         const PICK = '.mbtn,.btn,.pick,.cls,.slotc,.gs-att,.gs-slot,.mode,.mapc,.diff,.seg div,.camo,.bind-key';
         const bad = [];
@@ -559,9 +570,9 @@ try {
     // 枪匠是"进那一屏之后再点一层"才出现的，所以 act 自己等：420ms 的那一刀量到的是
     // 配装屏，等于把 loadout 扫了两遍、枪匠那一屏根本没进（HU-32 点名的重叠恰恰在它身上）。
     await visit('gunsmith', async () => {
-      await page.evaluate(() => game.menu.showLoadouts('main')); await sleep(350);
+      await page.evaluate(() => game.menu.showLoadouts('main')); await until(() => game.menu.screen === 'loadout', 3000);
       await page.evaluate(() => { const g = document.querySelector('[data-g=primary]'); if (g) g.click(); });
-      await sleep(800);
+      await until(() => !!document.querySelector('.gs-left'), 3000);
     });
     return screens;
   };
@@ -572,9 +583,9 @@ try {
       flat.length === 0 && sc.every(s => s.overflowX <= 2), `${flat.slice(0, 3).join(' ⏐ ')} 溢出X=${Math.max(...sc.map(s => s.overflowX))}`);
   }
   // HU-32 的枪匠那一族：窄窗下中列与数值板重叠（审计原话）。量 rect，不靠算。
-  await page.setViewportSize({ width: 1024, height: 768 }); await sleep(250);
-  await page.evaluate(() => { game.menu.showLoadouts('main'); }); await sleep(300);
-  await page.evaluate(() => { const g = document.querySelector('[data-g=primary]'); if (g) g.click(); }); await sleep(900);
+  await page.setViewportSize({ width: 1024, height: 768 }); await twoFrames();
+  await page.evaluate(() => { game.menu.showLoadouts('main'); }); await until(() => game.menu.screen === 'loadout', 3000);
+  await page.evaluate(() => { const g = document.querySelector('[data-g=primary]'); if (g) g.click(); }); await until(() => !!document.querySelector('.gs-left'), 3000);
   const gsOver = await page.evaluate(() => {
     const R = s => { const el = document.querySelector(s); if (!el) return null; const r = el.getBoundingClientRect(); return { l: r.left, t: r.top, r: r.right, b: r.bottom, w: r.width, h: r.height }; };
     const hit = (a, b) => a && b && a.l < b.r - 1 && b.l < a.r - 1 && a.t < b.b - 1 && b.t < a.b - 1;
@@ -666,7 +677,7 @@ try {
     if (window.__opSt) { window.__opSt.remove(); window.__opSt = null; }
     return out;
   };
-  await page.setViewportSize({ width: 1280, height: 720 }); await sleep(250);
+  await page.setViewportSize({ width: 1280, height: 720 }); await twoFrames();
   const op = await page.evaluate(optsProbe);
   const opOff = op.segs ? op.segs.filter(s => Math.abs(s.left - op.ctlLeft) > 2) : [];
   const opWrap = op.segs ? op.segs.filter(s => !s.oneLine || s.h > 40) : [];
@@ -685,7 +696,7 @@ try {
     opOldOff.length === 4 && opOld.segs.some(s => !s.oneLine || s.h > 40) && opOld.h > 500 && opOld.h > op.h + 200,
     `离列 ${opOldOff.length}/4·栏高=${Math.round(opOld.h)}（修好时 ${Math.round(op.h)}）`);
   // 同一把尺子在窄档上再过一遍：1280 那版的高度是内容撑出来的，窄窗下更容易顶出视口。
-  await page.setViewportSize({ width: 1024, height: 768 }); await sleep(250);
+  await page.setViewportSize({ width: 1024, height: 768 }); await twoFrames();
   const opNarrow = await page.evaluate(optsProbe);
   ok('L9c 1024×768 下同一把尺子同样过（那四行是内容撑高的，窄档才是最容易把它顶出视口的一档）',
     opNarrow.found && opNarrow.segs.every(s => Math.abs(s.left - opNarrow.ctlLeft) <= 2) && opNarrow.h <= 420,
@@ -757,7 +768,7 @@ try {
   await page.fill('#roomTitle', '占领验证房');
   await page.click('[data-a=create]');
   const roomOpened = await page.waitForFunction(() => game.menu.screen === 'onlineRoom' && !!document.getElementById('rmMode'), null, { timeout: 30000 }).then(() => true).catch(() => false);
-  await sleep(700);
+  await twoFrames();
   const roomDom = await page.evaluate(readRoomCfg);
   ok('L11b 建房之后房间屏上写的就是这一局：模式「占领」+ 图「双丘战区」+ **档位换过表**（时长 15/25/35 选 25、目标 100/200/500 选 200）—— 只换名字不换档位的话，房间标题上那两个数字从此是假的',
     roomOpened && /dom\*/.test(roomDom.mode || '') && roomDom.map === 'ridges*' && roomDom.min === '15,25*,35'
@@ -774,24 +785,24 @@ try {
   }, v, { timeout: 15000 }).catch(() => { });
   await clickCfg('rmMode', 'tdm');
   await waitMin('10');
-  await sleep(350);
+  await twoFrames();
   const backTdm = await page.evaluate(readRoomCfg);
   ok('L11c 房间里把模式换回「团队死斗」真的生效：图跟着迁回沙丘镇、时长换回 3/5/10/15（25 不在 tdm 的表里 ⇒ 落回 10），目标 200 在 tdm 的表里 ⇒ 留着 —— 这一帧发出去的是**一致的组合**；只发 mode 那一版会被服务端当场拒（症状就是"点了没反应"）',
     /tdm\*/.test(backTdm.mode || '') && /^dune\*/.test(backTdm.map || '') && backTdm.min === '3,5,10*,15'
     && /200\*/.test(backTdm.score || ''), JSON.stringify(backTdm));
   await clickCfg('rmMode', 'dom');
   await waitMin('25');
-  await sleep(350);
+  await twoFrames();
   const backDom = await page.evaluate(readRoomCfg);
   ok('L11d 再换回「占领」同样生效（图那行只剩双丘战区、时长回到 15/25/35 选 25）—— 两个方向都量，免得把"某一支恰好写死"当成通',
     /dom\*/.test(backDom.mode || '') && backDom.map === 'ridges*' && backDom.min === '15,25*,35', JSON.stringify(backDom));
   // 开局。这一条才是"联网里真的打得了占点"的端到端那一半：房是**真大厅 UI** 建出来的，
   // 不是把 modeId 按进去（net-play 那份 dom 判据是后者 —— 量的是同一条链的另一半，入口不同）。
-  await page.click('[data-a=addA]'); await sleep(300);
-  await page.click('[data-a=addA]'); await sleep(500);
+  await page.click('[data-a=addA]'); await until(() => document.querySelectorAll('#seatA .seat[data-bid]').length >= 1, 3000);
+  await page.click('[data-a=addA]'); await until(() => document.querySelectorAll('#seatA .seat[data-bid]').length >= 2, 3000);
   await page.click('[data-a=start]');
   const domPlaying = await page.waitForFunction(() => game.state === 'play' && game.net && game.net.modeId === 'dom', null, { timeout: 180000 }).then(() => true).catch(() => false);
-  await sleep(2000);
+  await until(() => game.net && game.net.flags && game.net.flags.length === 3, 8000);
   const domLive = await page.evaluate(() => ({
     modeId: game.net && game.net.modeId, map: game.net && game.net.mapId,
     flags: game.net && game.net.flags ? game.net.flags.length : -1,
@@ -802,8 +813,8 @@ try {
   await page.waitForFunction(() => game.state === 'menu' && game.menu.screen === 'main', null, { timeout: 60000 }).catch(() => { });
 
   // ══ M 段：HU-37 设置与重绑，在浏览器里真生效 ══
-  await page.setViewportSize({ width: 1280, height: 720 }); await sleep(250);
-  await page.evaluate(() => game.menu.showSettings('main')); await sleep(500);
+  await page.setViewportSize({ width: 1280, height: 720 }); await twoFrames();
+  await page.evaluate(() => game.menu.showSettings('main')); await until(() => !!document.querySelector('[data-k]'), 3000);
   const setRows = await page.evaluate(() => {
     const ks = [...document.querySelectorAll('[data-k]')].map(e => e.dataset.k);
     return { n: ks.length, has: ['hudScale', 'hudOpacity', 'mmSize', 'crossColor', 'crossSize', 'crossGap', 'subtitles', 'volSfx', 'volAmbient', 'volVoice', 'mouseAccel'].every(k => ks.includes(k)), binds: document.querySelectorAll('.bind-key').length };
@@ -827,8 +838,8 @@ try {
   });
   ok('M3 准星颜色：CSS 变量与那四根臂的实际底色同时改色（屏上选的颜色 = 屏幕上打出来的颜色，HU-01 那一族的闭环）',
     cc.css.toLowerCase() === '#4fe3ff' && cc.arm === 'rgb(79, 227, 255)', JSON.stringify(cc));
-  await page.evaluate(() => { document.querySelector('.bind-key[data-bind=fwd]').click(); }); await sleep(220);
-  await page.keyboard.press('KeyG'); await sleep(320);
+  await page.evaluate(() => { document.querySelector('.bind-key[data-bind=fwd]').click(); }); await until(() => !!document.querySelector('.bind-key[data-bind=fwd].cap'), 2000);
+  await page.keyboard.press('KeyG'); await until(() => ((document.querySelector('.bind-key[data-bind=fwd]') || {}).textContent || '').trim() === 'G', 3000);
   const rb = await page.evaluate(() => {
     const cell = document.querySelector('.bind-key[data-bind=fwd]');
     game.input.keys = { KeyG: true }; const fwdG = game.snapshotInput().fwd;
@@ -889,7 +900,7 @@ try {
   // HU-39：暂停屏 —— 要真进一局才量得到（联机暂停是假的这一条本来就只有对局里才成立）。
   // 进局走的是 E 段同一把钥匙（game.startGame），不靠大厅那个按钮：那一格能不能点
   // 是 H/I 段的事，这里要的是"确实有一个在跑的对局可以按暂停"。
-  await page.evaluate(() => { game.exitToMenu(); }); await sleep(600);
+  await page.evaluate(() => { game.exitToMenu(); }); await until(() => game.state === 'menu' && game.menu.screen === 'main', 5000);
   await page.evaluate(() => { game.menu.showMain(); game.startGame('mp',
     { mode: 'tdm', map: 'dune', diff: 1, allies: 3, enemies: 3, scoreLimit: 200, timeLimit: 5 }); });
   const inPlay = await wait(() => game.state === 'play' && !game.paused, 60000);
@@ -897,7 +908,7 @@ try {
   if (inPlay) {
     // HU-36 超宽那一档：**在真对局里**量（#scope 住在 #hud 内，菜单态整块 display:none，
     // 在那里量到的是 0×0 —— 量具没接上，不是遮罩不圆）。
-    await page.setViewportSize({ width: 2560, height: 1080 }); await sleep(400);
+    await page.setViewportSize({ width: 2560, height: 1080 }); await twoFrames();
     const scopeShape = await page.evaluate(() => {
       const sc = document.getElementById('scope');
       const old = sc.className;
@@ -919,8 +930,8 @@ try {
       && Math.abs(scopeShape.radius - scopeShape.w / 2) < 2
       && Math.abs(scopeShape.centeredX - 1280) < 3 && Math.abs(scopeShape.centeredY - 540) < 3,
       `${scopeShape.w}×${scopeShape.h} aspect=${scopeShape.ar}·圆角=${scopeShape.radius}·圆心=(${scopeShape.centeredX},${scopeShape.centeredY})`);
-    await page.setViewportSize({ width: 1280, height: 720 }); await sleep(400);
-    await page.evaluate(() => game.pause(true)); await sleep(700);
+    await page.setViewportSize({ width: 1280, height: 720 }); await twoFrames();
+    await page.evaluate(() => game.pause(true)); await until(() => game.paused && game.menu.screen === 'pause', 3000);
     const pz = await page.evaluate(() => {
       const sc = document.querySelector('.screen.scrim');
       const board = document.getElementById('pauseBoard');
